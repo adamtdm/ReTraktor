@@ -1,0 +1,38 @@
+# /etc/udev/rules.d/99-retraktor-ni.rules
+# Unprivileged hidraw and USB bulk display access for Native Instruments Traktor controllers
+
+# Traktor Kontrol S4 MK3
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="17cc", ATTRS{idProduct}=="1720", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="17cc", ATTR{idProduct}=="1720", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+
+# Traktor Kontrol S3
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="17cc", ATTRS{idProduct}=="1900", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="17cc", ATTR{idProduct}=="1900", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+
+# Traktor Kontrol S2 MK3
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="17cc", ATTRS{idProduct}=="1730", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="17cc", ATTR{idProduct}=="1730", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+
+# Traktor Kontrol S8
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="17cc", ATTRS{idProduct}=="1370", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="17cc", ATTR{idProduct}=="1370", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+
+# Traktor Kontrol S5
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="17cc", ATTRS{idProduct}=="1420", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="17cc", ATTR{idProduct}=="1420", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+
+# Traktor Kontrol D2
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="17cc", ATTRS{idProduct}=="1400", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="17cc", ATTR{idProduct}=="1400", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+
+# Traktor Kontrol X1 MK3
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="17cc", ATTRS{idProduct}=="1cbc", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="17cc", ATTR{idProduct}=="1cbc", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+
+# Traktor Kontrol Z1 MK2
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="17cc", ATTRS{idProduct}=="2120", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="17cc", ATTR{idProduct}=="2120", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+
+# Traktor Kontrol F1
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="17cc", ATTRS{idProduct}=="1120", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="17cc", ATTR{idProduct}=="1120", MODE="0660", GROUP="plugdev", TAG+="uaccess"

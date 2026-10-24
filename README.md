@@ -97,7 +97,43 @@ ReTraktor/
 
 ## Installation Guide
 
-### 1. Install System Dependencies (Linux & macOS)
+### ⚡ 1-Command Universal Linux Installation
+
+You can install ReTraktor and all required audio libraries, Native Instruments Kontrol `udev` rules, real-time PAM audio permissions, desktop launcher, and PATH binaries with a single command:
+
+#### Option A: 1-Line Universal Installer (Ubuntu, Debian, Fedora, Arch, openSUSE)
+```bash
+curl -fsSL https://raw.githubusercontent.com/adamtdm/ReTraktor/main/install.sh | bash
+```
+
+Once installed, simply run:
+```bash
+retraktor
+```
+*(or click the **ReTraktor** icon in your application launcher!)*
+
+#### Option B: Single Debian / Ubuntu Package (`.deb`)
+If you prefer native packages, install the single `.deb` file with `apt` (which automatically installs dependencies, configures NI udev rules, sets up user groups, and registers the desktop launcher):
+```bash
+sudo apt install ./retraktor_0.1.0_amd64.deb
+```
+Then run:
+```bash
+retraktor
+```
+
+#### Option C: Universal Standalone AppImage (Zero Dependencies)
+Download the single-file executable and run directly on any Linux distribution:
+```bash
+chmod +x ReTraktor-x86_64.AppImage
+./ReTraktor-x86_64.AppImage
+```
+
+---
+
+### Manual / Developer Build Instructions
+
+#### 1. Install System Dependencies (Linux & macOS)
 
 #### Ubuntu / Debian (22.04 / 24.04+)
 ```bash

@@ -1,0 +1,41 @@
+name: ReTraktor CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    name: Build & Test (Linux)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libudev-dev libusb-1.0-0-dev libhidapi-dev \
+            libasound2-dev libpipewire-0.3-dev \
+            pipewire pipewire-alsa wireplumber
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run workspace tests
+        run: cargo test --workspace --verbose
+
+      - name: Verify CLI simulation
+        run: cargo run -p retraktor-cli -- simulate-mix
+
+      - name: Verify package builder
+        run: |
+          chmod +x scripts/build-packages.sh
+          ./scripts/build-packages.sh

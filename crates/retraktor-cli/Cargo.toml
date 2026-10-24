@@ -12,3 +12,26 @@ retraktor-library = { path = "../retraktor-library" }
 retraktor-dsp = { path = "../retraktor-dsp" }
 retraktor-audio = { path = "../retraktor-audio" }
 retraktor-hid = { path = "../retraktor-hid" }
+
+[package.metadata.deb]
+name = "retraktor"
+maintainer = "Adam Meek <adamtdm@users.noreply.github.com>"
+copyright = "2026, Adam Meek <adamtdm@users.noreply.github.com>"
+license = "MIT OR Apache-2.0"
+extended-description = """
+Clean-room Linux re-implementation of Native Instruments Traktor Pro 4 in Rust.
+Includes 4-deck audio/DSP engine, CSI 1.0 QML compatibility, .nml and .tsi formats,
+and Native Instruments Kontrol HID and USB bulk display support.
+"""
+section = "sound"
+priority = "optional"
+depends = "$auto, libpipewire-0.3-0, wireplumber, libasound2, libhidapi-hidraw0, libusb-1.0-0"
+maintainer-scripts = "debian"
+assets = [
+    ["target/release/retraktor-cli", "usr/bin/retraktor-cli", "755"],
+    ["assets/retraktor-wrapper.sh", "usr/bin/retraktor", "755"],
+    ["assets/99-retraktor-ni.rules", "lib/udev/rules.d/99-retraktor-ni.rules", "644"],
+    ["assets/99-retraktor-realtime.conf", "etc/security/limits.d/99-retraktor-realtime.conf", "644"],
+    ["assets/retraktor.desktop", "usr/share/applications/retraktor.desktop", "644"],
+    ["assets/retraktor.svg", "usr/share/icons/hicolor/scalable/apps/retraktor.svg", "644"],
+]

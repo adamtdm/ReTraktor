@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100%" height="100%">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#141820" />
+      <stop offset="100%" stop-color="#0a0c10" />
+    </linearGradient>
+    <linearGradient id="deckBlue" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#00a8ff" />
+      <stop offset="100%" stop-color="#0055aa" />
+    </linearGradient>
+    <linearGradient id="deckOrange" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ff7b00" />
+      <stop offset="100%" stop-color="#cc4400" />
+    </linearGradient>
+  </defs>
+  <!-- Background rounded plate -->
+  <rect x="16" y="16" width="480" height="480" rx="96" fill="url(#bg)" stroke="#222834" stroke-width="8" />
+
+  <!-- Outer Vinyl Platter Ring -->
+  <circle cx="256" cy="256" r="180" fill="#181c24" stroke="#2a3040" stroke-width="6" />
+  <circle cx="256" cy="256" r="140" fill="#12151c" stroke="#363e52" stroke-dasharray="8 6" stroke-width="4" />
+  <circle cx="256" cy="256" r="100" fill="#181c24" stroke="#222834" stroke-width="4" />
+
+  <!-- Center Spindle & LED Center -->
+  <circle cx="256" cy="256" r="48" fill="#0d1016" stroke="#00a8ff" stroke-width="4" />
+  <circle cx="256" cy="256" r="18" fill="#ffffff" />
+
+  <!-- Dual Waveform Accent Arcs -->
+  <!-- Deck A (Blue) -->
+  <path d="M 120 256 A 136 136 0 0 1 256 120" fill="none" stroke="url(#deckBlue)" stroke-width="14" stroke-linecap="round" />
+  <!-- Deck B (Orange) -->
+  <path d="M 392 256 A 136 136 0 0 1 256 392" fill="none" stroke="url(#deckOrange)" stroke-width="14" stroke-linecap="round" />
+
+  <!-- Subtle Waveform Bars Across Horizon -->
+  <rect x="80" y="248" width="12" height="16" rx="4" fill="#00a8ff" opacity="0.9" />
+  <rect x="100" y="240" width="12" height="32" rx="4" fill="#00a8ff" opacity="0.9" />
+  <rect x="400" y="240" width="12" height="32" rx="4" fill="#ff7b00" opacity="0.9" />
+  <rect x="420" y="248" width="12" height="16" rx="4" fill="#ff7b00" opacity="0.9" />
+</svg>
