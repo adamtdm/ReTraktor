@@ -1,0 +1,14 @@
+[package]
+name = "retraktor-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Command-line inspector and verification tool for ReTraktor (.nml, .tsi, CSI QML, property bus, udev)"
+
+[dependencies]
+retraktor-core = { path = "../retraktor-core" }
+retraktor-formats = { path = "../retraktor-formats" }
+retraktor-library = { path = "../retraktor-library" }
+retraktor-dsp = { path = "../retraktor-dsp" }
+retraktor-audio = { path = "../retraktor-audio" }
+retraktor-hid = { path = "../retraktor-hid" }

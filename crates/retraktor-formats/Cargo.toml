@@ -1,0 +1,9 @@
+[package]
+name = "retraktor-formats"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Clean-room parsers and serializers for Traktor .nml collections, .tsi controller mappings, and .trak/.stem.m4a containers"
+
+[dependencies]
+retraktor-core = { path = "../retraktor-core" }

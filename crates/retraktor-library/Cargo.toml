@@ -1,0 +1,10 @@
+[package]
+name = "retraktor-library"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ReTraktor music library index, Smartlist query evaluator, and Deck loading bridge"
+
+[dependencies]
+retraktor-core = { path = "../retraktor-core" }
+retraktor-formats = { path = "../retraktor-formats" }

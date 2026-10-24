@@ -1,0 +1,10 @@
+[package]
+name = "retraktor-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ReTraktor real-time 4-deck audio engine and Linux PipeWire/ALSA multi-channel routing descriptors"
+
+[dependencies]
+retraktor-core = { path = "../retraktor-core" }
+retraktor-dsp = { path = "../retraktor-dsp" }

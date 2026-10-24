@@ -1,0 +1,8 @@
+[package]
+name = "retraktor-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ReTraktor core reactive app.traktor.* property bus, Defines enums, and CSI 1.0 wire graph engine"
+
+[dependencies]

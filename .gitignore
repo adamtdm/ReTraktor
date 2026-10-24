@@ -1,0 +1,11 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Node / REA local packages
+/node_modules/
+
+# OS / Editor metadata
+.DS_Store
+*.swp
+*~

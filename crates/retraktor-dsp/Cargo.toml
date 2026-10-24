@@ -1,0 +1,9 @@
+[package]
+name = "retraktor-dsp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ReTraktor real-time DSP blocks: 3/4-band mixer EQs, bipolar ZDF filter, Master Clock sync, and 4-stem summing"
+
+[dependencies]
+retraktor-formats = { path = "../retraktor-formats" }

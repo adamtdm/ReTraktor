@@ -1,0 +1,10 @@
+[package]
+name = "retraktor-hid"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Native Instruments Kontrol (0x17CC) USB HID/NHL report decoder, S4MK3 Haptic Drive platter protocol, OffscreenView RGB565 USB Bulk display streamer, ALSA MIDI .tsi router, and Linux udev generator"
+
+[dependencies]
+retraktor-core = { path = "../retraktor-core" }
+retraktor-formats = { path = "../retraktor-formats" }

@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/retraktor-core",
+    "crates/retraktor-formats",
+    "crates/retraktor-library",
+    "crates/retraktor-dsp",
+    "crates/retraktor-audio",
+    "crates/retraktor-hid",
+    "crates/retraktor-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Clean-room Linux re-implementation of Native Instruments Traktor Pro 4"
