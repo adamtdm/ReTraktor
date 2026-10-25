@@ -33,6 +33,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod gui;
+
 fn log_trace(msg: &str) {
     if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open("/tmp/retraktor.log") {
         let now = std::time::SystemTime::now()
@@ -46,11 +48,27 @@ fn log_trace(msg: &str) {
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 || args[1] == "run" {
-        run_interactive_player();
+        log_trace("Launching ReTraktor default application");
+        // Try native desktop GUI window first
+        if let Err(e) = gui::try_run_gui() {
+            log_trace(&format!(
+                "GUI window unavailable ({e}), falling back to interactive terminal player"
+            ));
+            run_interactive_player();
+        }
         return;
     }
 
     match args[1].as_str() {
+        "gui" => {
+            if let Err(e) = gui::try_run_gui() {
+                eprintln!("Failed to launch GUI window: {e}");
+                process::exit(1);
+            }
+        }
+        "tui" => {
+            run_interactive_player();
+        }
         "doctor" | "--doctor" | "diagnose" => {
             run_doctor();
         }
@@ -629,48 +647,34 @@ fn run_interactive_player() {
         let mut out = String::with_capacity(4096);
         out.push_str("\x1b[H"); // Cursor home
 
-        // Top Navigation Header
+        // Top Navigation Header (Fits 76 columns)
         out.push_str("\x1b[1;37;44m");
         out.push_str(" 🎛️  RETRAKTOR 4.5.1 [LINUX] ");
         out.push_str("\x1b[0m\x1b[1;30;47m");
-        out.push_str(" │ PIPEWIRE PRO-AUDIO │ OZONE MAXIMIZER: ON │ MASTER CLOCK: 128.00 BPM ");
+        out.push_str(" │ PIPEWIRE 48kHz (128q) │ OZONE: ON │ CLOCK: 128 BPM ");
         out.push_str("\x1b[0m\n\n");
 
-        // Deck A & Deck B Header Columns
-        let a_state = if deck_a_playing { "\x1b[1;32m▶ PLAYING\x1b[0m" } else { "\x1b[1;33m⏸ PAUSED\x1b[0m" };
-        let b_state = if deck_b_playing { "\x1b[1;32m▶ PLAYING\x1b[0m" } else { "\x1b[1;33m⏸ PAUSED\x1b[0m" };
-        let a_flux_txt = if deck_a_flux { "\x1b[1;35mFLUX: ON\x1b[0m" } else { "FLUX: OFF" };
-        let b_sync_txt = if deck_b_synced { "\x1b[1;32mSYNC: ON (128.00)\x1b[0m" } else { "SYNC: OFF (130.00)" };
-
-        out.push_str(&format!(
-            " \x1b[1;36mDECK A (CH 1)\x1b[0m {:<16} {:<12}      \x1b[1;33mDECK B (CH 2)\x1b[0m {:<16} {:<12}\n",
-            a_state, a_flux_txt, b_state, b_sync_txt
-        ));
-        out.push_str(&format!(
-            " 🎵 {:<36}       🎵 {:<36}\n",
-            "Berlin Midnight (Stem Edit)", "Detroit Dawn"
-        ));
-        out.push_str(&format!(
-            " 👤 {:<36}       👤 {:<36}\n",
-            "Ben Klock (ReTraktor)", "Robert Hood (ReTraktor)"
-        ));
+        let a_state = if deck_a_playing { "\x1b[1;32m▶ PLAY\x1b[0m" } else { "\x1b[1;33m⏸ PAUSE\x1b[0m" };
+        let b_state = if deck_b_playing { "\x1b[1;32m▶ PLAY\x1b[0m" } else { "\x1b[1;33m⏸ PAUSE\x1b[0m" };
+        let a_flux = if deck_a_flux { "\x1b[1;35mFLUX\x1b[0m" } else { "    " };
+        let b_sync = if deck_b_synced { "\x1b[1;32mSYNC\x1b[0m" } else { "    " };
 
         let a_min = (deck_a_time / 60.0) as u32;
         let a_sec = (deck_a_time % 60.0) as u32;
-        let a_ms = ((deck_a_time % 1.0) * 10.0) as u32;
         let b_min = (deck_b_time / 60.0) as u32;
         let b_sec = (deck_b_time % 60.0) as u32;
-        let b_ms = ((deck_b_time % 1.0) * 10.0) as u32;
 
         out.push_str(&format!(
-            " ⏱️  {:02}:{:02}.{} / 06:00.0  Key: 4m (Am)           ⏱️  {:02}:{:02}.{} / 06:30.0  Key: 5m (Em) [✓ Match]\n",
-            a_min, a_sec, a_ms, b_min, b_sec, b_ms
+            " \x1b[1;36mDECK A\x1b[0m {} {} {:02}:{:02} 128BPM 4m │ \x1b[1;33mDECK B\x1b[0m {} {} {:02}:{:02} 130BPM 5m [✓]\n",
+            a_state, a_flux, a_min, a_sec, b_state, b_sync, b_min, b_sec
         ));
+        out.push_str(" 🎵 Berlin Midnight (Stem Edit)      │ 🎵 Detroit Dawn                    \n");
+        out.push_str(" 👤 Ben Klock (ReTraktor)            │ 👤 Robert Hood (ReTraktor)         \n");
 
         // Waveforms
         out.push_str("\n \x1b[1;36mWaveform A:\x1b[0m\n ");
-        let playhead_col_a = ((deck_a_time * 4.0) as usize) % 40;
-        for c in 0..40 {
+        let playhead_col_a = ((deck_a_time * 4.0) as usize) % 36;
+        for c in 0..36 {
             if c == playhead_col_a {
                 out.push_str("\x1b[1;37;41m|\x1b[0m");
             } else if c % 8 == 0 {
@@ -681,11 +685,11 @@ fn run_interactive_player() {
                 out.push_str("\x1b[0;34m▒\x1b[0m");
             }
         }
-        out.push_str("   Hotcues: [1:Drop] [2:Loop] [3] [4]\n");
+        out.push_str("  Cues: [1:Drop] [2:Loop] [3] [4]\n");
 
         out.push_str("\n \x1b[1;33mWaveform B:\x1b[0m\n ");
-        let playhead_col_b = ((deck_b_time * 4.0) as usize) % 40;
-        for c in 0..40 {
+        let playhead_col_b = ((deck_b_time * 4.0) as usize) % 36;
+        for c in 0..36 {
             if c == playhead_col_b {
                 out.push_str("\x1b[1;37;41m|\x1b[0m");
             } else if c % 8 == 0 {
@@ -696,47 +700,39 @@ fn run_interactive_player() {
                 out.push_str("\x1b[0;31m▒\x1b[0m");
             }
         }
-        out.push_str("   Hotcues: [5:Intro] [6:Break] [7] [8]\n");
+        out.push_str("  Cues: [5:Intro] [6:Break] [7] [8]\n");
 
-        // Mixer & Crossfader section
-        out.push_str("\n ─────────────────────────────── MIXER & AUDIO ───────────────────────────────\n");
-        let vu_a_bars = if deck_a_playing { (12.0 + (frame_count % 5) as f64) as usize } else { 0 };
-        let vu_b_bars = if deck_b_playing { (11.0 + ((frame_count + 2) % 5) as f64) as usize } else { 0 };
-        let vu_a_str: String = (0..16).map(|i| if i < vu_a_bars { '█' } else { '░' }).collect();
-        let vu_b_str: String = (0..16).map(|i| if i < vu_b_bars { '█' } else { '░' }).collect();
-
-        out.push_str(&format!(
-            "  VU A: \x1b[1;32m{}\x1b[0m -3.2 dB                  VU B: \x1b[1;32m{}\x1b[0m -4.8 dB\n",
-            vu_a_str, vu_b_str
-        ));
+        // Mixer & Crossfader section (Within 76 columns)
+        out.push_str("\n ────────────────────────── MIXER & HARDWARE ───────────────────────────\n");
+        let vu_a_bars = if deck_a_playing { (8.0 + (frame_count % 3) as f64) as usize } else { 0 };
+        let vu_b_bars = if deck_b_playing { (7.0 + ((frame_count + 1) % 3) as f64) as usize } else { 0 };
+        let vu_a_str: String = (0..10).map(|i| if i < vu_a_bars { '█' } else { '░' }).collect();
+        let vu_b_str: String = (0..10).map(|i| if i < vu_b_bars { '█' } else { '░' }).collect();
 
         // Crossfader graphic
-        let xf_pos = (crossfader * 20.0).round() as usize;
+        let xf_pos = (crossfader * 16.0).round() as usize;
         let mut xf_slider = String::new();
-        for i in 0..=20 {
+        for i in 0..=16 {
             if i == xf_pos {
                 xf_slider.push_str("\x1b[1;37;41m█\x1b[0m");
-            } else if i < 10 {
+            } else if i < 8 {
                 xf_slider.push_str("\x1b[0;36m─\x1b[0m");
             } else {
                 xf_slider.push_str("\x1b[0;33m─\x1b[0m");
             }
         }
+
         out.push_str(&format!(
-            "  Crossfader: [◄ CH 1] {} [CH 2 ►]   Master Gain: {:.0}%\n",
-            xf_slider, master_vol * 100.0
+            " VU A: \x1b[1;32m{}\x1b[0m -3dB │ XF: [◄] {} [►] │ VU B: \x1b[1;32m{}\x1b[0m -5dB\n",
+            vu_a_str, xf_slider, vu_b_str
         ));
+        out.push_str(" NI Kontrol: S4 MK3 / S8 / S3 / S2 / X1 / Z1 │ ALSA MIDI: Ready         \n");
 
-        // Hardware controller status
-        out.push_str("\n ────────────────────────── HARDWARE & PROTOCOLS ───────────────────────────\n");
-        out.push_str("  NI Kontrol: S4 MK3 / S8 / S3 / S2 / X1 / Z1  │  /dev/hidraw uaccess: OK\n");
-        out.push_str("  ALSA MIDI:  Active                           │  CSI 1.0 QML Engine: Ready\n");
-
-        // Hotkey Cheatsheet
-        out.push_str("\n ───────────────────────────── KEYBOARD CONTROLS ─────────────────────────────\n");
-        out.push_str("  [Space] Play/Pause A   [Enter] Play/Pause B    [C] Cue A    [V] Cue B\n");
-        out.push_str("  [S]     Sync B -> A    [F]     Flux Mode A     [1-4] Cues A [5-8] Cues B\n");
-        out.push_str("  [← / →] Crossfader     [↑ / ↓] Master Volume   [Q / Esc]    Quit ReTraktor\n");
+        // Keyboard Controls
+        out.push_str("\n ────────────────────────── KEYBOARD CONTROLS ──────────────────────────\n");
+        out.push_str(" [Space] Play/Pause A   [Enter] Play/Pause B    [C/V] Cue A/B  [S] Sync \n");
+        out.push_str(" [F]     Flux Mode A    [1-4]   Cues A (1..4)   [5-8] Cues B   [Q] Quit \n");
+        out.push_str(" [←/→]   Crossfader     [↑/↓]   Master Volume   [Tab] Switch Active Deck\n");
 
         let _ = stdout.write_all(out.as_bytes());
         let _ = stdout.flush();
