@@ -79,17 +79,20 @@ if [[ "$DISTRO_ID" == "ubuntu" || "$DISTRO_ID" == "debian" || "$DISTRO_ID" == "p
         build-essential pkg-config curl git \
         libudev-dev libusb-1.0-0-dev libhidapi-dev \
         libasound2-dev libpipewire-0.3-dev \
+        libx11-dev libxkbcommon-dev libgl1-mesa-dev \
         pipewire pipewire-alsa wireplumber
 elif [[ "$DISTRO_ID" == "fedora" || "$DISTRO_ID" == "rhel" || "$DISTRO_ID" == "centos" || "$DISTRO_LIKE" == *"fedora"* ]]; then
     $SUDO dnf install -y \
         gcc gcc-c++ make pkgconf-pkg-config curl git \
         systemd-devel libusb1-devel hidapi-devel \
-        alsa-lib-devel pipewire-devel pipewire-alsa wireplumber
+        alsa-lib-devel pipewire-devel pipewire-alsa wireplumber \
+        libxkbcommon-devel libX11-devel mesa-libGL-devel
 elif [[ "$DISTRO_ID" == "arch" || "$DISTRO_ID" == "manjaro" || "$DISTRO_LIKE" == *"arch"* ]]; then
     $SUDO pacman -S --needed --noconfirm \
         base-devel pkgconf curl git \
         systemd-libs libusb hidapi \
-        alsa-lib pipewire pipewire-alsa wireplumber
+        alsa-lib pipewire pipewire-alsa wireplumber \
+        libxkbcommon libx11 mesa
 elif [[ "$DISTRO_ID" == "opensuse"* || "$DISTRO_LIKE" == *"suse"* ]]; then
     $SUDO zypper --non-interactive install \
         gcc gcc-c++ make pkg-config curl git \
@@ -168,6 +171,7 @@ if command -v dpkg-deb >/dev/null 2>&1; then
     mkdir -p "$DEB_ROOT/usr/share/applications"
     mkdir -p "$DEB_ROOT/usr/share/icons/hicolor/scalable/apps"
 
+    install -m 0755 "$BIN_DIR/retraktor-gui" "$DEB_ROOT/usr/bin/retraktor-gui"
     install -m 0755 "$BIN_DIR/retraktor-cli" "$DEB_ROOT/usr/bin/retraktor-cli"
     install -m 0755 "$SCRIPT_DIR/assets/retraktor-wrapper.sh" "$DEB_ROOT/usr/bin/retraktor"
     install -m 0644 "$SCRIPT_DIR/assets/99-retraktor-ni.rules" "$DEB_ROOT/lib/udev/rules.d/99-retraktor-ni.rules"
@@ -181,12 +185,13 @@ Version: ${VERSION}
 Section: sound
 Priority: optional
 Architecture: ${DEB_ARCH}
-Depends: libasound2, libusb-1.0-0, libhidapi-hidraw0 | libhidapi-libusb0
+Depends: libasound2, libusb-1.0-0, libhidapi-hidraw0 | libhidapi-libusb0, libgl1 | libglvnd0, libx11-6
 Recommends: pipewire, wireplumber
 Maintainer: Adam Meek <adamtdm@users.noreply.github.com>
 Description: Clean-room Linux re-implementation of Native Instruments Traktor Pro 4
  ReTraktor provides complete 4-deck DJ mixing, reactive CSI 1.0 QML scripting,
- .nml/.tsi library interoperability, and Native Instruments Kontrol HID/USB hardware support.
+ .nml/.tsi library interoperability, hardware-accelerated 60 FPS waveforms GUI,
+ and Native Instruments Kontrol HID/USB hardware support.
 EOF
 
     install -m 0755 "$SCRIPT_DIR/debian/postinst" "$DEB_ROOT/DEBIAN/postinst"
@@ -204,6 +209,7 @@ EOF
     cp "$DEB_OUT" "./retraktor_${VERSION}_${DEB_ARCH}.deb" 2>/dev/null || true
 else
     log_info "Installing binaries and system configuration directly..."
+    $SUDO install -m 0755 "$BIN_DIR/retraktor-gui" /usr/local/bin/retraktor-gui
     $SUDO install -m 0755 "$BIN_DIR/retraktor-cli" /usr/local/bin/retraktor-cli
     $SUDO install -m 0755 "$SCRIPT_DIR/assets/retraktor-wrapper.sh" /usr/local/bin/retraktor
 
@@ -220,7 +226,9 @@ else
     $SUDO install -m 0644 "$SCRIPT_DIR/assets/retraktor.svg" /usr/share/icons/hicolor/scalable/apps/retraktor.svg
 fi
 
-# Ensure both /usr/local/bin and /usr/bin have the active retraktor and retraktor-cli binaries
+# Ensure both /usr/local/bin and /usr/bin have the active retraktor, retraktor-gui, and retraktor-cli binaries
+$SUDO install -m 0755 "$BIN_DIR/retraktor-gui" /usr/local/bin/retraktor-gui 2>/dev/null || true
+$SUDO install -m 0755 "$BIN_DIR/retraktor-gui" /usr/bin/retraktor-gui 2>/dev/null || true
 $SUDO install -m 0755 "$BIN_DIR/retraktor-cli" /usr/local/bin/retraktor-cli 2>/dev/null || true
 $SUDO install -m 0755 "$BIN_DIR/retraktor-cli" /usr/bin/retraktor-cli 2>/dev/null || true
 $SUDO install -m 0755 "$SCRIPT_DIR/assets/retraktor-wrapper.sh" /usr/local/bin/retraktor 2>/dev/null || true
@@ -250,16 +258,17 @@ echo ""
 log_success "ReTraktor installation completed successfully!"
 echo ""
 echo -e "${BOLD}Installed components:${NC}"
-echo -e "  • Executable:      ${GREEN}/usr/local/bin/retraktor${NC}"
+echo -e "  • Desktop GUI:     ${GREEN}/usr/local/bin/retraktor${NC} (native 60 FPS Traktor Pro 4 interface)"
 echo -e "  • CLI Utility:     ${GREEN}/usr/local/bin/retraktor-cli${NC}"
 echo -e "  • NI udev rules:   ${GREEN}/etc/udev/rules.d/99-retraktor-ni.rules${NC}"
 echo -e "  • Audio limits:    ${GREEN}/etc/security/limits.d/99-retraktor-realtime.conf${NC}"
 echo -e "  • Desktop Launcher:${GREEN}/usr/share/applications/retraktor.desktop${NC}"
 echo ""
 echo -e "${BOLD}To start using ReTraktor:${NC}"
-echo -e "  Simply run:  ${GREEN}retraktor${NC}  or click the ${GREEN}ReTraktor${NC} icon in your application launcher."
-echo -e "  Inspect NML: ${BLUE}retraktor-cli inspect-nml <collection.nml>${NC}"
-echo -e "  Inspect TSI: ${BLUE}retraktor-cli inspect-tsi <mapping.tsi>${NC}"
+echo -e "  Simply run:  ${GREEN}retraktor${NC}  or click the ${BOLD}ReTraktor${NC} icon in your application launcher."
+echo -e "  Inspect NML: ${CYAN}retraktor-cli inspect-nml <collection.nml>${NC}"
+echo -e "  Inspect TSI: ${CYAN}retraktor-cli inspect-tsi <mapping.tsi>${NC}"
+echo -e "  Run Doctor:  ${CYAN}retraktor-cli doctor${NC}"
 echo ""
 if [ -n "$TARGET_USER" ]; then
     echo -e "${YELLOW}[NOTE]${NC} If you were just added to the 'audio'/'plugdev' groups, please log out and back in once for permissions to take full effect."

@@ -1,48 +1,62 @@
 #!/usr/bin/env bash
-# ReTraktor user launcher
+# ==============================================================================
+# ReTraktor: Native Desktop & CLI Launcher
+# Dispatches to the native graphical desktop interface (retraktor-gui) by default,
+# or to retraktor-cli when CLI subcommands or headless environments are detected.
+# ==============================================================================
 set -e
 
 # Record launch attempt in /tmp/retraktor.log
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] retraktor launcher called with args: '$*'" >> /tmp/retraktor.log
 
-CLI_BIN="$(command -v retraktor-cli 2>/dev/null || echo "/usr/local/bin/retraktor-cli")"
-if [ ! -x "$CLI_BIN" ]; then
-    CLI_BIN="/usr/bin/retraktor-cli"
+GUI_BIN="$(command -v retraktor-gui 2>/dev/null || echo "")"
+if [ -z "$GUI_BIN" ] || [ ! -x "$GUI_BIN" ]; then
+    if [ -x "/usr/local/bin/retraktor-gui" ]; then
+        GUI_BIN="/usr/local/bin/retraktor-gui"
+    elif [ -x "/usr/bin/retraktor-gui" ]; then
+        GUI_BIN="/usr/bin/retraktor-gui"
+    fi
 fi
 
-if [ ! -x "$CLI_BIN" ]; then
-    echo "ERROR: retraktor-cli binary not found in /usr/local/bin or /usr/bin" | tee -a /tmp/retraktor.log
-    exit 1
+CLI_BIN="$(command -v retraktor-cli 2>/dev/null || echo "")"
+if [ -z "$CLI_BIN" ] || [ ! -x "$CLI_BIN" ]; then
+    if [ -x "/usr/local/bin/retraktor-cli" ]; then
+        CLI_BIN="/usr/local/bin/retraktor-cli"
+    elif [ -x "/usr/bin/retraktor-cli" ]; then
+        CLI_BIN="/usr/bin/retraktor-cli"
+    fi
 fi
 
-# If already inside a terminal spawned by this wrapper, bypass
-if [ "${1:-}" = "--in-terminal" ]; then
-    shift
+# 1. Handle CLI subcommands directly
+if [ "$#" -gt 0 ]; then
+    case "$1" in
+        inspect-nml|inspect-tsi|inspect-stripe|inspect-transients|inspect-csi|dump-prop-bus|list-devices|udev-rules|doctor|--doctor|diagnose|simulate-mix|tui|--help|-h|help)
+            if [ -n "$CLI_BIN" ] && [ -x "$CLI_BIN" ]; then
+                exec "$CLI_BIN" "$@"
+            fi
+            ;;
+        gui)
+            shift
+            if [ -n "$GUI_BIN" ] && [ -x "$GUI_BIN" ]; then
+                exec "$GUI_BIN" "$@"
+            fi
+            ;;
+    esac
+fi
+
+# 2. Launch native desktop GUI window if display server (Wayland or X11) is active
+if [ -n "${WAYLAND_DISPLAY:-}" ] || [ -n "${DISPLAY:-}" ]; then
+    if [ -n "$GUI_BIN" ] && [ -x "$GUI_BIN" ]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Launching native ReTraktor Pro 4 GUI window..." >> /tmp/retraktor.log
+        exec "$GUI_BIN" "$@"
+    fi
+fi
+
+# 3. Fallback to CLI or TUI if no graphical display is attached (e.g. headless SSH session)
+if [ -n "$CLI_BIN" ] && [ -x "$CLI_BIN" ]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Graphical display unavailable; falling back to terminal player." >> /tmp/retraktor.log
     exec "$CLI_BIN" "$@"
 fi
 
-# If launched from GUI / desktop launcher without an interactive TTY, spawn a real terminal window
-if [ ! -t 0 ] || [ ! -t 1 ]; then
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Spawning terminal emulator..." >> /tmp/retraktor.log
-    for TERM_EMU in cosmic-term gnome-terminal x-terminal-emulator alacritty kitty xterm; do
-        if command -v "$TERM_EMU" >/dev/null 2>&1; then
-            case "$TERM_EMU" in
-                gnome-terminal)
-                    exec gnome-terminal --title="ReTraktor DJ" -- "$0" --in-terminal run "$@"
-                    ;;
-                cosmic-term)
-                    exec cosmic-term -e "$0" --in-terminal run "$@"
-                    ;;
-                *)
-                    exec "$TERM_EMU" -e "$0" --in-terminal run "$@"
-                    ;;
-            esac
-        fi
-    done
-fi
-
-if [ "$#" -eq 0 ]; then
-    exec "$CLI_BIN" run
-else
-    exec "$CLI_BIN" "$@"
-fi
+echo "ERROR: Neither retraktor-gui nor retraktor-cli could be located." | tee -a /tmp/retraktor.log
+exit 1

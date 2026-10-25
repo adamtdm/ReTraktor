@@ -27,6 +27,14 @@ It provides native Linux interoperability for Traktor music libraries (`.nml` v1
 
 ## Key Features
 
+- **Native Hardware-Accelerated Desktop Graphical Application (`retraktor-gui`)**:
+  - Full-blown desktop GUI interface matching Native Instruments Traktor Pro 4 on macOS/Windows, built on `eframe`/`egui` with native Wayland and X11 acceleration.
+  - **Top Bar**: Master Clock BPM display with Tap/Sync, FX Units 1 & 2 racks with Dry/Wet and 3 parameter knobs, Ozone Maximizer limiter meter, and PipeWire `pro-audio` 48kHz status indicator.
+  - **Decks A & B (and toggleable C & D)**: Authentic Traktor Pro 4 dark palette (Cyan for Deck A, Orange for Deck B), Track header with Open Key badge and harmonic match indicator, 60 FPS parallel scrolling 3-band frequency spectrum waveforms, full-track Stripe minimap overview (`PRTS`) with draggable scrubber, Loop strip (`/2`, `x2`, Active), 8 backlit Hotcue pads (`[1]`..`[8]`), and transport buttons (`[PLAY]`, `[CUE]`, `[SYNC]`, `[FLUX]`, `[PITCH]`).
+  - **Center 4-Channel Mixer**: Rotary gain knobs with autogain, 3-band EQ knobs with individual kill buttons, Bipolar Filter / Mixer FX knobs with selector, Headphone Cue listen buttons, smooth vertical volume faders with dB scale, stereo LED VU meter towers (Green/Yellow/Red), and horizontal Crossfader with curve selector.
+  - **Track Collection Browser**: Left tree navigation (Collection, Playlists, Smartlists, History, Explorer, NI Controllers), instant search bar, sortable track table with live Circle of Fifths harmonic compatibility highlighting, and one-click `[LOAD A]` / `[LOAD B]` buttons.
+  - **Real-Time Sound Engine**: Real-time stereo audio playback through PipeWire / ALSA (`cpal`), synthesis demo tracks, and audio file loading.
+  - **Preferences Modal (`Ctrl+,`)**: Audio backend (PipeWire / ALSA), sample rate (44.1k/48k/96k), buffer size / latency (64, 128, 256, 512 frames), output routing (Master L/R 1/2, Headphone Cue 3/4), mixer EQ emulations, and NI controller hardware detection.
 - **100% Observed `app.traktor.*` Property Bus (`retraktor-core`)**:
   - Pre-registers `1,797` typed properties covering all `190` unique `app.traktor.*` property path templates extracted across all `510` QML files shipped in Traktor Pro `4.5.1` (`Decks 1..4`, `Stems 1..4`, `Remix Decks 4x16`, `Step Sequencer`, `4-Channel Mixer`, `4 FX Units`, `Ozone Maximizer`, `Master Clock`, and `Browser`).
   - Implements all 10 `Defines 1.0` QML singletons with exact integer parity (`PadsMode`, `Overlay`, `FooterPage`, `FxOverlay`, `StemStyle`, `ScreenView`, `NavigationMode`, `JumpSize`, `LoopSize`, `MoveSize`).
@@ -66,6 +74,7 @@ ReTraktor/
 │   ├── retraktor-dsp/          # 5 EQ models, 9 Mixer FX, Flux/Loop/Freeze transport, Stem summer, Ozone Maximizer
 │   ├── retraktor-audio/        # 4-Deck real-time mixer, Crossfader curves, PipeWire pro-audio UAC2 routing
 │   ├── retraktor-hid/          # NI Kontrol (0x17CC) HID reports, S4 MK3 Haptic Drive, RGB565 USB Bulk screens, udev
+│   ├── retraktor-gui/          # Full-blown 60 FPS Traktor Pro 4 native desktop GUI (Wayland & X11)
 │   └── retraktor-cli/          # CLI inspector, udev rule generator, and 4-deck performance simulator
 └── docs/
     └── evidence/               # REA static analysis specifications & extracted QML property catalogs

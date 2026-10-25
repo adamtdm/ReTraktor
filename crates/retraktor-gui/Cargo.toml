@@ -1,0 +1,21 @@
+[package]
+name = "retraktor-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Native desktop graphical application for ReTraktor (Traktor Pro 4 on Linux)"
+
+[dependencies]
+retraktor-core = { path = "../retraktor-core" }
+retraktor-formats = { path = "../retraktor-formats" }
+retraktor-library = { path = "../retraktor-library" }
+retraktor-dsp = { path = "../retraktor-dsp" }
+retraktor-audio = { path = "../retraktor-audio" }
+retraktor-hid = { path = "../retraktor-hid" }
+eframe = "0.29"
+cpal = "0.18.2"
+symphonia = { version = "0.6.1", features = ["mp3", "wav", "flac", "aac", "isomp4", "ogg"] }
+
+[[bin]]
+name = "retraktor-gui"
+path = "src/main.rs"
