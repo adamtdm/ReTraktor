@@ -12,6 +12,7 @@ retraktor-library = { path = "../retraktor-library" }
 retraktor-dsp = { path = "../retraktor-dsp" }
 retraktor-audio = { path = "../retraktor-audio" }
 retraktor-hid = { path = "../retraktor-hid" }
+crossterm = "0.28"
 
 [package.metadata.deb]
 name = "retraktor"

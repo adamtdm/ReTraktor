@@ -2,8 +2,13 @@
 # ReTraktor user launcher
 set -e
 
+CLI_BIN="$(command -v retraktor-cli 2>/dev/null || echo "/usr/local/bin/retraktor-cli")"
+if [ ! -x "$CLI_BIN" ]; then
+    CLI_BIN="/usr/bin/retraktor-cli"
+fi
+
 if [ "$#" -eq 0 ]; then
-    exec /usr/bin/retraktor-cli simulate-mix
+    exec "$CLI_BIN" run
 else
-    exec /usr/bin/retraktor-cli "$@"
+    exec "$CLI_BIN" "$@"
 fi

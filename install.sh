@@ -99,14 +99,22 @@ else
     log_warn "Unknown Linux distribution. Ensure you have libudev, libusb, hidapi, alsa, and pipewire installed."
 fi
 
+# Ensure Cargo is in PATH if installed in ~/.cargo/bin
+if [ -d "$HOME/.cargo/bin" ]; then
+    export PATH="$HOME/.cargo/bin:$PATH"
+fi
+
 # 2. Check for or install Rust
 if ! command -v cargo >/dev/null 2>&1; then
     log_info "Rust toolchain not detected. Installing Rust via rustup..."
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-    source "$HOME/.cargo/env" || export PATH="$HOME/.cargo/bin:$PATH"
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+    if [ -f "$HOME/.cargo/env" ]; then
+        source "$HOME/.cargo/env"
+    fi
+    export PATH="$HOME/.cargo/bin:$PATH"
 fi
 
-# 3. Build or fetch ReTraktor binaries
+# 3. Build ReTraktor
 TEMP_DIR=""
 cleanup() {
     if [ -n "$TEMP_DIR" ] && [ -d "$TEMP_DIR" ]; then
@@ -115,11 +123,14 @@ cleanup() {
 }
 trap cleanup EXIT
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR=""
+if [ -n "${BASH_SOURCE[0]:-}" ]; then
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || echo "")"
+fi
 BIN_DIR=""
 
 # Check if we are running from inside the cloned repo
-if [ -f "$SCRIPT_DIR/Cargo.toml" ] && [ -d "$SCRIPT_DIR/crates" ]; then
+if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/Cargo.toml" ] && [ -d "$SCRIPT_DIR/crates" ]; then
     log_info "Building ReTraktor from local repository..."
     cd "$SCRIPT_DIR"
     cargo build --workspace --release
@@ -134,53 +145,99 @@ else
     SCRIPT_DIR="$TEMP_DIR/ReTraktor"
 fi
 
-# 4. Install binaries to /usr/local/bin
-log_info "Installing binaries to /usr/local/bin..."
-$SUDO install -m 0755 "$BIN_DIR/retraktor-cli" /usr/local/bin/retraktor-cli
+# 4. Packaging & Installation
+# If dpkg-deb is available (Ubuntu, Debian, Pop!_OS), build and install a real .deb package
+if command -v dpkg-deb >/dev/null 2>&1; then
+    log_info "Building and installing native Debian package (.deb)..."
+    ARCH="$(uname -m)"
+    if [ "$ARCH" = "x86_64" ]; then
+        DEB_ARCH="amd64"
+    elif [ "$ARCH" = "aarch64" ]; then
+        DEB_ARCH="arm64"
+    else
+        DEB_ARCH="$ARCH"
+    fi
+    VERSION="0.1.0"
+    DEB_STAGE="$(mktemp -d)"
+    DEB_ROOT="$DEB_STAGE/retraktor_${VERSION}_${DEB_ARCH}"
 
-# Create convenient 'retraktor' wrapper command
-$SUDO tee /usr/local/bin/retraktor > /dev/null << 'EOF'
-#!/usr/bin/env bash
-# ReTraktor launcher
-if [ "$#" -eq 0 ]; then
-    exec /usr/local/bin/retraktor-cli simulate-mix
-else
-    exec /usr/local/bin/retraktor-cli "$@"
-fi
+    mkdir -p "$DEB_ROOT/DEBIAN"
+    mkdir -p "$DEB_ROOT/usr/bin"
+    mkdir -p "$DEB_ROOT/lib/udev/rules.d"
+    mkdir -p "$DEB_ROOT/etc/security/limits.d"
+    mkdir -p "$DEB_ROOT/usr/share/applications"
+    mkdir -p "$DEB_ROOT/usr/share/icons/hicolor/scalable/apps"
+
+    install -m 0755 "$BIN_DIR/retraktor-cli" "$DEB_ROOT/usr/bin/retraktor-cli"
+    install -m 0755 "$SCRIPT_DIR/assets/retraktor-wrapper.sh" "$DEB_ROOT/usr/bin/retraktor"
+    install -m 0644 "$SCRIPT_DIR/assets/99-retraktor-ni.rules" "$DEB_ROOT/lib/udev/rules.d/99-retraktor-ni.rules"
+    install -m 0644 "$SCRIPT_DIR/assets/99-retraktor-realtime.conf" "$DEB_ROOT/etc/security/limits.d/99-retraktor-realtime.conf"
+    install -m 0644 "$SCRIPT_DIR/assets/retraktor.desktop" "$DEB_ROOT/usr/share/applications/retraktor.desktop"
+    install -m 0644 "$SCRIPT_DIR/assets/retraktor.svg" "$DEB_ROOT/usr/share/icons/hicolor/scalable/apps/retraktor.svg"
+
+    cat > "$DEB_ROOT/DEBIAN/control" << EOF
+Package: retraktor
+Version: ${VERSION}
+Section: sound
+Priority: optional
+Architecture: ${DEB_ARCH}
+Depends: libasound2, libusb-1.0-0, libhidapi-hidraw0 | libhidapi-libusb0
+Recommends: pipewire, wireplumber
+Maintainer: Adam Meek <adamtdm@users.noreply.github.com>
+Description: Clean-room Linux re-implementation of Native Instruments Traktor Pro 4
+ ReTraktor provides complete 4-deck DJ mixing, reactive CSI 1.0 QML scripting,
+ .nml/.tsi library interoperability, and Native Instruments Kontrol HID/USB hardware support.
 EOF
-$SUDO chmod 0755 /usr/local/bin/retraktor
 
-# 5. Install Native Instruments udev rules
-log_info "Installing Native Instruments USB & HID udev rules (/etc/udev/rules.d/99-retraktor-ni.rules)..."
-$SUDO install -d -m 0755 /etc/udev/rules.d
-$SUDO install -m 0644 "$SCRIPT_DIR/assets/99-retraktor-ni.rules" /etc/udev/rules.d/99-retraktor-ni.rules
+    install -m 0755 "$SCRIPT_DIR/debian/postinst" "$DEB_ROOT/DEBIAN/postinst"
+    install -m 0755 "$SCRIPT_DIR/debian/postrm" "$DEB_ROOT/DEBIAN/postrm"
 
-# Ensure plugdev & audio groups exist and user is enrolled
-$SUDO groupadd -f plugdev
-$SUDO groupadd -f audio
+    DEB_OUT="/tmp/retraktor_${VERSION}_${DEB_ARCH}.deb"
+    dpkg-deb --build "$DEB_ROOT" "$DEB_OUT"
+    rm -rf "$DEB_STAGE"
+
+    $SUDO apt-get install -y --reinstall "$DEB_OUT" || $SUDO dpkg -i "$DEB_OUT"
+    # Also save a copy to the invoking user's home directory so they have the .deb file locally
+    if [ -n "${HOME:-}" ] && [ -d "$HOME" ]; then
+        cp "$DEB_OUT" "$HOME/retraktor_${VERSION}_${DEB_ARCH}.deb" 2>/dev/null || true
+    fi
+    cp "$DEB_OUT" "./retraktor_${VERSION}_${DEB_ARCH}.deb" 2>/dev/null || true
+else
+    log_info "Installing binaries and system configuration directly..."
+    $SUDO install -m 0755 "$BIN_DIR/retraktor-cli" /usr/local/bin/retraktor-cli
+    $SUDO install -m 0755 "$SCRIPT_DIR/assets/retraktor-wrapper.sh" /usr/local/bin/retraktor
+
+    $SUDO install -d -m 0755 /etc/udev/rules.d
+    $SUDO install -m 0644 "$SCRIPT_DIR/assets/99-retraktor-ni.rules" /etc/udev/rules.d/99-retraktor-ni.rules
+
+    $SUDO install -d -m 0755 /etc/security/limits.d
+    $SUDO install -m 0644 "$SCRIPT_DIR/assets/99-retraktor-realtime.conf" /etc/security/limits.d/99-retraktor-realtime.conf
+
+    $SUDO install -d -m 0755 /usr/share/applications
+    $SUDO install -m 0644 "$SCRIPT_DIR/assets/retraktor.desktop" /usr/share/applications/retraktor.desktop
+
+    $SUDO install -d -m 0755 /usr/share/icons/hicolor/scalable/apps
+    $SUDO install -m 0644 "$SCRIPT_DIR/assets/retraktor.svg" /usr/share/icons/hicolor/scalable/apps/retraktor.svg
+fi
+
+# Ensure both /usr/local/bin and /usr/bin have the active retraktor and retraktor-cli binaries
+$SUDO install -m 0755 "$BIN_DIR/retraktor-cli" /usr/local/bin/retraktor-cli 2>/dev/null || true
+$SUDO install -m 0755 "$BIN_DIR/retraktor-cli" /usr/bin/retraktor-cli 2>/dev/null || true
+$SUDO install -m 0755 "$SCRIPT_DIR/assets/retraktor-wrapper.sh" /usr/local/bin/retraktor 2>/dev/null || true
+$SUDO install -m 0755 "$SCRIPT_DIR/assets/retraktor-wrapper.sh" /usr/bin/retraktor 2>/dev/null || true
+
+# 5. User group enrollment & udev trigger
+$SUDO groupadd -f plugdev || true
+$SUDO groupadd -f audio || true
 if [ -n "$TARGET_USER" ]; then
     log_info "Adding user '$TARGET_USER' to 'plugdev' and 'audio' groups..."
     $SUDO usermod -aG plugdev,audio "$TARGET_USER" || true
 fi
 
-# Reload udev rules
 if command -v udevadm >/dev/null 2>&1; then
     $SUDO udevadm control --reload-rules || true
     $SUDO udevadm trigger || true
 fi
-
-# 6. Install real-time PAM limits for low-latency audio
-log_info "Configuring real-time audio scheduling limits (/etc/security/limits.d/99-retraktor-realtime.conf)..."
-$SUDO install -d -m 0755 /etc/security/limits.d
-$SUDO install -m 0644 "$SCRIPT_DIR/assets/99-retraktor-realtime.conf" /etc/security/limits.d/99-retraktor-realtime.conf
-
-# 7. Install XDG Desktop application launcher and icon
-log_info "Installing desktop entry and icon..."
-$SUDO install -d -m 0755 /usr/share/applications
-$SUDO install -m 0644 "$SCRIPT_DIR/assets/retraktor.desktop" /usr/share/applications/retraktor.desktop
-
-$SUDO install -d -m 0755 /usr/share/icons/hicolor/scalable/apps
-$SUDO install -m 0644 "$SCRIPT_DIR/assets/retraktor.svg" /usr/share/icons/hicolor/scalable/apps/retraktor.svg
 
 if command -v update-desktop-database >/dev/null 2>&1; then
     $SUDO update-desktop-database /usr/share/applications || true
