@@ -15,20 +15,26 @@ if [ ! -x "$CLI_BIN" ]; then
     exit 1
 fi
 
-# If launched without an interactive TTY (e.g. from desktop launcher / app menu), spawn a terminal window
+# If already inside a terminal spawned by this wrapper, bypass
+if [ "${1:-}" = "--in-terminal" ]; then
+    shift
+    exec "$CLI_BIN" "$@"
+fi
+
+# If launched from GUI / desktop launcher without an interactive TTY, spawn a real terminal window
 if [ ! -t 0 ] || [ ! -t 1 ]; then
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] Spawning terminal emulator..." >> /tmp/retraktor.log
-    for TERM_EMU in xdg-terminal-exec cosmic-term gnome-terminal x-terminal-emulator alacritty kitty xterm; do
+    for TERM_EMU in cosmic-term gnome-terminal x-terminal-emulator alacritty kitty xterm; do
         if command -v "$TERM_EMU" >/dev/null 2>&1; then
             case "$TERM_EMU" in
                 gnome-terminal)
-                    exec gnome-terminal --title="ReTraktor DJ" -- "$CLI_BIN" "$@"
+                    exec gnome-terminal --title="ReTraktor DJ" -- "$0" --in-terminal run "$@"
                     ;;
                 cosmic-term)
-                    exec cosmic-term -e "$CLI_BIN" "$@"
+                    exec cosmic-term -e "$0" --in-terminal run "$@"
                     ;;
                 *)
-                    exec "$TERM_EMU" -e "$CLI_BIN" "$@"
+                    exec "$TERM_EMU" -e "$0" --in-terminal run "$@"
                     ;;
             esac
         fi
