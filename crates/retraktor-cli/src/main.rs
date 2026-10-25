@@ -33,6 +33,16 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+fn log_trace(msg: &str) {
+    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open("/tmp/retraktor.log") {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = writeln!(f, "[{now}] {msg}");
+    }
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 || args[1] == "run" {
@@ -41,6 +51,9 @@ fn main() {
     }
 
     match args[1].as_str() {
+        "doctor" | "--doctor" | "diagnose" => {
+            run_doctor();
+        }
         "inspect-nml" => {
             let Some(path) = args.get(2) else {
                 eprintln!("Usage: retraktor-cli inspect-nml <path-to-collection.nml>");
@@ -425,6 +438,7 @@ fn print_usage() {
     println!();
     println!("Commands:");
     println!("  run                          Start interactive live 4-deck DJ player & audio engine (Default)");
+    println!("  doctor                       Run system diagnostics, check audio, udev & permissions");
     println!("  inspect-nml <file.nml>       Parse and summarize a Traktor .nml collection");
     println!("  inspect-tsi <file.tsi>       Decode and summarize a Traktor .tsi controller mapping");
     println!("  inspect-stripe <file>        Inspect a Traktor PRTS binary waveform stripe cache");
@@ -437,6 +451,8 @@ fn print_usage() {
 }
 
 fn run_interactive_player() {
+    log_trace("Starting ReTraktor live interactive player");
+
     // Set panic hook to ensure terminal is restored if panic occurs
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -445,12 +461,17 @@ fn run_interactive_player() {
         default_hook(info);
     }));
 
-    if let Err(e) = terminal::enable_raw_mode() {
-        eprintln!("Failed to enable terminal raw mode: {e}");
-        return;
-    }
+    let is_raw = match terminal::enable_raw_mode() {
+        Ok(()) => true,
+        Err(e) => {
+            log_trace(&format!("Note: Raw terminal mode disabled ({e}), continuing"));
+            false
+        }
+    };
     let mut stdout = io::stdout();
-    let _ = execute!(stdout, EnterAlternateScreen, cursor::Hide);
+    if is_raw {
+        let _ = execute!(stdout, EnterAlternateScreen, cursor::Hide);
+    }
 
     // Initialize Engine & Property Bus
     let mut bus = PropertyBus::new_traktor_pro4_default();
@@ -722,7 +743,113 @@ fn run_interactive_player() {
     }
 
     // Clean terminal restoration on exit
-    let _ = terminal::disable_raw_mode();
-    let _ = execute!(stdout, LeaveAlternateScreen, cursor::Show);
+    if is_raw {
+        let _ = terminal::disable_raw_mode();
+        let _ = execute!(stdout, LeaveAlternateScreen, cursor::Show);
+    }
+    log_trace("ReTraktor interactive session ended");
     println!("\nReTraktor session ended cleanly. Keep mixing!");
+}
+
+fn run_doctor() {
+    println!("=== ReTraktor System Diagnostics & Troubleshooting (Doctor) ===\n");
+    // 1. OS & Kernel
+    println!("1. System Information:");
+    println!("   OS:           {}", std::env::consts::OS);
+    println!("   Architecture: {}", std::env::consts::ARCH);
+    if let Ok(os_rel) = fs::read_to_string("/etc/os-release") {
+        for line in os_rel.lines() {
+            if line.starts_with("PRETTY_NAME=") {
+                println!(
+                    "   Distribution: {}",
+                    line.trim_start_matches("PRETTY_NAME=").trim_matches('"')
+                );
+            }
+        }
+    }
+    println!(
+        "   Display:      {}",
+        env::var("WAYLAND_DISPLAY")
+            .or_else(|_| env::var("DISPLAY"))
+            .unwrap_or_else(|_| "None".to_string())
+    );
+    println!(
+        "   Terminal:     {}",
+        env::var("TERM").unwrap_or_else(|_| "None".to_string())
+    );
+
+    // 2. Audio Subsystems
+    println!("\n2. Audio Subsystems:");
+    let has_pw = Command::new("pw-cat").arg("--version").output().is_ok();
+    let has_aplay = Command::new("aplay").arg("--version").output().is_ok();
+    println!(
+        "   PipeWire (pw-cat): {}",
+        if has_pw { "Found (Available)" } else { "Not installed (Optional)" }
+    );
+    println!(
+        "   ALSA (aplay):     {}",
+        if has_aplay { "Found (Available)" } else { "Not installed (Optional)" }
+    );
+    if !has_pw && !has_aplay {
+        println!("   [!] Note: Neither pw-cat nor aplay was found. Audio stream will run internally.");
+    }
+
+    // 3. Permissions & Groups
+    println!("\n3. User Permissions & Groups:");
+    if let Ok(out) = Command::new("groups").output() {
+        let grps = String::from_utf8_lossy(&out.stdout);
+        let in_audio = grps.contains("audio");
+        let in_plugdev = grps.contains("plugdev");
+        println!("   User groups:     {}", grps.trim());
+        println!(
+            "   'audio' group:   {}",
+            if in_audio { "OK (Member)" } else { "MISSING (Run: sudo usermod -aG audio $USER)" }
+        );
+        println!(
+            "   'plugdev' group: {}",
+            if in_plugdev { "OK (Member)" } else { "MISSING (Run: sudo usermod -aG plugdev $USER)" }
+        );
+    }
+
+    // 4. NI Hardware & udev
+    println!("\n4. Native Instruments Hardware & udev:");
+    let udev_path = Path::new("/etc/udev/rules.d/99-retraktor-ni.rules");
+    println!(
+        "   udev rules:      {}",
+        if udev_path.exists() {
+            "Installed (/etc/udev/rules.d/99-retraktor-ni.rules)"
+        } else {
+            "MISSING (Run: retraktor-cli udev-rules | sudo tee /etc/udev/rules.d/99-retraktor-ni.rules)"
+        }
+    );
+    let mut detected_controllers = 0;
+    if let Ok(entries) = fs::read_dir("/sys/bus/usb/devices") {
+        for entry in entries.flatten() {
+            let id_vendor = fs::read_to_string(entry.path().join("idVendor")).unwrap_or_default();
+            let id_product = fs::read_to_string(entry.path().join("idProduct")).unwrap_or_default();
+            for dev in &NI_DEVICES {
+                if id_vendor.trim() == format!("{:04x}", dev.vid)
+                    && id_product.trim() == format!("{:04x}", dev.pid)
+                {
+                    println!("   [CONNECTED] {} ({:04x}:{:04x})", dev.model, dev.vid, dev.pid);
+                    detected_controllers += 1;
+                }
+            }
+        }
+    }
+    if detected_controllers == 0 {
+        println!("   No NI Kontrol hardware currently connected via USB.");
+    }
+
+    // 5. Recent Logs
+    println!("\n5. Log file (/tmp/retraktor.log):");
+    if let Ok(log) = fs::read_to_string("/tmp/retraktor.log") {
+        let lines: Vec<&str> = log.lines().collect();
+        for line in lines.iter().rev().take(10).rev() {
+            println!("   {}", line);
+        }
+    } else {
+        println!("   No logs at /tmp/retraktor.log yet.");
+    }
+    println!("\n=== Diagnostics complete ===");
 }
