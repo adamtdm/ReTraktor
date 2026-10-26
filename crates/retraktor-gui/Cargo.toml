@@ -14,7 +14,7 @@ retraktor-audio = { path = "../retraktor-audio" }
 retraktor-hid = { path = "../retraktor-hid" }
 eframe = "0.29"
 cpal = "0.18.2"
-symphonia = { version = "0.6.1", features = ["mp3", "wav", "flac", "aac", "isomp4", "ogg"] }
+symphonia = { version = "0.5", features = ["mp3", "wav", "flac", "aac", "isomp4", "ogg"] }
 
 [[bin]]
 name = "retraktor-gui"
