@@ -15,7 +15,7 @@ use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
 /// Number of waveform peak columns stored per second of audio for real-time scrolling & stripe rendering.
-pub const PEAKS_PER_SEC: usize = 40;
+pub const PEAKS_PER_SEC: usize = 60;
 
 /// Real-time audio track loaded into a deck (either decoded from disk via Symphonia or synthesized).
 #[derive(Clone)]
@@ -66,6 +66,11 @@ impl LoadedTrackAudio {
             let mut max_inst = 0.0_f32;
             let mut max_vocals = 0.0_f32;
 
+            let n = (end_f - start_f).max(1) as f32;
+            let mut sum_low = 0.0_f32;
+            let mut sum_mid = 0.0_f32;
+            let mut sum_high = 0.0_f32;
+
             for f in start_f..end_f {
                 let l = pcm_stereo[f * 2];
                 let r = pcm_stereo[f * 2 + 1];
@@ -73,8 +78,8 @@ impl LoadedTrackAudio {
                 let side_ch = (l - r) * 0.5;
 
                 // 1-pole crossover estimation for 3-band & 4-stem decomposition
-                lp_state += 0.035 * (mid_ch - lp_state);
-                mp_state += 0.22 * (mid_ch - mp_state);
+                lp_state += 0.032 * (mid_ch - lp_state);
+                mp_state += 0.20 * (mid_ch - mp_state);
                 let low = lp_state.abs();
                 let mid = (mp_state - lp_state).abs();
                 let high = (mid_ch - mp_state).abs();
@@ -83,15 +88,19 @@ impl LoadedTrackAudio {
                 fast_env = if abs_in > fast_env {
                     fast_env + 0.35 * (abs_in - fast_env)
                 } else {
-                    fast_env * 0.992
+                    fast_env * 0.990
                 };
-                slow_env += 0.008 * (abs_in - slow_env);
+                slow_env += 0.006 * (abs_in - slow_env);
                 let transient = (fast_env - slow_env).max(0.0);
 
-                let drums_val = (transient * 2.2 + high * 0.85).min(1.0);
-                let bass_val = (low * 1.35).min(1.0);
-                let inst_val = (side_ch.abs() * 1.9 + high * 0.55).min(1.0);
-                let vocal_val = ((mid - side_ch.abs() * 0.6).max(0.0) * 1.75).min(1.0);
+                let drums_val = (transient * 2.1 + high * 0.65).min(1.0);
+                let bass_val = (low * 1.15).min(1.0);
+                let inst_val = (side_ch.abs() * 1.6 + mid * 0.55).min(1.0);
+                let vocal_val = ((mid - side_ch.abs() * 0.5).max(0.0) * 1.45).min(1.0);
+
+                sum_low += low;
+                sum_mid += mid;
+                sum_high += high;
 
                 if low > max_low {
                     max_low = low;
@@ -115,16 +124,20 @@ impl LoadedTrackAudio {
                     max_vocals = vocal_val;
                 }
             }
-            peaks.push([
-                (max_low * 1.3).clamp(0.04, 1.0),
-                (max_mid * 1.6).clamp(0.04, 1.0),
-                (max_high * 2.0).clamp(0.03, 1.0),
-            ]);
+            // Blend RMS and Peak with power-curve shaping for realistic Traktor Pro 4 transient silhouettes
+            let avg_low = sum_low / n;
+            let avg_mid = sum_mid / n;
+            let avg_high = sum_high / n;
+            let shaped_low = ((max_low * 0.65 + avg_low * 0.75) * 1.15).clamp(0.02, 0.96).powf(0.85);
+            let shaped_mid = ((max_mid * 0.60 + avg_mid * 0.70) * 1.25).clamp(0.02, 0.92).powf(0.95);
+            let shaped_high = ((max_high * 0.55 + avg_high * 0.65) * 1.35).clamp(0.01, 0.88).powf(1.05);
+
+            peaks.push([shaped_low, shaped_mid, shaped_high]);
             stems.push([
-                max_drums.clamp(0.04, 1.0),
-                max_bass.clamp(0.04, 1.0),
-                max_inst.clamp(0.04, 1.0),
-                max_vocals.clamp(0.04, 1.0),
+                (max_drums * 0.88).clamp(0.02, 0.95).powf(0.9),
+                (max_bass * 0.85).clamp(0.02, 0.92).powf(0.9),
+                (max_inst * 0.78).clamp(0.02, 0.86).powf(1.05),
+                (max_vocals * 0.80).clamp(0.02, 0.88).powf(1.0),
             ]);
         }
         (peaks, stems)
@@ -301,9 +314,11 @@ impl LoadedTrackAudio {
                     let kick = (t * (60.0 + 140.0 * kick_env as f64) * 2.0 * pi64).sin() as f32
                         * kick_env;
 
-                    let cutoff = 400.0 + 1200.0 * (bar_pos * 2.0 * pi64).sin().abs() as f32;
+                    let sixteenth = (beat_pos * 4.0).fract();
+                    let acid_env = (-sixteenth * 11.5).exp() as f32;
+                    let cutoff = 400.0 + 1100.0 * (bar_pos * 2.0 * pi64).sin().abs() as f32;
                     let saw = ((t * 110.0 * 2.0 * pi64).fract() * 2.0 - 1.0) as f32;
-                    let acid = saw * (cutoff / 1600.0) * 0.4;
+                    let acid = saw * acid_env * (cutoff / 1600.0) * 0.42;
 
                     let beat_idx = (f as f64 / beat_period).floor() as i64 % 4;
                     let clap_env = if (beat_idx == 1 || beat_idx == 3) && beat_pos < 0.25 {

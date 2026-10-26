@@ -127,9 +127,9 @@ impl Default for LibraryManager {
             path_input: music_dir.to_string_lossy().to_string(),
             current_dir: music_dir,
             dir_entries: Vec::new(),
-            show_match_radar: true,
+            show_match_radar: false,
             open_prefs_requested: false,
-            status_message: "Ready — Click any track's [LOAD A] or [LOAD B], or click [🧪 Create] to generate 4-part Stems.".to_string(),
+            status_message: "Ready — Click [A] or [B] to load a track, or [+ Stems] to separate into 4 stems.".to_string(),
         };
         mgr.populate_default_collection();
         mgr.refresh_explorer_dir();
@@ -250,15 +250,15 @@ impl LibraryManager {
 
         self.playlists = vec![
             UserPlaylist {
-                name: "⭐ Preparation List".to_string(),
+                name: "★ Preparation".to_string(),
                 track_ids: vec![1, 2, 6],
             },
             UserPlaylist {
-                name: "🔥 Peak Time Techno".to_string(),
+                name: "Peak Time Techno".to_string(),
                 track_ids: vec![1, 2, 5, 7, 8],
             },
             UserPlaylist {
-                name: "🌴 Deep & Melodic House".to_string(),
+                name: "Deep & Melodic House".to_string(),
                 track_ids: vec![1, 3, 6],
             },
         ];
@@ -478,19 +478,19 @@ impl LibraryManager {
     /// Renders the Left Navigation Tree
     pub fn show_nav_tree(&mut self, ui: &mut Ui) {
         ui.vertical(|ui| {
-            ui.spacing_mut().item_spacing = Vec2::new(2.0, 3.0);
+            ui.spacing_mut().item_spacing = Vec2::new(2.0, 2.0);
 
             let mut nav_btn = |ui: &mut Ui, label: String, item: NavItem, indent: f32| {
                 let selected = self.selected_nav == item;
                 let text_color = if selected {
-                    Color32::BLACK
+                    Color32::WHITE
                 } else {
                     TraktorTheme::TEXT_PRIMARY
                 };
                 let bg_color = if selected {
-                    TraktorTheme::DECK_A
+                    TraktorTheme::ROW_SELECTED
                 } else {
-                    Color32::from_rgb(28, 30, 36)
+                    Color32::TRANSPARENT
                 };
 
                 ui.horizontal(|ui| {
@@ -501,12 +501,11 @@ impl LibraryManager {
                         egui::Button::new(
                             RichText::new(label)
                                 .color(text_color)
-                                .font(egui::FontId::proportional(11.5))
-                                .strong(),
+                                .font(egui::FontId::proportional(11.5)),
                         )
                         .fill(bg_color)
-                        .stroke(Stroke::new(0.5_f32, TraktorTheme::BORDER_COLOR))
-                        .min_size(Vec2::new((ui.available_width() - 4.0).max(80.0), 22.0)),
+                        .stroke(Stroke::NONE)
+                        .min_size(Vec2::new((ui.available_width() - 4.0).max(80.0), 21.0)),
                     );
                     if resp.clicked() {
                         self.selected_nav = item;
@@ -517,40 +516,50 @@ impl LibraryManager {
             let stems_count = self.tracks.iter().filter(|t| t.stems_ready).count();
             nav_btn(
                 ui,
-                format!("📁 Track Collection ({})", self.tracks.len()),
+                format!("▾ Track Collection ({})", self.tracks.len()),
                 NavItem::AllTracks,
                 0.0,
             );
             nav_btn(
                 ui,
-                format!("🧪 Stems Crate ({stems_count})"),
+                format!("▸ Stems Crate ({stems_count})"),
                 NavItem::StemsCrate,
                 0.0,
             );
-            nav_btn(ui, "💾 File Explorer (Local Disk)".to_string(), NavItem::Explorer, 0.0);
-            nav_btn(ui, "⚡ Smartlists (Harmonic)".to_string(), NavItem::Smartlists, 0.0);
             nav_btn(
                 ui,
-                format!("🕒 Session History ({})", self.history.len()),
+                "▸ Explorer (Local Disk)".to_string(),
+                NavItem::Explorer,
+                0.0,
+            );
+            nav_btn(
+                ui,
+                "▸ Smartlists (Harmonic)".to_string(),
+                NavItem::Smartlists,
+                0.0,
+            );
+            nav_btn(
+                ui,
+                format!("▸ History ({})", self.history.len()),
                 NavItem::History,
                 0.0,
             );
 
             ui.add_space(4.0);
             ui.label(
-                RichText::new("📂 PLAYLISTS & CRATES")
-                    .color(TraktorTheme::TEXT_MUTED)
-                    .font(egui::FontId::monospace(9.5))
+                RichText::new("▾ Playlists")
+                    .color(TraktorTheme::TEXT_SECONDARY)
+                    .font(egui::FontId::proportional(11.0))
                     .strong(),
             );
 
             for idx in 0..self.playlists.len() {
                 let lbl = format!(
-                    "{} ({})",
+                    "  {} ({})",
                     self.playlists[idx].name,
                     self.playlists[idx].track_ids.len()
                 );
-                nav_btn(ui, lbl, NavItem::Playlist(idx), 6.0);
+                nav_btn(ui, lbl, NavItem::Playlist(idx), 4.0);
             }
 
             ui.add_space(4.0);
@@ -558,12 +567,12 @@ impl LibraryManager {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.new_playlist_name)
                         .hint_text("New playlist...")
-                        .desired_width(105.0),
+                        .desired_width(115.0),
                 );
                 if ui.button("+").on_hover_text("Create Playlist").clicked()
                     && !self.new_playlist_name.trim().is_empty()
                 {
-                    let name = format!("🎵 {}", self.new_playlist_name.trim());
+                    let name = self.new_playlist_name.trim().to_string();
                     self.playlists.push(UserPlaylist {
                         name,
                         track_ids: Vec::new(),
@@ -581,9 +590,9 @@ impl LibraryManager {
                             .color(TraktorTheme::TEXT_SECONDARY)
                             .font(egui::FontId::proportional(11.0)),
                     )
-                    .fill(Color32::from_rgb(24, 27, 34))
+                    .fill(Color32::from_rgb(36, 39, 44))
                     .stroke(Stroke::new(0.5_f32, TraktorTheme::BORDER_COLOR))
-                    .min_size(Vec2::new((ui.available_width() - 4.0).max(80.0), 22.0)),
+                    .min_size(Vec2::new((ui.available_width() - 4.0).max(80.0), 21.0)),
                 )
                 .on_hover_text("Open Audio, Stems & Traktor MX2 Settings in Preferences")
                 .clicked()
@@ -630,21 +639,21 @@ impl LibraryManager {
                     .map(PathBuf::from)
                     .unwrap_or_else(|_| PathBuf::from("/"));
 
-                if ui.button("🏠 Home").clicked() {
+                if ui.button("Home").clicked() {
                     self.navigate_to(home.clone());
                 }
-                if ui.button("🎵 ~/Music").clicked() {
+                if ui.button("~/Music").clicked() {
                     let m = home.join("Music");
                     self.navigate_to(if m.is_dir() { m } else { home.clone() });
                 }
-                if ui.button("⬇️ ~/Downloads").clicked() {
+                if ui.button("~/Downloads").clicked() {
                     let d = home.join("Downloads");
                     self.navigate_to(if d.is_dir() { d } else { home.clone() });
                 }
-                if ui.button("💿 /media").clicked() {
+                if ui.button("/media").clicked() {
                     self.navigate_to(PathBuf::from("/media"));
                 }
-                if ui.button("⬆️ Up Dir").clicked() {
+                if ui.button("▲ Up").clicked() {
                     if let Some(parent) = self.current_dir.parent().map(Path::to_path_buf) {
                         self.navigate_to(parent);
                     }
@@ -665,18 +674,18 @@ impl LibraryManager {
                 if ui
                     .add(
                         egui::Button::new(
-                            RichText::new("📥 Import Folder to Collection")
-                                .color(Color32::BLACK)
+                            RichText::new("+ Import Folder to Collection")
+                                .color(Color32::WHITE)
                                 .strong(),
                         )
-                        .fill(TraktorTheme::PLAY_ACTIVE),
+                        .fill(TraktorTheme::ROW_SELECTED),
                     )
                     .clicked()
                 {
                     let dir = self.current_dir.clone();
                     let count = self.scan_directory_audio(&dir, true);
                     self.status_message = format!(
-                        "✓ Scanned {} and imported {} audio files into Track Collection!",
+                        "✓ Scanned {} and imported {} audio files into Track Collection",
                         dir.display(),
                         count
                     );
@@ -726,10 +735,11 @@ impl LibraryManager {
                                     if ui
                                         .add(
                                             egui::Button::new(
-                                                RichText::new("📂 Open Folder")
-                                                    .color(TraktorTheme::DECK_A),
+                                                RichText::new("▸ Open")
+                                                    .color(TraktorTheme::TEXT_PRIMARY),
                                             )
-                                            .min_size(Vec2::new(110.0, 20.0)),
+                                            .fill(Color32::from_rgb(52, 55, 62))
+                                            .min_size(Vec2::new(72.0, 19.0)),
                                         )
                                         .clicked()
                                     {
@@ -737,7 +747,7 @@ impl LibraryManager {
                                     }
                                     if ui
                                         .link(
-                                            RichText::new(format!("📁 {}", item.name))
+                                            RichText::new(format!("▸ {}", item.name))
                                                 .color(TraktorTheme::TEXT_PRIMARY)
                                                 .strong(),
                                         )
@@ -745,18 +755,18 @@ impl LibraryManager {
                                     {
                                         nav_target = Some(item.path.clone());
                                     }
-                                    ui.label(RichText::new("Directory").color(TraktorTheme::TEXT_MUTED));
+                                    ui.label(RichText::new("Folder").color(TraktorTheme::TEXT_MUTED));
                                     ui.label(RichText::new("-").color(TraktorTheme::TEXT_MUTED));
                                     ui.end_row();
                                 } else if item.ext == "nml" {
                                     if ui
                                         .add(
                                             egui::Button::new(
-                                                RichText::new("📥 Import NML")
-                                                    .color(Color32::BLACK)
+                                                RichText::new("+ Import NML")
+                                                    .color(Color32::WHITE)
                                                     .strong(),
                                             )
-                                            .fill(TraktorTheme::PLAY_ACTIVE),
+                                            .fill(TraktorTheme::ROW_SELECTED),
                                         )
                                         .clicked()
                                     {
@@ -774,12 +784,13 @@ impl LibraryManager {
                                         if ui
                                             .add(
                                                 egui::Button::new(
-                                                    RichText::new("LOAD A")
-                                                        .color(Color32::BLACK)
-                                                        .font(egui::FontId::monospace(9.5))
+                                                    RichText::new("A")
+                                                        .color(TraktorTheme::DECK_A)
+                                                        .font(egui::FontId::monospace(10.0))
                                                         .strong(),
                                                 )
-                                                .fill(TraktorTheme::DECK_A),
+                                                .fill(Color32::from_rgb(52, 55, 62))
+                                                .min_size(Vec2::new(22.0, 18.0)),
                                             )
                                             .clicked()
                                         {
@@ -788,12 +799,13 @@ impl LibraryManager {
                                         if ui
                                             .add(
                                                 egui::Button::new(
-                                                    RichText::new("LOAD B")
-                                                        .color(Color32::BLACK)
-                                                        .font(egui::FontId::monospace(9.5))
+                                                    RichText::new("B")
+                                                        .color(TraktorTheme::DECK_B)
+                                                        .font(egui::FontId::monospace(10.0))
                                                         .strong(),
                                                 )
-                                                .fill(TraktorTheme::DECK_B),
+                                                .fill(Color32::from_rgb(52, 55, 62))
+                                                .min_size(Vec2::new(22.0, 18.0)),
                                             )
                                             .clicked()
                                         {
@@ -804,11 +816,12 @@ impl LibraryManager {
                                                 .add(
                                                     egui::Button::new(
                                                         RichText::new("C")
-                                                            .color(Color32::BLACK)
-                                                            .font(egui::FontId::monospace(9.5))
+                                                            .color(TraktorTheme::DECK_C)
+                                                            .font(egui::FontId::monospace(10.0))
                                                             .strong(),
                                                     )
-                                                    .fill(TraktorTheme::DECK_C),
+                                                    .fill(Color32::from_rgb(52, 55, 62))
+                                                    .min_size(Vec2::new(22.0, 18.0)),
                                                 )
                                                 .clicked()
                                             {
@@ -818,11 +831,12 @@ impl LibraryManager {
                                                 .add(
                                                     egui::Button::new(
                                                         RichText::new("D")
-                                                            .color(Color32::BLACK)
-                                                            .font(egui::FontId::monospace(9.5))
+                                                            .color(TraktorTheme::DECK_D)
+                                                            .font(egui::FontId::monospace(10.0))
                                                             .strong(),
                                                     )
-                                                    .fill(TraktorTheme::DECK_D),
+                                                    .fill(Color32::from_rgb(52, 55, 62))
+                                                    .min_size(Vec2::new(22.0, 18.0)),
                                                 )
                                                 .clicked()
                                             {
@@ -838,7 +852,7 @@ impl LibraryManager {
                                         }
                                     });
                                     ui.label(
-                                        RichText::new(format!("🎵 {}", item.name))
+                                        RichText::new(&item.name)
                                             .color(TraktorTheme::TEXT_PRIMARY)
                                             .strong(),
                                     );
@@ -899,23 +913,30 @@ impl LibraryManager {
             // 1. Search Bar & Action Toolbar
             ui.horizontal(|ui| {
                 ui.label(
-                    RichText::new("🔍 Search:")
+                    RichText::new("Search:")
                         .color(TraktorTheme::TEXT_SECONDARY)
-                        .font(egui::FontId::proportional(12.0)),
+                        .font(egui::FontId::proportional(11.5)),
                 );
                 ui.add(
                     egui::TextEdit::singleline(&mut self.search_query)
-                        .hint_text("Filter by title, artist, BPM, key, or genre...")
-                        .desired_width(240.0),
+                        .hint_text("Search Track Collection...")
+                        .desired_width(220.0),
                 );
-                if !self.search_query.is_empty() && ui.button("✖").clicked() {
+                if !self.search_query.is_empty() && ui.button("x").clicked() {
                     self.search_query.clear();
                 }
 
                 ui.separator();
 
                 if ui
-                    .button("🎵 Scan ~/Music")
+                    .add(
+                        egui::Button::new(
+                            RichText::new("Scan ~/Music")
+                                .color(TraktorTheme::TEXT_PRIMARY)
+                                .font(egui::FontId::proportional(11.0)),
+                        )
+                        .fill(Color32::from_rgb(52, 55, 62)),
+                    )
                     .on_hover_text("Scan ~/Music for MP3/FLAC/WAV/OGG/M4A files")
                     .clicked()
                 {
@@ -926,14 +947,21 @@ impl LibraryManager {
                     let target = if music.is_dir() { music } else { home };
                     let count = self.scan_directory_audio(&target, true);
                     self.status_message = format!(
-                        "✓ Scanned {} — added {} new audio tracks to Collection.",
+                        "✓ Scanned {} — added {} audio tracks to Collection.",
                         target.display(),
                         count
                     );
                 }
 
                 if ui
-                    .button("💾 Browse Local Files")
+                    .add(
+                        egui::Button::new(
+                            RichText::new("Explorer")
+                                .color(TraktorTheme::TEXT_PRIMARY)
+                                .font(egui::FontId::proportional(11.0)),
+                        )
+                        .fill(Color32::from_rgb(52, 55, 62)),
+                    )
                     .on_hover_text("Open the built-in File Explorer")
                     .clicked()
                 {
@@ -943,14 +971,13 @@ impl LibraryManager {
                 if ui
                     .add(
                         egui::Button::new(
-                            RichText::new("🧪 Analyze All Stems")
-                                .color(Color32::from_rgb(200, 120, 255))
-                                .strong(),
+                            RichText::new("Analyze Stems")
+                                .color(TraktorTheme::TEXT_PRIMARY)
+                                .font(egui::FontId::proportional(11.0)),
                         )
-                        .fill(Color32::from_rgb(30, 20, 42))
-                        .stroke(Stroke::new(0.8_f32, Color32::from_rgb(175, 80, 255))),
+                        .fill(Color32::from_rgb(52, 55, 62)),
                     )
-                    .on_hover_text("Generate 4-Stem separation (Drums, Bass, Inst, Vocals) for all tracks in Collection")
+                    .on_hover_text("Generate 4-Stem separation (Drums, Bass, Other, Vocals) for all tracks in Collection")
                     .clicked()
                 {
                     let mut count = 0;
@@ -961,7 +988,7 @@ impl LibraryManager {
                         }
                     }
                     self.status_message = format!(
-                        "✓ Generated 4-Stem separation (Drums/Bass/Inst/Vocals) for {} tracks! ({} total in Stems Crate)",
+                        "✓ Generated 4-Stem separation for {} tracks ({} total in Stems Crate)",
                         count,
                         self.tracks.len()
                     );
@@ -970,25 +997,25 @@ impl LibraryManager {
                 let radar_btn = ui.add(
                     egui::Button::new(
                         RichText::new(if self.show_match_radar {
-                            "🎯 Match Radar: ON"
+                            "● Match Radar: ON"
                         } else {
-                            "🎯 Match Radar: OFF"
+                            "Match Radar"
                         })
                         .color(if self.show_match_radar {
-                            Color32::BLACK
+                            Color32::WHITE
                         } else {
-                            TraktorTheme::TEXT_PRIMARY
+                            TraktorTheme::TEXT_SECONDARY
                         })
-                        .strong(),
+                        .font(egui::FontId::proportional(11.0)),
                     )
                     .fill(if self.show_match_radar {
-                        TraktorTheme::PLAY_ACTIVE
+                        TraktorTheme::ROW_SELECTED
                     } else {
-                        Color32::from_rgb(32, 36, 44)
+                        Color32::from_rgb(48, 51, 57)
                     }),
                 );
                 if radar_btn
-                    .on_hover_text("Toggle rekordbox-style Harmonic & BPM Match Radar Side Panel")
+                    .on_hover_text("Toggle Harmonic & BPM Match Radar Side Panel")
                     .clicked()
                 {
                     self.show_match_radar = !self.show_match_radar;
@@ -998,7 +1025,7 @@ impl LibraryManager {
                     ui.label(
                         RichText::new(&self.status_message)
                             .color(TraktorTheme::TEXT_SECONDARY)
-                            .font(egui::FontId::monospace(10.0)),
+                            .font(egui::FontId::proportional(10.5)),
                     );
                 });
             });
@@ -1177,7 +1204,7 @@ impl LibraryManager {
                                 .show(ui, |ui| {
                                     // Sortable Column Headers
                                     ui.label(
-                                        RichText::new("Load Deck")
+                                        RichText::new("Load")
                                             .color(TraktorTheme::TEXT_SECONDARY)
                                             .font(egui::FontId::proportional(11.0))
                                             .strong(),
@@ -1191,7 +1218,7 @@ impl LibraryManager {
                                         };
                                         let txt = RichText::new(format!("{label}{arrow}"))
                                             .color(if self.sort_col == col {
-                                                TraktorTheme::DECK_A
+                                                Color32::WHITE
                                             } else {
                                                 TraktorTheme::TEXT_SECONDARY
                                             })
@@ -1213,7 +1240,7 @@ impl LibraryManager {
                                     sort_header(ui, "Key", SortColumn::Key);
                                     ui.label(
                                         RichText::new("Stems")
-                                            .color(Color32::from_rgb(185, 110, 255))
+                                            .color(TraktorTheme::TEXT_SECONDARY)
                                             .font(egui::FontId::proportional(11.0))
                                             .strong(),
                                     );
@@ -1221,7 +1248,7 @@ impl LibraryManager {
                                     sort_header(ui, "Genre", SortColumn::Genre);
                                     sort_header(ui, "Rating", SortColumn::Rating);
                                     ui.label(
-                                        RichText::new("Crate / Playlist")
+                                        RichText::new("Playlist")
                                             .color(TraktorTheme::TEXT_SECONDARY)
                                             .font(egui::FontId::proportional(11.0))
                                             .strong(),
@@ -1234,20 +1261,22 @@ impl LibraryManager {
                                             &track.musical_key,
                                         );
 
-                                        // Col 1: Load Deck Buttons
+                                        // Col 1: Subtle Matte Load Deck Buttons [A] [B]
                                         ui.horizontal(|ui| {
                                             ui.spacing_mut().item_spacing = Vec2::new(3.0, 0.0);
                                             if ui
                                                 .add(
                                                     egui::Button::new(
-                                                        RichText::new("LOAD A")
-                                                            .color(Color32::BLACK)
-                                                            .font(egui::FontId::monospace(9.5))
+                                                        RichText::new("A")
+                                                            .color(TraktorTheme::DECK_A)
+                                                            .font(egui::FontId::monospace(10.0))
                                                             .strong(),
                                                     )
-                                                    .fill(TraktorTheme::DECK_A)
-                                                    .min_size(Vec2::new(48.0, 19.0)),
+                                                    .fill(Color32::from_rgb(54, 57, 63))
+                                                    .stroke(Stroke::new(0.5_f32, Color32::from_rgb(76, 80, 88)))
+                                                    .min_size(Vec2::new(24.0, 18.0)),
                                                 )
+                                                .on_hover_text("Load into Deck A")
                                                 .clicked()
                                             {
                                                 load_cmd = Some((1, track.clone()));
@@ -1255,14 +1284,16 @@ impl LibraryManager {
                                             if ui
                                                 .add(
                                                     egui::Button::new(
-                                                        RichText::new("LOAD B")
-                                                            .color(Color32::BLACK)
-                                                            .font(egui::FontId::monospace(9.5))
+                                                        RichText::new("B")
+                                                            .color(TraktorTheme::DECK_B)
+                                                            .font(egui::FontId::monospace(10.0))
                                                             .strong(),
                                                     )
-                                                    .fill(TraktorTheme::DECK_B)
-                                                    .min_size(Vec2::new(48.0, 19.0)),
+                                                    .fill(Color32::from_rgb(54, 57, 63))
+                                                    .stroke(Stroke::new(0.5_f32, Color32::from_rgb(76, 80, 88)))
+                                                    .min_size(Vec2::new(24.0, 18.0)),
                                                 )
+                                                .on_hover_text("Load into Deck B")
                                                 .clicked()
                                             {
                                                 load_cmd = Some((2, track.clone()));
@@ -1272,12 +1303,12 @@ impl LibraryManager {
                                                     .add(
                                                         egui::Button::new(
                                                             RichText::new("C")
-                                                                .color(Color32::BLACK)
-                                                                .font(egui::FontId::monospace(9.5))
+                                                                .color(TraktorTheme::DECK_C)
+                                                                .font(egui::FontId::monospace(10.0))
                                                                 .strong(),
                                                         )
-                                                        .fill(TraktorTheme::DECK_C)
-                                                        .min_size(Vec2::new(22.0, 19.0)),
+                                                        .fill(Color32::from_rgb(54, 57, 63))
+                                                        .min_size(Vec2::new(22.0, 18.0)),
                                                     )
                                                     .clicked()
                                                 {
@@ -1287,12 +1318,12 @@ impl LibraryManager {
                                                     .add(
                                                         egui::Button::new(
                                                             RichText::new("D")
-                                                                .color(Color32::BLACK)
-                                                                .font(egui::FontId::monospace(9.5))
+                                                                .color(TraktorTheme::DECK_D)
+                                                                .font(egui::FontId::monospace(10.0))
                                                                 .strong(),
                                                         )
-                                                        .fill(TraktorTheme::DECK_D)
-                                                        .min_size(Vec2::new(22.0, 19.0)),
+                                                        .fill(Color32::from_rgb(54, 57, 63))
+                                                        .min_size(Vec2::new(22.0, 18.0)),
                                                     )
                                                     .clicked()
                                                 {
@@ -1304,78 +1335,67 @@ impl LibraryManager {
                                         // Col 2: Title
                                         ui.label(
                                             RichText::new(&track.title)
-                                                .color(Color32::WHITE)
-                                                .font(egui::FontId::proportional(12.0))
-                                                .strong(),
+                                                .color(TraktorTheme::TEXT_PRIMARY)
+                                                .font(egui::FontId::proportional(11.5)),
                                         );
 
                                         // Col 3: Artist
                                         ui.label(
                                             RichText::new(&track.artist)
-                                                .color(Color32::from_rgb(195, 202, 215))
-                                                .font(egui::FontId::proportional(12.0)),
+                                                .color(TraktorTheme::TEXT_PRIMARY)
+                                                .font(egui::FontId::proportional(11.5)),
                                         );
 
                                         // Col 4: BPM
                                         ui.label(
                                             RichText::new(format!("{:.2}", track.bpm))
-                                                .color(TraktorTheme::DECK_A)
-                                                .font(egui::FontId::monospace(11.5))
-                                                .strong(),
+                                                .color(TraktorTheme::TEXT_PRIMARY)
+                                                .font(egui::FontId::monospace(11.0)),
                                         );
 
-                                        // Col 5: Key Badge (Harmonic Match Glow)
-                                        let (badge_bg, badge_fg, badge_txt) = if is_harmonic {
+                                        // Col 5: Key (Calm Traktor OpenKey text with subtle harmonic dot)
+                                        let (key_color, key_txt) = if is_harmonic {
                                             (
                                                 TraktorTheme::PLAY_ACTIVE,
-                                                Color32::BLACK,
-                                                format!("★ {} MATCH", track.musical_key),
+                                                format!("● {}", track.musical_key),
                                             )
                                         } else {
                                             (
-                                                Color32::from_rgb(38, 42, 52),
-                                                TraktorTheme::TEXT_PRIMARY,
+                                                TraktorTheme::TEXT_SECONDARY,
                                                 track.musical_key.clone(),
                                             )
                                         };
-                                        egui::Frame::none()
-                                            .fill(badge_bg)
-                                            .rounding(3.0)
-                                            .inner_margin(egui::Margin::symmetric(6.0, 2.0))
-                                            .show(ui, |ui| {
-                                                ui.label(
-                                                    RichText::new(badge_txt)
-                                                        .color(badge_fg)
-                                                        .font(egui::FontId::monospace(10.0))
-                                                        .strong(),
-                                                );
-                                            });
+                                        ui.label(
+                                            RichText::new(key_txt)
+                                                .color(key_color)
+                                                .font(egui::FontId::monospace(11.0))
+                                                .strong(),
+                                        );
 
                                         // Col 6: Stems Status / Create Action
                                         if track.stems_ready {
                                             egui::Frame::none()
-                                                .fill(Color32::from_rgb(42, 22, 65))
-                                                .stroke(Stroke::new(0.8_f32, Color32::from_rgb(180, 90, 255)))
-                                                .rounding(3.0)
-                                                .inner_margin(egui::Margin::symmetric(5.0, 2.0))
+                                                .fill(Color32::from_rgb(50, 54, 62))
+                                                .rounding(2.0)
+                                                .inner_margin(egui::Margin::symmetric(5.0, 1.5))
                                                 .show(ui, |ui| {
                                                     ui.label(
-                                                        RichText::new("✓ 4 STEMS")
-                                                            .color(Color32::from_rgb(215, 155, 255))
-                                                            .font(egui::FontId::monospace(9.5))
+                                                        RichText::new("STEMS")
+                                                            .color(TraktorTheme::DECK_A)
+                                                            .font(egui::FontId::monospace(9.0))
                                                             .strong(),
                                                     );
                                                 });
                                         } else if ui
                                             .add(
                                                 egui::Button::new(
-                                                    RichText::new("🧪 Create")
-                                                        .color(Color32::from_rgb(200, 130, 255))
-                                                        .font(egui::FontId::monospace(9.5)),
+                                                    RichText::new("+ Stems")
+                                                        .color(TraktorTheme::TEXT_SECONDARY)
+                                                        .font(egui::FontId::proportional(10.0)),
                                                 )
-                                                .fill(Color32::from_rgb(28, 22, 38)),
+                                                .fill(Color32::from_rgb(46, 49, 55)),
                                             )
-                                            .on_hover_text("Separate into Drums, Bass, Instruments & Vocals stems")
+                                            .on_hover_text("Separate into Drums, Bass, Other & Vocals stems")
                                             .clicked()
                                         {
                                             create_stems_cmd = Some(track.id);
@@ -1397,11 +1417,11 @@ impl LibraryManager {
                                                 .font(egui::FontId::proportional(11.0)),
                                         );
 
-                                        // Col 9: Rating Stars
+                                        // Col 9: Rating Stars (Traktor muted slate-blue stars)
                                         let stars = "★".repeat(track.rating as usize);
                                         ui.label(
                                             RichText::new(stars)
-                                                .color(Color32::from_rgb(255, 195, 0))
+                                                .color(Color32::from_rgb(98, 144, 196))
                                                 .font(egui::FontId::proportional(11.0)),
                                         );
 
@@ -1410,18 +1430,18 @@ impl LibraryManager {
                                             let in_prep = prep_ids.contains(&track.id);
                                             let prep_btn = ui.add(
                                                 egui::Button::new(
-                                                    RichText::new(if in_prep { "★ Prepped" } else { "+ Prep" })
+                                                    RichText::new(if in_prep { "★ Prep" } else { "+ Prep" })
                                                         .color(if in_prep {
-                                                            Color32::BLACK
+                                                            Color32::WHITE
                                                         } else {
                                                             TraktorTheme::TEXT_SECONDARY
                                                         })
                                                         .font(egui::FontId::proportional(10.0)),
                                                 )
                                                 .fill(if in_prep {
-                                                    Color32::from_rgb(255, 200, 0)
+                                                    TraktorTheme::ROW_SELECTED
                                                 } else {
-                                                    Color32::from_rgb(32, 35, 42)
+                                                    Color32::from_rgb(46, 49, 55)
                                                 }),
                                             );
                                             if prep_btn.clicked() {
@@ -1429,8 +1449,8 @@ impl LibraryManager {
                                             }
 
                                             egui::ComboBox::from_id_salt(format!("pl_add_{}", track.id))
-                                                .selected_text("+ Playlist")
-                                                .width(85.0)
+                                                .selected_text("+ List")
+                                                .width(72.0)
                                                 .show_ui(ui, |ui| {
                                                     for (p_idx, p_name) in playlist_names.iter().enumerate()
                                                     {
@@ -1459,7 +1479,7 @@ impl LibraryManager {
                                 ui.vertical(|ui| {
                                     ui.horizontal(|ui| {
                                         ui.label(
-                                            RichText::new("🎯 MATCH RADAR")
+                                            RichText::new("● MATCH RADAR")
                                                 .color(TraktorTheme::PLAY_ACTIVE)
                                                 .font(egui::FontId::monospace(10.5))
                                                 .strong(),
@@ -1638,12 +1658,12 @@ impl LibraryManager {
         ui.vertical(|ui| {
             ui.horizontal(|ui| {
                 ui.label(
-                    RichText::new("🕒 SESSION PLAY HISTORY")
+                    RichText::new("SESSION PLAY HISTORY")
                         .color(TraktorTheme::DECK_A)
                         .font(egui::FontId::monospace(12.0))
                         .strong(),
                 );
-                if !self.history.is_empty() && ui.button("🗑 Clear History").clicked() {
+                if !self.history.is_empty() && ui.button("Clear History").clicked() {
                     self.history.clear();
                 }
             });

@@ -97,13 +97,13 @@ impl PreferencesDialog {
                                 }
                             };
 
-                            tab_btn("🎮 Controllers & MX2", PrefsTab::Controllers);
-                            tab_btn("🧪 Stems & Neural Mix", PrefsTab::StemsAndAi);
-                            tab_btn("🔊 Audio Setup", PrefsTab::AudioSetup);
-                            tab_btn("🔀 Output Routing", PrefsTab::OutputRouting);
-                            tab_btn("🎛️ Mixer & EQ", PrefsTab::Mixer);
-                            tab_btn("💿 Decks & Waveforms", PrefsTab::Decks);
-                            tab_btn("ℹ️ About", PrefsTab::About);
+                            tab_btn("Controllers & MX2", PrefsTab::Controllers);
+                            tab_btn("Stems & Neural Mix", PrefsTab::StemsAndAi);
+                            tab_btn("Audio Setup", PrefsTab::AudioSetup);
+                            tab_btn("Output Routing", PrefsTab::OutputRouting);
+                            tab_btn("Mixer & EQ", PrefsTab::Mixer);
+                            tab_btn("Decks & Waveforms", PrefsTab::Decks);
+                            tab_btn("About", PrefsTab::About);
                         },
                     );
 
@@ -273,12 +273,12 @@ impl PreferencesDialog {
             .inner_margin(egui::Margin::symmetric(10.0, 8.0))
             .show(ui, |ui| {
                 ui.label(
-                    RichText::new("🧪 4-Stem Architecture (Drums | Bass | Instruments | Vocals)")
+                    RichText::new("4-Stem Architecture (Drums | Bass | Other | Vocals)")
                         .color(TraktorTheme::DECK_A)
                         .strong(),
                 );
-                ui.label("• Deck Stems Bar: Mute/Unmute each stem, 1-click 🎤 ACAPELLA & 🎹 INST isolators");
-                ui.label("• 4-Lane Stem Waveform View: Toggle '4-STEM' on any deck or in Parallel layout");
+                ui.label("• Deck Stems Bar: Mute/Unmute each stem, 1-click ACAPELLA & INST isolators");
+                ui.label("• 4-Lane Stem Waveform View: Toggle 'STEMS' on any deck or in Parallel layout");
                 ui.label("• Traktor MX2 STEMS Pad Mode: Pads 1..4 = Stem Mute | Pads 5..8 = Stem FX Send");
             });
     }

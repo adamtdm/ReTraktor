@@ -839,10 +839,9 @@ impl ReTraktorApp {
 
                     // 3. Layout Switcher Pills (Parallel | Extended | Essential | 4-Deck | Timeline | Browser)
                     ui.label(
-                        RichText::new("LAYOUT:")
+                        RichText::new("LAYOUT")
                             .color(TraktorTheme::TEXT_SECONDARY)
-                            .font(egui::FontId::monospace(9.5))
-                            .strong(),
+                            .font(egui::FontId::proportional(10.0)),
                     );
                     let layouts = [
                         TraktorLayout::Parallel,
@@ -858,18 +857,19 @@ impl ReTraktorApp {
                             egui::Button::new(
                                 RichText::new(lay.label())
                                     .color(if active {
-                                        Color32::BLACK
+                                        Color32::WHITE
                                     } else {
-                                        TraktorTheme::TEXT_PRIMARY
+                                        TraktorTheme::TEXT_SECONDARY
                                     })
                                     .font(egui::FontId::proportional(10.5))
                                     .strong(),
                             )
                             .fill(if active {
-                                TraktorTheme::DECK_A
+                                TraktorTheme::ROW_SELECTED
                             } else {
-                                Color32::from_rgb(34, 37, 45)
+                                Color32::from_rgb(48, 51, 57)
                             })
+                            .stroke(Stroke::new(0.5_f32, TraktorTheme::BORDER_COLOR))
                             .min_size(Vec2::new(54.0, 20.0)),
                         );
                         if btn.clicked() {
@@ -884,24 +884,24 @@ impl ReTraktorApp {
                     let pat_btn = ui.add(
                         egui::Button::new(
                             RichText::new(if self.pattern_enabled {
-                                "🥁 PATTERN ●"
+                                "● PATTERN"
                             } else {
-                                "🥁 PATTERN"
+                                "PATTERN"
                             })
                             .color(if self.show_pattern_player || self.pattern_enabled {
                                 Color32::BLACK
                             } else {
-                                Color32::from_rgb(255, 195, 0)
+                                TraktorTheme::TEXT_SECONDARY
                             })
                             .font(egui::FontId::monospace(9.5))
                             .strong(),
                         )
                         .fill(if self.show_pattern_player || self.pattern_enabled {
-                            Color32::from_rgb(255, 195, 0)
+                            TraktorTheme::DECK_B
                         } else {
-                            Color32::from_rgb(32, 34, 42)
+                            Color32::from_rgb(48, 51, 57)
                         })
-                        .min_size(Vec2::new(72.0, 20.0)),
+                        .min_size(Vec2::new(66.0, 20.0)),
                     );
                     if pat_btn
                         .on_hover_text("Toggle Traktor Pro 4 16-Step Pattern Player (Drum Machine)")
@@ -1040,13 +1040,13 @@ impl ReTraktorApp {
                             };
                         vu_meter(ui, peak_l, peak_r, 30.0);
 
-                        // Master Mix Recorder Button (`🔴 REC` / `⏹ SAVE WAV`)
+                        // Master Mix Recorder Button (`● REC`)
                         let rec_m = (rec_sec / 60.0).floor() as u32;
                         let rec_s = (rec_sec % 60.0).floor() as u32;
                         let rec_label = if is_rec {
-                            format!("⏹ REC {rec_m:02}:{rec_s:02}")
+                            format!("■ REC {rec_m:02}:{rec_s:02}")
                         } else {
-                            "🔴 REC".to_string()
+                            "● REC".to_string()
                         };
                         if ui
                             .add(
@@ -1055,19 +1055,19 @@ impl ReTraktorApp {
                                         .color(if is_rec {
                                             Color32::WHITE
                                         } else {
-                                            Color32::from_rgb(255, 85, 85)
+                                            Color32::from_rgb(220, 95, 90)
                                         })
                                         .font(egui::FontId::monospace(9.5))
                                         .strong(),
                                 )
                                 .fill(if is_rec {
-                                    Color32::from_rgb(195, 25, 35)
+                                    Color32::from_rgb(175, 42, 42)
                                 } else {
-                                    Color32::from_rgb(38, 22, 26)
+                                    Color32::from_rgb(48, 51, 57)
                                 }),
                             )
                             .on_hover_text(
-                                "Record live Master Mix to ~/Music/ReTraktor_Mix.wav (16-bit 48kHz Stereo WAV)",
+                                "Record live Master Mix to ~/Music/ReTraktor_Master_Mix.wav (16-bit 48kHz Stereo WAV)",
                             )
                             .clicked()
                         {
@@ -1107,13 +1107,13 @@ impl ReTraktorApp {
 
                         let (mx2_label, mx2_color) = if let Some(ref node) = self.mx2_dev_node {
                             (
-                                format!("🎛️ MX2 ({node})"),
+                                format!("● MX2 ({node})"),
                                 TraktorTheme::PLAY_ACTIVE,
                             )
                         } else {
                             (
-                                "🎛️ MX2 READY".to_string(),
-                                TraktorTheme::DECK_A,
+                                "MX2 READY".to_string(),
+                                TraktorTheme::TEXT_SECONDARY,
                             )
                         };
                         if ui
@@ -1198,10 +1198,10 @@ impl ReTraktorApp {
 
                     // 4 Percussion Kit Voices
                     let voices = [
-                        (0usize, "🥁 808 KICK", Color32::from_rgb(0, 215, 255)),
-                        (1usize, "👏 909 CLAP", Color32::from_rgb(255, 145, 0)),
-                        (2usize, "🔔 909 HAT", Color32::from_rgb(255, 215, 0)),
-                        (3usize, "⚡ RAVE PERC", Color32::from_rgb(195, 95, 255)),
+                        (0usize, "808 KICK", TraktorTheme::DECK_A),
+                        (1usize, "909 CLAP", TraktorTheme::DECK_B),
+                        (2usize, "909 HAT", Color32::from_rgb(205, 175, 75)),
+                        (3usize, "RAVE PERC", Color32::from_rgb(155, 115, 205)),
                     ];
                     for (v_idx, v_lbl, v_col) in voices {
                         let sel = self.pattern_selected_voice == v_idx;
@@ -1308,7 +1308,7 @@ impl ReTraktorApp {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new("🎬 DJ.STUDIO TIMELINE TRANSITION & STEM AUTOMATION")
+                        RichText::new("TIMELINE TRANSITION & STEM AUTOMATION")
                             .color(TraktorTheme::DECK_A)
                             .font(egui::FontId::monospace(11.5))
                             .strong(),
@@ -1329,9 +1329,9 @@ impl ReTraktorApp {
                     ui.separator();
                     ui.label("Automation Curve:");
                     for (idx, name) in [
-                        (0usize, "📈 Smooth Crossfade"),
-                        (1usize, "🎸 Instant Bass-Swap"),
-                        (2usize, "🎤 Vocal Stem Bridge"),
+                        (0usize, "Smooth Crossfade"),
+                        (1usize, "Instant Bass-Swap"),
+                        (2usize, "Vocal Stem Bridge"),
                     ] {
                         if ui
                             .selectable_label(self.timeline_preset_idx == idx, name)
@@ -1491,20 +1491,21 @@ impl ReTraktorApp {
         // Compact info bar + Quick Stems / Acapella / Instrumental controls right above the parallel waveform
         ui.horizontal(|ui| {
             egui::Frame::none()
-                .fill(accent_color)
+                .fill(Color32::from_rgb(52, 55, 62))
+                .stroke(Stroke::new(0.8_f32, accent_color))
                 .rounding(2.0)
-                .inner_margin(egui::Margin::symmetric(5.0, 1.0))
+                .inner_margin(egui::Margin::symmetric(6.0, 1.0))
                 .show(ui, |ui| {
                     ui.label(
                         RichText::new(format!("DECK {deck_letter}"))
-                            .color(Color32::BLACK)
+                            .color(accent_color)
                             .font(egui::FontId::monospace(10.0))
                             .strong(),
                     );
                 });
             ui.label(
                 RichText::new(&title)
-                    .color(Color32::WHITE)
+                    .color(TraktorTheme::TEXT_PRIMARY)
                     .font(egui::FontId::proportional(12.0))
                     .strong(),
             );
@@ -1516,53 +1517,53 @@ impl ReTraktorApp {
 
             ui.separator();
 
-            // 4-Lane Stem Waveform Toggle (`📊 4-STEM`)
+            // 4-Lane Stem Waveform Toggle (`STEMS`)
             let stem_view_on = self.deck_stem_view[d];
             if ui
                 .add(
                     egui::Button::new(
-                        RichText::new("📊 4-STEM")
+                        RichText::new("STEMS")
                             .color(if stem_view_on {
-                                Color32::BLACK
+                                Color32::WHITE
                             } else {
-                                Color32::from_rgb(200, 130, 255)
+                                TraktorTheme::TEXT_SECONDARY
                             })
                             .font(egui::FontId::monospace(9.0))
                             .strong(),
                     )
                     .fill(if stem_view_on {
-                        Color32::from_rgb(190, 100, 255)
+                        TraktorTheme::ROW_SELECTED
                     } else {
-                        Color32::from_rgb(30, 24, 42)
+                        Color32::from_rgb(48, 51, 57)
                     }),
                 )
-                .on_hover_text("Toggle 4-Lane Stacked Stem Waveforms (Drums / Bass / Inst / Vocals)")
+                .on_hover_text("Toggle Traktor Pro 4 4-Lane Stem Waveform View (Drums / Bass / Other / Vocals)")
                 .clicked()
             {
                 self.deck_stem_view[d] = !self.deck_stem_view[d];
             }
 
-            // Serato-style 1-Click Acapella & Instrumental Isolator Buttons
+            // 1-Click Acapella & Instrumental Isolator Buttons
             let is_acapella = self.deck_stem_muted[d] == [true, true, true, false];
             if ui
                 .add(
                     egui::Button::new(
-                        RichText::new("🎤 ACAPELLA")
+                        RichText::new("ACAPELLA")
                             .color(if is_acapella {
-                                Color32::BLACK
+                                Color32::WHITE
                             } else {
-                                Color32::from_rgb(210, 145, 255)
+                                TraktorTheme::TEXT_SECONDARY
                             })
                             .font(egui::FontId::monospace(9.0))
                             .strong(),
                     )
                     .fill(if is_acapella {
-                        Color32::from_rgb(200, 110, 255)
+                        TraktorTheme::ROW_SELECTED
                     } else {
-                        Color32::from_rgb(28, 24, 36)
+                        Color32::from_rgb(48, 51, 57)
                     }),
                 )
-                .on_hover_text("Isolate Vocals Stem (Mute Drums, Bass & Instruments)")
+                .on_hover_text("Isolate Vocals Stem (Mute Drums, Bass & Other)")
                 .clicked()
             {
                 if is_acapella {
@@ -1576,19 +1577,19 @@ impl ReTraktorApp {
             if ui
                 .add(
                     egui::Button::new(
-                        RichText::new("🎹 INST")
+                        RichText::new("INST")
                             .color(if is_inst {
-                                Color32::BLACK
+                                Color32::WHITE
                             } else {
-                                Color32::from_rgb(255, 200, 70)
+                                TraktorTheme::TEXT_SECONDARY
                             })
                             .font(egui::FontId::monospace(9.0))
                             .strong(),
                     )
                     .fill(if is_inst {
-                        Color32::from_rgb(255, 195, 0)
+                        TraktorTheme::ROW_SELECTED
                     } else {
-                        Color32::from_rgb(32, 28, 22)
+                        Color32::from_rgb(48, 51, 57)
                     }),
                 )
                 .on_hover_text("Isolate Instrumental (Mute Vocals Stem)")
@@ -1607,20 +1608,19 @@ impl ReTraktorApp {
                 let rem_s = (rem_sec % 60.0).floor() as u32;
                 ui.label(
                     RichText::new(format!("-{rem_m:02}:{rem_s:02}"))
-                        .color(accent_color)
-                        .font(egui::FontId::monospace(12.5))
+                        .color(TraktorTheme::TEXT_PRIMARY)
+                        .font(egui::FontId::monospace(12.0))
                         .strong(),
                 );
                 ui.label(
                     RichText::new(format!("KEY {key}"))
-                        .color(TraktorTheme::PLAY_ACTIVE)
-                        .font(egui::FontId::monospace(10.5))
-                        .strong(),
+                        .color(TraktorTheme::TEXT_SECONDARY)
+                        .font(egui::FontId::monospace(10.5)),
                 );
                 let eff_bpm = bpm * (1.0 + self.deck_pitch_fader[d] as f64 / 100.0);
                 ui.label(
                     RichText::new(format!("{eff_bpm:.2} BPM"))
-                        .color(Color32::WHITE)
+                        .color(TraktorTheme::TEXT_PRIMARY)
                         .font(egui::FontId::monospace(11.5))
                         .strong(),
                 );
@@ -1638,7 +1638,7 @@ impl ReTraktorApp {
                 &cues,
                 &stem_peaks,
                 &self.deck_stem_volumes[d],
-                &self.deck_stem_muted[d],
+                &mut self.deck_stem_muted[d],
                 self.deck_loop_active[d],
                 self.deck_loop_start_sec[d],
                 loop_len,
@@ -1900,23 +1900,27 @@ impl ReTraktorApp {
 
         egui::Frame::none()
             .fill(TraktorTheme::BG_PANEL)
-            .stroke(Stroke::new(1.0_f32, accent_color))
+            .stroke(Stroke::new(1.0_f32, TraktorTheme::BORDER_COLOR))
             .inner_margin(egui::Margin::symmetric(8.0, 5.0))
             .show(ui, |ui| {
-                // 1. Deck Header Strip
+                // 1. Authentic Traktor Pro 4 Deck Header Strip:
+                //    Left: Dark album-art record square + Title / Artist
+                //    Right: Remaining Time + BPM + Pitch% + Key + Large Deck Letter (A / B)
                 ui.horizontal(|ui| {
-                    egui::Frame::none()
-                        .fill(accent_color)
-                        .rounding(2.0)
-                        .inner_margin(egui::Margin::symmetric(6.0, 2.0))
-                        .show(ui, |ui| {
-                            ui.label(
-                                RichText::new(deck_letter)
-                                    .color(Color32::BLACK)
-                                    .font(egui::FontId::monospace(13.0))
-                                    .strong(),
-                            );
-                        });
+                    // Mini Album Art / Vinyl Record Icon on Left
+                    let (art_rect, _) =
+                        ui.allocate_exact_size(Vec2::new(28.0, 28.0), egui::Sense::hover());
+                    ui.painter()
+                        .rect_filled(art_rect, 2.0, Color32::from_rgb(24, 26, 30));
+                    ui.painter().rect_stroke(
+                        art_rect,
+                        2.0,
+                        Stroke::new(0.8_f32, TraktorTheme::BORDER_COLOR),
+                    );
+                    ui.painter()
+                        .circle_stroke(art_rect.center(), 9.0, Stroke::new(1.2_f32, accent_color));
+                    ui.painter()
+                        .circle_filled(art_rect.center(), 2.5, accent_color);
 
                     ui.vertical(|ui| {
                         ui.spacing_mut().item_spacing = Vec2::new(0.0, 1.0);
@@ -1934,46 +1938,204 @@ impl ReTraktorApp {
                     });
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        // Large Traktor Deck Letter (A / B) on the far right
+                        ui.label(
+                            RichText::new(deck_letter)
+                                .color(accent_color)
+                                .font(egui::FontId::proportional(20.0))
+                                .strong(),
+                        );
+
+                        ui.add_space(4.0);
+
                         let rem_sec = (duration_sec - elapsed_sec).max(0.0);
                         let rem_m = (rem_sec / 60.0).floor() as u32;
                         let rem_s = (rem_sec % 60.0).floor() as u32;
                         ui.label(
                             RichText::new(format!("-{rem_m:02}:{rem_s:02}"))
-                                .color(accent_color)
-                                .font(egui::FontId::monospace(13.0))
+                                .color(TraktorTheme::TEXT_PRIMARY)
+                                .font(egui::FontId::monospace(12.5))
                                 .strong(),
                         );
 
-                        let key_bg = if is_harmonic {
+                        let key_col = if is_harmonic {
                             TraktorTheme::PLAY_ACTIVE
                         } else {
-                            Color32::from_rgb(38, 42, 50)
+                            TraktorTheme::TEXT_SECONDARY
                         };
-                        let key_fg = if is_harmonic {
-                            Color32::BLACK
-                        } else {
-                            Color32::WHITE
-                        };
-                        egui::Frame::none()
-                            .fill(key_bg)
-                            .rounding(2.0)
-                            .inner_margin(egui::Margin::symmetric(5.0, 1.5))
-                            .show(ui, |ui| {
-                                ui.label(
-                                    RichText::new(format!("KEY {key}"))
-                                        .color(key_fg)
-                                        .font(egui::FontId::monospace(9.5))
-                                        .strong(),
-                                );
-                            });
+                        ui.label(
+                            RichText::new(&key)
+                                .color(key_col)
+                                .font(egui::FontId::monospace(10.5))
+                                .strong(),
+                        );
 
                         let pitch_pct = self.deck_pitch_fader[d];
                         let effective_bpm = bpm * (1.0 + pitch_pct as f64 / 100.0);
                         ui.label(
-                            RichText::new(format!("{effective_bpm:.2} BPM ({pitch_pct:+.1}%)"))
+                            RichText::new(format!("{effective_bpm:.2} ({pitch_pct:+.1}%)"))
                                 .color(TraktorTheme::TEXT_SECONDARY)
                                 .font(egui::FontId::monospace(10.5)),
                         );
+                    });
+                });
+
+                // 1b. Traktor Sub-Header Bar: [SYNC] [MASTER] | [STEMS] [DRUMS] [BASS] [OTHER] [VOCALS] | [CUE|STEM|PAT|ROLL]
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing = Vec2::new(3.0, 0.0);
+
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("SYNC")
+                                    .color(TraktorTheme::TEXT_PRIMARY)
+                                    .font(egui::FontId::monospace(8.5))
+                                    .strong(),
+                            )
+                            .fill(Color32::from_rgb(52, 55, 62))
+                            .min_size(Vec2::new(36.0, 16.0)),
+                        )
+                        .clicked()
+                    {
+                        self.sync_deck(deck_idx);
+                    }
+
+                    let is_master = (self.master_tempo - bpm).abs() < 0.05;
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("MASTER")
+                                    .color(if is_master {
+                                        accent_color
+                                    } else {
+                                        TraktorTheme::TEXT_SECONDARY
+                                    })
+                                    .font(egui::FontId::monospace(8.5))
+                                    .strong(),
+                            )
+                            .fill(Color32::from_rgb(46, 49, 55))
+                            .min_size(Vec2::new(44.0, 16.0)),
+                        )
+                        .clicked()
+                    {
+                        self.master_tempo = bpm;
+                    }
+
+                    let stem_view_on = self.deck_stem_view[d];
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("STEMS")
+                                    .color(if stem_view_on {
+                                        Color32::WHITE
+                                    } else {
+                                        TraktorTheme::TEXT_SECONDARY
+                                    })
+                                    .font(egui::FontId::monospace(8.5))
+                                    .strong(),
+                            )
+                            .fill(if stem_view_on {
+                                TraktorTheme::ROW_SELECTED
+                            } else {
+                                Color32::from_rgb(46, 49, 55)
+                            })
+                            .min_size(Vec2::new(40.0, 16.0)),
+                        )
+                        .on_hover_text("Toggle Traktor Pro 4 4-Stem Lane View (Drums / Bass / Other / Vocals)")
+                        .clicked()
+                    {
+                        self.deck_stem_view[d] = !self.deck_stem_view[d];
+                    }
+
+                    ui.separator();
+
+                    // Subtle matte Stem Mute Pills
+                    let stem_defs = [
+                        (0usize, "DRUM", Color32::from_rgb(84, 164, 214)),
+                        (1usize, "BASS", Color32::from_rgb(208, 92, 62)),
+                        (2usize, "OTHER", Color32::from_rgb(96, 172, 132)),
+                        (3usize, "VOCAL", Color32::from_rgb(214, 148, 56)),
+                    ];
+                    for (s_idx, s_lbl, s_col) in stem_defs {
+                        let muted = self.deck_stem_muted[d][s_idx];
+                        let resp = ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new(s_lbl)
+                                        .color(if muted {
+                                            TraktorTheme::TEXT_MUTED
+                                        } else {
+                                            Color32::WHITE
+                                        })
+                                        .font(egui::FontId::monospace(8.0))
+                                        .strong(),
+                                )
+                                .fill(if muted {
+                                    Color32::from_rgb(35, 37, 42)
+                                } else {
+                                    s_col.gamma_multiply(0.55)
+                                })
+                                .stroke(Stroke::new(
+                                    0.6_f32,
+                                    if muted {
+                                        TraktorTheme::BORDER_COLOR
+                                    } else {
+                                        s_col
+                                    },
+                                ))
+                                .min_size(Vec2::new(36.0, 16.0)),
+                            )
+                            .on_hover_text("Left-click: Mute/Unmute Stem | Right-click: Send Stem to FX");
+                        if resp.clicked() {
+                            self.deck_stem_muted[d][s_idx] = !self.deck_stem_muted[d][s_idx];
+                        }
+                        if resp.secondary_clicked() {
+                            self.deck_stem_fx_send[d][s_idx] = !self.deck_stem_fx_send[d][s_idx];
+                        }
+                    }
+
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        for mode in [
+                            DeckPadMode::FluxLoop,
+                            DeckPadMode::Pattern,
+                            DeckPadMode::Stems,
+                            DeckPadMode::Hotcues,
+                        ] {
+                            let active = self.deck_pad_mode[d] == mode;
+                            let short_lbl = match mode {
+                                DeckPadMode::Hotcues => "CUE",
+                                DeckPadMode::Stems => "STEM",
+                                DeckPadMode::Pattern => "PAT",
+                                DeckPadMode::FluxLoop => "ROLL",
+                            };
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new(short_lbl)
+                                            .color(if active {
+                                                Color32::WHITE
+                                            } else {
+                                                TraktorTheme::TEXT_SECONDARY
+                                            })
+                                            .font(egui::FontId::monospace(8.0))
+                                            .strong(),
+                                    )
+                                    .fill(if active {
+                                        TraktorTheme::ROW_SELECTED
+                                    } else {
+                                        Color32::from_rgb(44, 47, 52)
+                                    })
+                                    .min_size(Vec2::new(26.0, 16.0)),
+                                )
+                                .on_hover_text(format!("MX2 Performance Pad Mode: {}", mode.label()))
+                                .clicked()
+                            {
+                                self.deck_pad_mode[d] = mode;
+                                if mode == DeckPadMode::Pattern {
+                                    self.show_pattern_player = true;
+                                }
+                            }
+                        }
                     });
                 });
 
@@ -1991,7 +2153,7 @@ impl ReTraktorApp {
                             &cues,
                             &stem_peaks,
                             &self.deck_stem_volumes[d],
-                            &self.deck_stem_muted[d],
+                            &mut self.deck_stem_muted[d],
                             self.deck_loop_active[d],
                             self.deck_loop_start_sec[d],
                             loop_len_sec,
@@ -2043,136 +2205,211 @@ impl ReTraktorApp {
                     }
                 }
 
-                ui.add_space(2.0);
+                ui.add_space(3.0);
 
-                // 3b. Real-Time 4-Stem Isolator Bar (Drums, Bass, Inst, Vocals + Acapella/Inst + Pad Mode)
+                // 4. Authentic Traktor Pro 4 Transport & Loop Selector Row:
+                //    Left: [▶] [CUE] [CUP] [FLX]   |   Right: [<] [1] [2] [4] [8] [16] [>] + Pitch Slider
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing = Vec2::new(3.0, 0.0);
-                    let stem_defs = [
-                        (0usize, "🥁 DRUM", Color32::from_rgb(0, 210, 255)),
-                        (1usize, "🎸 BASS", Color32::from_rgb(255, 75, 55)),
-                        (2usize, "🎹 INST", Color32::from_rgb(255, 195, 0)),
-                        (3usize, "🎤 VOCAL", Color32::from_rgb(190, 85, 255)),
-                    ];
-                    for (s_idx, s_lbl, s_col) in stem_defs {
-                        let muted = self.deck_stem_muted[d][s_idx];
-                        let resp = ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new(s_lbl)
-                                        .color(if muted {
-                                            TraktorTheme::TEXT_MUTED
-                                        } else {
-                                            Color32::BLACK
-                                        })
-                                        .font(egui::FontId::monospace(8.5))
-                                        .strong(),
-                                )
-                                .fill(if muted {
-                                    Color32::from_rgb(25, 27, 34)
-                                } else {
-                                    s_col
-                                })
-                                .min_size(Vec2::new(46.0, 17.0)),
+
+                    let play_color = if is_playing {
+                        TraktorTheme::PLAY_ACTIVE
+                    } else {
+                        TraktorTheme::PLAY_INACTIVE
+                    };
+                    let play_text_color = if is_playing {
+                        Color32::BLACK
+                    } else {
+                        TraktorTheme::TEXT_PRIMARY
+                    };
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("▶")
+                                    .color(play_text_color)
+                                    .font(egui::FontId::proportional(12.0))
+                                    .strong(),
                             )
-                            .on_hover_text("Left-click: Mute/Unmute Stem | Right-click: Send Stem to FX");
-                        if resp.clicked() {
-                            self.deck_stem_muted[d][s_idx] = !self.deck_stem_muted[d][s_idx];
+                            .fill(play_color)
+                            .stroke(Stroke::new(0.5_f32, TraktorTheme::BORDER_COLOR))
+                            .min_size(Vec2::new(34.0, 20.0)),
+                        )
+                        .on_hover_text("Play / Pause Deck")
+                        .clicked()
+                    {
+                        self.toggle_play(deck_idx);
+                    }
+
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("CUE")
+                                    .color(TraktorTheme::TEXT_PRIMARY)
+                                    .font(egui::FontId::monospace(9.5))
+                                    .strong(),
+                            )
+                            .fill(TraktorTheme::CUE_INACTIVE)
+                            .stroke(Stroke::new(0.5_f32, TraktorTheme::BORDER_COLOR))
+                            .min_size(Vec2::new(34.0, 20.0)),
+                        )
+                        .clicked()
+                    {
+                        self.jump_to_cue(deck_idx, 1);
+                    }
+
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("CUP")
+                                    .color(TraktorTheme::TEXT_SECONDARY)
+                                    .font(egui::FontId::monospace(9.0)),
+                            )
+                            .fill(TraktorTheme::CUE_INACTIVE)
+                            .stroke(Stroke::new(0.5_f32, TraktorTheme::BORDER_COLOR))
+                            .min_size(Vec2::new(32.0, 20.0)),
+                        )
+                        .on_hover_text("Cue Play (Jump to Cue 1 & Play)")
+                        .clicked()
+                    {
+                        self.jump_to_cue(deck_idx, 1);
+                        if let Ok(mut state) = self.audio.shared.lock() {
+                            state.is_playing[d] = true;
                         }
-                        if resp.secondary_clicked() {
-                            self.deck_stem_fx_send[d][s_idx] = !self.deck_stem_fx_send[d][s_idx];
-                        }
+                    }
+
+                    let flux_active = self.deck_flux_active[d];
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("FLX")
+                                    .color(if flux_active {
+                                        Color32::BLACK
+                                    } else {
+                                        TraktorTheme::TEXT_SECONDARY
+                                    })
+                                    .font(egui::FontId::monospace(9.0))
+                                    .strong(),
+                            )
+                            .fill(if flux_active {
+                                TraktorTheme::FLUX_ACTIVE
+                            } else {
+                                TraktorTheme::CUE_INACTIVE
+                            })
+                            .stroke(Stroke::new(0.5_f32, TraktorTheme::BORDER_COLOR))
+                            .min_size(Vec2::new(30.0, 20.0)),
+                        )
+                        .on_hover_text("Toggle Flux / Slip Mode")
+                        .clicked()
+                    {
+                        self.deck_flux_active[d] = !self.deck_flux_active[d];
                     }
 
                     ui.separator();
 
-                    // Pad Mode Selector (syncs with Traktor MX2 HOTCUES / STEMS / PATTERN / LOOP buttons)
-                    for mode in [
-                        DeckPadMode::Hotcues,
-                        DeckPadMode::Stems,
-                        DeckPadMode::Pattern,
-                        DeckPadMode::FluxLoop,
-                    ] {
-                        let active = self.deck_pad_mode[d] == mode;
-                        let short_lbl = match mode {
-                            DeckPadMode::Hotcues => "CUE",
-                            DeckPadMode::Stems => "STEM",
-                            DeckPadMode::Pattern => "PAT",
-                            DeckPadMode::FluxLoop => "ROLL",
-                        };
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new(short_lbl)
-                                        .color(if active {
-                                            Color32::BLACK
-                                        } else {
-                                            TraktorTheme::TEXT_SECONDARY
-                                        })
-                                        .font(egui::FontId::monospace(8.0))
-                                        .strong(),
-                                )
-                                .fill(if active {
-                                    accent_color
-                                } else {
-                                    Color32::from_rgb(28, 30, 38)
-                                })
-                                .min_size(Vec2::new(26.0, 17.0)),
-                            )
-                            .on_hover_text(format!("MX2 Performance Pad Mode: {}", mode.label()))
-                            .clicked()
-                        {
-                            self.deck_pad_mode[d] = mode;
-                            if mode == DeckPadMode::Pattern {
-                                self.show_pattern_player = true;
-                            }
-                        }
-                    }
-                });
-
-                ui.add_space(2.0);
-
-                // 4. Loop Strip & Performance Pads 1..8 Grid
-                ui.horizontal(|ui| {
+                    // Traktor Loop Bar: [<] [1] [2] [4] [8] [16] [>]
                     if ui
-                        .add(egui::Button::new("/2").min_size(Vec2::new(24.0, 20.0)))
+                        .add(
+                            egui::Button::new(
+                                RichText::new("◄")
+                                    .color(TraktorTheme::TEXT_SECONDARY)
+                                    .font(egui::FontId::monospace(8.5)),
+                            )
+                            .fill(Color32::from_rgb(48, 51, 57))
+                            .min_size(Vec2::new(18.0, 20.0)),
+                        )
+                        .on_hover_text("Halve Loop Size (/2)")
                         .clicked()
                     {
                         self.deck_loop_size_beats[d] = (self.deck_loop_size_beats[d] / 2).max(1);
                     }
+
+                    for beats in [1u32, 2, 4, 8, 16] {
+                        let is_selected_size = self.deck_loop_size_beats[d] == beats;
+                        let is_active_loop = self.deck_loop_active[d] && is_selected_size;
+                        let fill = if is_active_loop {
+                            TraktorTheme::LOOP_ACTIVE
+                        } else if is_selected_size {
+                            Color32::from_rgb(64, 68, 76)
+                        } else {
+                            Color32::from_rgb(46, 49, 55)
+                        };
+                        let fg = if is_active_loop {
+                            Color32::BLACK
+                        } else if is_selected_size {
+                            TraktorTheme::LOOP_ACTIVE
+                        } else {
+                            TraktorTheme::TEXT_SECONDARY
+                        };
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new(format!("{beats}"))
+                                        .color(fg)
+                                        .font(egui::FontId::monospace(9.0))
+                                        .strong(),
+                                )
+                                .fill(fill)
+                                .min_size(Vec2::new(20.0, 20.0)),
+                            )
+                            .clicked()
+                        {
+                            if self.deck_loop_size_beats[d] == beats {
+                                self.toggle_loop(deck_idx);
+                            } else {
+                                self.deck_loop_size_beats[d] = beats;
+                                if !self.deck_loop_active[d] {
+                                    self.toggle_loop(deck_idx);
+                                }
+                            }
+                        }
+                    }
+
                     if ui
-                        .add(egui::Button::new("x2").min_size(Vec2::new(24.0, 20.0)))
+                        .add(
+                            egui::Button::new(
+                                RichText::new("►")
+                                    .color(TraktorTheme::TEXT_SECONDARY)
+                                    .font(egui::FontId::monospace(8.5)),
+                            )
+                            .fill(Color32::from_rgb(48, 51, 57))
+                            .min_size(Vec2::new(18.0, 20.0)),
+                        )
+                        .on_hover_text("Double Loop Size (x2)")
                         .clicked()
                     {
                         self.deck_loop_size_beats[d] = (self.deck_loop_size_beats[d] * 2).min(32);
                     }
 
-                    let loop_lbl = format!("LOOP {}b", self.deck_loop_size_beats[d]);
-                    let loop_active_btn = ui.add(
-                        egui::Button::new(
-                            RichText::new(loop_lbl)
-                                .color(if self.deck_loop_active[d] {
-                                    Color32::BLACK
-                                } else {
-                                    TraktorTheme::LOOP_ACTIVE
-                                })
-                                .font(egui::FontId::monospace(9.0))
-                                .strong(),
-                        )
-                        .fill(if self.deck_loop_active[d] {
-                            TraktorTheme::LOOP_ACTIVE
-                        } else {
-                            Color32::TRANSPARENT
-                        })
-                        .min_size(Vec2::new(56.0, 20.0)),
-                    );
-                    if loop_active_btn.clicked() {
-                        self.toggle_loop(deck_idx);
-                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("0%")
+                                        .color(TraktorTheme::TEXT_SECONDARY)
+                                        .font(egui::FontId::monospace(8.5)),
+                                )
+                                .fill(Color32::from_rgb(48, 51, 57))
+                                .min_size(Vec2::new(24.0, 20.0)),
+                            )
+                            .on_hover_text("Reset pitch to 0.0%")
+                            .clicked()
+                        {
+                            self.deck_pitch_fader[d] = 0.0;
+                        }
+                        ui.add(
+                            egui::Slider::new(&mut self.deck_pitch_fader[d], -8.0..=8.0)
+                                .suffix("%")
+                                .show_value(false),
+                        );
+                    });
+                });
 
-                    ui.separator();
+                ui.add_space(2.0);
 
-                    let cue_w = ((ui.available_width() - 28.0) / 8.0).max(16.0);
+                // 5. Slim Understated Hotcue / Performance Pads 1..8 Row (matching Traktor Pro 4 bottom deck strip)
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing = Vec2::new(3.0, 0.0);
+                    let cue_w = ((ui.available_width() - 21.0) / 8.0).max(16.0);
                     for i in 1..=8 {
                         let pad_active = match self.deck_pad_mode[d] {
                             DeckPadMode::Hotcues => {
@@ -2201,109 +2438,6 @@ impl ReTraktorApp {
                         }
                     }
                 });
-
-                ui.add_space(3.0);
-
-                // 5. Transport Bottom Strip (Play, Cue, Sync, Flux, Pitch Fader)
-                ui.horizontal(|ui| {
-                    let play_color = if is_playing {
-                        TraktorTheme::PLAY_ACTIVE
-                    } else {
-                        TraktorTheme::PLAY_INACTIVE
-                    };
-                    let play_text_color = if is_playing {
-                        Color32::BLACK
-                    } else {
-                        Color32::WHITE
-                    };
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                RichText::new(if is_playing { "⏸ PAUSE" } else { "▶ PLAY" })
-                                    .color(play_text_color)
-                                    .font(egui::FontId::proportional(12.0))
-                                    .strong(),
-                            )
-                            .fill(play_color)
-                            .min_size(Vec2::new(68.0, 24.0)),
-                        )
-                        .clicked()
-                    {
-                        self.toggle_play(deck_idx);
-                    }
-
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                RichText::new("CUE")
-                                    .color(Color32::WHITE)
-                                    .font(egui::FontId::proportional(11.5))
-                                    .strong(),
-                            )
-                            .fill(TraktorTheme::CUE_INACTIVE)
-                            .min_size(Vec2::new(46.0, 24.0)),
-                        )
-                        .clicked()
-                    {
-                        self.jump_to_cue(deck_idx, 1);
-                    }
-
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                RichText::new("SYNC")
-                                    .color(TraktorTheme::SYNC_ACTIVE)
-                                    .font(egui::FontId::monospace(10.5))
-                                    .strong(),
-                            )
-                            .fill(Color32::from_rgb(20, 36, 44))
-                            .min_size(Vec2::new(46.0, 24.0)),
-                        )
-                        .clicked()
-                    {
-                        self.sync_deck(deck_idx);
-                    }
-
-                    let flux_active = self.deck_flux_active[d];
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                RichText::new("FLUX")
-                                    .color(if flux_active {
-                                        Color32::BLACK
-                                    } else {
-                                        TraktorTheme::FLUX_ACTIVE
-                                    })
-                                    .font(egui::FontId::monospace(9.5))
-                                    .strong(),
-                            )
-                            .fill(if flux_active {
-                                TraktorTheme::FLUX_ACTIVE
-                            } else {
-                                Color32::TRANSPARENT
-                            })
-                            .min_size(Vec2::new(42.0, 24.0)),
-                        )
-                        .clicked()
-                    {
-                        self.deck_flux_active[d] = !self.deck_flux_active[d];
-                    }
-
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui
-                            .button("0%")
-                            .on_hover_text("Reset pitch to 0.0%")
-                            .clicked()
-                        {
-                            self.deck_pitch_fader[d] = 0.0;
-                        }
-                        ui.add(
-                            egui::Slider::new(&mut self.deck_pitch_fader[d], -8.0..=8.0)
-                                .suffix("%")
-                                .show_value(false),
-                        );
-                    });
-                });
             });
     }
 
@@ -2322,24 +2456,24 @@ impl ReTraktorApp {
                         let mode_btn = ui.add(
                             egui::Button::new(
                                 RichText::new(if neural {
-                                    "🧠 KNOBS: NEURAL STEMS (VOC / INST / D+B)"
+                                    "● KNOBS: NEURAL STEMS (VOC / INST / D+B)"
                                 } else {
-                                    "🎚️ KNOBS: 3-BAND EQ (HI / MID / LOW)  ⇄  STEMS"
+                                    "KNOBS: 3-BAND EQ (HI / MID / LOW)  |  STEMS"
                                 })
                                 .color(if neural {
-                                    Color32::BLACK
+                                    Color32::WHITE
                                 } else {
-                                    Color32::from_rgb(205, 140, 255)
+                                    TraktorTheme::TEXT_SECONDARY
                                 })
-                                .font(egui::FontId::monospace(9.0))
+                                .font(egui::FontId::monospace(8.5))
                                 .strong(),
                             )
                             .fill(if neural {
-                                Color32::from_rgb(195, 105, 255)
+                                TraktorTheme::ROW_SELECTED
                             } else {
-                                Color32::from_rgb(28, 24, 38)
+                                Color32::from_rgb(42, 45, 50)
                             })
-                            .min_size(Vec2::new(ui.available_width(), 17.0)),
+                            .min_size(Vec2::new(ui.available_width(), 16.0)),
                         );
                         if mode_btn
                             .on_hover_text(
@@ -2409,7 +2543,7 @@ impl ReTraktorApp {
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new(format!("CH{ch_num} ({ch_letter})"))
-                        .color(accent)
+                        .color(TraktorTheme::TEXT_PRIMARY)
                         .font(egui::FontId::monospace(9.5))
                         .strong(),
                 );
@@ -2417,20 +2551,21 @@ impl ReTraktorApp {
                 if ui
                     .add(
                         egui::Button::new(
-                            RichText::new("🎧")
+                            RichText::new("CUE")
                                 .color(if cue_active {
                                     Color32::BLACK
                                 } else {
-                                    TraktorTheme::CUE_ACTIVE
+                                    TraktorTheme::TEXT_SECONDARY
                                 })
-                                .font(egui::FontId::proportional(9.5)),
+                                .font(egui::FontId::monospace(8.0))
+                                .strong(),
                         )
                         .fill(if cue_active {
                             TraktorTheme::CUE_ACTIVE
                         } else {
-                            Color32::from_rgb(28, 30, 36)
+                            Color32::from_rgb(46, 49, 55)
                         })
-                        .min_size(Vec2::new(20.0, 15.0)),
+                        .min_size(Vec2::new(24.0, 15.0)),
                     )
                     .on_hover_text("Headphone Cue Listen")
                     .clicked()
