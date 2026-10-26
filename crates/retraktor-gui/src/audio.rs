@@ -29,21 +29,30 @@ pub struct LoadedTrackAudio {
     pub sample_rate: u32,
     /// Precomputed 3-band `[low, mid, high]` amplitude peaks at `PEAKS_PER_SEC` Hz.
     pub waveform_peaks: Vec<[f32; 3]>,
+    /// Precomputed 4-stem `[drums, bass, instruments, vocals]` amplitude peaks at `PEAKS_PER_SEC` Hz.
+    pub stem_peaks: Vec<[f32; 4]>,
+    pub stems_ready: bool,
 }
 
 impl LoadedTrackAudio {
-    /// Computes 3-band `[low, mid, high]` waveform peaks from interleaved stereo PCM.
-    pub fn compute_waveform_peaks(pcm_stereo: &[f32], sample_rate: u32) -> Vec<[f32; 3]> {
+    /// Computes 3-band `[low, mid, high]` waveform peaks and 4-stem `[drums, bass, inst, vocals]` peaks.
+    pub fn compute_waveform_peaks(
+        pcm_stereo: &[f32],
+        sample_rate: u32,
+    ) -> (Vec<[f32; 3]>, Vec<[f32; 4]>) {
         let total_frames = pcm_stereo.len() / 2;
         if total_frames == 0 || sample_rate == 0 {
-            return vec![[0.1, 0.1, 0.1]; 120];
+            return (vec![[0.1, 0.1, 0.1]; 120], vec![[0.1, 0.1, 0.1, 0.1]; 120]);
         }
         let frames_per_bucket = ((sample_rate as usize) / PEAKS_PER_SEC).max(64);
         let num_buckets = (total_frames / frames_per_bucket).max(1);
         let mut peaks = Vec::with_capacity(num_buckets);
+        let mut stems = Vec::with_capacity(num_buckets);
 
         let mut lp_state = 0.0_f32;
         let mut mp_state = 0.0_f32;
+        let mut fast_env = 0.0_f32;
+        let mut slow_env = 0.0_f32;
 
         for b in 0..num_buckets {
             let start_f = b * frames_per_bucket;
@@ -52,14 +61,37 @@ impl LoadedTrackAudio {
             let mut max_mid = 0.0_f32;
             let mut max_high = 0.0_f32;
 
+            let mut max_drums = 0.0_f32;
+            let mut max_bass = 0.0_f32;
+            let mut max_inst = 0.0_f32;
+            let mut max_vocals = 0.0_f32;
+
             for f in start_f..end_f {
-                let mono = (pcm_stereo[f * 2] + pcm_stereo[f * 2 + 1]) * 0.5;
-                // Simple 1-pole crossover estimation for visual 3-band separation
-                lp_state += 0.04 * (mono - lp_state);
-                mp_state += 0.22 * (mono - mp_state);
+                let l = pcm_stereo[f * 2];
+                let r = pcm_stereo[f * 2 + 1];
+                let mid_ch = (l + r) * 0.5;
+                let side_ch = (l - r) * 0.5;
+
+                // 1-pole crossover estimation for 3-band & 4-stem decomposition
+                lp_state += 0.035 * (mid_ch - lp_state);
+                mp_state += 0.22 * (mid_ch - mp_state);
                 let low = lp_state.abs();
                 let mid = (mp_state - lp_state).abs();
-                let high = (mono - mp_state).abs();
+                let high = (mid_ch - mp_state).abs();
+
+                let abs_in = mid_ch.abs();
+                fast_env = if abs_in > fast_env {
+                    fast_env + 0.35 * (abs_in - fast_env)
+                } else {
+                    fast_env * 0.992
+                };
+                slow_env += 0.008 * (abs_in - slow_env);
+                let transient = (fast_env - slow_env).max(0.0);
+
+                let drums_val = (transient * 2.2 + high * 0.85).min(1.0);
+                let bass_val = (low * 1.35).min(1.0);
+                let inst_val = (side_ch.abs() * 1.9 + high * 0.55).min(1.0);
+                let vocal_val = ((mid - side_ch.abs() * 0.6).max(0.0) * 1.75).min(1.0);
 
                 if low > max_low {
                     max_low = low;
@@ -70,14 +102,32 @@ impl LoadedTrackAudio {
                 if high > max_high {
                     max_high = high;
                 }
+                if drums_val > max_drums {
+                    max_drums = drums_val;
+                }
+                if bass_val > max_bass {
+                    max_bass = bass_val;
+                }
+                if inst_val > max_inst {
+                    max_inst = inst_val;
+                }
+                if vocal_val > max_vocals {
+                    max_vocals = vocal_val;
+                }
             }
             peaks.push([
                 (max_low * 1.3).clamp(0.04, 1.0),
                 (max_mid * 1.6).clamp(0.04, 1.0),
                 (max_high * 2.0).clamp(0.03, 1.0),
             ]);
+            stems.push([
+                max_drums.clamp(0.04, 1.0),
+                max_bass.clamp(0.04, 1.0),
+                max_inst.clamp(0.04, 1.0),
+                max_vocals.clamp(0.04, 1.0),
+            ]);
         }
-        peaks
+        (peaks, stems)
     }
 
     /// Decodes a real audio file (`.mp3`, `.flac`, `.wav`, `.ogg`, `.m4a`, `.aac`) from disk using Symphonia.
@@ -177,7 +227,7 @@ impl LoadedTrackAudio {
         }
 
         let duration_sec = (pcm_stereo.len() / 2) as f64 / (sr as f64);
-        let waveform_peaks = Self::compute_waveform_peaks(&pcm_stereo, sr);
+        let (waveform_peaks, stem_peaks) = Self::compute_waveform_peaks(&pcm_stereo, sr);
 
         Ok(Self {
             title,
@@ -188,6 +238,8 @@ impl LoadedTrackAudio {
             pcm_stereo,
             sample_rate: sr,
             waveform_peaks,
+            stem_peaks,
+            stems_ready: true,
         })
     }
 
@@ -281,7 +333,7 @@ impl LoadedTrackAudio {
             pcm.push(r.clamp(-1.0, 1.0));
         }
 
-        let waveform_peaks = Self::compute_waveform_peaks(&pcm, sr);
+        let (waveform_peaks, stem_peaks) = Self::compute_waveform_peaks(&pcm, sr);
 
         Self {
             title: title.to_string(),
@@ -292,6 +344,8 @@ impl LoadedTrackAudio {
             pcm_stereo: pcm,
             sample_rate: sr,
             waveform_peaks,
+            stem_peaks,
+            stems_ready: true,
         }
     }
 }
@@ -316,10 +370,54 @@ pub struct AudioSharedState {
     pub cue_enabled: [bool; 4],
     pub crossfader: f32,
     pub crossfader_curve: f32,
+
+    // Real-Time 4-Stem Mixing per Deck: [Drums, Bass, Instruments, Vocals]
+    pub stem_volumes: [[f32; 4]; 4],
+    pub stem_muted: [[bool; 4]; 4],
+    pub stem_fx_send: [[bool; 4]; 4],
+    stem_lp_l: [f32; 4],
+    stem_lp_r: [f32; 4],
+    stem_mp_l: [f32; 4],
+    stem_mp_r: [f32; 4],
+    stem_fast_env: [f32; 4],
+    stem_slow_env: [f32; 4],
+
+    // 16-Step Pattern Player (Drum Machine) State
+    pub pattern_enabled: bool,
+    pub pattern_steps: [[bool; 16]; 4], // 0: Kick, 1: Clap, 2: Closed Hat, 3: Rave Perc
+    pub pattern_volume: f32,
+    pub pattern_pitch: f32,
+    pub pattern_decay: f32,
+    pub pattern_current_step: usize,
+    pattern_phase_sec: f64,
+
+    // Master Mix Recorder (.WAV)
+    pub is_recording: bool,
+    pub recorded_samples: Vec<i16>,
+    pub recording_sample_rate: u32,
 }
 
 impl Default for AudioSharedState {
     fn default() -> Self {
+        let mut default_steps = [[false; 16]; 4];
+        // Default Techno/House groove pattern
+        default_steps[0] = [
+            true, false, false, false, true, false, false, false, true, false, false, false, true,
+            false, false, false,
+        ]; // 4x4 Kick
+        default_steps[1] = [
+            false, false, false, false, true, false, false, false, false, false, false, false,
+            true, false, false, false,
+        ]; // 2 & 4 Clap
+        default_steps[2] = [
+            false, false, true, false, false, false, true, false, false, false, true, false, false,
+            false, true, true,
+        ]; // Offbeat 909 Hat
+        default_steps[3] = [
+            false, false, false, true, false, false, false, false, false, true, false, false,
+            false, false, true, false,
+        ]; // Syncopated Rave Perc
+
         Self {
             engine: FourDeckAudioEngine::default(),
             is_playing: [false, false, false, false],
@@ -339,6 +437,25 @@ impl Default for AudioSharedState {
             cue_enabled: [false, false, false, false],
             crossfader: 0.5,
             crossfader_curve: 0.5,
+            stem_volumes: [[1.0; 4]; 4],
+            stem_muted: [[false; 4]; 4],
+            stem_fx_send: [[false; 4]; 4],
+            stem_lp_l: [0.0; 4],
+            stem_lp_r: [0.0; 4],
+            stem_mp_l: [0.0; 4],
+            stem_mp_r: [0.0; 4],
+            stem_fast_env: [0.0; 4],
+            stem_slow_env: [0.0; 4],
+            pattern_enabled: false,
+            pattern_steps: default_steps,
+            pattern_volume: 0.75,
+            pattern_pitch: 0.5,
+            pattern_decay: 0.6,
+            pattern_current_step: 0,
+            pattern_phase_sec: 0.0,
+            is_recording: false,
+            recorded_samples: Vec::new(),
+            recording_sample_rate: 48_000,
         }
     }
 }
@@ -464,6 +581,13 @@ impl AudioSystem {
                     last_tick = Instant::now();
 
                     if let Ok(mut state) = shared_companion.try_lock() {
+                        if state.pattern_enabled {
+                            let bpm = state.engine.clock.bpm.max(40.0);
+                            let step_dur = (60.0 / bpm) / 4.0;
+                            state.pattern_phase_sec += dt;
+                            state.pattern_current_step =
+                                ((state.pattern_phase_sec / step_dur).floor() as usize) % 16;
+                        }
                         for d in 0..4 {
                             if state.is_playing[d] {
                                 let ratio = state.pitch_ratio[d];
@@ -492,6 +616,45 @@ impl AudioSystem {
         }
     }
 
+    /// Writes a slice of interleaved stereo `i16` PCM samples to a standard RIFF `.wav` file on disk.
+    pub fn write_stereo_wav_file(
+        path: &Path,
+        samples: &[i16],
+        sample_rate: u32,
+    ) -> Result<f64, String> {
+        use std::io::Write;
+        let mut f = File::create(path)
+            .map_err(|e| format!("Failed to create {}: {e}", path.display()))?;
+        let data_bytes = (samples.len() * 2) as u32;
+        let riff_size = 36u32.saturating_add(data_bytes);
+        let channels = 2u16;
+        let bits_per_sample = 16u16;
+        let byte_rate = sample_rate * (channels as u32) * (bits_per_sample as u32 / 8);
+        let block_align = channels * (bits_per_sample / 8);
+
+        f.write_all(b"RIFF").map_err(|e| e.to_string())?;
+        f.write_all(&riff_size.to_le_bytes()).map_err(|e| e.to_string())?;
+        f.write_all(b"WAVEfmt ").map_err(|e| e.to_string())?;
+        f.write_all(&16u32.to_le_bytes()).map_err(|e| e.to_string())?;
+        f.write_all(&1u16.to_le_bytes()).map_err(|e| e.to_string())?; // PCM
+        f.write_all(&channels.to_le_bytes()).map_err(|e| e.to_string())?;
+        f.write_all(&sample_rate.to_le_bytes()).map_err(|e| e.to_string())?;
+        f.write_all(&byte_rate.to_le_bytes()).map_err(|e| e.to_string())?;
+        f.write_all(&block_align.to_le_bytes()).map_err(|e| e.to_string())?;
+        f.write_all(&bits_per_sample.to_le_bytes()).map_err(|e| e.to_string())?;
+        f.write_all(b"data").map_err(|e| e.to_string())?;
+        f.write_all(&data_bytes.to_le_bytes()).map_err(|e| e.to_string())?;
+
+        let mut byte_buf = Vec::with_capacity(samples.len() * 2);
+        for &s in samples {
+            byte_buf.extend_from_slice(&s.to_le_bytes());
+        }
+        f.write_all(&byte_buf).map_err(|e| e.to_string())?;
+
+        let dur_sec = (samples.len() / 2) as f64 / (sample_rate.max(1) as f64);
+        Ok(dur_sec)
+    }
+
     fn render_audio_f32(
         shared: &Arc<Mutex<AudioSharedState>>,
         output: &mut [f32],
@@ -505,6 +668,7 @@ impl AudioSystem {
             Ok(s) => s,
             Err(_) => return,
         };
+        state.recording_sample_rate = sr;
 
         for f in 0..frames {
             let mut deck_samples: [(f32, f32); 4] = [(0.0, 0.0); 4];
@@ -516,42 +680,102 @@ impl AudioSystem {
                 }
                 let mut advance_dt = 0.0_f64;
                 let mut track_dur = 120.0_f64;
+                let mut raw_l = 0.0_f32;
+                let mut raw_r = 0.0_f32;
+                let mut has_sample = false;
 
                 if let Some(track) = &state.loaded_tracks[d] {
                     track_dur = track.duration_sec.max(0.1);
                     let frame_pos = (state.playhead_sec[d] * track.sample_rate as f64) as usize;
                     let idx = (frame_pos * 2) % track.pcm_stereo.len().max(2);
                     if idx + 1 < track.pcm_stereo.len() {
-                        let gain = (state.channel_gain[d] * 2.0).clamp(0.0, 2.0);
-                        let eq_scalar = if state.eq_kill_low[d]
-                            && state.eq_kill_mid[d]
-                            && state.eq_kill_hi[d]
-                        {
-                            0.0
-                        } else {
-                            let l_g = if state.eq_kill_low[d] {
-                                0.0
-                            } else {
-                                state.engine.strips[d].eq.low * 2.0
-                            };
-                            let m_g = if state.eq_kill_mid[d] {
-                                0.0
-                            } else {
-                                state.engine.strips[d].eq.mid * 2.0
-                            };
-                            let h_g = if state.eq_kill_hi[d] {
-                                0.0
-                            } else {
-                                state.engine.strips[d].eq.high * 2.0
-                            };
-                            ((l_g + m_g + h_g) / 3.0).clamp(0.0, 2.0)
-                        };
-                        deck_samples[d] = (
-                            track.pcm_stereo[idx] * gain * eq_scalar,
-                            track.pcm_stereo[idx + 1] * gain * eq_scalar,
-                        );
+                        raw_l = track.pcm_stereo[idx];
+                        raw_r = track.pcm_stereo[idx + 1];
+                        has_sample = true;
                     }
                     advance_dt = dt * state.pitch_ratio[d];
+                }
+
+                if has_sample {
+                    // 1. Real-Time 4-Stem Decomposition ([Drums, Bass, Instruments, Vocals])
+                    state.stem_lp_l[d] += 0.035 * (raw_l - state.stem_lp_l[d]);
+                    state.stem_lp_r[d] += 0.035 * (raw_r - state.stem_lp_r[d]);
+                    state.stem_mp_l[d] += 0.22 * (raw_l - state.stem_mp_l[d]);
+                    state.stem_mp_r[d] += 0.22 * (raw_r - state.stem_mp_r[d]);
+
+                    let bass_l = state.stem_lp_l[d];
+                    let bass_r = state.stem_lp_r[d];
+                    let mid_band_l = state.stem_mp_l[d] - bass_l;
+                    let mid_band_r = state.stem_mp_r[d] - bass_r;
+                    let high_band_l = raw_l - state.stem_mp_l[d];
+                    let high_band_r = raw_r - state.stem_mp_r[d];
+
+                    // Center vocal extraction from mid-band + transient percussion separation
+                    let mid_center = (mid_band_l + mid_band_r) * 0.5;
+                    let mid_side = (mid_band_l - mid_band_r) * 0.5;
+                    let abs_in = ((raw_l + raw_r) * 0.5).abs();
+                    state.stem_fast_env[d] = if abs_in > state.stem_fast_env[d] {
+                        state.stem_fast_env[d] + 0.35 * (abs_in - state.stem_fast_env[d])
+                    } else {
+                        state.stem_fast_env[d] * 0.992
+                    };
+                    state.stem_slow_env[d] += 0.008 * (abs_in - state.stem_slow_env[d]);
+                    let transient_gate =
+                        ((state.stem_fast_env[d] - state.stem_slow_env[d]).max(0.0) * 3.5).min(1.0);
+
+                    let drums_l = high_band_l * 0.65 + mid_band_l * transient_gate * 0.45;
+                    let drums_r = high_band_r * 0.65 + mid_band_r * transient_gate * 0.45;
+                    let vocal_l = mid_center * (1.0 - transient_gate * 0.45);
+                    let vocal_r = mid_center * (1.0 - transient_gate * 0.45);
+                    let inst_l = mid_side + high_band_l * 0.35;
+                    let inst_r = -mid_side + high_band_r * 0.35;
+
+                    let g_drums = if state.stem_muted[d][0] {
+                        0.0
+                    } else {
+                        state.stem_volumes[d][0]
+                    };
+                    let g_bass = if state.stem_muted[d][1] {
+                        0.0
+                    } else {
+                        state.stem_volumes[d][1]
+                    };
+                    let g_inst = if state.stem_muted[d][2] {
+                        0.0
+                    } else {
+                        state.stem_volumes[d][2]
+                    };
+                    let g_voc = if state.stem_muted[d][3] {
+                        0.0
+                    } else {
+                        state.stem_volumes[d][3]
+                    };
+
+                    let stem_l =
+                        drums_l * g_drums + bass_l * g_bass + inst_l * g_inst + vocal_l * g_voc;
+                    let stem_r =
+                        drums_r * g_drums + bass_r * g_bass + inst_r * g_inst + vocal_r * g_voc;
+
+                    // 2. Channel Gain & 3-Band EQ
+                    let gain = (state.channel_gain[d] * 2.0).clamp(0.0, 2.0);
+                    let l_g = if state.eq_kill_low[d] {
+                        0.0
+                    } else {
+                        state.engine.strips[d].eq.low * 2.0
+                    };
+                    let m_g = if state.eq_kill_mid[d] {
+                        0.0
+                    } else {
+                        state.engine.strips[d].eq.mid * 2.0
+                    };
+                    let h_g = if state.eq_kill_hi[d] {
+                        0.0
+                    } else {
+                        state.engine.strips[d].eq.high * 2.0
+                    };
+                    let eq_scalar = ((l_g + m_g + h_g) / 3.0).clamp(0.0, 2.0);
+
+                    deck_samples[d] = (stem_l * gain * eq_scalar, stem_r * gain * eq_scalar);
                 }
 
                 state.playhead_sec[d] += advance_dt;
@@ -566,9 +790,60 @@ impl AudioSystem {
                 }
             }
 
+            // 3. 16-Step Pattern Player (Master Clock Synced Drum Machine)
+            let mut pat_sample = 0.0_f32;
+            if state.pattern_enabled {
+                let bpm = state.engine.clock.bpm.max(40.0);
+                let step_dur = (60.0 / bpm) / 4.0;
+                state.pattern_phase_sec += dt;
+                let step_idx = ((state.pattern_phase_sec / step_dur).floor() as usize) % 16;
+                state.pattern_current_step = step_idx;
+                let step_t = (state.pattern_phase_sec % step_dur) as f32;
+                let decay_scale = (0.3 + state.pattern_decay * 1.4).max(0.2);
+                let pitch_scale = 0.75 + state.pattern_pitch * 0.5;
+
+                // Voice 0: 808 Sub Kick
+                if state.pattern_steps[0][step_idx] {
+                    let env = (-step_t * 18.0 / decay_scale).exp();
+                    let freq = (52.0 + 130.0 * (-step_t * 42.0).exp()) * pitch_scale;
+                    pat_sample += (step_t * freq * 2.0 * PI).sin() * env * 0.75;
+                }
+                // Voice 1: 909 Clap
+                if state.pattern_steps[1][step_idx] {
+                    let env = (-step_t * 24.0 / decay_scale).exp();
+                    let noise = (((f * 1664525 + 1013904223) & 0x7FFF) as f32 / 16384.0) - 1.0;
+                    pat_sample += noise * env * 0.45;
+                }
+                // Voice 2: 909 Closed/Open Hat
+                if state.pattern_steps[2][step_idx] {
+                    let env = (-step_t * 36.0 / decay_scale).exp();
+                    let metallic = (step_t * 6400.0 * pitch_scale * 2.0 * PI).sin()
+                        * (step_t * 9100.0 * 2.0 * PI).cos();
+                    pat_sample += metallic * env * 0.35;
+                }
+                // Voice 3: Rave Rim / Tom
+                if state.pattern_steps[3][step_idx] {
+                    let env = (-step_t * 28.0 / decay_scale).exp();
+                    let freq = 240.0 * pitch_scale;
+                    pat_sample += (step_t * freq * 2.0 * PI).sin() * env * 0.45;
+                }
+                pat_sample *= state.pattern_volume;
+            }
+
             state.engine.crossfader = state.crossfader;
             state.engine.crossfader_curve = state.crossfader_curve;
-            let (ml, mr, _cl, _cr) = state.engine.process_frame(deck_samples);
+            let (mut ml, mut mr, _cl, _cr) = state.engine.process_frame(deck_samples);
+            ml = (ml + pat_sample).clamp(-1.0, 1.0);
+            mr = (mr + pat_sample).clamp(-1.0, 1.0);
+
+            if state.is_recording && state.recorded_samples.len() < (sr as usize) * 2 * 3600 {
+                state
+                    .recorded_samples
+                    .push((ml.clamp(-1.0, 1.0) * 32767.0) as i16);
+                state
+                    .recorded_samples
+                    .push((mr.clamp(-1.0, 1.0) * 32767.0) as i16);
+            }
 
             if channels >= 2 {
                 output[f * channels] = ml;

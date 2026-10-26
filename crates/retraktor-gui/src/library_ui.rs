@@ -1,7 +1,6 @@
 use crate::theme::TraktorTheme;
 use eframe::egui::{self, Color32, RichText, Stroke, Ui, Vec2};
-use retraktor_formats::{NmlCollection, TsiFile};
-use retraktor_hid::NI_DEVICES;
+use retraktor_formats::NmlCollection;
 use retraktor_library::KeyWheel;
 use std::env;
 use std::fs;
@@ -19,6 +18,7 @@ pub struct UiTrackEntry {
     pub genre: String,
     pub rating: u8,
     pub file_path: Option<PathBuf>,
+    pub stems_ready: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -46,11 +46,11 @@ pub struct FsEntry {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum NavItem {
     AllTracks,
+    StemsCrate,
     Playlist(usize),
     Smartlists,
     History,
     Explorer,
-    Controllers,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -90,8 +90,9 @@ pub struct LibraryManager {
     pub path_input: String,
     pub dir_entries: Vec<FsEntry>,
 
-    // Controller / TSI state
-    pub loaded_tsi_summary: Option<String>,
+    // Match Radar & Settings shortcut state
+    pub show_match_radar: bool,
+    pub open_prefs_requested: bool,
     pub status_message: String,
 }
 
@@ -126,8 +127,9 @@ impl Default for LibraryManager {
             path_input: music_dir.to_string_lossy().to_string(),
             current_dir: music_dir,
             dir_entries: Vec::new(),
-            loaded_tsi_summary: None,
-            status_message: "Ready — Click any track's [LOAD A] or [LOAD B] button, or browse local audio files in File Explorer.".to_string(),
+            show_match_radar: true,
+            open_prefs_requested: false,
+            status_message: "Ready — Click any track's [LOAD A] or [LOAD B], or click [🧪 Create] to generate 4-part Stems.".to_string(),
         };
         mgr.populate_default_collection();
         mgr.refresh_explorer_dir();
@@ -151,6 +153,7 @@ impl LibraryManager {
                 genre: "Melodic Techno".to_string(),
                 rating: 5,
                 file_path: None,
+                stems_ready: true,
             },
             UiTrackEntry {
                 id: 2,
@@ -163,6 +166,7 @@ impl LibraryManager {
                 genre: "Peak Time Techno".to_string(),
                 rating: 5,
                 file_path: None,
+                stems_ready: true,
             },
             UiTrackEntry {
                 id: 3,
@@ -175,6 +179,7 @@ impl LibraryManager {
                 genre: "Deep House".to_string(),
                 rating: 4,
                 file_path: None,
+                stems_ready: true,
             },
             UiTrackEntry {
                 id: 4,
@@ -187,6 +192,7 @@ impl LibraryManager {
                 genre: "Drum & Bass".to_string(),
                 rating: 5,
                 file_path: None,
+                stems_ready: false,
             },
             UiTrackEntry {
                 id: 5,
@@ -199,6 +205,7 @@ impl LibraryManager {
                 genre: "Techno".to_string(),
                 rating: 4,
                 file_path: None,
+                stems_ready: true,
             },
             UiTrackEntry {
                 id: 6,
@@ -211,6 +218,7 @@ impl LibraryManager {
                 genre: "Melodic House".to_string(),
                 rating: 5,
                 file_path: None,
+                stems_ready: true,
             },
             UiTrackEntry {
                 id: 7,
@@ -223,6 +231,7 @@ impl LibraryManager {
                 genre: "Classic Techno".to_string(),
                 rating: 4,
                 file_path: None,
+                stems_ready: false,
             },
             UiTrackEntry {
                 id: 8,
@@ -235,6 +244,7 @@ impl LibraryManager {
                 genre: "Minimal Techno".to_string(),
                 rating: 5,
                 file_path: None,
+                stems_ready: true,
             },
         ];
 
@@ -397,6 +407,7 @@ impl LibraryManager {
                 .to_ascii_uppercase(),
             rating: 5,
             file_path: Some(path.to_path_buf()),
+            stems_ready: true,
         };
         self.tracks.push(entry.clone());
         Some(entry)
@@ -431,6 +442,7 @@ impl LibraryManager {
                 genre: entry.genre.clone().unwrap_or_else(|| "Electronic".to_string()),
                 rating: 4,
                 file_path: Some(PathBuf::from(entry.location.to_posix_path())),
+                stems_ready: false,
             });
             count += 1;
         }
@@ -502,10 +514,17 @@ impl LibraryManager {
                 });
             };
 
+            let stems_count = self.tracks.iter().filter(|t| t.stems_ready).count();
             nav_btn(
                 ui,
                 format!("📁 Track Collection ({})", self.tracks.len()),
                 NavItem::AllTracks,
+                0.0,
+            );
+            nav_btn(
+                ui,
+                format!("🧪 Stems Crate ({stems_count})"),
+                NavItem::StemsCrate,
                 0.0,
             );
             nav_btn(ui, "💾 File Explorer (Local Disk)".to_string(), NavItem::Explorer, 0.0);
@@ -516,7 +535,6 @@ impl LibraryManager {
                 NavItem::History,
                 0.0,
             );
-            nav_btn(ui, "🎛️ NI Controllers & TSI".to_string(), NavItem::Controllers, 0.0);
 
             ui.add_space(4.0);
             ui.label(
@@ -554,6 +572,24 @@ impl LibraryManager {
                     self.selected_nav = NavItem::Playlist(self.playlists.len() - 1);
                 }
             });
+
+            ui.add_space(6.0);
+            if ui
+                .add(
+                    egui::Button::new(
+                        RichText::new("⚙ Audio & Controllers")
+                            .color(TraktorTheme::TEXT_SECONDARY)
+                            .font(egui::FontId::proportional(11.0)),
+                    )
+                    .fill(Color32::from_rgb(24, 27, 34))
+                    .stroke(Stroke::new(0.5_f32, TraktorTheme::BORDER_COLOR))
+                    .min_size(Vec2::new((ui.available_width() - 4.0).max(80.0), 22.0)),
+                )
+                .on_hover_text("Open Audio, Stems & Traktor MX2 Settings in Preferences")
+                .clicked()
+            {
+                self.open_prefs_requested = true;
+            }
         });
     }
 
@@ -569,13 +605,13 @@ impl LibraryManager {
             NavItem::Explorer => {
                 self.show_file_explorer_view(ui, four_deck_mode, &mut on_load_deck);
             }
-            NavItem::Controllers => {
-                self.show_controllers_view(ui);
-            }
             NavItem::History => {
                 self.show_history_view(ui, four_deck_mode, &mut on_load_deck);
             }
-            NavItem::AllTracks | NavItem::Playlist(_) | NavItem::Smartlists => {
+            NavItem::AllTracks
+            | NavItem::StemsCrate
+            | NavItem::Playlist(_)
+            | NavItem::Smartlists => {
                 self.show_tracks_table_view(ui, current_deck_a_key, four_deck_mode, &mut on_load_deck);
             }
         }
@@ -904,6 +940,60 @@ impl LibraryManager {
                     self.selected_nav = NavItem::Explorer;
                 }
 
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new("🧪 Analyze All Stems")
+                                .color(Color32::from_rgb(200, 120, 255))
+                                .strong(),
+                        )
+                        .fill(Color32::from_rgb(30, 20, 42))
+                        .stroke(Stroke::new(0.8_f32, Color32::from_rgb(175, 80, 255))),
+                    )
+                    .on_hover_text("Generate 4-Stem separation (Drums, Bass, Inst, Vocals) for all tracks in Collection")
+                    .clicked()
+                {
+                    let mut count = 0;
+                    for t in &mut self.tracks {
+                        if !t.stems_ready {
+                            t.stems_ready = true;
+                            count += 1;
+                        }
+                    }
+                    self.status_message = format!(
+                        "✓ Generated 4-Stem separation (Drums/Bass/Inst/Vocals) for {} tracks! ({} total in Stems Crate)",
+                        count,
+                        self.tracks.len()
+                    );
+                }
+
+                let radar_btn = ui.add(
+                    egui::Button::new(
+                        RichText::new(if self.show_match_radar {
+                            "🎯 Match Radar: ON"
+                        } else {
+                            "🎯 Match Radar: OFF"
+                        })
+                        .color(if self.show_match_radar {
+                            Color32::BLACK
+                        } else {
+                            TraktorTheme::TEXT_PRIMARY
+                        })
+                        .strong(),
+                    )
+                    .fill(if self.show_match_radar {
+                        TraktorTheme::PLAY_ACTIVE
+                    } else {
+                        Color32::from_rgb(32, 36, 44)
+                    }),
+                );
+                if radar_btn
+                    .on_hover_text("Toggle rekordbox-style Harmonic & BPM Match Radar Side Panel")
+                    .clicked()
+                {
+                    self.show_match_radar = !self.show_match_radar;
+                }
+
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
                         RichText::new(&self.status_message)
@@ -977,6 +1067,9 @@ impl LibraryManager {
                 .tracks
                 .iter()
                 .filter(|track| {
+                    if self.selected_nav == NavItem::StemsCrate && !track.stems_ready {
+                        return false;
+                    }
                     if let Some(ref allowed_ids) = playlist_filter {
                         if !allowed_ids.contains(&track.id) {
                             return false;
@@ -1049,7 +1142,7 @@ impl LibraryManager {
                 }),
             }
 
-            // 4. Render Full-Width Sortable Track Grid
+            // 4. Render Full-Width Sortable Track Grid (+ optional rekordbox Match Radar side panel)
             let playlist_names: Vec<String> =
                 self.playlists.iter().map(|p| p.name.clone()).collect();
             let prep_ids: Vec<usize> = self
@@ -1060,251 +1153,448 @@ impl LibraryManager {
 
             let mut add_to_playlist_cmd: Option<(usize, usize)> = None;
             let mut toggle_prep_cmd: Option<usize> = None;
+            let mut create_stems_cmd: Option<usize> = None;
             let mut load_cmd: Option<(usize, UiTrackEntry)> = None;
 
-            egui::ScrollArea::vertical()
-                .id_salt("tracks_table_scroll")
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    egui::Grid::new("traktor_collection_grid")
-                        .striped(true)
-                        .spacing(Vec2::new(10.0, 4.0))
-                        .min_col_width(48.0)
+            let avail_w = ui.available_width();
+            let radar_w = if self.show_match_radar && avail_w > 680.0 {
+                265.0
+            } else {
+                0.0
+            };
+            let table_w = (avail_w - radar_w - 8.0).max(300.0);
+
+            ui.horizontal_top(|ui| {
+                ui.allocate_ui(Vec2::new(table_w, ui.available_height()), |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("tracks_table_scroll")
+                        .auto_shrink([false, false])
                         .show(ui, |ui| {
-                            // Sortable Column Headers
-                            ui.label(
-                                RichText::new("Load Deck")
-                                    .color(TraktorTheme::TEXT_SECONDARY)
-                                    .font(egui::FontId::proportional(11.0))
-                                    .strong(),
-                            );
-
-                            let mut sort_header = |ui: &mut Ui, label: &str, col: SortColumn| {
-                                let arrow = if self.sort_col == col {
-                                    if self.sort_asc { " ▲" } else { " ▼" }
-                                } else {
-                                    ""
-                                };
-                                let txt = RichText::new(format!("{label}{arrow}"))
-                                    .color(if self.sort_col == col {
-                                        TraktorTheme::DECK_A
-                                    } else {
-                                        TraktorTheme::TEXT_SECONDARY
-                                    })
-                                    .font(egui::FontId::proportional(11.0))
-                                    .strong();
-                                if ui.add(egui::Button::new(txt).frame(false)).clicked() {
-                                    if self.sort_col == col {
-                                        self.sort_asc = !self.sort_asc;
-                                    } else {
-                                        self.sort_col = col;
-                                        self.sort_asc = true;
-                                    }
-                                }
-                            };
-
-                            sort_header(ui, "Title", SortColumn::Title);
-                            sort_header(ui, "Artist", SortColumn::Artist);
-                            sort_header(ui, "BPM", SortColumn::Bpm);
-                            sort_header(ui, "Key (Open)", SortColumn::Key);
-                            sort_header(ui, "Time", SortColumn::Duration);
-                            sort_header(ui, "Genre", SortColumn::Genre);
-                            sort_header(ui, "Rating", SortColumn::Rating);
-                            ui.label(
-                                RichText::new("Crate / Playlist")
-                                    .color(TraktorTheme::TEXT_SECONDARY)
-                                    .font(egui::FontId::proportional(11.0))
-                                    .strong(),
-                            );
-                            ui.end_row();
-
-                            for track in &visible_tracks {
-                                let is_harmonic = KeyWheel::are_harmonically_compatible(
-                                    current_deck_a_key,
-                                    &track.musical_key,
-                                );
-
-                                // Col 1: Load Deck Buttons
-                                ui.horizontal(|ui| {
-                                    ui.spacing_mut().item_spacing = Vec2::new(3.0, 0.0);
-                                    if ui
-                                        .add(
-                                            egui::Button::new(
-                                                RichText::new("LOAD A")
-                                                    .color(Color32::BLACK)
-                                                    .font(egui::FontId::monospace(9.5))
-                                                    .strong(),
-                                            )
-                                            .fill(TraktorTheme::DECK_A)
-                                            .min_size(Vec2::new(48.0, 19.0)),
-                                        )
-                                        .clicked()
-                                    {
-                                        load_cmd = Some((1, track.clone()));
-                                    }
-                                    if ui
-                                        .add(
-                                            egui::Button::new(
-                                                RichText::new("LOAD B")
-                                                    .color(Color32::BLACK)
-                                                    .font(egui::FontId::monospace(9.5))
-                                                    .strong(),
-                                            )
-                                            .fill(TraktorTheme::DECK_B)
-                                            .min_size(Vec2::new(48.0, 19.0)),
-                                        )
-                                        .clicked()
-                                    {
-                                        load_cmd = Some((2, track.clone()));
-                                    }
-                                    if four_deck_mode {
-                                        if ui
-                                            .add(
-                                                egui::Button::new(
-                                                    RichText::new("C")
-                                                        .color(Color32::BLACK)
-                                                        .font(egui::FontId::monospace(9.5))
-                                                        .strong(),
-                                                )
-                                                .fill(TraktorTheme::DECK_C)
-                                                .min_size(Vec2::new(22.0, 19.0)),
-                                            )
-                                            .clicked()
-                                        {
-                                            load_cmd = Some((3, track.clone()));
-                                        }
-                                        if ui
-                                            .add(
-                                                egui::Button::new(
-                                                    RichText::new("D")
-                                                        .color(Color32::BLACK)
-                                                        .font(egui::FontId::monospace(9.5))
-                                                        .strong(),
-                                                )
-                                                .fill(TraktorTheme::DECK_D)
-                                                .min_size(Vec2::new(22.0, 19.0)),
-                                            )
-                                            .clicked()
-                                        {
-                                            load_cmd = Some((4, track.clone()));
-                                        }
-                                    }
-                                });
-
-                                // Col 2: Title
-                                ui.label(
-                                    RichText::new(&track.title)
-                                        .color(Color32::WHITE)
-                                        .font(egui::FontId::proportional(12.0))
-                                        .strong(),
-                                );
-
-                                // Col 3: Artist
-                                ui.label(
-                                    RichText::new(&track.artist)
-                                        .color(Color32::from_rgb(195, 202, 215))
-                                        .font(egui::FontId::proportional(12.0)),
-                                );
-
-                                // Col 4: BPM
-                                ui.label(
-                                    RichText::new(format!("{:.2}", track.bpm))
-                                        .color(TraktorTheme::DECK_A)
-                                        .font(egui::FontId::monospace(11.5))
-                                        .strong(),
-                                );
-
-                                // Col 5: Key Badge (Harmonic Match Glow)
-                                let (badge_bg, badge_fg, badge_txt) = if is_harmonic {
-                                    (
-                                        TraktorTheme::PLAY_ACTIVE,
-                                        Color32::BLACK,
-                                        format!("★ {} MATCH", track.musical_key),
-                                    )
-                                } else {
-                                    (
-                                        Color32::from_rgb(38, 42, 52),
-                                        TraktorTheme::TEXT_PRIMARY,
-                                        track.musical_key.clone(),
-                                    )
-                                };
-                                egui::Frame::none()
-                                    .fill(badge_bg)
-                                    .rounding(3.0)
-                                    .inner_margin(egui::Margin::symmetric(6.0, 2.0))
-                                    .show(ui, |ui| {
-                                        ui.label(
-                                            RichText::new(badge_txt)
-                                                .color(badge_fg)
-                                                .font(egui::FontId::monospace(10.0))
-                                                .strong(),
-                                        );
-                                    });
-
-                                // Col 6: Duration
-                                let m = (track.duration_sec / 60.0).floor() as u32;
-                                let s = (track.duration_sec % 60.0).floor() as u32;
-                                ui.label(
-                                    RichText::new(format!("{m:02}:{s:02}"))
-                                        .color(TraktorTheme::TEXT_SECONDARY)
-                                        .font(egui::FontId::monospace(11.0)),
-                                );
-
-                                // Col 7: Genre
-                                ui.label(
-                                    RichText::new(&track.genre)
-                                        .color(TraktorTheme::TEXT_SECONDARY)
-                                        .font(egui::FontId::proportional(11.0)),
-                                );
-
-                                // Col 8: Rating Stars
-                                let stars = "★".repeat(track.rating as usize);
-                                ui.label(
-                                    RichText::new(stars)
-                                        .color(Color32::from_rgb(255, 195, 0))
-                                        .font(egui::FontId::proportional(11.0)),
-                                );
-
-                                // Col 9: Crate / Playlist Actions
-                                ui.horizontal(|ui| {
-                                    let in_prep = prep_ids.contains(&track.id);
-                                    let prep_btn = ui.add(
-                                        egui::Button::new(
-                                            RichText::new(if in_prep { "★ Prepped" } else { "+ Prep" })
-                                                .color(if in_prep {
-                                                    Color32::BLACK
-                                                } else {
-                                                    TraktorTheme::TEXT_SECONDARY
-                                                })
-                                                .font(egui::FontId::proportional(10.0)),
-                                        )
-                                        .fill(if in_prep {
-                                            Color32::from_rgb(255, 200, 0)
-                                        } else {
-                                            Color32::from_rgb(32, 35, 42)
-                                        }),
+                            egui::Grid::new("traktor_collection_grid")
+                                .striped(true)
+                                .spacing(Vec2::new(10.0, 4.0))
+                                .min_col_width(44.0)
+                                .show(ui, |ui| {
+                                    // Sortable Column Headers
+                                    ui.label(
+                                        RichText::new("Load Deck")
+                                            .color(TraktorTheme::TEXT_SECONDARY)
+                                            .font(egui::FontId::proportional(11.0))
+                                            .strong(),
                                     );
-                                    if prep_btn.clicked() {
-                                        toggle_prep_cmd = Some(track.id);
-                                    }
 
-                                    egui::ComboBox::from_id_salt(format!("pl_add_{}", track.id))
-                                        .selected_text("+ Playlist")
-                                        .width(85.0)
-                                        .show_ui(ui, |ui| {
-                                            for (p_idx, p_name) in playlist_names.iter().enumerate()
+                                    let mut sort_header = |ui: &mut Ui, label: &str, col: SortColumn| {
+                                        let arrow = if self.sort_col == col {
+                                            if self.sort_asc { " ▲" } else { " ▼" }
+                                        } else {
+                                            ""
+                                        };
+                                        let txt = RichText::new(format!("{label}{arrow}"))
+                                            .color(if self.sort_col == col {
+                                                TraktorTheme::DECK_A
+                                            } else {
+                                                TraktorTheme::TEXT_SECONDARY
+                                            })
+                                            .font(egui::FontId::proportional(11.0))
+                                            .strong();
+                                        if ui.add(egui::Button::new(txt).frame(false)).clicked() {
+                                            if self.sort_col == col {
+                                                self.sort_asc = !self.sort_asc;
+                                            } else {
+                                                self.sort_col = col;
+                                                self.sort_asc = true;
+                                            }
+                                        }
+                                    };
+
+                                    sort_header(ui, "Title", SortColumn::Title);
+                                    sort_header(ui, "Artist", SortColumn::Artist);
+                                    sort_header(ui, "BPM", SortColumn::Bpm);
+                                    sort_header(ui, "Key", SortColumn::Key);
+                                    ui.label(
+                                        RichText::new("Stems")
+                                            .color(Color32::from_rgb(185, 110, 255))
+                                            .font(egui::FontId::proportional(11.0))
+                                            .strong(),
+                                    );
+                                    sort_header(ui, "Time", SortColumn::Duration);
+                                    sort_header(ui, "Genre", SortColumn::Genre);
+                                    sort_header(ui, "Rating", SortColumn::Rating);
+                                    ui.label(
+                                        RichText::new("Crate / Playlist")
+                                            .color(TraktorTheme::TEXT_SECONDARY)
+                                            .font(egui::FontId::proportional(11.0))
+                                            .strong(),
+                                    );
+                                    ui.end_row();
+
+                                    for track in &visible_tracks {
+                                        let is_harmonic = KeyWheel::are_harmonically_compatible(
+                                            current_deck_a_key,
+                                            &track.musical_key,
+                                        );
+
+                                        // Col 1: Load Deck Buttons
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing = Vec2::new(3.0, 0.0);
+                                            if ui
+                                                .add(
+                                                    egui::Button::new(
+                                                        RichText::new("LOAD A")
+                                                            .color(Color32::BLACK)
+                                                            .font(egui::FontId::monospace(9.5))
+                                                            .strong(),
+                                                    )
+                                                    .fill(TraktorTheme::DECK_A)
+                                                    .min_size(Vec2::new(48.0, 19.0)),
+                                                )
+                                                .clicked()
                                             {
-                                                if ui.selectable_label(false, p_name).clicked() {
-                                                    add_to_playlist_cmd = Some((p_idx, track.id));
+                                                load_cmd = Some((1, track.clone()));
+                                            }
+                                            if ui
+                                                .add(
+                                                    egui::Button::new(
+                                                        RichText::new("LOAD B")
+                                                            .color(Color32::BLACK)
+                                                            .font(egui::FontId::monospace(9.5))
+                                                            .strong(),
+                                                    )
+                                                    .fill(TraktorTheme::DECK_B)
+                                                    .min_size(Vec2::new(48.0, 19.0)),
+                                                )
+                                                .clicked()
+                                            {
+                                                load_cmd = Some((2, track.clone()));
+                                            }
+                                            if four_deck_mode {
+                                                if ui
+                                                    .add(
+                                                        egui::Button::new(
+                                                            RichText::new("C")
+                                                                .color(Color32::BLACK)
+                                                                .font(egui::FontId::monospace(9.5))
+                                                                .strong(),
+                                                        )
+                                                        .fill(TraktorTheme::DECK_C)
+                                                        .min_size(Vec2::new(22.0, 19.0)),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    load_cmd = Some((3, track.clone()));
+                                                }
+                                                if ui
+                                                    .add(
+                                                        egui::Button::new(
+                                                            RichText::new("D")
+                                                                .color(Color32::BLACK)
+                                                                .font(egui::FontId::monospace(9.5))
+                                                                .strong(),
+                                                        )
+                                                        .fill(TraktorTheme::DECK_D)
+                                                        .min_size(Vec2::new(22.0, 19.0)),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    load_cmd = Some((4, track.clone()));
                                                 }
                                             }
                                         });
-                                });
 
-                                ui.end_row();
-                            }
+                                        // Col 2: Title
+                                        ui.label(
+                                            RichText::new(&track.title)
+                                                .color(Color32::WHITE)
+                                                .font(egui::FontId::proportional(12.0))
+                                                .strong(),
+                                        );
+
+                                        // Col 3: Artist
+                                        ui.label(
+                                            RichText::new(&track.artist)
+                                                .color(Color32::from_rgb(195, 202, 215))
+                                                .font(egui::FontId::proportional(12.0)),
+                                        );
+
+                                        // Col 4: BPM
+                                        ui.label(
+                                            RichText::new(format!("{:.2}", track.bpm))
+                                                .color(TraktorTheme::DECK_A)
+                                                .font(egui::FontId::monospace(11.5))
+                                                .strong(),
+                                        );
+
+                                        // Col 5: Key Badge (Harmonic Match Glow)
+                                        let (badge_bg, badge_fg, badge_txt) = if is_harmonic {
+                                            (
+                                                TraktorTheme::PLAY_ACTIVE,
+                                                Color32::BLACK,
+                                                format!("★ {} MATCH", track.musical_key),
+                                            )
+                                        } else {
+                                            (
+                                                Color32::from_rgb(38, 42, 52),
+                                                TraktorTheme::TEXT_PRIMARY,
+                                                track.musical_key.clone(),
+                                            )
+                                        };
+                                        egui::Frame::none()
+                                            .fill(badge_bg)
+                                            .rounding(3.0)
+                                            .inner_margin(egui::Margin::symmetric(6.0, 2.0))
+                                            .show(ui, |ui| {
+                                                ui.label(
+                                                    RichText::new(badge_txt)
+                                                        .color(badge_fg)
+                                                        .font(egui::FontId::monospace(10.0))
+                                                        .strong(),
+                                                );
+                                            });
+
+                                        // Col 6: Stems Status / Create Action
+                                        if track.stems_ready {
+                                            egui::Frame::none()
+                                                .fill(Color32::from_rgb(42, 22, 65))
+                                                .stroke(Stroke::new(0.8_f32, Color32::from_rgb(180, 90, 255)))
+                                                .rounding(3.0)
+                                                .inner_margin(egui::Margin::symmetric(5.0, 2.0))
+                                                .show(ui, |ui| {
+                                                    ui.label(
+                                                        RichText::new("✓ 4 STEMS")
+                                                            .color(Color32::from_rgb(215, 155, 255))
+                                                            .font(egui::FontId::monospace(9.5))
+                                                            .strong(),
+                                                    );
+                                                });
+                                        } else if ui
+                                            .add(
+                                                egui::Button::new(
+                                                    RichText::new("🧪 Create")
+                                                        .color(Color32::from_rgb(200, 130, 255))
+                                                        .font(egui::FontId::monospace(9.5)),
+                                                )
+                                                .fill(Color32::from_rgb(28, 22, 38)),
+                                            )
+                                            .on_hover_text("Separate into Drums, Bass, Instruments & Vocals stems")
+                                            .clicked()
+                                        {
+                                            create_stems_cmd = Some(track.id);
+                                        }
+
+                                        // Col 7: Duration
+                                        let m = (track.duration_sec / 60.0).floor() as u32;
+                                        let s = (track.duration_sec % 60.0).floor() as u32;
+                                        ui.label(
+                                            RichText::new(format!("{m:02}:{s:02}"))
+                                                .color(TraktorTheme::TEXT_SECONDARY)
+                                                .font(egui::FontId::monospace(11.0)),
+                                        );
+
+                                        // Col 8: Genre
+                                        ui.label(
+                                            RichText::new(&track.genre)
+                                                .color(TraktorTheme::TEXT_SECONDARY)
+                                                .font(egui::FontId::proportional(11.0)),
+                                        );
+
+                                        // Col 9: Rating Stars
+                                        let stars = "★".repeat(track.rating as usize);
+                                        ui.label(
+                                            RichText::new(stars)
+                                                .color(Color32::from_rgb(255, 195, 0))
+                                                .font(egui::FontId::proportional(11.0)),
+                                        );
+
+                                        // Col 10: Crate / Playlist Actions
+                                        ui.horizontal(|ui| {
+                                            let in_prep = prep_ids.contains(&track.id);
+                                            let prep_btn = ui.add(
+                                                egui::Button::new(
+                                                    RichText::new(if in_prep { "★ Prepped" } else { "+ Prep" })
+                                                        .color(if in_prep {
+                                                            Color32::BLACK
+                                                        } else {
+                                                            TraktorTheme::TEXT_SECONDARY
+                                                        })
+                                                        .font(egui::FontId::proportional(10.0)),
+                                                )
+                                                .fill(if in_prep {
+                                                    Color32::from_rgb(255, 200, 0)
+                                                } else {
+                                                    Color32::from_rgb(32, 35, 42)
+                                                }),
+                                            );
+                                            if prep_btn.clicked() {
+                                                toggle_prep_cmd = Some(track.id);
+                                            }
+
+                                            egui::ComboBox::from_id_salt(format!("pl_add_{}", track.id))
+                                                .selected_text("+ Playlist")
+                                                .width(85.0)
+                                                .show_ui(ui, |ui| {
+                                                    for (p_idx, p_name) in playlist_names.iter().enumerate()
+                                                    {
+                                                        if ui.selectable_label(false, p_name).clicked() {
+                                                            add_to_playlist_cmd = Some((p_idx, track.id));
+                                                        }
+                                                    }
+                                                });
+                                        });
+
+                                        ui.end_row();
+                                    }
+                                });
                         });
                 });
+
+                // 4b. rekordbox 7-style Harmonic & Energy Match Radar Side Panel
+                if radar_w > 0.0 {
+                    ui.allocate_ui(Vec2::new(radar_w, ui.available_height()), |ui| {
+                        egui::Frame::none()
+                            .fill(Color32::from_rgb(16, 20, 26))
+                            .stroke(Stroke::new(1.0_f32, TraktorTheme::PLAY_ACTIVE))
+                            .rounding(4.0)
+                            .inner_margin(egui::Margin::same(6.0))
+                            .show(ui, |ui| {
+                                ui.vertical(|ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            RichText::new("🎯 MATCH RADAR")
+                                                .color(TraktorTheme::PLAY_ACTIVE)
+                                                .font(egui::FontId::monospace(10.5))
+                                                .strong(),
+                                        );
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                ui.label(
+                                                    RichText::new(format!("Key {current_deck_a_key}"))
+                                                        .color(TraktorTheme::DECK_A)
+                                                        .font(egui::FontId::monospace(9.5))
+                                                        .strong(),
+                                                );
+                                            },
+                                        );
+                                    });
+                                    ui.label(
+                                        RichText::new("Best Next Tracks (Harmonic + BPM + Stems)")
+                                            .color(TraktorTheme::TEXT_MUTED)
+                                            .font(egui::FontId::proportional(9.5)),
+                                    );
+                                    ui.separator();
+
+                                    let mut radar_matches: Vec<(u8, UiTrackEntry)> = self
+                                        .tracks
+                                        .iter()
+                                        .filter_map(|t| {
+                                            if KeyWheel::are_harmonically_compatible(
+                                                current_deck_a_key,
+                                                &t.musical_key,
+                                            ) {
+                                                let exact = t.musical_key == current_deck_a_key;
+                                                let score = if exact { 99 } else { 93 }
+                                                    + u8::from(t.stems_ready);
+                                                Some((score.min(99), t.clone()))
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                        .collect();
+                                    radar_matches.sort_by(|a, b| b.0.cmp(&a.0));
+
+                                    egui::ScrollArea::vertical()
+                                        .id_salt("match_radar_scroll")
+                                        .show(ui, |ui| {
+                                            for (score, mtrack) in radar_matches.iter().take(8) {
+                                                egui::Frame::none()
+                                                    .fill(Color32::from_rgb(23, 27, 35))
+                                                    .rounding(3.0)
+                                                    .inner_margin(egui::Margin::symmetric(6.0, 4.0))
+                                                    .show(ui, |ui| {
+                                                        ui.horizontal(|ui| {
+                                                            ui.label(
+                                                                RichText::new(format!("{score}%"))
+                                                                    .color(TraktorTheme::PLAY_ACTIVE)
+                                                                    .font(egui::FontId::monospace(10.0))
+                                                                    .strong(),
+                                                            );
+                                                            ui.label(
+                                                                RichText::new(&mtrack.title)
+                                                                    .color(Color32::WHITE)
+                                                                    .font(egui::FontId::proportional(11.0))
+                                                                    .strong(),
+                                                            );
+                                                        });
+                                                        ui.horizontal(|ui| {
+                                                            ui.label(
+                                                                RichText::new(format!(
+                                                                    "{} • {:.1} BPM • {}",
+                                                                    mtrack.artist,
+                                                                    mtrack.bpm,
+                                                                    mtrack.musical_key
+                                                                ))
+                                                                .color(TraktorTheme::TEXT_SECONDARY)
+                                                                .font(egui::FontId::monospace(9.0)),
+                                                            );
+                                                            ui.with_layout(
+                                                                egui::Layout::right_to_left(
+                                                                    egui::Align::Center,
+                                                                ),
+                                                                |ui| {
+                                                                    if ui
+                                                                        .add(
+                                                                            egui::Button::new(
+                                                                                RichText::new("B")
+                                                                                    .color(Color32::BLACK)
+                                                                                    .font(egui::FontId::monospace(9.0))
+                                                                                    .strong(),
+                                                                            )
+                                                                            .fill(TraktorTheme::DECK_B)
+                                                                            .min_size(Vec2::new(20.0, 16.0)),
+                                                                        )
+                                                                        .on_hover_text("Load into Deck B")
+                                                                        .clicked()
+                                                                    {
+                                                                        load_cmd = Some((2, mtrack.clone()));
+                                                                    }
+                                                                    if ui
+                                                                        .add(
+                                                                            egui::Button::new(
+                                                                                RichText::new("A")
+                                                                                    .color(Color32::BLACK)
+                                                                                    .font(egui::FontId::monospace(9.0))
+                                                                                    .strong(),
+                                                                            )
+                                                                            .fill(TraktorTheme::DECK_A)
+                                                                            .min_size(Vec2::new(20.0, 16.0)),
+                                                                        )
+                                                                        .on_hover_text("Load into Deck A")
+                                                                        .clicked()
+                                                                    {
+                                                                        load_cmd = Some((1, mtrack.clone()));
+                                                                    }
+                                                                },
+                                                            );
+                                                        });
+                                                    });
+                                                ui.add_space(3.0);
+                                            }
+                                        });
+                                });
+                            });
+                    });
+                }
+            });
+
+            if let Some(track_id) = create_stems_cmd {
+                if let Some(t) = self.tracks.iter_mut().find(|t| t.id == track_id) {
+                    t.stems_ready = true;
+                    self.status_message = format!(
+                        "✓ Created 4-Stem separation (Drums, Bass, Instruments, Vocals) for '{}'!",
+                        t.title
+                    );
+                }
+            }
 
             if let Some((deck_idx, track)) = load_cmd {
                 self.record_history(deck_idx, &track);
@@ -1414,140 +1704,6 @@ impl LibraryManager {
                                 ui.end_row();
                             }
                         });
-                });
-        });
-    }
-
-    fn show_controllers_view(&mut self, ui: &mut Ui) {
-        ui.vertical(|ui| {
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new("🎛️ NATIVE INSTRUMENTS TRAKTOR MX2 & KONTROL HARDWARE")
-                        .color(TraktorTheme::DECK_A)
-                        .font(egui::FontId::monospace(12.0))
-                        .strong(),
-                );
-                if let Some(ref tsi_info) = self.loaded_tsi_summary {
-                    ui.label(RichText::new(tsi_info).color(TraktorTheme::PLAY_ACTIVE));
-                }
-            });
-            ui.separator();
-
-            // Featured Traktor MX2 Hardware Profile Banner
-            egui::Frame::none()
-                .fill(Color32::from_rgb(18, 25, 34))
-                .stroke(Stroke::new(1.0_f32, TraktorTheme::DECK_A))
-                .inner_margin(egui::Margin::symmetric(10.0, 6.0))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new("★ TRAKTOR MX2 [USB 17CC:2420]")
-                                .color(TraktorTheme::DECK_A)
-                                .font(egui::FontId::monospace(11.5))
-                                .strong(),
-                        );
-                        ui.separator();
-                        ui.label(
-                            RichText::new(
-                                "NHL2 Native HID (Report 0x01: 83 Buttons + 6 Encoders | Report 0x02: 26 12-bit Pots/Faders | Report 0x03: 960-tick Jogwheels)",
-                            )
-                            .color(TraktorTheme::TEXT_PRIMARY)
-                            .font(egui::FontId::proportional(11.0)),
-                        );
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(
-                                "• Illuminated Bottom Shell (bottom.leds.1..6): Green=Active Loop | Blinking Red=Track End Warning | Cyan/Blue=Deck Glow",
-                            )
-                            .color(TraktorTheme::PLAY_ACTIVE)
-                            .font(egui::FontId::monospace(10.0)),
-                        );
-                        ui.separator();
-                        ui.label(
-                            RichText::new(
-                                "• Audio: 24-bit/96kHz 4-Out/2-In UAC2 (Master Out 1/2, Headphone Cue 3/4, Mic In 1/2)",
-                            )
-                            .color(TraktorTheme::TEXT_SECONDARY)
-                            .font(egui::FontId::monospace(10.0)),
-                        );
-                    });
-                });
-            ui.add_space(4.0);
-
-            egui::ScrollArea::vertical()
-                .id_salt("controllers_scroll")
-                .show(ui, |ui| {
-                    egui::Grid::new("ni_controllers_grid")
-                        .striped(true)
-                        .spacing(Vec2::new(16.0, 4.0))
-                        .show(ui, |ui| {
-                            ui.label(RichText::new("Controller Model").color(TraktorTheme::TEXT_SECONDARY).strong());
-                            ui.label(RichText::new("USB VID:PID").color(TraktorTheme::TEXT_SECONDARY).strong());
-                            ui.label(RichText::new("CSI Module").color(TraktorTheme::TEXT_SECONDARY).strong());
-                            ui.label(RichText::new("RGB565 Display").color(TraktorTheme::TEXT_SECONDARY).strong());
-                            ui.label(RichText::new("Haptic Drive Platters").color(TraktorTheme::TEXT_SECONDARY).strong());
-                            ui.end_row();
-
-                            for dev in &NI_DEVICES {
-                                ui.label(RichText::new(dev.model).color(Color32::WHITE).strong());
-                                ui.label(
-                                    RichText::new(format!("{:04X}:{:04X}", dev.vid, dev.pid))
-                                        .color(TraktorTheme::DECK_A)
-                                        .monospace(),
-                                );
-                                ui.label(RichText::new(format!("CSI/{}", dev.csi_folder)).monospace());
-                                ui.label(
-                                    RichText::new(if dev.has_color_screen {
-                                        "✓ OffscreenView (0x8400)"
-                                    } else {
-                                        "LED Matrix"
-                                    })
-                                    .color(if dev.has_color_screen {
-                                        TraktorTheme::PLAY_ACTIVE
-                                    } else {
-                                        TraktorTheme::TEXT_MUTED
-                                    }),
-                                );
-                                ui.label(
-                                    RichText::new(if dev.has_motorized_jog {
-                                        "✓ Report 0x30 Motorized"
-                                    } else {
-                                        "Capacitive Jog / Strip"
-                                    })
-                                    .color(if dev.has_motorized_jog {
-                                        TraktorTheme::DECK_B
-                                    } else {
-                                        TraktorTheme::TEXT_MUTED
-                                    }),
-                                );
-                                ui.end_row();
-                            }
-                        });
-
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        ui.label("Load .tsi Mapping File Path:");
-                        ui.add(egui::TextEdit::singleline(&mut self.path_input).desired_width(300.0));
-                        if ui.button("Load .tsi").clicked() {
-                            let p = PathBuf::from(self.path_input.trim());
-                            match fs::read_to_string(&p)
-                                .map_err(|e| e.to_string())
-                                .and_then(|xml| TsiFile::parse_xml(&xml).map_err(|e| e.to_string()))
-                            {
-                                Ok(tsi) => {
-                                    self.loaded_tsi_summary = Some(format!(
-                                        "✓ Loaded {} ({} devices mapped)",
-                                        p.display(),
-                                        tsi.devices.len()
-                                    ));
-                                }
-                                Err(e) => {
-                                    self.loaded_tsi_summary = Some(format!("⚠ TSI error: {e}"));
-                                }
-                            }
-                        }
-                    });
                 });
         });
     }

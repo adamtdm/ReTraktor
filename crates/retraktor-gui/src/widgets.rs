@@ -501,6 +501,191 @@ pub fn scrolling_waveform(
     response
 }
 
+/// Real-Time 4-Lane Stacked Stem Waveforms Display (`Drums`, `Bass`, `Instruments`, `Vocals`)
+#[allow(clippy::too_many_arguments)]
+pub fn scrolling_stem_waveforms(
+    ui: &mut Ui,
+    elapsed_sec: f64,
+    bpm: f64,
+    cues: &[(u8, f64)],
+    stem_peaks: &[[f32; 4]],
+    stem_volumes: &[f32; 4],
+    stem_muted: &[bool; 4],
+    loop_active: bool,
+    loop_start_sec: f64,
+    loop_len_sec: f64,
+    deck_badge: Option<(&str, Color32)>,
+    height: f32,
+) -> Response {
+    let width = ui.available_width().max(180.0);
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(width, height), Sense::click_and_drag());
+
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+
+    let painter = ui.painter();
+    painter.rect_filled(rect, 2.0, TraktorTheme::WAVEFORM_BG);
+    painter.rect_stroke(rect, 2.0, Stroke::new(1.0_f32, TraktorTheme::BORDER_COLOR));
+
+    let center_x = rect.center().x;
+    let pixels_per_sec = 85.0_f32;
+    let lane_h = height / 4.0;
+
+    let stem_colors = [
+        Color32::from_rgb(0, 215, 255),   // 0: Drums (Cyan)
+        Color32::from_rgb(255, 68, 68),   // 1: Bass (Red/Coral)
+        Color32::from_rgb(255, 196, 0),   // 2: Instruments (Amber)
+        Color32::from_rgb(195, 105, 255), // 3: Vocals (Neon Purple)
+    ];
+    let stem_labels = ["DRUMS", "BASS", "INST", "VOCAL"];
+
+    // 1. Draw lane dividers & labels
+    for lane in 0..4 {
+        let top_y = rect.top() + (lane as f32) * lane_h;
+        if lane > 0 {
+            painter.line_segment(
+                [Pos2::new(rect.left(), top_y), Pos2::new(rect.right(), top_y)],
+                Stroke::new(0.6_f32, Color32::from_rgb(30, 34, 42)),
+            );
+        }
+    }
+
+    // 2. Active Loop Overlay
+    if loop_active && loop_len_sec > 0.01 {
+        let l_start_x = (center_x + ((loop_start_sec - elapsed_sec) as f32) * pixels_per_sec)
+            .clamp(rect.left(), rect.right());
+        let l_end_x = (center_x
+            + ((loop_start_sec + loop_len_sec - elapsed_sec) as f32) * pixels_per_sec)
+            .clamp(rect.left(), rect.right());
+        if l_end_x > l_start_x {
+            let loop_rect =
+                Rect::from_min_max(Pos2::new(l_start_x, rect.top()), Pos2::new(l_end_x, rect.bottom()));
+            painter.rect_filled(
+                loop_rect,
+                0.0,
+                Color32::from_rgba_unmultiplied(118, 255, 3, 24),
+            );
+            painter.rect_stroke(loop_rect, 0.0, Stroke::new(1.0_f32, TraktorTheme::LOOP_ACTIVE));
+        }
+    }
+
+    // 3. Beatgrid Lines
+    let beat_len_sec = 60.0 / bpm.max(30.0);
+    let visible_sec_half = (width / 2.0 / pixels_per_sec) as f64;
+    let min_sec = (elapsed_sec - visible_sec_half).max(0.0);
+    let max_sec = elapsed_sec + visible_sec_half;
+    let start_beat = (min_sec / beat_len_sec).floor() as i64;
+    let end_beat = (max_sec / beat_len_sec).ceil() as i64;
+
+    for b in start_beat..=end_beat {
+        let beat_time = b as f64 * beat_len_sec;
+        let x = center_x + ((beat_time - elapsed_sec) as f32) * pixels_per_sec;
+        if x < rect.left() || x > rect.right() {
+            continue;
+        }
+        let is_bar_start = b % 4 == 0;
+        let stroke = if is_bar_start {
+            Stroke::new(1.1_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 75))
+        } else {
+            Stroke::new(0.5_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 32))
+        };
+        painter.line_segment([Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())], stroke);
+    }
+
+    // 4. Draw 4 Stem Waveform Ribbons
+    let col_w = 2.0_f32;
+    let cols = (width / col_w).ceil() as usize;
+    let max_lane_half = (lane_h * 0.44).max(2.0);
+
+    for i in 0..cols {
+        let col_x = rect.left() + (i as f32) * col_w;
+        let time_at_col = elapsed_sec + ((col_x - center_x) / pixels_per_sec) as f64;
+        if time_at_col < 0.0 {
+            continue;
+        }
+
+        let amps = if !stem_peaks.is_empty() {
+            let bucket = ((time_at_col * PEAKS_PER_SEC as f64) as usize) % stem_peaks.len();
+            stem_peaks[bucket]
+        } else {
+            [0.4, 0.5, 0.35, 0.3]
+        };
+
+        for lane in 0..4 {
+            let lane_cy = rect.top() + (lane as f32 + 0.5) * lane_h;
+            let vol = if stem_muted[lane] {
+                0.15
+            } else {
+                stem_volumes[lane].clamp(0.1, 1.0)
+            };
+            let h = amps[lane] * vol * max_lane_half;
+            let col = if stem_muted[lane] {
+                Color32::from_rgb(55, 60, 70)
+            } else {
+                stem_colors[lane]
+            };
+            painter.line_segment(
+                [Pos2::new(col_x, lane_cy - h), Pos2::new(col_x, lane_cy + h)],
+                Stroke::new(col_w, col),
+            );
+        }
+    }
+
+    // 5. Hotcues & Playhead
+    for &(cue_id, cue_sec) in cues {
+        let cue_x = center_x + ((cue_sec - elapsed_sec) as f32) * pixels_per_sec;
+        if cue_x >= rect.left() && cue_x <= rect.right() {
+            let color = TraktorTheme::hotcue_color(cue_id as usize);
+            painter.line_segment(
+                [Pos2::new(cue_x, rect.top()), Pos2::new(cue_x, rect.bottom())],
+                Stroke::new(1.3_f32, color),
+            );
+        }
+    }
+
+    painter.line_segment(
+        [
+            Pos2::new(center_x, rect.top()),
+            Pos2::new(center_x, rect.bottom()),
+        ],
+        Stroke::new(2.0_f32, TraktorTheme::WAVEFORM_PLAYHEAD),
+    );
+
+    // 6. Stem Lane Tags on Right Edge & Optional Deck Badge on Left Edge
+    for lane in 0..4 {
+        let lane_cy = rect.top() + (lane as f32 + 0.5) * lane_h;
+        let col = if stem_muted[lane] {
+            TraktorTheme::TEXT_MUTED
+        } else {
+            stem_colors[lane]
+        };
+        painter.text(
+            Pos2::new(rect.right() - 4.0, lane_cy),
+            egui::Align2::RIGHT_CENTER,
+            stem_labels[lane],
+            egui::FontId::monospace(7.5),
+            col,
+        );
+    }
+
+    if let Some((badge_txt, badge_col)) = deck_badge {
+        let badge_rect =
+            Rect::from_min_size(Pos2::new(rect.left() + 6.0, rect.top() + 4.0), Vec2::new(22.0, 16.0));
+        painter.rect_filled(badge_rect, 2.0, badge_col);
+        painter.text(
+            badge_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            badge_txt,
+            egui::FontId::monospace(10.5),
+            Color32::BLACK,
+        );
+    }
+
+    response
+}
+
 /// Full-Track Stripe Overview Minimap Widget (`PRTS` Style with scrubber)
 #[allow(clippy::too_many_arguments)]
 pub fn stripe_overview(
