@@ -117,7 +117,7 @@ impl PreferencesDialog {
         ui.add_space(8.0);
 
         ui.label(egui::RichText::new("Audio Device Backend:").strong());
-        ui.label("PipeWire pro-audio / ALSA UAC2 (Native Instruments Kontrol S4/S3/S2)");
+        ui.label("PipeWire pro-audio / ALSA UAC2 (Traktor MX2 / S4 MK3 / S3 / S2 MK3 / Z1 MK2)");
 
         ui.add_space(8.0);
         ui.horizontal(|ui| {
@@ -232,12 +232,25 @@ impl PreferencesDialog {
     }
 
     fn show_controller_prefs(&mut self, ui: &mut Ui) {
-        ui.heading("Controller Manager");
+        ui.heading("Controller Manager — Traktor MX2 & NI Kontrol");
         ui.add_space(8.0);
 
+        ui.label(
+            egui::RichText::new("✓ Native Instruments Traktor MX2 [VID 0x17CC : PID 0x2420] Driver Ready")
+                .color(TraktorTheme::PLAY_ACTIVE)
+                .strong(),
+        );
+        ui.label("• NHL2 HID Reports: 0x01 (83 Buttons + 6 Encoders), 0x02 (26 12-bit Pots/Faders), 0x03 (960-tick Jogwheels)");
+        ui.label("• Output Report 0x80: 105 LEDs + 6 RGB Bottom-Shell LEDs per deck (Loop/End-Warning/Ambient)");
+        ui.label("• Audio Interface: 24-bit / 96kHz 4-Out / 2-In UAC2 (Master 1/2, Headphone Monitor 3/4, Mic 1/2)");
+
+        ui.add_space(8.0);
         ui.label("Supported Native Instruments USB & HID Hardware:");
-        for dev in NI_DEVICES.iter().take(8) {
-            ui.label(format!("• {} [VID 0x{:04X} : PID 0x{:04X}]", dev.model, dev.vid, dev.pid));
+        for dev in NI_DEVICES.iter() {
+            ui.label(format!(
+                "• {} [VID 0x{:04X} : PID 0x{:04X}] (CSI/{})",
+                dev.model, dev.vid, dev.pid, dev.csi_folder
+            ));
         }
 
         ui.add_space(8.0);

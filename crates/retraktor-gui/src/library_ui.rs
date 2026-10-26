@@ -1422,7 +1422,7 @@ impl LibraryManager {
         ui.vertical(|ui| {
             ui.horizontal(|ui| {
                 ui.label(
-                    RichText::new("🎛️ NATIVE INSTRUMENTS KONTROL HARDWARE & TSI MAPPINGS")
+                    RichText::new("🎛️ NATIVE INSTRUMENTS TRAKTOR MX2 & KONTROL HARDWARE")
                         .color(TraktorTheme::DECK_A)
                         .font(egui::FontId::monospace(12.0))
                         .strong(),
@@ -1432,6 +1432,48 @@ impl LibraryManager {
                 }
             });
             ui.separator();
+
+            // Featured Traktor MX2 Hardware Profile Banner
+            egui::Frame::none()
+                .fill(Color32::from_rgb(18, 25, 34))
+                .stroke(Stroke::new(1.0_f32, TraktorTheme::DECK_A))
+                .inner_margin(egui::Margin::symmetric(10.0, 6.0))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("★ TRAKTOR MX2 [USB 17CC:2420]")
+                                .color(TraktorTheme::DECK_A)
+                                .font(egui::FontId::monospace(11.5))
+                                .strong(),
+                        );
+                        ui.separator();
+                        ui.label(
+                            RichText::new(
+                                "NHL2 Native HID (Report 0x01: 83 Buttons + 6 Encoders | Report 0x02: 26 12-bit Pots/Faders | Report 0x03: 960-tick Jogwheels)",
+                            )
+                            .color(TraktorTheme::TEXT_PRIMARY)
+                            .font(egui::FontId::proportional(11.0)),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(
+                                "• Illuminated Bottom Shell (bottom.leds.1..6): Green=Active Loop | Blinking Red=Track End Warning | Cyan/Blue=Deck Glow",
+                            )
+                            .color(TraktorTheme::PLAY_ACTIVE)
+                            .font(egui::FontId::monospace(10.0)),
+                        );
+                        ui.separator();
+                        ui.label(
+                            RichText::new(
+                                "• Audio: 24-bit/96kHz 4-Out/2-In UAC2 (Master Out 1/2, Headphone Cue 3/4, Mic In 1/2)",
+                            )
+                            .color(TraktorTheme::TEXT_SECONDARY)
+                            .font(egui::FontId::monospace(10.0)),
+                        );
+                    });
+                });
+            ui.add_space(4.0);
 
             egui::ScrollArea::vertical()
                 .id_salt("controllers_scroll")

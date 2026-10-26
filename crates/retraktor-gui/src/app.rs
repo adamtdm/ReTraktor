@@ -7,9 +7,15 @@ use crate::widgets::{
     vu_meter,
 };
 use eframe::egui::{self, Align, Color32, Key, Layout, RichText, Stroke, Ui, Vec2};
-use retraktor_core::PropertyBus;
+use retraktor_core::{PropValue, PropertyBus, SurfaceEvent};
 use retraktor_dsp::MixerFxKind;
+use retraktor_hid::{
+    scan_linux_ni_hidraw_devices, Mx2BottomShellState, Mx2HidDriver, TRAKTOR_MX2_JOG_TICKS_PER_REV,
+    TRAKTOR_MX2_PID,
+};
 use retraktor_library::KeyWheel;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
 
 /// Traktor Pro 4 Workspace Layouts (switchable from Top Header or F1..F5)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -79,6 +85,13 @@ pub struct ReTraktorApp {
     pub deck_loop_start_sec: [f64; 4],
     pub deck_loop_size_beats: [u32; 4],
     pub deck_hotcues: [Vec<(u8, f64)>; 4],
+
+    // Traktor MX2 (VID 0x17CC, PID 0x2420) Live Hardware State
+    pub mx2_driver: Mx2HidDriver,
+    pub mx2_hidraw_file: Option<File>,
+    pub mx2_dev_node: Option<String>,
+    pub mx2_model_name: Option<String>,
+    pub mx2_scan_counter: u32,
 }
 
 impl Default for ReTraktorApp {
@@ -128,6 +141,11 @@ impl Default for ReTraktorApp {
                 vec![(1, 0.0), (2, 15.0)],
                 vec![(1, 0.0), (2, 15.0)],
             ],
+            mx2_driver: Mx2HidDriver::new(),
+            mx2_hidraw_file: None,
+            mx2_dev_node: None,
+            mx2_model_name: None,
+            mx2_scan_counter: 0,
         }
     }
 }
@@ -138,6 +156,7 @@ impl eframe::App for ReTraktorApp {
         ctx.request_repaint();
 
         self.handle_keyboard_shortcuts(ctx);
+        self.poll_mx2_hardware();
         self.sync_audio_state();
 
         // Authentic Traktor Dark Theme Canvas
@@ -228,6 +247,255 @@ impl ReTraktorApp {
 
             state.engine.master_volume = self.master_volume;
             state.engine.clock.bpm = self.master_tempo;
+
+            // Sync telemetry into PropertyBus for MX2 105-LED & 9-segment VU meter feedback
+            for d in 0..4 {
+                let idx = d + 1;
+                self.bus.set(
+                    &format!("app.traktor.decks.{idx}.play"),
+                    PropValue::Bool(state.is_playing[d]),
+                );
+                self.bus.set(
+                    &format!("app.traktor.decks.{idx}.flux.enabled"),
+                    PropValue::Bool(self.deck_flux_active[d]),
+                );
+                self.bus.set(
+                    &format!("app.traktor.mixer.channels.{idx}.cue"),
+                    PropValue::Bool(self.channel_cue[d]),
+                );
+                self.bus.set(
+                    &format!("app.traktor.mixer.channels.{idx}.fx.on"),
+                    PropValue::Bool(self.channel_filter_on[d]),
+                );
+                self.bus.set(
+                    &format!("app.traktor.mixer.channels.{idx}.level.prefader.linear.sum"),
+                    PropValue::Float(state.channel_peaks[d] as f64),
+                );
+            }
+            self.bus.set(
+                "app.traktor.mixer.master.level.clip.left",
+                PropValue::Bool(state.master_peak_l >= 0.98),
+            );
+            self.bus.set(
+                "app.traktor.mixer.master.level.clip.right",
+                PropValue::Bool(state.master_peak_r >= 0.98),
+            );
+        }
+    }
+
+    /// Polls Linux `/dev/hidraw*` for a connected Native Instruments Traktor MX2 (`17CC:2420`)
+    /// or other NI Kontrol surface, decodes Input Reports `0x01`/`0x02`/`0x03`, and writes
+    /// Output Report `0x80` (105 LEDs + 6 RGB Bottom-Shell LEDs per deck).
+    fn poll_mx2_hardware(&mut self) {
+        if self.mx2_hidraw_file.is_none() {
+            self.mx2_scan_counter = self.mx2_scan_counter.wrapping_add(1);
+            if self.mx2_scan_counter % 120 == 1 {
+                let detected = scan_linux_ni_hidraw_devices();
+                // Prefer Traktor MX2 if multiple NI devices are attached
+                if let Some(dev) = detected
+                    .iter()
+                    .find(|d| d.descriptor.pid == TRAKTOR_MX2_PID)
+                    .or_else(|| detected.first())
+                {
+                    let mut opts = OpenOptions::new();
+                    opts.read(true).write(true);
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::OpenOptionsExt;
+                        opts.custom_flags(0x0800); // O_NONBLOCK on Linux
+                    }
+                    if let Ok(mut file) = opts.open(&dev.dev_node) {
+                        // Send NHL2 mode activation report [0xA0, 0x00, 0xFF]
+                        let _ = file.write_all(&Mx2HidDriver::mode_enable_nhl_report());
+                        self.mx2_dev_node = Some(dev.dev_node.clone());
+                        self.mx2_model_name = Some(dev.descriptor.model.to_string());
+                        self.mx2_hidraw_file = Some(file);
+                    } else {
+                        // Detected in sysfs even if hidraw node needs udev reload
+                        self.mx2_dev_node = Some(dev.dev_node.clone());
+                        self.mx2_model_name = Some(dev.descriptor.model.to_string());
+                    }
+                }
+            }
+            return;
+        }
+
+        // Non-blocking read of up to 8 queued HID input reports per frame
+        let mut pending_events = Vec::new();
+        let mut disconnected = false;
+        if let Some(ref mut file) = self.mx2_hidraw_file {
+            let mut buf = [0u8; 64];
+            for _ in 0..8 {
+                match file.read(&mut buf) {
+                    Ok(n) if n > 0 => {
+                        let evs = self.mx2_driver.decode_input_report(&buf[..n]);
+                        pending_events.extend(evs);
+                    }
+                    Ok(_) => break,
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if disconnected {
+            self.mx2_hidraw_file = None;
+            self.mx2_dev_node = None;
+            return;
+        }
+
+        for ev in pending_events {
+            self.apply_mx2_surface_event(ev);
+        }
+
+        // Compute Bottom Shell 6-LED state (`bottom.leds.1..6`) for Deck A and Deck B
+        let left_shell = if self.deck_loop_active[0] {
+            Mx2BottomShellState::ActiveLoopGreen
+        } else {
+            Mx2BottomShellState::DefaultGlow
+        };
+        let right_shell = if self.deck_loop_active[1] {
+            Mx2BottomShellState::ActiveLoopGreen
+        } else {
+            Mx2BottomShellState::DefaultGlow
+        };
+
+        let led_report = self
+            .mx2_driver
+            .encode_led_report(&self.bus, left_shell, right_shell);
+        if let Some(ref mut file) = self.mx2_hidraw_file {
+            let _ = file.write_all(&led_report);
+        }
+    }
+
+    pub fn apply_mx2_surface_event(&mut self, ev: SurfaceEvent) {
+        match ev {
+            SurfaceEvent::Fader { control, value } => {
+                let v = value as f32;
+                match control.as_str() {
+                    "surface.mixer.xfader" => self.crossfader_pos = v,
+                    "surface.mixer.channels.1.volume" => self.channel_volume[0] = v,
+                    "surface.mixer.channels.2.volume" => self.channel_volume[1] = v,
+                    "surface.mixer.channels.1.gain" => self.channel_gain[0] = v,
+                    "surface.mixer.channels.2.gain" => self.channel_gain[1] = v,
+                    "surface.mixer.channels.1.eq.high" => self.channel_eq_hi[0] = v,
+                    "surface.mixer.channels.1.eq.mid" => self.channel_eq_mid[0] = v,
+                    "surface.mixer.channels.1.eq.low" => self.channel_eq_low[0] = v,
+                    "surface.mixer.channels.2.eq.high" => self.channel_eq_hi[1] = v,
+                    "surface.mixer.channels.2.eq.mid" => self.channel_eq_mid[1] = v,
+                    "surface.mixer.channels.2.eq.low" => self.channel_eq_low[1] = v,
+                    "surface.mixer.channels.1.channel_fx.amount" => self.channel_filter[0] = v,
+                    "surface.mixer.channels.2.channel_fx.amount" => self.channel_filter[1] = v,
+                    "surface.mixer.main.volume" => self.master_volume = v,
+                    "surface.left.pitch.fader" => self.deck_pitch_fader[0] = (v * 16.0) - 8.0,
+                    "surface.right.pitch.fader" => self.deck_pitch_fader[1] = (v * 16.0) - 8.0,
+                    "surface.left.fx.knobs.1" => self.fx1_dry_wet = v,
+                    "surface.left.fx.knobs.2" => self.fx1_param[0] = v,
+                    "surface.left.fx.knobs.3" => self.fx1_param[1] = v,
+                    "surface.left.fx.knobs.4" => self.fx1_param[2] = v,
+                    "surface.right.fx.knobs.1" => self.fx2_dry_wet = v,
+                    "surface.right.fx.knobs.2" => self.fx2_param[0] = v,
+                    "surface.right.fx.knobs.3" => self.fx2_param[1] = v,
+                    "surface.right.fx.knobs.4" => self.fx2_param[2] = v,
+                    _ => {}
+                }
+            }
+            SurfaceEvent::Button {
+                control,
+                pressed: true,
+            } => match control.as_str() {
+                "surface.left.play" => self.toggle_play(1),
+                "surface.right.play" => self.toggle_play(2),
+                "surface.left.cue" => self.jump_to_cue(1, 1),
+                "surface.right.cue" => self.jump_to_cue(2, 1),
+                "surface.left.sync" => self.sync_deck(1),
+                "surface.right.sync" => self.sync_deck(2),
+                "surface.left.flux" => self.deck_flux_active[0] = !self.deck_flux_active[0],
+                "surface.right.flux" => self.deck_flux_active[1] = !self.deck_flux_active[1],
+                "surface.left.loop_size.push" => self.toggle_loop(1),
+                "surface.right.loop_size.push" => self.toggle_loop(2),
+                "surface.left.browse.view" | "surface.right.browse.view" => {
+                    self.layout = if self.layout == TraktorLayout::Browser {
+                        TraktorLayout::Parallel
+                    } else {
+                        TraktorLayout::Browser
+                    };
+                }
+                "surface.left.fx.buttons.1" => self.fx1_on = !self.fx1_on,
+                "surface.right.fx.buttons.1" => self.fx2_on = !self.fx2_on,
+                "surface.mixer.channels.1.cue" => self.channel_cue[0] = !self.channel_cue[0],
+                "surface.mixer.channels.2.cue" => self.channel_cue[1] = !self.channel_cue[1],
+                "surface.mixer.channels.1.channel_fx.on" => {
+                    self.channel_filter_on[0] = !self.channel_filter_on[0];
+                }
+                "surface.mixer.channels.2.channel_fx.on" => {
+                    self.channel_filter_on[1] = !self.channel_filter_on[1];
+                }
+                "surface.mixer.channel_fx.filter" => {
+                    self.channel_fx_kind[0] = MixerFxKind::Filter;
+                    self.channel_fx_kind[1] = MixerFxKind::Filter;
+                }
+                "surface.mixer.channel_fx.fx1" => {
+                    self.channel_fx_kind[0] = MixerFxKind::Reverb;
+                    self.channel_fx_kind[1] = MixerFxKind::Reverb;
+                }
+                "surface.mixer.channel_fx.fx2" => {
+                    self.channel_fx_kind[0] = MixerFxKind::DualDelay;
+                    self.channel_fx_kind[1] = MixerFxKind::DualDelay;
+                }
+                "surface.mixer.channel_fx.fx3" => {
+                    self.channel_fx_kind[0] = MixerFxKind::Noise;
+                    self.channel_fx_kind[1] = MixerFxKind::Noise;
+                }
+                "surface.mixer.channel_fx.fx4" => {
+                    self.channel_fx_kind[0] = MixerFxKind::TimeGater;
+                    self.channel_fx_kind[1] = MixerFxKind::TimeGater;
+                }
+                s if s.starts_with("surface.left.pads.") => {
+                    if let Ok(pad) = s.trim_start_matches("surface.left.pads.").parse::<u8>() {
+                        self.jump_to_cue(1, pad);
+                    }
+                }
+                s if s.starts_with("surface.right.pads.") => {
+                    if let Ok(pad) = s.trim_start_matches("surface.right.pads.").parse::<u8>() {
+                        self.jump_to_cue(2, pad);
+                    }
+                }
+                _ => {}
+            },
+            SurfaceEvent::Encoder { control, delta } => match control.as_str() {
+                "surface.left.jogwheel.rotation" => {
+                    if let Ok(mut state) = self.audio.shared.lock() {
+                        let nudge_sec = (delta as f64 / TRAKTOR_MX2_JOG_TICKS_PER_REV as f64) * 1.8;
+                        state.playhead_sec[0] = (state.playhead_sec[0] + nudge_sec).max(0.0);
+                    }
+                }
+                "surface.right.jogwheel.rotation" => {
+                    if let Ok(mut state) = self.audio.shared.lock() {
+                        let nudge_sec = (delta as f64 / TRAKTOR_MX2_JOG_TICKS_PER_REV as f64) * 1.8;
+                        state.playhead_sec[1] = (state.playhead_sec[1] + nudge_sec).max(0.0);
+                    }
+                }
+                "surface.left.loop_size" => {
+                    if delta > 0 {
+                        self.deck_loop_size_beats[0] = (self.deck_loop_size_beats[0] * 2).min(32);
+                    } else if delta < 0 {
+                        self.deck_loop_size_beats[0] = (self.deck_loop_size_beats[0] / 2).max(1);
+                    }
+                }
+                "surface.right.loop_size" => {
+                    if delta > 0 {
+                        self.deck_loop_size_beats[1] = (self.deck_loop_size_beats[1] * 2).min(32);
+                    } else if delta < 0 {
+                        self.deck_loop_size_beats[1] = (self.deck_loop_size_beats[1] / 2).max(1);
+                    }
+                }
+                _ => {}
+            },
+            _ => {}
         }
     }
 
@@ -534,6 +802,27 @@ impl ReTraktorApp {
                             (0.0, 0.0)
                         };
                         vu_meter(ui, peak_l, peak_r, 30.0);
+
+                        let (mx2_label, mx2_color) = if let Some(ref node) = self.mx2_dev_node {
+                            (
+                                format!("🎛️ MX2 ({node})"),
+                                TraktorTheme::PLAY_ACTIVE,
+                            )
+                        } else {
+                            (
+                                "🎛️ MX2 READY".to_string(),
+                                TraktorTheme::DECK_A,
+                            )
+                        };
+                        ui.label(
+                            RichText::new(mx2_label)
+                                .color(mx2_color)
+                                .font(egui::FontId::monospace(9.5))
+                                .strong(),
+                        )
+                        .on_hover_text(
+                            "Native Instruments Traktor MX2 [USB 17CC:2420] NHL2 HID + UAC2 4-Out/2-In Audio",
+                        );
 
                         ui.label(
                             RichText::new("● PipeWire 48kHz")

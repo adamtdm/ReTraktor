@@ -1,6 +1,14 @@
 # /etc/udev/rules.d/99-retraktor-ni.rules
 # Unprivileged hidraw and USB bulk display access for Native Instruments Traktor controllers
 
+# Traktor MX2
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="17cc", ATTRS{idProduct}=="2420", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="17cc", ATTR{idProduct}=="2420", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+
+# Traktor MX4
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="17cc", ATTRS{idProduct}=="2430", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="17cc", ATTR{idProduct}=="2430", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+
 # Traktor Kontrol S4 MK3
 SUBSYSTEM=="hidraw", ATTRS{idVendor}=="17cc", ATTRS{idProduct}=="1720", MODE="0660", GROUP="plugdev", TAG+="uaccess"
 SUBSYSTEM=="usb", ATTR{idVendor}=="17cc", ATTR{idProduct}=="1720", MODE="0660", GROUP="plugdev", TAG+="uaccess"
@@ -26,13 +34,16 @@ SUBSYSTEM=="hidraw", ATTRS{idVendor}=="17cc", ATTRS{idProduct}=="1400", MODE="06
 SUBSYSTEM=="usb", ATTR{idVendor}=="17cc", ATTR{idProduct}=="1400", MODE="0660", GROUP="plugdev", TAG+="uaccess"
 
 # Traktor Kontrol X1 MK3
-SUBSYSTEM=="hidraw", ATTRS{idVendor}=="17cc", ATTRS{idProduct}=="1cbc", MODE="0660", GROUP="plugdev", TAG+="uaccess"
-SUBSYSTEM=="usb", ATTR{idVendor}=="17cc", ATTR{idProduct}=="1cbc", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="17cc", ATTRS{idProduct}=="2200", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="17cc", ATTR{idProduct}=="2200", MODE="0660", GROUP="plugdev", TAG+="uaccess"
 
 # Traktor Kontrol Z1 MK2
-SUBSYSTEM=="hidraw", ATTRS{idVendor}=="17cc", ATTRS{idProduct}=="2120", MODE="0660", GROUP="plugdev", TAG+="uaccess"
-SUBSYSTEM=="usb", ATTR{idVendor}=="17cc", ATTR{idProduct}=="2120", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="17cc", ATTRS{idProduct}=="2400", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="17cc", ATTR{idProduct}=="2400", MODE="0660", GROUP="plugdev", TAG+="uaccess"
 
 # Traktor Kontrol F1
 SUBSYSTEM=="hidraw", ATTRS{idVendor}=="17cc", ATTRS{idProduct}=="1120", MODE="0660", GROUP="plugdev", TAG+="uaccess"
 SUBSYSTEM=="usb", ATTR{idVendor}=="17cc", ATTR{idProduct}=="1120", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+
+# Traktor MX2 / MX4 / Z1 MK2 DFU Mode
+SUBSYSTEM=="usb", ATTR{idVendor}=="17cc", ATTR{idProduct}=="0400", MODE="0660", GROUP="plugdev", TAG+="uaccess"

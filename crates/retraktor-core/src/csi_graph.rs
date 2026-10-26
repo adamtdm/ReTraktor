@@ -87,7 +87,7 @@ pub struct CsiWiresGroup {
 }
 
 /// Hardware surface control event delivered from NI HID or MIDI controller.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SurfaceEvent {
     Button { control: String, pressed: bool },
     Fader { control: String, value: f64 },
