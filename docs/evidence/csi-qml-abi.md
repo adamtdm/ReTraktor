@@ -2,7 +2,7 @@
 
 ## 1. Provenance & Shipped Evidence
 
-Extracted from `/Applications/Native Instruments/Traktor Pro 4/Traktor Pro 4.app/Contents/Resources/qml/`:
+Extracted from `Traktor Pro 4.app/Contents/Resources/qml/`:
 - `Defines/qmldir` and all 10 QML singleton files (`PadsMode.qml`, `Overlay.qml`, `StemStyle.qml`, `FooterPage.qml`, `FxOverlay.qml`, `JumpSize.qml`, `LoopSize.qml`, `MoveSize.qml`, `NavigationMode.qml`, `ScreenView.qml`).
 - `CSI/Common/Deck_S8Style.qml`, `CSI/Common/BrowserModule.qml`, `CSI/Common/ExtendedBrowserModule.qml`, `CSI/Common/HotcuesModule.qml`, and controller directories `S4MK3`, `S8`, `S5`, `D2`, `S2MK3`, `S3`, `X1MK3`, `Z1MK2`, `CDJ3000`, `XDJ1000MK2`, `XDJ700`, `MX2`.
 - Binary registration symbols in `Traktor Pro 4` (`ev_fb958e256da8dbb4f77cb48853b8d825c706ee0e6c6c15656ae0de75af169bab`).

@@ -3,7 +3,7 @@
 # ReTraktor: 1-Command Universal Linux Installer
 # https://github.com/adamtdm/ReTraktor
 #
-# Installs ReTraktor, audio libraries, Native Instruments Kontrol udev rules,
+# Installs ReTraktor, audio libraries, Traktor Kontrol & MX2 udev rules,
 # real-time audio permissions, desktop launcher, and PATH binaries.
 #
 # Usage:
@@ -27,7 +27,7 @@ log_warn()    { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_error()   { echo -e "${RED}[ERROR]${NC} $*"; }
 
 echo -e "${BOLD}${BLUE}================================================================${NC}"
-echo -e "${BOLD}       ReTraktor — Native Instruments Traktor Pro 4 on Linux     ${NC}"
+echo -e "${BOLD}             ReTraktor — Traktor Pro 4 on Linux                 ${NC}"
 echo -e "${BOLD}${BLUE}================================================================${NC}"
 
 # Detect OS
@@ -188,10 +188,10 @@ Architecture: ${DEB_ARCH}
 Depends: libasound2, libusb-1.0-0, libhidapi-hidraw0 | libhidapi-libusb0, libgl1 | libglvnd0, libx11-6
 Recommends: pipewire, wireplumber
 Maintainer: Adam Meek <adamtdm@users.noreply.github.com>
-Description: Clean-room Linux re-implementation of Native Instruments Traktor Pro 4
+Description: Clean-room Linux re-implementation of Traktor Pro 4
  ReTraktor provides complete 4-deck DJ mixing, reactive CSI 1.0 QML scripting,
  .nml/.tsi library interoperability, hardware-accelerated 60 FPS waveforms GUI,
- and Native Instruments Kontrol HID/USB hardware support.
+ and Traktor Kontrol & MX2 HID/USB hardware support.
 EOF
 
     install -m 0755 "$SCRIPT_DIR/debian/postinst" "$DEB_ROOT/DEBIAN/postinst"

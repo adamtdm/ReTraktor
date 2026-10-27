@@ -1,7 +1,7 @@
 [Desktop Entry]
 Name=ReTraktor
 GenericName=DJ Performance & Library System
-Comment=Clean-room Linux port of Native Instruments Traktor Pro 4
+Comment=Clean-room Linux port of Traktor Pro 4
 Exec=retraktor
 Icon=retraktor
 Terminal=false

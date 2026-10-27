@@ -76,9 +76,9 @@ Architecture: ${DEB_ARCH}
 Depends: libasound2, libusb-1.0-0, libhidapi-hidraw0 | libhidapi-libusb0
 Recommends: pipewire, wireplumber
 Maintainer: Adam Meek <adamtdm@users.noreply.github.com>
-Description: Clean-room Linux re-implementation of Native Instruments Traktor Pro 4
+Description: Clean-room Linux re-implementation of Traktor Pro 4
  ReTraktor provides complete 4-deck DJ mixing, reactive CSI 1.0 QML scripting,
- .nml/.tsi library interoperability, and Native Instruments Kontrol HID/USB hardware support.
+ .nml/.tsi library interoperability, and Traktor Kontrol & MX2 HID/USB hardware support.
 EOF
 
     cp debian/postinst "$DEB_ROOT/DEBIAN/postinst"

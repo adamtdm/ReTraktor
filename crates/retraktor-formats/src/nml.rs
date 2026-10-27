@@ -1,4 +1,4 @@
-//! `.nml` (Native Instruments Music Library v19 & v20) parser, serializer, and Linux path normalizer.
+//! `.nml` (Traktor Music Library v19 & v20) parser, serializer, and Linux path normalizer.
 //!
 //! Backed by [`crate::xml::XmlDocument`] so multiline attributes (such as `INFO/@KEY_LYRICS` in
 //! real 16,160-track Traktor Pro 4 collections) and unmodeled nodes round-trip losslessly.

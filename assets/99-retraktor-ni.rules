@@ -1,5 +1,5 @@
 # /etc/udev/rules.d/99-retraktor-ni.rules
-# Unprivileged hidraw and USB bulk display access for Native Instruments Traktor controllers
+# Unprivileged hidraw and USB bulk display access for Traktor Kontrol & Traktor MX2 controllers
 
 # Traktor MX2
 SUBSYSTEM=="hidraw", ATTRS{idVendor}=="17cc", ATTRS{idProduct}=="2420", MODE="0660", GROUP="plugdev", TAG+="uaccess"

@@ -240,7 +240,7 @@ fn main() {
             }
         }
         "list-devices" => {
-            println!("Supported Native Instruments Kontrol Devices (VID 0x17CC):");
+            println!("Supported Traktor Kontrol & MX2 Devices (VID 0x17CC):");
             for dev in &NI_DEVICES {
                 println!(
                     "  {:04x}:{:04x}  {:<26} CSI={:<8} Screen={} MotorizedJog={}",
@@ -452,7 +452,7 @@ fn run_simulation() {
 }
 
 fn print_usage() {
-    println!("ReTraktor CLI — Linux Port of Native Instruments Traktor Pro 4");
+    println!("ReTraktor CLI — Linux Port of Traktor Pro 4");
     println!();
     println!("Commands:");
     println!("  run                          Start interactive live 4-deck DJ player & audio engine (Default)");
@@ -807,8 +807,8 @@ fn run_doctor() {
         );
     }
 
-    // 4. NI Hardware & udev
-    println!("\n4. Native Instruments Hardware & udev:");
+    // 4. Traktor Hardware & udev
+    println!("\n4. Traktor Hardware & udev:");
     let udev_path = Path::new("/etc/udev/rules.d/99-retraktor-ni.rules");
     println!(
         "   udev rules:      {}",

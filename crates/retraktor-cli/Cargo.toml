@@ -21,9 +21,9 @@ maintainer = "Adam Meek <adamtdm@users.noreply.github.com>"
 copyright = "2026, Adam Meek <adamtdm@users.noreply.github.com>"
 license = "MIT OR Apache-2.0"
 extended-description = """
-Clean-room Linux re-implementation of Native Instruments Traktor Pro 4 in Rust.
+Clean-room Linux re-implementation of Traktor Pro 4 in Rust.
 Includes 4-deck audio/DSP engine, CSI 1.0 QML compatibility, .nml and .tsi formats,
-and Native Instruments Kontrol HID and USB bulk display support.
+and Traktor Kontrol & MX2 HID and USB bulk display support.
 """
 section = "sound"
 priority = "optional"

@@ -299,7 +299,7 @@ impl PreferencesDialog {
     }
 
     fn show_controller_prefs(&mut self, ui: &mut Ui) {
-        ui.heading("Controller Manager — Traktor MX2 & NI Kontrol");
+        ui.heading("Controller Manager — Traktor MX2 & Traktor Kontrol");
         ui.add_space(6.0);
 
         egui::Frame::none()
@@ -308,7 +308,7 @@ impl PreferencesDialog {
             .inner_margin(egui::Margin::symmetric(10.0, 6.0))
             .show(ui, |ui| {
                 ui.label(
-                    RichText::new("★ Native Instruments Traktor MX2 [VID 0x17CC : PID 0x2420] Active")
+                    RichText::new("★ Traktor MX2 [VID 0x17CC : PID 0x2420] Active")
                         .color(TraktorTheme::PLAY_ACTIVE)
                         .strong(),
                 );
@@ -402,7 +402,7 @@ impl PreferencesDialog {
     fn show_about(&mut self, ui: &mut Ui) {
         ui.heading("ReTraktor Pro 4.5.1");
         ui.add_space(8.0);
-        ui.label("Clean-Room Linux Re-Implementation of Native Instruments Traktor Pro 4.");
+        ui.label("Clean-Room Linux Re-Implementation of Traktor Pro 4.");
         ui.label("Pure Rust real-time audio DSP, CSI 1.0 QML engine, and eframe/egui interface.");
         ui.add_space(8.0);
         ui.label("Repository: https://github.com/adamtdm/ReTraktor");

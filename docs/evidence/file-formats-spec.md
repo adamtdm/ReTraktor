@@ -2,11 +2,11 @@
 
 ## 1. Provenance & Binary Evidence
 
-Derived from static inspection of `/Applications/Native Instruments/Traktor Pro 4/Traktor Pro 4.app/Contents/MacOS/Traktor Pro 4` (`ev_fb958e256da8dbb4f77cb48853b8d825c706ee0e6c6c15656ae0de75af169bab`), `Contents/Info.plist` (`CFBundleDocumentTypes` registering `.nml`, `.tsi`, `.trak`, `.mp3`, `.wav`, `.aif`, `.flac`, `.ogg`, `.m4a`, `.mp4`, `.aac`), and embedded `.qtmimedatabase` (`ev_a9ec5856a95be76b9a45a68cf735caff40617150b9173991fb1fff36f2b8679a`).
+Derived from static inspection of `Traktor Pro 4.app/Contents/MacOS/Traktor Pro 4` (`ev_fb958e256da8dbb4f77cb48853b8d825c706ee0e6c6c15656ae0de75af169bab`), `Contents/Info.plist` (`CFBundleDocumentTypes` registering `.nml`, `.tsi`, `.trak`, `.mp3`, `.wav`, `.aif`, `.flac`, `.ogg`, `.m4a`, `.mp4`, `.aac`), and embedded `.qtmimedatabase` (`ev_a9ec5856a95be76b9a45a68cf735caff40617150b9173991fb1fff36f2b8679a`).
 
 ---
 
-## 2. Native Instruments Music Library (`.nml`, Versions 19 & 20)
+## 2. Traktor Music Library (`.nml`, Versions 19 & 20)
 
 `.nml` files (`collection.nml` and exported playlist `.nml` files) are UTF-8 XML documents rooted at `<NML VERSION="19">` (Traktor Pro 3) or `<NML VERSION="20">` (Traktor Pro 4, which adds Ozone Maximizer, Flexible Beatgrids `GRID` markers, and Pattern Player settings).
 
@@ -73,7 +73,7 @@ Derived from static inspection of `/Applications/Native Instruments/Traktor Pro 
 - `HOTCUE`: `-1` for unmapped memory cues/grid markers, `0..7` for Hotcue pads `1..8`.
 
 ### 2.4 Musical Key Encoding (`MUSICAL_KEY/@VALUE` vs `INFO/@KEY`)
-Verified across 16,160 tracks in `~/Documents/Native Instruments/Traktor 4.5.1/collection.nml`, `MUSICAL_KEY VALUE="0..23"` maps chromatically to Open Key notation:
+Verified across 16,160 tracks in `Traktor 4.5.1/collection.nml`, `MUSICAL_KEY VALUE="0..23"` maps chromatically to Open Key notation:
 - `0..11` (Major `C`, `Db`, `D`, `Eb`, `E`, `F`, `Gb`, `G`, `Ab`, `A`, `Bb`, `B`): `["1d", "8d", "3d", "10d", "5d", "12d", "7d", "2d", "9d", "4d", "11d", "6d"]`
 - `12..23` (Minor `Cm`, `C#m`, `Dm`, `Ebm`, `Em`, `Fm`, `F#m`, `Gm`, `G#m`, `Am`, `Bbm`, `Bm`): `["10m", "5m", "12m", "7m", "2m", "9m", "4m", "11m", "6m", "1m", "8m", "3m"]`
 

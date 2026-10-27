@@ -1,7 +1,7 @@
 //! # `retraktor-gui`
 //!
 //! Native hardware-accelerated desktop graphical user interface for ReTraktor
-//! (clean-room Linux reimplementation of Native Instruments Traktor Pro 4).
+//! (clean-room Linux reimplementation of Traktor Pro 4).
 //!
 //! Provides 60 FPS parallel scrolling frequency waveforms, 4-channel DJ mixer,
 //! rotary knobs, vertical faders, crossfader, harmonic KeyWheel browser,
@@ -23,7 +23,7 @@ use app::ReTraktorApp;
 fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("ReTraktor 4.5.1 — Native Instruments Traktor Pro 4 on Linux")
+            .with_title("ReTraktor 4.5.1 — Traktor Pro 4 on Linux")
             .with_inner_size(Vec2::new(1280.0, 820.0))
             .with_min_inner_size(Vec2::new(1024.0, 640.0))
             .with_active(true),

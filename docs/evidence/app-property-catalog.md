@@ -2,7 +2,7 @@
 
 ## 1. Provenance & REA Binary Evidence
 
-All findings in this catalog are anchored to shipped artifacts from **Native Instruments Traktor Pro 4 (`4.5.1 21`)** inspected via **REA (`rea-agents@6.7.0`)** + **Hopper Disassembler v6.2.0**:
+All findings in this catalog are anchored to shipped artifacts from **Traktor Pro 4 (`4.5.1 21`)** inspected via **REA (`rea-agents@6.7.0`)** + **Hopper Disassembler v6.2.0**:
 
 | Artifact / View | REA Evidence ID / Path | SHA-256 / UUID |
 | :--- | :--- | :--- |
@@ -14,7 +14,7 @@ All findings in this catalog are anchored to shipped artifacts from **Native Ins
 | Mach-O Entrypoints | `ev_3323a851855472a3fcd662f7d31188ce237ba7679b87f20f71a5ece569cfd3f5` | `file_offset: 11086800` (`0x100a92b90`) |
 | `iZTraktorTDSP.dylib` (iZotope Ozone Maximizer) | `ev_3bbfeea70b9b15fe32b11954527ae893063832e0b1995ec7af7d0812eb021803` / `ev_0f3b8a2c2c8b6708ecf63e17480e116ee99ab720358d61a5793eaf7d98730e0a` | `_TestableDSP_*`, `MOTHERSHIP_9_13_6` (`b21cf78b...`) |
 | `libpcon.dylib` (Pioneer Pro DJ Link / CDJ Auth) | `ev_4ee84839e36b5c247471ffbd25ab7b030fb6b3faed06c61d0a05371d83051b14` / `ev_38d2bfbb15bf83d3a1830cde871d0058f55be88678098776d290e542767e1cbc` | `_PDJ_AuthInitialize`, `_PDJ_AuthSetup`, `_PDJ_AuthInput` (`108d02ea...`) |
-| Shipped QML CSI Property Bindings | `/Applications/Native Instruments/Traktor Pro 4/Traktor Pro 4.app/Contents/Resources/qml/CSI/` | `S4MK3/`, `S8/`, `X1MK3/`, `Z1MK2/`, `Common/` |
+| Shipped QML CSI Property Bindings | `Traktor Pro 4.app/Contents/Resources/qml/CSI/` | `S4MK3/`, `S8/`, `X1MK3/`, `Z1MK2/`, `Common/` |
 
 ---
 

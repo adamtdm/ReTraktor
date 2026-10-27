@@ -1,17 +1,17 @@
-# ReTraktor Evidence Ledger: Native Instruments Kontrol HID & Display Protocol (`0x17CC`)
+# ReTraktor Evidence Ledger: Traktor Kontrol & MX2 HID & Display Protocol (`0x17CC`)
 
 ## 1. Provenance & Evidence
 
 Anchored to:
 - `Traktor Pro 4` Mach-O binary (`ev_fb958e256da8dbb4f77cb48853b8d825c706ee0e6c6c15656ae0de75af169bab`) and `IOKit.framework` / `CoreMIDI.framework` imports (`ev_0db2f69bfbd1521bc1986118a7817103f09f53b4d8403ec86649ad28fb6b30b9`).
-- Shipped QML hardware controller definitions in `/Applications/Native Instruments/Traktor Pro 4/Traktor Pro 4.app/Contents/Resources/qml/CSI/`:
+- Shipped QML hardware controller definitions in `Traktor Pro 4.app/Contents/Resources/qml/CSI/`:
   - `S4MK3/`, `S3/`, `S2MK3/`, `S8/`, `S5/`, `D2/`, `X1MK3/`, `Z1MK2/`, `MX2/`.
 
 ---
 
 ## 2. USB Vendor & Product ID Registry
 
-All Native Instruments Traktor hardware controllers use **USB Vendor ID `0x17CC`** (*Native Instruments GmbH*):
+All Traktor hardware controllers use **USB Vendor ID `0x17CC`**:
 
 | Controller Model | USB VID | USB PID | CSI QML Folder | Audio Channels (In / Out) | Display / Haptics |
 | :--- | :--- | :--- | :--- | :--- | :--- |

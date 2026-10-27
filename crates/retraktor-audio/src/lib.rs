@@ -35,7 +35,7 @@ impl LinuxAudioRoutingProfile {
     }
 
     /// 4-Out / 2-In 24-bit 96kHz/48kHz USB Audio Class 2.0 routing profile for the
-    /// **Native Instruments Traktor MX2** (`VID 0x17CC, PID 0x2420`) matching `<device id="Traktor MX2">`
+    /// **Traktor MX2** (`VID 0x17CC, PID 0x2420`) matching `<device id="Traktor MX2">`
     /// (`out_master_left=0`, `out_master_right=1`, `out_monitor_left=2`, `out_monitor_right=3`,
     /// `in_microphone_left=0`, `in_microphone_right=1`).
     pub fn traktor_mx2_default() -> Self {

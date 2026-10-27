@@ -1,7 +1,7 @@
 //! # `retraktor-hid`
 //!
-//! Native Instruments Kontrol (`VID 0x17CC`) USB HID, Haptic Drive, & `OffscreenView` Display protocol layer:
-//! - [`NI_DEVICES`]: Complete USB VID/PID registry for Kontrol S4 MK3, S3, S2 MK3, S8, S5, D2, X1 MK3, Z1 MK2, and F1.
+//! Traktor Kontrol & Traktor MX2 (`VID 0x17CC`) USB HID, Haptic Drive, & `OffscreenView` Display protocol layer:
+//! - [`NI_DEVICES`]: Complete USB VID/PID registry for Traktor MX2, MX4, Kontrol S4 MK3, S3, S2 MK3, S8, S5, D2, X1 MK3, Z1 MK2, and F1.
 //! - [`HidReportDecoder`]: Decodes Report `0x01` (Buttons, Encoders, Jog Wheels) and Report `0x02`
 //!   (12-bit/16-bit ADC Faders/Pots) into [`retraktor_core::SurfaceEvent`]s.
 //! - [`S4Mk3HapticPlatterConfig`]: Encodes Report `0x30`/`0x31` for S4 MK3 Haptic Drive motorized platters
@@ -15,10 +15,10 @@
 use retraktor_core::{JogwheelMode, PropValue, PropertyBus, ScreenFlavor, SurfaceEvent, TraktorColor};
 use retraktor_formats::{TsiFile, WaveformStripe};
 
-/// Native Instruments GmbH USB Vendor ID.
+/// Traktor Hardware USB Vendor ID (`0x17CC`).
 pub const NI_USB_VID: u16 = 0x17CC;
 
-/// Supported Native Instruments Kontrol hardware models.
+/// Supported Traktor Kontrol & MX2 hardware models.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NiDeviceDescriptor {
     pub model: &'static str,
@@ -29,7 +29,7 @@ pub struct NiDeviceDescriptor {
     pub has_motorized_jog: bool,
 }
 
-/// Registry of Native Instruments Traktor Kontrol hardware USB IDs.
+/// Registry of Traktor Kontrol & MX2 hardware USB IDs.
 pub const NI_DEVICES: [NiDeviceDescriptor; 11] = [
     NiDeviceDescriptor {
         model: "Traktor MX2",
@@ -410,11 +410,11 @@ impl AlsaMidiTsiRouter {
 }
 
 /// Generates the Linux `udev` rules file (`/etc/udev/rules.d/99-retraktor-ni.rules`)
-/// granting unprivileged user-space access (`TAG+="uaccess"`) to all NI Kontrol HID & USB display endpoints.
+/// granting unprivileged user-space access (`TAG+="uaccess"`) to all Traktor Kontrol & MX2 HID & USB display endpoints.
 pub fn generate_linux_udev_rules() -> String {
     let mut rules = String::new();
     rules.push_str("# /etc/udev/rules.d/99-retraktor-ni.rules\n");
-    rules.push_str("# Unprivileged hidraw and USB bulk display access for Native Instruments Traktor controllers\n\n");
+    rules.push_str("# Unprivileged hidraw and USB bulk display access for Traktor Kontrol & MX2 controllers\n\n");
     for dev in &NI_DEVICES {
         rules.push_str(&format!("# {}\n", dev.model));
         rules.push_str(&format!(
@@ -432,9 +432,9 @@ pub fn generate_linux_udev_rules() -> String {
     rules
 }
 
-/// USB Product ID for the Native Instruments Traktor MX2 (`NI::NHL2::USBDeviceDB::TraktorMX2`).
+/// USB Product ID for the Traktor MX2 (`NHL2::USBDeviceDB::TraktorMX2`).
 pub const TRAKTOR_MX2_PID: u16 = 0x2420;
-/// USB Product ID for the Native Instruments Traktor MX4 (`NI::NHL2::USBDeviceDB::TraktorMX4`).
+/// USB Product ID for the Traktor MX4 (`NHL2::USBDeviceDB::TraktorMX4`).
 pub const TRAKTOR_MX4_PID: u16 = 0x2430;
 /// Jogwheel resolution for Traktor MX2 / MX4 (`0x3C0 = 960` ticks per revolution).
 pub const TRAKTOR_MX2_JOG_TICKS_PER_REV: i32 = 960;
@@ -601,8 +601,8 @@ pub enum Mx2BottomShellState {
     SyncWarningRed,
 }
 
-/// Complete NHL2 HID driver for the **Native Instruments Traktor MX2** (`VID 0x17CC, PID 0x2420`)
-/// matching `NI::NHL2::Traktor::MX2::Device` and `CSI/MX2/MX2.qml`:
+/// Complete NHL2 HID driver for the **Traktor MX2** (`VID 0x17CC, PID 0x2420`)
+/// matching `NHL2::Traktor::MX2::Device` and `CSI/MX2/MX2.qml`:
 /// - Input Report `0x01` (`14` bytes): 83 buttons (`b58`) + 6 4-bit encoders (`n6` at byte offset `11`).
 /// - Input Report `0x02` (`52` bytes): 21 12-bit pots + 5 12-bit faders (`W1A`, `0..=4095`).
 /// - Input Report `0x03` (`19` bytes): 2 jogwheels (`960` ticks/rev at byte offset `3`: `(timestamp_u32, ticks_i32)`).
@@ -870,14 +870,14 @@ impl Mx2HidDriver {
     }
 }
 
-/// Discovered Linux `/dev/hidraw*` Native Instruments controller endpoint.
+/// Discovered Linux `/dev/hidraw*` Traktor controller endpoint.
 #[derive(Debug, Clone)]
 pub struct DetectedNiHidrawDevice {
     pub dev_node: String,
     pub descriptor: &'static NiDeviceDescriptor,
 }
 
-/// Scans `/sys/class/hidraw` on Linux for any connected Native Instruments controller (`VID 0x17CC`),
+/// Scans `/sys/class/hidraw` on Linux for any connected Traktor controller (`VID 0x17CC`),
 /// including **Traktor MX2** (`17CC:2420`), **Traktor MX4** (`17CC:2430`), S4 MK3, S3, S2 MK3, X1 MK3, Z1 MK2, etc.
 pub fn scan_linux_ni_hidraw_devices() -> Vec<DetectedNiHidrawDevice> {
     let mut found = Vec::new();

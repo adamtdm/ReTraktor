@@ -1,14 +1,13 @@
 {
   "mcpServers": {
     "rea": {
-      "command": "/opt/homebrew/bin/node",
+      "command": "/usr/bin/node",
       "args": [
-        "/Users/adammeek/Documents/ReTraktor/node_modules/rea-agents/scripts/rea.mjs",
+        "/home/mcsbot/Documents/ReTraktor/node_modules/rea-agents/scripts/rea.mjs",
         "mcp"
       ],
       "env": {
-        "HOPPER_LAUNCHER_PATH": "/Users/adammeek/Applications/Hopper Disassembler.app/Contents/MacOS/hopper",
-        "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        "PATH": "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
       }
     }
   }

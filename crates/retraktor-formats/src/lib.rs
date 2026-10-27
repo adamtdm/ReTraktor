@@ -1,6 +1,6 @@
 //! # `retraktor-formats`
 //!
-//! Clean-room parsers and serializers for Native Instruments Traktor Pro 4 file formats:
+//! Clean-room parsers and serializers for Traktor Pro 4 file formats:
 //! - [`nml`]: `.nml` (v19 & v20) XML music library collections, `ENTRY` track metadata,
 //!   Flexible Beatgrids (`CUE_V2` + `GRID`), Hotcues, Playlists, and Smartlists, including
 //!   Linux POSIX path <-> Traktor `/:` path normalization.
