@@ -137,6 +137,15 @@ pub struct ReTraktorApp {
     pub mx2_dev_node: Option<String>,
     pub mx2_model_name: Option<String>,
     pub mx2_scan_counter: u32,
+    pub mx2_access_status: Option<String>,
+    pub mx2_packets_received: u64,
+    pub mx2_last_report_id: Option<u8>,
+    pub mx2_last_packet_hex: Option<String>,
+    pub mx2_last_events: Vec<String>,
+    pub mx2_led_test_active: bool,
+    pub mx2_led_test_phase: u8,
+    pub mx2_led_test_timer: f32,
+    pub discovered_hardware: Vec<retraktor_hid::DiscoveredHardwareItem>,
 }
 
 impl Default for ReTraktorApp {
@@ -223,6 +232,15 @@ impl Default for ReTraktorApp {
             mx2_dev_node: None,
             mx2_model_name: None,
             mx2_scan_counter: 0,
+            mx2_access_status: None,
+            mx2_packets_received: 0,
+            mx2_last_report_id: None,
+            mx2_last_packet_hex: None,
+            mx2_last_events: Vec::new(),
+            mx2_led_test_active: false,
+            mx2_led_test_phase: 0,
+            mx2_led_test_timer: 0.0,
+            discovered_hardware: Vec::new(),
         }
     }
 }
@@ -290,6 +308,33 @@ impl eframe::App for ReTraktorApp {
                     }
                 }
             });
+
+        // Synchronize live hardware state with Preferences Controller Dialog
+        self.preferences.mx2_connected_node = self.mx2_dev_node.clone();
+        self.preferences.mx2_access_status = self.mx2_access_status.clone();
+        self.preferences.mx2_packets_count = self.mx2_packets_received;
+        self.preferences.mx2_last_report_id = self.mx2_last_report_id;
+        self.preferences.mx2_last_hex = self.mx2_last_packet_hex.clone();
+        self.preferences.mx2_recent_events = self.mx2_last_events.clone();
+        if self.preferences.trigger_rescan {
+            self.discovered_hardware = retraktor_hid::scan_all_dj_hardware();
+            self.preferences.discovered_hardware = self.discovered_hardware.clone();
+            self.preferences.trigger_rescan = false;
+        }
+        if let Some(target_node) = self.preferences.trigger_connect_node.take() {
+            self.connect_hidraw_node(&target_node);
+        }
+        if self.preferences.trigger_led_test {
+            self.mx2_led_test_active = true;
+            self.mx2_led_test_phase = 0;
+            self.mx2_led_test_timer = 0.0;
+            self.preferences.trigger_led_test = false;
+        }
+        if self.preferences.trigger_self_test {
+            let report = self.mx2_driver.run_full_self_test();
+            self.preferences.self_test_report = Some(report);
+            self.preferences.trigger_self_test = false;
+        }
 
         // Preferences Dialog
         self.preferences.show(ctx);
@@ -385,13 +430,62 @@ impl ReTraktorApp {
         }
     }
 
+    /// Connects to a specific `/dev/hidraw*` endpoint for Traktor MX2 / Kontrol hardware.
+    pub fn connect_hidraw_node(&mut self, dev_node: &str) {
+        let mut opts = OpenOptions::new();
+        opts.read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.custom_flags(0x0800); // O_NONBLOCK
+        }
+        match opts.open(dev_node) {
+            Ok(mut file) => {
+                // Send initial Output Report 0x80 to illuminate deck and bottom shell
+                let initial_leds = self.mx2_driver.encode_led_report(
+                    &self.bus,
+                    Mx2BottomShellState::DefaultGlow,
+                    Mx2BottomShellState::DefaultGlow,
+                );
+                let _ = file.write_all(&initial_leds);
+                self.mx2_dev_node = Some(dev_node.to_string());
+                self.mx2_model_name = Some("Traktor MX2".to_string());
+                self.mx2_access_status = Some("Connected (Read/Write OK)".to_string());
+                self.mx2_hidraw_file = Some(file);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                // Try read-only so button/fader/jog inputs work even if udev write rule is missing
+                let mut ro_opts = OpenOptions::new();
+                ro_opts.read(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    ro_opts.custom_flags(0x0800);
+                }
+                if let Ok(file) = ro_opts.open(dev_node) {
+                    self.mx2_dev_node = Some(dev_node.to_string());
+                    self.mx2_model_name = Some("Traktor MX2".to_string());
+                    self.mx2_access_status = Some("Connected (Read-Only: inputs work; write permissions needed for LEDs)".to_string());
+                    self.mx2_hidraw_file = Some(file);
+                } else {
+                    self.mx2_dev_node = Some(dev_node.to_string());
+                    self.mx2_model_name = Some("Traktor MX2".to_string());
+                    self.mx2_access_status = Some(format!("Permission Denied: cannot open {} (udev rule required)", dev_node));
+                }
+            }
+            Err(e) => {
+                self.mx2_access_status = Some(format!("Error opening {}: {}", dev_node, e));
+            }
+        }
+    }
+
     /// Polls Linux `/dev/hidraw*` for a connected Traktor MX2 (`17CC:2420`)
     /// or other Traktor Kontrol surface, decodes Input Reports `0x01`/`0x02`/`0x03`, and writes
     /// Output Report `0x80` (105 LEDs + 6 RGB Bottom-Shell LEDs per deck).
     fn poll_mx2_hardware(&mut self) {
         if self.mx2_hidraw_file.is_none() {
             self.mx2_scan_counter = self.mx2_scan_counter.wrapping_add(1);
-            if self.mx2_scan_counter % 120 == 1 {
+            if self.mx2_scan_counter % 90 == 1 {
                 let detected = scan_linux_ni_hidraw_devices();
                 // Prefer Traktor MX2 if multiple NI devices are attached
                 if let Some(dev) = detected
@@ -399,44 +493,55 @@ impl ReTraktorApp {
                     .find(|d| d.descriptor.pid == TRAKTOR_MX2_PID)
                     .or_else(|| detected.first())
                 {
-                    let mut opts = OpenOptions::new();
-                    opts.read(true).write(true);
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::OpenOptionsExt;
-                        opts.custom_flags(0x0800); // O_NONBLOCK on Linux
-                    }
-                    if let Ok(mut file) = opts.open(&dev.dev_node) {
-                        // Send NHL2 mode activation report [0xA0, 0x00, 0xFF]
-                        let _ = file.write_all(&Mx2HidDriver::mode_enable_nhl_report());
-                        self.mx2_dev_node = Some(dev.dev_node.clone());
-                        self.mx2_model_name = Some(dev.descriptor.model.to_string());
-                        self.mx2_hidraw_file = Some(file);
-                    } else {
-                        // Detected in sysfs even if hidraw node needs udev reload
-                        self.mx2_dev_node = Some(dev.dev_node.clone());
-                        self.mx2_model_name = Some(dev.descriptor.model.to_string());
-                    }
+                    self.connect_hidraw_node(&dev.dev_node);
                 }
             }
             return;
         }
 
-        // Non-blocking read of up to 8 queued HID input reports per frame
+        // Non-blocking read of up to 16 queued HID input reports per frame
         let mut pending_events = Vec::new();
         let mut disconnected = false;
         if let Some(ref mut file) = self.mx2_hidraw_file {
-            let mut buf = [0u8; 64];
-            for _ in 0..8 {
+            let mut buf = [0u8; 256];
+            for _ in 0..16 {
                 match file.read(&mut buf) {
                     Ok(n) if n > 0 => {
+                        self.mx2_packets_received = self.mx2_packets_received.wrapping_add(1);
+                        self.mx2_last_report_id = Some(buf[0]);
+
+                        // Format hex preview for Settings inspector
+                        let hex_bytes: Vec<String> = buf[..n.min(16)].iter().map(|b| format!("{:02X}", b)).collect();
+                        self.mx2_last_packet_hex = Some(format!("{} ({} bytes)", hex_bytes.join(" "), n));
+
                         let evs = self.mx2_driver.decode_input_report(&buf[..n]);
+                        for ev in &evs {
+                            let desc = match ev {
+                                SurfaceEvent::Button { control, pressed } => format!("Button {control} = {pressed}"),
+                                SurfaceEvent::Fader { control, value } => format!("Fader {control} = {value:.3}"),
+                                SurfaceEvent::Encoder { control, delta } => format!("Encoder {control} += {delta}"),
+                            };
+                            self.mx2_last_events.push(desc);
+                            if self.mx2_last_events.len() > 8 {
+                                self.mx2_last_events.remove(0);
+                            }
+                        }
                         pending_events.extend(evs);
                     }
-                    Ok(_) => break,
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(_) => {
+                    Ok(_) => {
+                        // EOF -> device unplugged
                         disconnected = true;
+                        break;
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::Interrupted => {
+                        break;
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::BrokenPipe || e.kind() == std::io::ErrorKind::NotConnected => {
+                        disconnected = true;
+                        break;
+                    }
+                    Err(_) => {
+                        // Transient I/O error, do not immediately disconnect
                         break;
                     }
                 }
@@ -446,6 +551,7 @@ impl ReTraktorApp {
         if disconnected {
             self.mx2_hidraw_file = None;
             self.mx2_dev_node = None;
+            self.mx2_access_status = Some("Disconnected (USB cable unplugged)".to_string());
             return;
         }
 
@@ -453,7 +559,24 @@ impl ReTraktorApp {
             self.apply_mx2_surface_event(ev);
         }
 
-        // Compute Bottom Shell 6-LED state (`bottom.leds.1..6`) for Deck A and Deck B
+        // Handle Interactive LED Light Test if requested from Preferences
+        if self.mx2_led_test_active {
+            self.mx2_led_test_timer += 1.0 / 60.0;
+            if self.mx2_led_test_timer > 0.6 {
+                self.mx2_led_test_timer = 0.0;
+                self.mx2_led_test_phase += 1;
+                if self.mx2_led_test_phase >= 4 {
+                    self.mx2_led_test_active = false;
+                }
+            }
+            let test_report = self.mx2_driver.generate_led_test_pattern(self.mx2_led_test_phase);
+            if let Some(ref mut file) = self.mx2_hidraw_file {
+                let _ = file.write_all(&test_report);
+            }
+            return;
+        }
+
+        // Normal Operational LED Update
         let left_shell = if self.deck_loop_active[0] {
             Mx2BottomShellState::ActiveLoopGreen
         } else {

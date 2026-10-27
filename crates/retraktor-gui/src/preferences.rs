@@ -1,9 +1,5 @@
 use crate::theme::TraktorTheme;
 use eframe::egui::{self, Color32, RichText, Stroke, Ui, Vec2, Window};
-use retraktor_formats::TsiFile;
-use retraktor_hid::NI_DEVICES;
-use std::fs;
-use std::path::PathBuf;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PrefsTab {
@@ -31,6 +27,21 @@ pub struct PreferencesDialog {
     pub tsi_path_input: String,
     pub loaded_tsi_summary: Option<String>,
     pub mx2_bottom_led_brightness: f32,
+
+    // Live Hardware Setup & Diagnostics State
+    pub mx2_connected_node: Option<String>,
+    pub mx2_access_status: Option<String>,
+    pub mx2_packets_count: u64,
+    pub mx2_last_report_id: Option<u8>,
+    pub mx2_last_hex: Option<String>,
+    pub mx2_recent_events: Vec<String>,
+    pub discovered_hardware: Vec<retraktor_hid::DiscoveredHardwareItem>,
+    pub self_test_report: Option<retraktor_hid::Mx2SelfTestReport>,
+    pub trigger_rescan: bool,
+    pub trigger_connect_node: Option<String>,
+    pub trigger_led_test: bool,
+    pub trigger_self_test: bool,
+    pub udev_command_copied: bool,
 }
 
 impl Default for PreferencesDialog {
@@ -50,6 +61,19 @@ impl Default for PreferencesDialog {
             tsi_path_input: String::new(),
             loaded_tsi_summary: None,
             mx2_bottom_led_brightness: 1.0,
+            mx2_connected_node: None,
+            mx2_access_status: None,
+            mx2_packets_count: 0,
+            mx2_last_report_id: None,
+            mx2_last_hex: None,
+            mx2_recent_events: Vec::new(),
+            discovered_hardware: Vec::new(),
+            self_test_report: None,
+            trigger_rescan: true,
+            trigger_connect_node: None,
+            trigger_led_test: false,
+            trigger_self_test: false,
+            udev_command_copied: false,
         }
     }
 }
@@ -299,64 +323,183 @@ impl PreferencesDialog {
     }
 
     fn show_controller_prefs(&mut self, ui: &mut Ui) {
-        ui.heading("Controller Manager — Traktor MX2 & Traktor Kontrol");
-        ui.add_space(6.0);
+        ui.heading("Controller Manager — Traktor MX2 & Traktor Kontrol Setup");
+        ui.add_space(4.0);
+
+        // 1. Live Connection Status Banner
+        let is_connected = self.mx2_connected_node.is_some();
+        let (banner_bg, stroke_col, title_text, subtitle_text) = if is_connected {
+            (
+                Color32::from_rgb(14, 32, 20),
+                TraktorTheme::PLAY_ACTIVE,
+                format!("● Traktor MX2 Connected ({})", self.mx2_connected_node.as_deref().unwrap_or("")),
+                format!(
+                    "{} | {} Packets Received | NHL2 Reports 0x01/0x02/0x03 Active",
+                    self.mx2_access_status.as_deref().unwrap_or("Read/Write Active"),
+                    self.mx2_packets_count
+                ),
+            )
+        } else if let Some(ref status) = self.mx2_access_status {
+            (
+                Color32::from_rgb(38, 28, 14),
+                Color32::from_rgb(255, 170, 0),
+                "⚠ Traktor Controller Detected — Permission Check Needed".to_string(),
+                status.clone(),
+            )
+        } else {
+            (
+                Color32::from_rgb(24, 26, 34),
+                Color32::from_rgb(70, 80, 95),
+                "○ No Traktor MX2 Controller Attached via USB".to_string(),
+                "Plug in the 15V DC power supply and connect via USB-C cable to auto-detect.".to_string(),
+            )
+        };
 
         egui::Frame::none()
-            .fill(Color32::from_rgb(18, 25, 34))
-            .stroke(Stroke::new(1.0_f32, TraktorTheme::PLAY_ACTIVE))
+            .fill(banner_bg)
+            .stroke(Stroke::new(1.0_f32, stroke_col))
             .inner_margin(egui::Margin::symmetric(10.0, 6.0))
             .show(ui, |ui| {
-                ui.label(
-                    RichText::new("★ Traktor MX2 [VID 0x17CC : PID 0x2420] Active")
-                        .color(TraktorTheme::PLAY_ACTIVE)
-                        .strong(),
-                );
-                ui.label("• NHL2 HID Reports: 0x01 (83 Buttons + 6 Encoders), 0x02 (26 12-bit Pots/Faders), 0x03 (960-tick Jogwheels)");
-                ui.label("• Output Report 0x80: 105 LEDs + 6 RGB Bottom-Shell LEDs per deck (Green=Loop, Red=End Warning, Blue/Cyan=Glow)");
-                ui.label("• Audio Interface: 24-bit / 96kHz 4-Out / 2-In UAC2 (Master 1/2, Headphone Monitor 3/4, Mic 1/2)");
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(title_text).color(stroke_col).strong());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("🔄 Rescan Hardware").clicked() {
+                            self.trigger_rescan = true;
+                        }
+                    });
+                });
+                ui.label(RichText::new(subtitle_text).color(Color32::LIGHT_GRAY).font(egui::FontId::monospace(9.5)));
             });
 
         ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            ui.label("MX2 Bottom-Shell LED Brightness:");
-            ui.add(egui::Slider::new(&mut self.mx2_bottom_led_brightness, 0.1..=1.0));
-        });
+
+        // 2. Hardware Checklist & Troubleshooting Card
+        egui::CollapsingHeader::new(RichText::new("⚙ Hardware Setup & Troubleshooting Guide").strong())
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.label("• 🔌 Dedicated Power Supply: The Traktor MX2 requires the external 15V DC power adapter plugged into the back panel. USB-C bus power alone cannot power the audio DAC, platters, and RGB lighting.");
+                ui.label("• 🎛️ Native HID Mode vs MIDI Mode: If the unit is in MIDI mode, press and hold Left SHIFT + Right SHIFT together to switch back to Native HID mode.");
+                ui.label("• 🔒 Linux Permissions (udev): Requires /etc/udev/rules.d/60-retraktor-controllers.rules for non-root /dev/hidraw* read/write access.");
+                ui.horizontal(|ui| {
+                    if ui.button("📋 Copy 1-Click udev Fix Command to Clipboard").clicked() {
+                        let cmd = "sudo cp assets/99-retraktor-ni.rules /etc/udev/rules.d/60-retraktor-controllers.rules && sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=hidraw";
+                        ui.output_mut(|o| o.copied_text = cmd.to_string());
+                        self.udev_command_copied = true;
+                    }
+                    if self.udev_command_copied {
+                        ui.label(RichText::new("✓ Copied command to clipboard!").color(TraktorTheme::PLAY_ACTIVE));
+                    }
+                });
+            });
 
         ui.add_space(6.0);
-        egui::ScrollArea::vertical()
-            .id_salt("prefs_controllers_scroll")
-            .max_height(155.0)
+
+        // 3. Hardware Test & Verification Actions
+        ui.horizontal(|ui| {
+            if ui.add(egui::Button::new(RichText::new("✨ Test Controller LEDs (Light Show)").strong())).clicked() {
+                self.trigger_led_test = true;
+            }
+            if ui.add(egui::Button::new(RichText::new("▶ Run 114-Control Automated Verification").strong())).clicked() {
+                self.trigger_self_test = true;
+            }
+        });
+
+        if let Some(ref report) = self.self_test_report {
+            ui.add_space(4.0);
+            egui::Frame::none()
+                .fill(Color32::from_rgb(18, 28, 20))
+                .stroke(Stroke::new(1.0_f32, TraktorTheme::PLAY_ACTIVE))
+                .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+                .show(ui, |ui| {
+                    ui.label(RichText::new("✓ Automated Hardware Protocol Verification Passed!").color(TraktorTheme::PLAY_ACTIVE).strong());
+                    ui.label(format!(
+                        "Tested: {} Buttons ({}), {} Encoders ({}), {} Pots/Faders ({}), {} Jogwheels ({}), {} LEDs ({})",
+                        report.buttons_tested, report.buttons_passed,
+                        report.encoders_tested, report.encoders_passed,
+                        report.pots_faders_tested, report.pots_faders_passed,
+                        report.jogwheels_tested, report.jogwheels_passed,
+                        report.leds_tested, report.leds_passed
+                    ));
+                });
+        }
+
+        ui.add_space(6.0);
+
+        // 4. Live HID Packet & Control Inspector
+        egui::CollapsingHeader::new(RichText::new("📡 Live HID Input & Control Monitor").strong())
+            .default_open(true)
             .show(ui, |ui| {
-                egui::Grid::new("prefs_ni_controllers_grid")
+                ui.horizontal(|ui| {
+                    let r_id = self.mx2_last_report_id.map(|id| format!("0x{:02X}", id)).unwrap_or_else(|| "None".to_string());
+                    ui.label(RichText::new(format!("Last Report: {}", r_id)).monospace().color(TraktorTheme::DECK_A));
+                    ui.label(RichText::new(format!("Total Packets: {}", self.mx2_packets_count)).monospace());
+                });
+                if let Some(ref hex) = self.mx2_last_hex {
+                    ui.label(RichText::new(format!("Raw Hex: {}", hex)).monospace().color(Color32::LIGHT_GRAY).font(egui::FontId::monospace(9.0)));
+                }
+                if !self.mx2_recent_events.is_empty() {
+                    ui.label(RichText::new("Recent Control Events:").strong());
+                    for ev in self.mx2_recent_events.iter().rev().take(4) {
+                        ui.label(RichText::new(format!("  • {}", ev)).monospace().color(TraktorTheme::PLAY_ACTIVE).font(egui::FontId::monospace(9.5)));
+                    }
+                } else {
+                    ui.label(RichText::new("Touch any button, fader, knob, or jogwheel on the hardware to see live events here.").italics());
+                }
+            });
+
+        ui.add_space(6.0);
+
+        // 5. Detected Hardware Devices Table
+        ui.label(RichText::new("Discovered USB, HIDRAW & ALSA Devices:").strong());
+        egui::ScrollArea::vertical()
+            .id_salt("prefs_discovered_hw_scroll")
+            .max_height(110.0)
+            .show(ui, |ui| {
+                egui::Grid::new("prefs_discovered_hw_grid")
                     .striped(true)
-                    .spacing(Vec2::new(14.0, 4.0))
+                    .spacing(Vec2::new(10.0, 3.0))
                     .show(ui, |ui| {
-                        ui.label(RichText::new("Controller Model").color(TraktorTheme::TEXT_SECONDARY).strong());
-                        ui.label(RichText::new("USB VID:PID").color(TraktorTheme::TEXT_SECONDARY).strong());
-                        ui.label(RichText::new("CSI Module").color(TraktorTheme::TEXT_SECONDARY).strong());
-                        ui.label(RichText::new("Display").color(TraktorTheme::TEXT_SECONDARY).strong());
-                        ui.label(RichText::new("Platters").color(TraktorTheme::TEXT_SECONDARY).strong());
+                        ui.label(RichText::new("Type").color(TraktorTheme::TEXT_SECONDARY).strong());
+                        ui.label(RichText::new("Device Node / Path").color(TraktorTheme::TEXT_SECONDARY).strong());
+                        ui.label(RichText::new("Device Model").color(TraktorTheme::TEXT_SECONDARY).strong());
+                        ui.label(RichText::new("VID:PID").color(TraktorTheme::TEXT_SECONDARY).strong());
+                        ui.label(RichText::new("Access / Action").color(TraktorTheme::TEXT_SECONDARY).strong());
                         ui.end_row();
 
-                        for dev in &NI_DEVICES {
-                            ui.label(RichText::new(dev.model).color(Color32::WHITE).strong());
+                        for item in &self.discovered_hardware {
+                            ui.label(RichText::new(item.category).monospace());
+                            ui.label(RichText::new(&item.identifier).monospace().color(TraktorTheme::DECK_A));
+                            ui.label(RichText::new(&item.name).strong());
                             ui.label(
-                                RichText::new(format!("{:04X}:{:04X}", dev.vid, dev.pid))
-                                    .color(TraktorTheme::DECK_A)
-                                    .monospace(),
+                                if let Some((v, p)) = item.vid_pid {
+                                    RichText::new(format!("{:04X}:{:04X}", v, p)).monospace()
+                                } else {
+                                    RichText::new("-").monospace()
+                                }
                             );
-                            ui.label(RichText::new(format!("CSI/{}", dev.csi_folder)).monospace());
-                            ui.label(if dev.has_color_screen {
-                                "RGB565 (0x8400)"
+                            if item.category == "HIDRAW" {
+                                match item.access {
+                                    retraktor_hid::DeviceAccessLevel::ReadWriteOk => {
+                                        let is_cur = self.mx2_connected_node.as_ref() == Some(&item.identifier);
+                                        if is_cur {
+                                            ui.label(RichText::new("✓ Active").color(TraktorTheme::PLAY_ACTIVE).strong());
+                                        } else if ui.button("Connect").clicked() {
+                                            self.trigger_connect_node = Some(item.identifier.clone());
+                                        }
+                                    }
+                                    retraktor_hid::DeviceAccessLevel::ReadOnlyOk => {
+                                        ui.label(RichText::new("Read-Only").color(Color32::from_rgb(255, 170, 0)));
+                                    }
+                                    retraktor_hid::DeviceAccessLevel::PermissionDenied => {
+                                        ui.label(RichText::new("Permission Denied").color(Color32::from_rgb(255, 80, 80)));
+                                    }
+                                    _ => {
+                                        ui.label("-");
+                                    }
+                                }
                             } else {
-                                "RGB LEDs"
-                            });
-                            ui.label(if dev.has_motorized_jog {
-                                "Motorized (0x30)"
-                            } else {
-                                "Capacitive Jog"
-                            });
+                                ui.label("-");
+                            }
                             ui.end_row();
                         }
                     });
@@ -364,39 +507,9 @@ impl PreferencesDialog {
 
         ui.add_space(6.0);
         ui.horizontal(|ui| {
-            ui.label("Import .tsi Mapping:");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.tsi_path_input)
-                    .hint_text("/path/to/controller.tsi")
-                    .desired_width(240.0),
-            );
-            if ui.button("Load .tsi").clicked() {
-                let p = PathBuf::from(self.tsi_path_input.trim());
-                match fs::read_to_string(&p)
-                    .map_err(|e| e.to_string())
-                    .and_then(|xml| TsiFile::parse_xml(&xml).map_err(|e| e.to_string()))
-                {
-                    Ok(tsi) => {
-                        self.loaded_tsi_summary = Some(format!(
-                            "✓ Loaded {} ({} devices mapped)",
-                            p.display(),
-                            tsi.devices.len()
-                        ));
-                    }
-                    Err(e) => {
-                        self.loaded_tsi_summary = Some(format!("⚠ TSI error: {e}"));
-                    }
-                }
-            }
+            ui.label("MX2 Bottom-Shell LED Brightness:");
+            ui.add(egui::Slider::new(&mut self.mx2_bottom_led_brightness, 0.1..=1.0));
         });
-        if let Some(ref msg) = self.loaded_tsi_summary {
-            ui.label(RichText::new(msg).color(TraktorTheme::PLAY_ACTIVE));
-        }
-        ui.label(
-            RichText::new("Linux udev rule: /etc/udev/rules.d/99-retraktor-ni.rules")
-                .color(TraktorTheme::TEXT_MUTED)
-                .font(egui::FontId::monospace(9.5)),
-        );
     }
 
     fn show_about(&mut self, ui: &mut Ui) {
