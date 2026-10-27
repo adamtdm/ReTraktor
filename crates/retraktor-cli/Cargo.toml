@@ -17,8 +17,8 @@ minifb = "0.29"
 
 [package.metadata.deb]
 name = "retraktor"
-maintainer = "Adam Meek <adamtdm@users.noreply.github.com>"
-copyright = "2026, Adam Meek <adamtdm@users.noreply.github.com>"
+maintainer = "ReTraktor Project <https://github.com/adamtdm/ReTraktor>"
+copyright = "2026, ReTraktor Project Contributors"
 license = "MIT OR Apache-2.0"
 extended-description = """
 Clean-room Linux re-implementation of Traktor Pro 4 in Rust.

@@ -1,5 +1,0 @@
-{
-  "name": "rea",
-  "displayName": "REA (Reverse Engineer Anything)",
-  "description": "Reverse engineer native binaries, Electron/JS apps, and runtime behavior using REA and Hopper Disassembler."
-}

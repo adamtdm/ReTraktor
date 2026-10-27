@@ -555,13 +555,13 @@ mod tests {
 
     #[test]
     fn test_linux_posix_path_roundtrip() {
-        let loc = NmlLocation::from_posix_path("/home/adam/Music/Sets/track01.flac", "linux-root");
-        assert_eq!(loc.dir, "/:home/:adam/:Music/:Sets/:");
+        let loc = NmlLocation::from_posix_path("/home/dj/Music/Sets/track01.flac", "linux-root");
+        assert_eq!(loc.dir, "/:home/:dj/:Music/:Sets/:");
         assert_eq!(loc.file, "track01.flac");
-        assert_eq!(loc.to_posix_path(), "/home/adam/Music/Sets/track01.flac");
+        assert_eq!(loc.to_posix_path(), "/home/dj/Music/Sets/track01.flac");
         assert_eq!(
             loc.primary_key(),
-            "linux-root/:home/:adam/:Music/:Sets/:track01.flac"
+            "linux-root/:home/:dj/:Music/:Sets/:track01.flac"
         );
     }
 

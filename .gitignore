@@ -2,11 +2,23 @@
 /target/
 /dist/
 **/*.rs.bk
+*.deb
+*.tar.gz
 
-# Node / REA local packages
+# Node / REA local packages & Agent metadata
 /node_modules/
+/.agents/
+package.json
+package-lock.json
+
+# Local recordings & logs
+*.wav
+*.log
+/tmp/
 
 # OS / Editor metadata
 .DS_Store
 *.swp
 *~
+.idea/
+.vscode/
