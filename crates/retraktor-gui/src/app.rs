@@ -3244,6 +3244,29 @@ impl ReTraktorApp {
                             }
                         },
                     );
+
+                    // If a track was loaded and has stems ready, automatically enable deck stems view
+                    if let Some((d, stems_ready)) = self.library.last_loaded_deck.take() {
+                        if stems_ready {
+                            self.deck_stem_view[d] = true;
+                        }
+                    }
+
+                    // If stems were generated for a track, enable stems view if it is currently playing/loaded on any deck
+                    if let Some(stemmed_id) = self.library.last_stemmed_track_id.take() {
+                        if let Some(track) = self.library.tracks.iter().find(|t| t.id == stemmed_id) {
+                            if let Ok(mut state) = self.audio.shared.lock() {
+                                for d in 0..4 {
+                                    if let Some(ref mut loaded) = state.loaded_tracks[d] {
+                                        if loaded.title == track.title && loaded.artist == track.artist {
+                                            loaded.stems_ready = true;
+                                            self.deck_stem_view[d] = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 });
             });
     }
