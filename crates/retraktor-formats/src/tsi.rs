@@ -541,7 +541,7 @@ mod tests {
 
     #[test]
     fn test_parse_real_traktor4_ddj_flx4_tsi_if_present() {
-        let path = "/Users/adammeek/Documents/Native Instruments/Traktor 4.5.1/Settings/Default Settings/Controller/AlphaTheta/02 - Controller - AlphaTheta - DDJ-FLX4.tsi";
+        let path = "Traktor 4.5.1/Settings/Default Settings/Controller/AlphaTheta/02 - Controller - AlphaTheta - DDJ-FLX4.tsi";
         if let Ok(xml) = std::fs::read_to_string(path) {
             let parsed = TsiFile::parse_xml(&xml).expect("parse real DDJ-FLX4.tsi");
             assert_eq!(parsed.root_chunks.len(), 1);

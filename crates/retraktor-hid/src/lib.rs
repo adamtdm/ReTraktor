@@ -121,7 +121,7 @@ pub const NI_DEVICES: [NiDeviceDescriptor; 11] = [
     },
 ];
 
-/// Looks up a Native Instruments controller descriptor by `(vid, pid)`.
+/// Looks up a Traktor controller descriptor by `(vid, pid)`.
 pub fn lookup_ni_device(vid: u16, pid: u16) -> Option<&'static NiDeviceDescriptor> {
     NI_DEVICES.iter().find(|d| d.vid == vid && d.pid == pid)
 }

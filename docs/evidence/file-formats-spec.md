@@ -129,7 +129,7 @@ When the Base64 payload of `DeviceIO.Config.Controller` is decoded, it forms a n
 
 ## 4. Binary Waveform `Stripes/` & `Transients/` Cache Files
 
-Verified against `~/Documents/Native Instruments/Traktor 4.5.1/Stripes/` and `Transients/`:
+Verified against `Traktor 4.5.1/Stripes/` and `Transients/`:
 
 ### 4.1 `Stripes/<subdir>/<28-char-base32-key>` (`262,169` bytes fixed size)
 - **Header (`25` bytes, Little-Endian)**:
@@ -157,7 +157,7 @@ Verified against `~/Documents/Native Instruments/Traktor 4.5.1/Stripes/` and `Tr
 ## 5. Stem Container (`.stem.m4a`) & `.trak` Pack Archive
 
 ### 4.1 `.stem.m4a` / `.stem.mp4` Format
-A Native Instruments Stem file is an ISO Base Media File Format (`MP4` / `M4A`) container with:
+A Traktor Stem file is an ISO Base Media File Format (`MP4` / `M4A`) container with:
 1. **5 Audio Tracks (`trak` atoms)**:
    - Track 0: Master stereo mixdown (AAC or ALAC, backwards-compatible with standard media players)
    - Track 1: Stem 1 (e.g., `Drums`)

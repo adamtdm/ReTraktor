@@ -33,7 +33,7 @@ const COLOR_VU_RED: u32 = 0x00ff1744;
 
 pub fn try_run_gui() -> Result<(), String> {
     let mut window = Window::new(
-        "ReTraktor 4.5.1 — Native Instruments Traktor Pro 4 [Linux]",
+        "ReTraktor 4.5.1 — Traktor Pro 4 [Linux]",
         GUI_WIDTH,
         GUI_HEIGHT,
         WindowOptions {

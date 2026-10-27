@@ -1,7 +1,7 @@
 //! Binary waveform Stripe (`Stripes/000/...`) and Transient (`Transients/000/...`) cache formats
 //! used by Traktor Pro 4's overview and high-resolution scrolling waveforms (`OffscreenView` & desktop decks).
 //!
-//! ## Binary Layout Verified Against `~/Documents/Native Instruments/Traktor 4.5.1/`
+//! ## Binary Layout Verified Against `Traktor 4.5.1/`
 //!
 //! ### 1. `Stripes/<dir>/<hash>` (`262,169` bytes)
 //! - Byte `0`: `header_tag: u8` (`0x06`)
@@ -236,7 +236,7 @@ mod tests {
             return;
         };
         let stripe_path = PathBuf::from(&home)
-            .join("Documents/Native Instruments/Traktor 4.5.1/Stripes/104/ILFBD3BZNWLA3AMJMZPRDMDCOCRB");
+            .join("Documents/Traktor 4.5.1/Stripes/104/ILFBD3BZNWLA3AMJMZPRDMDCOCRB");
         if stripe_path.exists() {
             let raw = fs::read(&stripe_path).expect("read real stripe file");
             assert_eq!(raw.len(), 262_169);

@@ -626,7 +626,7 @@ mod tests {
         let Some(home) = std::env::var_os("HOME") else {
             return;
         };
-        let path = PathBuf::from(home).join("Documents/Native Instruments/Traktor 4.5.1/collection.nml");
+        let path = PathBuf::from(home).join("Documents/Traktor 4.5.1/collection.nml");
         if path.exists() {
             let raw = fs::read_to_string(&path).expect("read real collection.nml");
             let parsed = NmlCollection::parse_xml(&raw).expect("parse real 16,160-track collection.nml");

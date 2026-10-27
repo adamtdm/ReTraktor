@@ -385,8 +385,8 @@ impl ReTraktorApp {
         }
     }
 
-    /// Polls Linux `/dev/hidraw*` for a connected Native Instruments Traktor MX2 (`17CC:2420`)
-    /// or other NI Kontrol surface, decodes Input Reports `0x01`/`0x02`/`0x03`, and writes
+    /// Polls Linux `/dev/hidraw*` for a connected Traktor MX2 (`17CC:2420`)
+    /// or other Traktor Kontrol surface, decodes Input Reports `0x01`/`0x02`/`0x03`, and writes
     /// Output Report `0x80` (105 LEDs + 6 RGB Bottom-Shell LEDs per deck).
     fn poll_mx2_hardware(&mut self) {
         if self.mx2_hidraw_file.is_none() {
