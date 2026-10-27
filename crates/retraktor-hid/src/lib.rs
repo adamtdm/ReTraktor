@@ -792,64 +792,172 @@ impl Mx2HidDriver {
 
     /// Synchronizes the 105 LEDs (`0..=104`) from [`PropertyBus`] and builds the 106-byte
     /// Output Report `0x80` (`[0x80, ...105_led_bytes]`) matching `NI::NHL2::Traktor::MX2::Device::updateLEDs`.
+    /// Synchronizes the 105 LEDs (`0..=104`) from [`PropertyBus`] and builds the 106-byte
+    /// Output Report `0x80` (`[0x80, ...105_led_bytes]`) matching `NI::NHL2::Traktor::MX2::Device::updateLEDs`.
     pub fn encode_led_report(
         &mut self,
         bus: &PropertyBus,
         left_shell: Mx2BottomShellState,
         right_shell: Mx2BottomShellState,
     ) -> [u8; 106] {
-        let on_val = 0x7Fu8;
-        let dim_val = 0x18u8;
+        use mx2_colors::*;
 
         // Deck 1 (Left) transport & pad LEDs
         let d1_play = bus.get("app.traktor.decks.1.play").and_then(|v| v.as_bool()).unwrap_or(false);
         let d1_sync = bus.get("app.traktor.decks.1.sync.enabled").and_then(|v| v.as_bool()).unwrap_or(false);
         let d1_flux = bus.get("app.traktor.decks.1.flux.enabled").and_then(|v| v.as_bool()).unwrap_or(false);
-        self.leds[8] = if d1_flux { on_val } else { dim_val }; // left.flux
-        self.leds[11] = on_val; // left.mode.jogwheel
-        self.leds[13] = if d1_sync { on_val } else { dim_val }; // left.sync
-        self.leds[16] = on_val; // left.hotcues
-        for pad in 0..8 {
-            self.leds[20 + pad] = on_val; // left.pads.1..8
+        let d1_cue = bus.get("app.traktor.decks.1.cue.active").and_then(|v| v.as_bool()).unwrap_or(false);
+        let d1_tt = bus.get("app.traktor.decks.1.jog.turntable").and_then(|v| v.as_bool()).unwrap_or(true);
+        let d1_pad_mode = bus.get("app.traktor.decks.1.pad_mode").and_then(|v| v.as_i64()).unwrap_or(0); // 0: Hotcues, 1: Stems, 2: Pattern, 3: Loops
+
+        self.leds[8] = if d1_flux { RED_FULL } else { RED_DIM }; // left.flux (Slip)
+        self.leds[9] = RED_DIM; // left.reverse
+        self.leds[10] = if d1_tt { BLUE_FULL } else { BLUE_DIM }; // left.tt (Turntable scratch mode)
+        self.leds[11] = if !d1_tt { BLUE_FULL } else { BLUE_DIM }; // left.jog (CDJ pitch bend mode)
+        self.leds[12] = WHITE_DIM; // left.shift
+        self.leds[13] = if d1_sync { BLUE_FULL } else { BLUE_DIM }; // left.sync
+        self.leds[14] = BLUE_DIM; // left.master
+        self.leds[15] = BLUE_DIM; // left.keylock
+
+        // Pad Mode selector buttons (16: hotcues, 17: stems, 18: pattern, 19: loops)
+        self.leds[16] = if d1_pad_mode == 0 { BLUE_FULL } else { BLUE_DIM };
+        self.leds[17] = if d1_pad_mode == 1 { BLUE_FULL } else { BLUE_DIM };
+        self.leds[18] = if d1_pad_mode == 2 { RED_FULL } else { OFF };
+        self.leds[19] = if d1_pad_mode == 3 { GREEN_FULL } else { GREEN_DIM };
+
+        // Left Deck 8 RGB Performance Pads (20..=27)
+        match d1_pad_mode {
+            1 => {
+                // Stems Mode: Pad 1 Drums (Orange), Pad 2 Bass (Blue), Pad 3 Inst (Cyan), Pad 4 Vocals (Magenta)
+                let stem_muted = [
+                    bus.get("app.traktor.decks.1.stems.0.muted").and_then(|v| v.as_bool()).unwrap_or(false),
+                    bus.get("app.traktor.decks.1.stems.1.muted").and_then(|v| v.as_bool()).unwrap_or(false),
+                    bus.get("app.traktor.decks.1.stems.2.muted").and_then(|v| v.as_bool()).unwrap_or(false),
+                    bus.get("app.traktor.decks.1.stems.3.muted").and_then(|v| v.as_bool()).unwrap_or(false),
+                ];
+                self.leds[20] = if stem_muted[0] { RED_DIM } else { ORANGE_FULL }; // Drums
+                self.leds[21] = if stem_muted[1] { RED_DIM } else { BLUE_FULL };   // Bass
+                self.leds[22] = if stem_muted[2] { RED_DIM } else { CYAN_FULL };   // Other / Instruments
+                self.leds[23] = if stem_muted[3] { RED_DIM } else { 0x36 };        // Vocals (Magenta)
+                self.leds[24] = ORANGE_DIM;
+                self.leds[25] = BLUE_DIM;
+                self.leds[26] = CYAN_DIM;
+                self.leds[27] = 0x34; // Dim Magenta
+            }
+            3 => {
+                // Loops Mode: Green
+                for pad in 0..8 {
+                    self.leds[20 + pad] = GREEN_FULL;
+                }
+            }
+            _ => {
+                // Hotcues Mode: Vibrant Blue & Yellow
+                self.leds[20] = BLUE_FULL;
+                self.leds[21] = GREEN_FULL;
+                self.leds[22] = YELLOW_FULL;
+                self.leds[23] = CYAN_FULL;
+                self.leds[24] = WHITE_DIM;
+                self.leds[25] = WHITE_DIM;
+                self.leds[26] = WHITE_DIM;
+                self.leds[27] = WHITE_DIM;
+            }
         }
-        self.leds[28] = on_val; // left.cue
-        self.leds[29] = if d1_play { on_val } else { dim_val }; // left.play
+        self.leds[28] = if d1_cue { BLUE_FULL } else { BLUE_DIM }; // left.cue
+        self.leds[29] = if d1_play { GREEN_FULL } else { GREEN_DIM }; // left.play
 
         // Deck 2 (Right) transport & pad LEDs
         let d2_play = bus.get("app.traktor.decks.2.play").and_then(|v| v.as_bool()).unwrap_or(false);
         let d2_sync = bus.get("app.traktor.decks.2.sync.enabled").and_then(|v| v.as_bool()).unwrap_or(false);
         let d2_flux = bus.get("app.traktor.decks.2.flux.enabled").and_then(|v| v.as_bool()).unwrap_or(false);
-        self.leds[38] = if d2_flux { on_val } else { dim_val }; // right.flux
-        self.leds[41] = on_val; // right.mode.jogwheel
-        self.leds[43] = if d2_sync { on_val } else { dim_val }; // right.sync
-        self.leds[46] = on_val; // right.hotcues
-        for pad in 0..8 {
-            self.leds[50 + pad] = on_val; // right.pads.1..8
+        let d2_cue = bus.get("app.traktor.decks.2.cue.active").and_then(|v| v.as_bool()).unwrap_or(false);
+        let d2_tt = bus.get("app.traktor.decks.2.jog.turntable").and_then(|v| v.as_bool()).unwrap_or(true);
+        let d2_pad_mode = bus.get("app.traktor.decks.2.pad_mode").and_then(|v| v.as_i64()).unwrap_or(0);
+
+        self.leds[38] = if d2_flux { RED_FULL } else { RED_DIM }; // right.flux
+        self.leds[39] = RED_DIM; // right.reverse
+        self.leds[40] = if d2_tt { BLUE_FULL } else { BLUE_DIM }; // right.tt
+        self.leds[41] = if !d2_tt { BLUE_FULL } else { BLUE_DIM }; // right.jog
+        self.leds[42] = WHITE_DIM; // right.shift
+        self.leds[43] = if d2_sync { BLUE_FULL } else { BLUE_DIM }; // right.sync
+        self.leds[44] = BLUE_DIM; // right.master
+        self.leds[45] = BLUE_DIM; // right.keylock
+
+        self.leds[46] = if d2_pad_mode == 0 { BLUE_FULL } else { BLUE_DIM };
+        self.leds[47] = if d2_pad_mode == 1 { BLUE_FULL } else { BLUE_DIM };
+        self.leds[48] = if d2_pad_mode == 2 { RED_FULL } else { OFF };
+        self.leds[49] = if d2_pad_mode == 3 { GREEN_FULL } else { GREEN_DIM };
+
+        // Right Deck 8 RGB Performance Pads (50..=57)
+        match d2_pad_mode {
+            1 => {
+                let stem_muted = [
+                    bus.get("app.traktor.decks.2.stems.0.muted").and_then(|v| v.as_bool()).unwrap_or(false),
+                    bus.get("app.traktor.decks.2.stems.1.muted").and_then(|v| v.as_bool()).unwrap_or(false),
+                    bus.get("app.traktor.decks.2.stems.2.muted").and_then(|v| v.as_bool()).unwrap_or(false),
+                    bus.get("app.traktor.decks.2.stems.3.muted").and_then(|v| v.as_bool()).unwrap_or(false),
+                ];
+                self.leds[50] = if stem_muted[0] { RED_DIM } else { ORANGE_FULL }; // Drums
+                self.leds[51] = if stem_muted[1] { RED_DIM } else { BLUE_FULL };   // Bass
+                self.leds[52] = if stem_muted[2] { RED_DIM } else { CYAN_FULL };   // Other / Instruments
+                self.leds[53] = if stem_muted[3] { RED_DIM } else { 0x36 };        // Vocals (Magenta)
+                self.leds[54] = ORANGE_DIM;
+                self.leds[55] = BLUE_DIM;
+                self.leds[56] = CYAN_DIM;
+                self.leds[57] = 0x34;
+            }
+            3 => {
+                for pad in 0..8 {
+                    self.leds[50 + pad] = GREEN_FULL;
+                }
+            }
+            _ => {
+                self.leds[50] = BLUE_FULL;
+                self.leds[51] = GREEN_FULL;
+                self.leds[52] = YELLOW_FULL;
+                self.leds[53] = CYAN_FULL;
+                self.leds[54] = WHITE_DIM;
+                self.leds[55] = WHITE_DIM;
+                self.leds[56] = WHITE_DIM;
+                self.leds[57] = WHITE_DIM;
+            }
         }
-        self.leds[58] = on_val; // right.cue
-        self.leds[59] = if d2_play { on_val } else { dim_val }; // right.play
+        self.leds[58] = if d2_cue { BLUE_FULL } else { BLUE_DIM }; // right.cue
+        self.leds[59] = if d2_play { GREEN_FULL } else { GREEN_DIM }; // right.play
 
         // Mixer channel 1 & 2 Cue & Filter/FX On LEDs
-        let c1_cue = bus.get("app.traktor.mixer.channels.1.cue").and_then(|v| v.as_bool()).unwrap_or(false);
         let c1_fx = bus.get("app.traktor.mixer.channels.1.fx.on").and_then(|v| v.as_bool()).unwrap_or(true);
-        let c2_cue = bus.get("app.traktor.mixer.channels.2.cue").and_then(|v| v.as_bool()).unwrap_or(false);
+        let c1_cue = bus.get("app.traktor.mixer.channels.1.cue").and_then(|v| v.as_bool()).unwrap_or(false);
         let c2_fx = bus.get("app.traktor.mixer.channels.2.fx.on").and_then(|v| v.as_bool()).unwrap_or(true);
-        self.leds[62] = if c1_fx { on_val } else { dim_val };
-        self.leds[63] = if c1_cue { on_val } else { dim_val };
-        self.leds[66] = if c2_fx { on_val } else { dim_val };
-        self.leds[67] = if c2_cue { on_val } else { dim_val };
-        self.leds[72] = on_val; // mixer.channel_fx.filter
+        let c2_cue = bus.get("app.traktor.mixer.channels.2.cue").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        self.leds[60] = ORANGE_DIM; // fx_select_1 Ch1
+        self.leds[61] = ORANGE_DIM; // fx_select_2 Ch1
+        self.leds[62] = if c1_fx { YELLOW_FULL } else { YELLOW_DIM }; // Ch1 Channel FX Toggle
+        self.leds[63] = if c1_cue { WHITE_FULL } else { WHITE_DIM };   // Ch1 Headphone Cue
+        self.leds[64] = ORANGE_DIM; // fx_select_1 Ch2
+        self.leds[65] = ORANGE_DIM; // fx_select_2 Ch2
+        self.leds[66] = if c2_fx { YELLOW_FULL } else { YELLOW_DIM }; // Ch2 Channel FX Toggle
+        self.leds[67] = if c2_cue { WHITE_FULL } else { WHITE_DIM };   // Ch2 Headphone Cue
+
+        // Channel FX Buttons (68..=72)
+        self.leds[68] = RED_FULL;    // GFX 1 (Reverb)
+        self.leds[69] = CYAN_FULL;   // GFX 2 (Dual Delay)
+        self.leds[70] = BLUE_FULL;   // GFX 3 (Noise)
+        self.leds[71] = YELLOW_FULL; // GFX 4 (Time Gater)
+        self.leds[72] = ORANGE_FULL; // GFX 0 (Filter)
+        self.leds[73] = WHITE_DIM;   // Mic Talkover
 
         // Left & Right 6 Illuminated Bottom Shell LEDs (`74..=79` and `80..=85`)
-        let map_shell = |state: Mx2BottomShellState, default_val: u8| -> u8 {
-            match state {
-                Mx2BottomShellState::DefaultGlow => default_val,
-                Mx2BottomShellState::ActiveLoopGreen => 0x38, // Green palette index
-                Mx2BottomShellState::TrackEndWarningRed | Mx2BottomShellState::SyncWarningRed => 0x04, // Red palette index
-            }
+        let l_val = match left_shell {
+            Mx2BottomShellState::ActiveLoopGreen => GREEN_FULL,
+            Mx2BottomShellState::TrackEndWarningRed | Mx2BottomShellState::SyncWarningRed => RED_FULL,
+            Mx2BottomShellState::DefaultGlow => if d1_play { BLUE_FULL } else { BLUE_DIM },
         };
-        let l_val = map_shell(left_shell, 0x48);
-        let r_val = map_shell(right_shell, 0x44);
+        let r_val = match right_shell {
+            Mx2BottomShellState::ActiveLoopGreen => GREEN_FULL,
+            Mx2BottomShellState::TrackEndWarningRed | Mx2BottomShellState::SyncWarningRed => RED_FULL,
+            Mx2BottomShellState::DefaultGlow => if d2_play { CYAN_FULL } else { CYAN_DIM },
+        };
         for i in 74..=79 {
             self.leds[i] = l_val;
         }
@@ -860,7 +968,7 @@ impl Mx2HidDriver {
         // Main Clip LED (86)
         let clip_l = bus.get("app.traktor.mixer.master.level.clip.left").and_then(|v| v.as_bool()).unwrap_or(false);
         let clip_r = bus.get("app.traktor.mixer.master.level.clip.right").and_then(|v| v.as_bool()).unwrap_or(false);
-        self.leds[86] = if clip_l || clip_r { on_val } else { 0 };
+        self.leds[86] = if clip_l || clip_r { RED_FULL } else { OFF };
 
         // 9-segment Channel 1 Level Meter (`87..=95`) & Channel 2 Level Meter (`96..=104`)
         let ch1_lvl = bus
@@ -874,8 +982,8 @@ impl Mx2HidDriver {
         let ch1_segs = ((ch1_lvl.clamp(0.0, 1.0) * 9.0).round() as usize).min(9);
         let ch2_segs = ((ch2_lvl.clamp(0.0, 1.0) * 9.0).round() as usize).min(9);
         for s in 0..9 {
-            self.leds[87 + s] = if s < ch1_segs { on_val } else { 0 };
-            self.leds[96 + s] = if s < ch2_segs { on_val } else { 0 };
+            self.leds[87 + s] = if s < ch1_segs { MONO_FULL } else { OFF };
+            self.leds[96 + s] = if s < ch2_segs { MONO_FULL } else { OFF };
         }
 
         let mut report = [0u8; 106];
@@ -1408,8 +1516,8 @@ mod tests {
             Mx2BottomShellState::DefaultGlow,
         );
         assert_eq!(led_pkt[0], 0x80);
-        assert_eq!(led_pkt[1 + 29], 0x7F); // left.play lit
-        assert_eq!(led_pkt[1 + 74], 0x38); // left.bottom.leds.1 green
+        assert_eq!(led_pkt[1 + 29], mx2_colors::GREEN_FULL); // left.play lit in vibrant green
+        assert_eq!(led_pkt[1 + 74], mx2_colors::GREEN_FULL); // left.bottom.leds.1 green on active loop
     }
 
     #[test]

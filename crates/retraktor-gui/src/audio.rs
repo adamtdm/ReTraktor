@@ -386,6 +386,10 @@ pub struct AudioSharedState {
     pub crossfader: f32,
     pub crossfader_curve: f32,
 
+    // Live Vinyl Scratching & Platter Touch Simulation
+    pub scratch_active: [bool; 4],
+    pub scratch_rate: [f64; 4],
+
     // Real-Time 4-Stem Mixing per Deck: [Drums, Bass, Instruments, Vocals]
     pub stem_volumes: [[f32; 4]; 4],
     pub stem_muted: [[bool; 4]; 4],
@@ -452,6 +456,8 @@ impl Default for AudioSharedState {
             cue_enabled: [false, false, false, false],
             crossfader: 0.5,
             crossfader_curve: 0.5,
+            scratch_active: [false; 4],
+            scratch_rate: [0.0; 4],
             stem_volumes: [[1.0; 4]; 4],
             stem_muted: [[false; 4]; 4],
             stem_fx_send: [[false; 4]; 4],
@@ -701,14 +707,26 @@ impl AudioSystem {
 
                 if let Some(track) = &state.loaded_tracks[d] {
                     track_dur = track.duration_sec.max(0.1);
-                    let frame_pos = (state.playhead_sec[d] * track.sample_rate as f64) as usize;
-                    let idx = (frame_pos * 2) % track.pcm_stereo.len().max(2);
-                    if idx + 1 < track.pcm_stereo.len() {
-                        raw_l = track.pcm_stereo[idx];
-                        raw_r = track.pcm_stereo[idx + 1];
-                        has_sample = true;
+                    let total_pcm_frames = track.pcm_stereo.len() / 2;
+                    if total_pcm_frames >= 2 {
+                        let sample_pos = (state.playhead_sec[d] * track.sample_rate as f64)
+                            .clamp(0.0, (total_pcm_frames - 2) as f64);
+                        let f_floor = sample_pos.floor();
+                        let idx0 = (f_floor as usize) * 2;
+                        let frac = (sample_pos - f_floor) as f32;
+                        let idx1 = idx0 + 2;
+                        if idx1 + 1 < track.pcm_stereo.len() {
+                            raw_l = track.pcm_stereo[idx0] * (1.0 - frac) + track.pcm_stereo[idx1] * frac;
+                            raw_r = track.pcm_stereo[idx0 + 1] * (1.0 - frac) + track.pcm_stereo[idx1 + 1] * frac;
+                            has_sample = true;
+                        }
                     }
-                    advance_dt = dt * state.pitch_ratio[d];
+                    let effective_rate = if state.scratch_active[d] {
+                        state.scratch_rate[d]
+                    } else {
+                        state.pitch_ratio[d]
+                    };
+                    advance_dt = dt * effective_rate;
                 }
 
                 if has_sample {

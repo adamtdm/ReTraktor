@@ -140,6 +140,40 @@ impl Default for LibraryManager {
 }
 
 impl LibraryManager {
+    pub fn select_next_track(&mut self) {
+        if self.tracks.is_empty() {
+            return;
+        }
+        let next_idx = match self.selected_track_id {
+            Some(id) => {
+                if let Some(pos) = self.tracks.iter().position(|t| t.id == id) {
+                    (pos + 1).min(self.tracks.len() - 1)
+                } else {
+                    0
+                }
+            }
+            None => 0,
+        };
+        self.selected_track_id = Some(self.tracks[next_idx].id);
+    }
+
+    pub fn select_prev_track(&mut self) {
+        if self.tracks.is_empty() {
+            return;
+        }
+        let prev_idx = match self.selected_track_id {
+            Some(id) => {
+                if let Some(pos) = self.tracks.iter().position(|t| t.id == id) {
+                    pos.saturating_sub(1)
+                } else {
+                    0
+                }
+            }
+            None => 0,
+        };
+        self.selected_track_id = Some(self.tracks[prev_idx].id);
+    }
+
     pub fn populate_default_collection(&mut self) {
         self.tracks = vec![
             UiTrackEntry {

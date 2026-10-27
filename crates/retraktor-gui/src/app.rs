@@ -10,7 +10,7 @@ use eframe::egui::{self, Align, Color32, Key, Layout, RichText, Stroke, Ui, Vec2
 use retraktor_core::{PropValue, PropertyBus, SurfaceEvent};
 use retraktor_dsp::MixerFxKind;
 use retraktor_hid::{
-    scan_linux_ni_hidraw_devices, Mx2BottomShellState, Mx2HidDriver, TRAKTOR_MX2_JOG_TICKS_PER_REV,
+    scan_linux_ni_hidraw_devices, Mx2BottomShellState, Mx2HidDriver,
     TRAKTOR_MX2_PID,
 };
 use retraktor_library::KeyWheel;
@@ -146,6 +146,12 @@ pub struct ReTraktorApp {
     pub mx2_led_test_phase: u8,
     pub mx2_led_test_timer: f32,
     pub discovered_hardware: Vec<retraktor_hid::DiscoveredHardwareItem>,
+
+    // Live Scratching & Controller Remapping State
+    pub deck_scratch_active: [bool; 4],
+    pub deck_turntable_mode: [bool; 4],
+    pub jog_scratch_sensitivity: f32,
+    pub custom_mappings: std::collections::HashMap<String, String>,
 }
 
 impl Default for ReTraktorApp {
@@ -241,6 +247,10 @@ impl Default for ReTraktorApp {
             mx2_led_test_phase: 0,
             mx2_led_test_timer: 0.0,
             discovered_hardware: Vec::new(),
+            deck_scratch_active: [false; 4],
+            deck_turntable_mode: [true; 4],
+            jog_scratch_sensitivity: 1.0,
+            custom_mappings: std::collections::HashMap::new(),
         }
     }
 }
@@ -335,6 +345,12 @@ impl eframe::App for ReTraktorApp {
             self.preferences.self_test_report = Some(report);
             self.preferences.trigger_self_test = false;
         }
+
+        // Synchronize visual remapper and controller settings from Preferences
+        self.jog_scratch_sensitivity = self.preferences.jog_scratch_sensitivity;
+        self.deck_turntable_mode[0] = self.preferences.jog_mode_turntable;
+        self.deck_turntable_mode[1] = self.preferences.jog_mode_turntable;
+        self.custom_mappings = self.preferences.custom_control_action.clone();
 
         // Preferences Dialog
         self.preferences.show(ctx);
@@ -597,6 +613,30 @@ impl ReTraktorApp {
     }
 
     pub fn apply_mx2_surface_event(&mut self, ev: SurfaceEvent) {
+        // Check for user custom mapping override first
+        let custom_action = match &ev {
+            SurfaceEvent::Button { control, pressed: true } => self.custom_mappings.get(control).cloned(),
+            SurfaceEvent::Fader { control, .. } => self.custom_mappings.get(control).cloned(),
+            _ => None,
+        };
+        if let Some(action) = custom_action {
+            match action.as_str() {
+                "play_deck_a" => { self.toggle_play(1); return; }
+                "play_deck_b" => { self.toggle_play(2); return; }
+                "cue_deck_a" => { self.jump_to_cue(1, 1); return; }
+                "cue_deck_b" => { self.jump_to_cue(2, 1); return; }
+                "sync_deck_a" => { self.sync_deck(1); return; }
+                "sync_deck_b" => { self.sync_deck(2); return; }
+                "stem_mute_drums_a" => { self.deck_stem_muted[0][0] = !self.deck_stem_muted[0][0]; return; }
+                "stem_mute_bass_a" => { self.deck_stem_muted[0][1] = !self.deck_stem_muted[0][1]; return; }
+                "stem_mute_inst_a" => { self.deck_stem_muted[0][2] = !self.deck_stem_muted[0][2]; return; }
+                "stem_mute_vocals_a" => { self.deck_stem_muted[0][3] = !self.deck_stem_muted[0][3]; return; }
+                "filter_toggle_a" => { self.channel_filter_on[0] = !self.channel_filter_on[0]; return; }
+                "filter_toggle_b" => { self.channel_filter_on[1] = !self.channel_filter_on[1]; return; }
+                _ => {}
+            }
+        }
+
         let neural_eq = self.preferences.neural_mix_eq_mode;
         match ev {
             SurfaceEvent::Fader { control, value } => {
@@ -667,100 +707,193 @@ impl ReTraktorApp {
                     _ => {}
                 }
             }
-            SurfaceEvent::Button {
-                control,
-                pressed: true,
-            } => match control.as_str() {
-                "surface.left.play" => self.toggle_play(1),
-                "surface.right.play" => self.toggle_play(2),
-                "surface.left.cue" => self.jump_to_cue(1, 1),
-                "surface.right.cue" => self.jump_to_cue(2, 1),
-                "surface.left.sync" => self.sync_deck(1),
-                "surface.right.sync" => self.sync_deck(2),
-                "surface.left.flux" => self.deck_flux_active[0] = !self.deck_flux_active[0],
-                "surface.right.flux" => self.deck_flux_active[1] = !self.deck_flux_active[1],
-                "surface.left.loop_size.push" => self.toggle_loop(1),
-                "surface.right.loop_size.push" => self.toggle_loop(2),
-                "surface.left.pad_mode.hotcues" => self.deck_pad_mode[0] = DeckPadMode::Hotcues,
-                "surface.left.pad_mode.stems" => {
-                    self.deck_pad_mode[0] = DeckPadMode::Stems;
-                    self.deck_stem_view[0] = true;
-                }
-                "surface.left.pad_mode.pattern" => {
-                    self.deck_pad_mode[0] = DeckPadMode::Pattern;
-                    self.show_pattern_player = true;
-                }
-                "surface.left.pad_mode.flux_loop" => self.deck_pad_mode[0] = DeckPadMode::FluxLoop,
-                "surface.right.pad_mode.hotcues" => self.deck_pad_mode[1] = DeckPadMode::Hotcues,
-                "surface.right.pad_mode.stems" => {
-                    self.deck_pad_mode[1] = DeckPadMode::Stems;
-                    self.deck_stem_view[1] = true;
-                }
-                "surface.right.pad_mode.pattern" => {
-                    self.deck_pad_mode[1] = DeckPadMode::Pattern;
-                    self.show_pattern_player = true;
-                }
-                "surface.right.pad_mode.flux_loop" => self.deck_pad_mode[1] = DeckPadMode::FluxLoop,
-                "surface.left.browse.view" | "surface.right.browse.view" => {
-                    self.layout = if self.layout == TraktorLayout::Browser {
-                        TraktorLayout::Parallel
-                    } else {
-                        TraktorLayout::Browser
-                    };
-                }
-                "surface.left.fx.buttons.1" => self.fx1_on = !self.fx1_on,
-                "surface.right.fx.buttons.1" => self.fx2_on = !self.fx2_on,
-                "surface.mixer.channels.1.cue" => self.channel_cue[0] = !self.channel_cue[0],
-                "surface.mixer.channels.2.cue" => self.channel_cue[1] = !self.channel_cue[1],
-                "surface.mixer.channels.1.channel_fx.on" => {
-                    self.channel_filter_on[0] = !self.channel_filter_on[0];
-                }
-                "surface.mixer.channels.2.channel_fx.on" => {
-                    self.channel_filter_on[1] = !self.channel_filter_on[1];
-                }
-                "surface.mixer.channel_fx.filter" => {
-                    self.channel_fx_kind[0] = MixerFxKind::Filter;
-                    self.channel_fx_kind[1] = MixerFxKind::Filter;
-                }
-                "surface.mixer.channel_fx.fx1" => {
-                    self.channel_fx_kind[0] = MixerFxKind::Reverb;
-                    self.channel_fx_kind[1] = MixerFxKind::Reverb;
-                }
-                "surface.mixer.channel_fx.fx2" => {
-                    self.channel_fx_kind[0] = MixerFxKind::DualDelay;
-                    self.channel_fx_kind[1] = MixerFxKind::DualDelay;
-                }
-                "surface.mixer.channel_fx.fx3" => {
-                    self.channel_fx_kind[0] = MixerFxKind::Noise;
-                    self.channel_fx_kind[1] = MixerFxKind::Noise;
-                }
-                "surface.mixer.channel_fx.fx4" => {
-                    self.channel_fx_kind[0] = MixerFxKind::TimeGater;
-                    self.channel_fx_kind[1] = MixerFxKind::TimeGater;
-                }
-                s if s.starts_with("surface.left.pads.") => {
-                    if let Ok(pad) = s.trim_start_matches("surface.left.pads.").parse::<u8>() {
-                        self.trigger_performance_pad(1, pad);
+            SurfaceEvent::Button { control, pressed } => {
+                // Handle Capacitive Jogwheel Platter Touch (Scratching on/off)
+                match control.as_str() {
+                    "surface.left.jogwheel.touch" => {
+                        if self.deck_turntable_mode[0] {
+                            self.deck_scratch_active[0] = pressed;
+                            if let Ok(mut state) = self.audio.shared.lock() {
+                                state.scratch_active[0] = pressed;
+                                state.scratch_rate[0] = 0.0;
+                            }
+                        }
+                        return;
                     }
-                }
-                s if s.starts_with("surface.right.pads.") => {
-                    if let Ok(pad) = s.trim_start_matches("surface.right.pads.").parse::<u8>() {
-                        self.trigger_performance_pad(2, pad);
+                    "surface.right.jogwheel.touch" => {
+                        if self.deck_turntable_mode[1] {
+                            self.deck_scratch_active[1] = pressed;
+                            if let Ok(mut state) = self.audio.shared.lock() {
+                                state.scratch_active[1] = pressed;
+                                state.scratch_rate[1] = 0.0;
+                            }
+                        }
+                        return;
                     }
+                    _ => {}
                 }
-                _ => {}
-            },
+
+                // Handle standard button press triggers
+                if !pressed {
+                    return;
+                }
+                match control.as_str() {
+                    "surface.left.play" => self.toggle_play(1),
+                    "surface.right.play" => self.toggle_play(2),
+                    "surface.left.cue" => self.jump_to_cue(1, 1),
+                    "surface.right.cue" => self.jump_to_cue(2, 1),
+                    "surface.left.sync" => self.sync_deck(1),
+                    "surface.right.sync" => self.sync_deck(2),
+                    "surface.left.flux" => self.deck_flux_active[0] = !self.deck_flux_active[0],
+                    "surface.right.flux" => self.deck_flux_active[1] = !self.deck_flux_active[1],
+                    "surface.left.loop_size.push" => self.toggle_loop(1),
+                    "surface.right.loop_size.push" => self.toggle_loop(2),
+
+                    // Turntable Vinyl Scratch Mode vs CDJ Jog Bend Mode
+                    "surface.left.mode.turntable" => {
+                        self.deck_turntable_mode[0] = true;
+                        self.bus.set("app.traktor.decks.1.jog.turntable", PropValue::Bool(true));
+                    }
+                    "surface.left.mode.jogwheel" => {
+                        self.deck_turntable_mode[0] = false;
+                        self.deck_scratch_active[0] = false;
+                        if let Ok(mut state) = self.audio.shared.lock() {
+                            state.scratch_active[0] = false;
+                        }
+                        self.bus.set("app.traktor.decks.1.jog.turntable", PropValue::Bool(false));
+                    }
+                    "surface.right.mode.turntable" => {
+                        self.deck_turntable_mode[1] = true;
+                        self.bus.set("app.traktor.decks.2.jog.turntable", PropValue::Bool(true));
+                    }
+                    "surface.right.mode.jogwheel" => {
+                        self.deck_turntable_mode[1] = false;
+                        self.deck_scratch_active[1] = false;
+                        if let Ok(mut state) = self.audio.shared.lock() {
+                            state.scratch_active[1] = false;
+                        }
+                        self.bus.set("app.traktor.decks.2.jog.turntable", PropValue::Bool(false));
+                    }
+
+                    // Deck Pad Mode Selectors (Hotcues, Stems, Pattern, Flux Loop)
+                    "surface.left.stems" | "surface.left.pad_mode.stems" => {
+                        self.deck_pad_mode[0] = DeckPadMode::Stems;
+                        self.deck_stem_view[0] = true;
+                        self.bus.set("app.traktor.decks.1.pad_mode", PropValue::Int(1));
+                    }
+                    "surface.right.stems" | "surface.right.pad_mode.stems" => {
+                        self.deck_pad_mode[1] = DeckPadMode::Stems;
+                        self.deck_stem_view[1] = true;
+                        self.bus.set("app.traktor.decks.2.pad_mode", PropValue::Int(1));
+                    }
+                    "surface.left.hotcues" | "surface.left.pad_mode.hotcues" => {
+                        self.deck_pad_mode[0] = DeckPadMode::Hotcues;
+                        self.bus.set("app.traktor.decks.1.pad_mode", PropValue::Int(0));
+                    }
+                    "surface.right.hotcues" | "surface.right.pad_mode.hotcues" => {
+                        self.deck_pad_mode[1] = DeckPadMode::Hotcues;
+                        self.bus.set("app.traktor.decks.2.pad_mode", PropValue::Int(0));
+                    }
+                    "surface.left.pattern" | "surface.left.pad_mode.pattern" => {
+                        self.deck_pad_mode[0] = DeckPadMode::Pattern;
+                        self.show_pattern_player = true;
+                        self.bus.set("app.traktor.decks.1.pad_mode", PropValue::Int(2));
+                    }
+                    "surface.right.pattern" | "surface.right.pad_mode.pattern" => {
+                        self.deck_pad_mode[1] = DeckPadMode::Pattern;
+                        self.show_pattern_player = true;
+                        self.bus.set("app.traktor.decks.2.pad_mode", PropValue::Int(2));
+                    }
+                    "surface.left.flux_loop" | "surface.left.pad_mode.flux_loop" => {
+                        self.deck_pad_mode[0] = DeckPadMode::FluxLoop;
+                        self.bus.set("app.traktor.decks.1.pad_mode", PropValue::Int(3));
+                    }
+                    "surface.right.flux_loop" | "surface.right.pad_mode.flux_loop" => {
+                        self.deck_pad_mode[1] = DeckPadMode::FluxLoop;
+                        self.bus.set("app.traktor.decks.2.pad_mode", PropValue::Int(3));
+                    }
+
+                    "surface.left.browse.view" | "surface.right.browse.view" => {
+                        self.layout = if self.layout == TraktorLayout::Browser {
+                            TraktorLayout::Parallel
+                        } else {
+                            TraktorLayout::Browser
+                        };
+                    }
+                    "surface.left.fx.buttons.1" => self.fx1_on = !self.fx1_on,
+                    "surface.right.fx.buttons.1" => self.fx2_on = !self.fx2_on,
+                    "surface.mixer.channels.1.cue" => self.channel_cue[0] = !self.channel_cue[0],
+                    "surface.mixer.channels.2.cue" => self.channel_cue[1] = !self.channel_cue[1],
+                    "surface.mixer.channels.1.channel_fx.on" => {
+                        self.channel_filter_on[0] = !self.channel_filter_on[0];
+                    }
+                    "surface.mixer.channels.2.channel_fx.on" => {
+                        self.channel_filter_on[1] = !self.channel_filter_on[1];
+                    }
+                    "surface.mixer.channel_fx.filter" => {
+                        self.channel_fx_kind[0] = MixerFxKind::Filter;
+                        self.channel_fx_kind[1] = MixerFxKind::Filter;
+                    }
+                    "surface.mixer.channel_fx.fx1" => {
+                        self.channel_fx_kind[0] = MixerFxKind::Reverb;
+                        self.channel_fx_kind[1] = MixerFxKind::Reverb;
+                    }
+                    "surface.mixer.channel_fx.fx2" => {
+                        self.channel_fx_kind[0] = MixerFxKind::DualDelay;
+                        self.channel_fx_kind[1] = MixerFxKind::DualDelay;
+                    }
+                    "surface.mixer.channel_fx.fx3" => {
+                        self.channel_fx_kind[0] = MixerFxKind::Noise;
+                        self.channel_fx_kind[1] = MixerFxKind::Noise;
+                    }
+                    "surface.mixer.channel_fx.fx4" => {
+                        self.channel_fx_kind[0] = MixerFxKind::TimeGater;
+                        self.channel_fx_kind[1] = MixerFxKind::TimeGater;
+                    }
+                    s if s.starts_with("surface.left.pads.") => {
+                        if let Ok(pad) = s.trim_start_matches("surface.left.pads.").parse::<u8>() {
+                            self.trigger_performance_pad(1, pad);
+                        }
+                    }
+                    s if s.starts_with("surface.right.pads.") => {
+                        if let Ok(pad) = s.trim_start_matches("surface.right.pads.").parse::<u8>() {
+                            self.trigger_performance_pad(2, pad);
+                        }
+                    }
+                    _ => {}
+                }
+            }
             SurfaceEvent::Encoder { control, delta } => match control.as_str() {
                 "surface.left.jogwheel.rotation" => {
-                    if let Ok(mut state) = self.audio.shared.lock() {
-                        let nudge_sec = (delta as f64 / TRAKTOR_MX2_JOG_TICKS_PER_REV as f64) * 1.8;
-                        state.playhead_sec[0] = (state.playhead_sec[0] + nudge_sec).max(0.0);
+                    let sens = (self.jog_scratch_sensitivity as f64).clamp(0.2, 3.0);
+                    if self.deck_scratch_active[0] {
+                        // Scratching: direct hand vinyl tracking (1 rev / 1024 ticks = 1.8 seconds)
+                        let delta_sec = (delta as f64 / 1024.0) * 1.8 * sens;
+                        if let Ok(mut state) = self.audio.shared.lock() {
+                            state.playhead_sec[0] = (state.playhead_sec[0] + delta_sec).max(0.0);
+                            state.scratch_rate[0] = (delta as f64 / 1024.0) * 75.0 * sens;
+                        }
+                    } else {
+                        // Nudge / Phase bend when outer rim is turned without touching top
+                        let nudge_sec = (delta as f64 / 1024.0) * 0.08 * sens;
+                        if let Ok(mut state) = self.audio.shared.lock() {
+                            state.playhead_sec[0] = (state.playhead_sec[0] + nudge_sec).max(0.0);
+                        }
                     }
                 }
                 "surface.right.jogwheel.rotation" => {
-                    if let Ok(mut state) = self.audio.shared.lock() {
-                        let nudge_sec = (delta as f64 / TRAKTOR_MX2_JOG_TICKS_PER_REV as f64) * 1.8;
-                        state.playhead_sec[1] = (state.playhead_sec[1] + nudge_sec).max(0.0);
+                    let sens = (self.jog_scratch_sensitivity as f64).clamp(0.2, 3.0);
+                    if self.deck_scratch_active[1] {
+                        let delta_sec = (delta as f64 / 1024.0) * 1.8 * sens;
+                        if let Ok(mut state) = self.audio.shared.lock() {
+                            state.playhead_sec[1] = (state.playhead_sec[1] + delta_sec).max(0.0);
+                            state.scratch_rate[1] = (delta as f64 / 1024.0) * 75.0 * sens;
+                        }
+                    } else {
+                        let nudge_sec = (delta as f64 / 1024.0) * 0.08 * sens;
+                        if let Ok(mut state) = self.audio.shared.lock() {
+                            state.playhead_sec[1] = (state.playhead_sec[1] + nudge_sec).max(0.0);
+                        }
                     }
                 }
                 "surface.left.loop_size" => {
@@ -777,9 +910,22 @@ impl ReTraktorApp {
                         self.deck_loop_size_beats[1] = (self.deck_loop_size_beats[1] / 2).max(1);
                     }
                 }
+                "surface.left.browse.encoder" => {
+                    if delta > 0 {
+                        self.library.select_next_track();
+                    } else if delta < 0 {
+                        self.library.select_prev_track();
+                    }
+                }
+                "surface.right.browse.encoder" => {
+                    if delta > 0 {
+                        self.library.select_next_track();
+                    } else if delta < 0 {
+                        self.library.select_prev_track();
+                    }
+                }
                 _ => {}
             },
-            _ => {}
         }
     }
 
@@ -793,6 +939,11 @@ impl ReTraktorApp {
             DeckPadMode::Stems => {
                 if pad_idx < 4 {
                     self.deck_stem_muted[d][pad_idx] = !self.deck_stem_muted[d][pad_idx];
+                    let prop = format!("app.traktor.decks.{}.stems.{}.muted", d + 1, pad_idx);
+                    self.bus.set(&prop, PropValue::Bool(self.deck_stem_muted[d][pad_idx]));
+                    if let Ok(mut state) = self.audio.shared.lock() {
+                        state.stem_muted[d][pad_idx] = self.deck_stem_muted[d][pad_idx];
+                    }
                 } else {
                     let s = pad_idx - 4;
                     self.deck_stem_fx_send[d][s] = !self.deck_stem_fx_send[d][s];
