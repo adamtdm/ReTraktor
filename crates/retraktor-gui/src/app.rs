@@ -714,8 +714,11 @@ impl ReTraktorApp {
                         if self.deck_turntable_mode[0] {
                             self.deck_scratch_active[0] = pressed;
                             if let Ok(mut state) = self.audio.shared.lock() {
-                                state.scratch_active[0] = pressed;
-                                state.scratch_rate[0] = 0.0;
+                                if pressed {
+                                    state.enable_scratch(0, 1024, 33.333333333333336, 0.125, 0.125 / 32.0);
+                                } else {
+                                    state.disable_scratch(0);
+                                }
                             }
                         }
                         return;
@@ -724,8 +727,11 @@ impl ReTraktorApp {
                         if self.deck_turntable_mode[1] {
                             self.deck_scratch_active[1] = pressed;
                             if let Ok(mut state) = self.audio.shared.lock() {
-                                state.scratch_active[1] = pressed;
-                                state.scratch_rate[1] = 0.0;
+                                if pressed {
+                                    state.enable_scratch(1, 1024, 33.333333333333336, 0.125, 0.125 / 32.0);
+                                } else {
+                                    state.disable_scratch(1);
+                                }
                             }
                         }
                         return;
@@ -866,32 +872,25 @@ impl ReTraktorApp {
             SurfaceEvent::Encoder { control, delta } => match control.as_str() {
                 "surface.left.jogwheel.rotation" => {
                     let sens = (self.jog_scratch_sensitivity as f64).clamp(0.2, 3.0);
-                    if self.deck_scratch_active[0] {
-                        // Scratching: direct hand vinyl tracking (1 rev / 1024 ticks = 1.8 seconds)
-                        let delta_sec = (delta as f64 / 1024.0) * 1.8 * sens;
-                        if let Ok(mut state) = self.audio.shared.lock() {
-                            state.playhead_sec[0] = (state.playhead_sec[0] + delta_sec).max(0.0);
-                            state.scratch_rate[0] = (delta as f64 / 1024.0) * 75.0 * sens;
-                        }
-                    } else {
-                        // Nudge / Phase bend when outer rim is turned without touching top
-                        let nudge_sec = (delta as f64 / 1024.0) * 0.08 * sens;
-                        if let Ok(mut state) = self.audio.shared.lock() {
+                    if let Ok(mut state) = self.audio.shared.lock() {
+                        if state.scratch_active[0] {
+                            let scaled_ticks = ((delta as f64) * sens).round() as i64;
+                            state.scratch_tick(0, scaled_ticks);
+                        } else {
+                            // Nudge / Phase bend when outer rim is turned without touching top
+                            let nudge_sec = (delta as f64 / 1024.0) * 0.08 * sens;
                             state.playhead_sec[0] = (state.playhead_sec[0] + nudge_sec).max(0.0);
                         }
                     }
                 }
                 "surface.right.jogwheel.rotation" => {
                     let sens = (self.jog_scratch_sensitivity as f64).clamp(0.2, 3.0);
-                    if self.deck_scratch_active[1] {
-                        let delta_sec = (delta as f64 / 1024.0) * 1.8 * sens;
-                        if let Ok(mut state) = self.audio.shared.lock() {
-                            state.playhead_sec[1] = (state.playhead_sec[1] + delta_sec).max(0.0);
-                            state.scratch_rate[1] = (delta as f64 / 1024.0) * 75.0 * sens;
-                        }
-                    } else {
-                        let nudge_sec = (delta as f64 / 1024.0) * 0.08 * sens;
-                        if let Ok(mut state) = self.audio.shared.lock() {
+                    if let Ok(mut state) = self.audio.shared.lock() {
+                        if state.scratch_active[1] {
+                            let scaled_ticks = ((delta as f64) * sens).round() as i64;
+                            state.scratch_tick(1, scaled_ticks);
+                        } else {
+                            let nudge_sec = (delta as f64 / 1024.0) * 0.08 * sens;
                             state.playhead_sec[1] = (state.playhead_sec[1] + nudge_sec).max(0.0);
                         }
                     }

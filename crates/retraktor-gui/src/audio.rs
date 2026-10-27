@@ -365,6 +365,99 @@ impl LoadedTrackAudio {
     }
 }
 
+/// Mixxx / xwax-based Alpha-Beta tracking filter for authentic turntable physics simulation.
+#[derive(Clone, Copy, Debug)]
+pub struct AlphaBetaFilter {
+    pub initialized: bool,
+    pub dt: f64,
+    pub x: f64,
+    pub v: f64,
+    pub alpha: f64,
+    pub beta: f64,
+}
+
+impl Default for AlphaBetaFilter {
+    fn default() -> Self {
+        Self {
+            initialized: false,
+            dt: 0.001,
+            x: 0.0,
+            v: 0.0,
+            alpha: 1.0 / 8.0,         // 0.125
+            beta: (1.0 / 8.0) / 32.0, // 0.00390625
+        }
+    }
+}
+
+impl AlphaBetaFilter {
+    pub fn init(&mut self, dt: f64, initial_v: f64, alpha: f64, beta: f64) {
+        self.initialized = true;
+        self.dt = dt.max(0.0001);
+        self.x = 0.0;
+        self.v = initial_v;
+        self.alpha = alpha;
+        self.beta = beta;
+    }
+
+    pub fn observation(&mut self, dx: f64, dt: f64) {
+        if !self.initialized {
+            self.init(dt, 0.0, 1.0 / 8.0, (1.0 / 8.0) / 32.0);
+        }
+        self.dt = dt.max(0.0001);
+        let predicted_x = self.x + self.v * self.dt;
+        let predicted_v = self.v;
+        let residual_x = dx - predicted_x;
+
+        self.x = predicted_x + residual_x * self.alpha;
+        self.v = predicted_v + residual_x * self.beta / self.dt;
+
+        self.x -= dx;
+    }
+
+    #[inline(always)]
+    pub fn predicted_velocity(&self) -> f64 {
+        self.v
+    }
+}
+
+/// 4-point Hermite cubic spline interpolation for anti-aliased vinyl scratching.
+#[inline(always)]
+pub fn hermite4(y0: f32, y1: f32, y2: f32, y3: f32, frac: f32) -> f32 {
+    let c0 = y1;
+    let c1 = 0.5 * (y2 - y0);
+    let c2 = y0 - 2.5 * y1 + 2.0 * y2 - 0.5 * y3;
+    let c3 = 0.5 * (y3 - y0) + 1.5 * (y1 - y2);
+    ((c3 * frac + c2) * frac + c1) * frac + c0
+}
+
+#[inline(always)]
+pub fn sample_stereo_hermite(pcm: &[f32], sample_pos: f64) -> (f32, f32) {
+    let total_frames = pcm.len() / 2;
+    if total_frames < 2 {
+        return (0.0, 0.0);
+    }
+    let clamped_pos = sample_pos.clamp(0.0, (total_frames - 1) as f64);
+    let f0 = clamped_pos.floor() as usize;
+    let frac = (clamped_pos - (f0 as f64)) as f32;
+
+    if total_frames < 4 || f0 == 0 || f0 >= total_frames - 2 {
+        let idx0 = f0 * 2;
+        let idx1 = ((f0 + 1).min(total_frames - 1)) * 2;
+        let l = pcm[idx0] * (1.0 - frac) + pcm[idx1] * frac;
+        let r = pcm[idx0 + 1] * (1.0 - frac) + pcm[idx1 + 1] * frac;
+        (l, r)
+    } else {
+        let im1 = (f0 - 1) * 2;
+        let i0 = f0 * 2;
+        let i1 = (f0 + 1) * 2;
+        let i2 = (f0 + 2) * 2;
+
+        let l = hermite4(pcm[im1], pcm[i0], pcm[i1], pcm[i2], frac);
+        let r = hermite4(pcm[im1 + 1], pcm[i0 + 1], pcm[i1 + 1], pcm[i2 + 1], frac);
+        (l, r)
+    }
+}
+
 /// Thread-safe shared state for UI <-> Audio Engine communication.
 pub struct AudioSharedState {
     pub engine: FourDeckAudioEngine,
@@ -386,9 +479,14 @@ pub struct AudioSharedState {
     pub crossfader: f32,
     pub crossfader_curve: f32,
 
-    // Live Vinyl Scratching & Platter Touch Simulation
+    // Mixxx / xwax-based Vinyl Scratching Physics
     pub scratch_active: [bool; 4],
     pub scratch_rate: [f64; 4],
+    pub scratch_ticks_accum: [i64; 4],
+    pub scratch_dx_per_tick: [f64; 4],
+    pub scratch_filter: [AlphaBetaFilter; 4],
+    pub scratch_ramping: [bool; 4],
+    pub scratch_ramp_target: [f64; 4],
 
     // Real-Time 4-Stem Mixing per Deck: [Drums, Bass, Instruments, Vocals]
     pub stem_volumes: [[f32; 4]; 4],
@@ -458,6 +556,11 @@ impl Default for AudioSharedState {
             crossfader_curve: 0.5,
             scratch_active: [false; 4],
             scratch_rate: [0.0; 4],
+            scratch_ticks_accum: [0; 4],
+            scratch_dx_per_tick: [1.0 / 568.888889; 4],
+            scratch_filter: [AlphaBetaFilter::default(); 4],
+            scratch_ramping: [false; 4],
+            scratch_ramp_target: [1.0; 4],
             stem_volumes: [[1.0; 4]; 4],
             stem_muted: [[false; 4]; 4],
             stem_fx_send: [[false; 4]; 4],
@@ -478,6 +581,44 @@ impl Default for AudioSharedState {
             recorded_samples: Vec::new(),
             recording_sample_rate: 48_000,
         }
+    }
+}
+
+impl AudioSharedState {
+    pub fn enable_scratch(
+        &mut self,
+        deck: usize,
+        intervals_per_rev: u32,
+        rpm: f64,
+        alpha: f64,
+        beta: f64,
+    ) {
+        let d = deck.min(3);
+        let intervals_per_sec = (rpm * (intervals_per_rev as f64)) / 60.0;
+        self.scratch_dx_per_tick[d] = if intervals_per_sec > 0.0 {
+            1.0 / intervals_per_sec
+        } else {
+            1.0 / 568.888889
+        };
+        let init_v = if self.is_playing[d] { self.pitch_ratio[d] } else { 0.0 };
+        self.scratch_filter[d].init(0.002, init_v, alpha, beta);
+        self.scratch_rate[d] = init_v;
+        self.scratch_ticks_accum[d] = 0;
+        self.scratch_active[d] = true;
+        self.scratch_ramping[d] = false;
+    }
+
+    pub fn scratch_tick(&mut self, deck: usize, ticks: i64) {
+        let d = deck.min(3);
+        self.scratch_ticks_accum[d] += ticks;
+    }
+
+    pub fn disable_scratch(&mut self, deck: usize) {
+        let d = deck.min(3);
+        self.scratch_active[d] = false;
+        let target = if self.is_playing[d] { self.pitch_ratio[d] } else { 0.0 };
+        self.scratch_ramping[d] = true;
+        self.scratch_ramp_target[d] = target;
     }
 }
 
@@ -610,8 +751,12 @@ impl AudioSystem {
                                 ((state.pattern_phase_sec / step_dur).floor() as usize) % 16;
                         }
                         for d in 0..4 {
-                            if state.is_playing[d] {
-                                let ratio = state.pitch_ratio[d];
+                            if state.is_playing[d] || state.scratch_active[d] || state.scratch_ramping[d] {
+                                let ratio = if state.scratch_active[d] || state.scratch_ramping[d] {
+                                    state.scratch_rate[d]
+                                } else {
+                                    state.pitch_ratio[d]
+                                };
                                 state.playhead_sec[d] += dt * ratio;
                                 if state.loop_active[d] && state.loop_len_sec[d] > 0.05 {
                                     let end = state.loop_start_sec[d] + state.loop_len_sec[d];
@@ -620,6 +765,8 @@ impl AudioSystem {
                                     }
                                 } else if let Some(track) = &state.loaded_tracks[d] {
                                     if state.playhead_sec[d] >= track.duration_sec {
+                                        state.playhead_sec[d] = 0.0;
+                                    } else if state.playhead_sec[d] < 0.0 {
                                         state.playhead_sec[d] = 0.0;
                                     }
                                 }
@@ -684,6 +831,7 @@ impl AudioSystem {
     ) {
         let frames = output.len() / channels;
         let dt = 1.0 / (sr as f64).max(1.0);
+        let block_dt = (frames as f64) / (sr as f64).max(1.0);
 
         let mut state = match shared.lock() {
             Ok(s) => s,
@@ -691,12 +839,34 @@ impl AudioSystem {
         };
         state.recording_sample_rate = sr;
 
+        // Block-level scratch filter observation and release inertia ramping
+        for d in 0..4 {
+            if state.scratch_active[d] {
+                let ticks = state.scratch_ticks_accum[d];
+                state.scratch_ticks_accum[d] = 0;
+                let dx = state.scratch_dx_per_tick[d] * (ticks as f64);
+                state.scratch_filter[d].observation(dx, block_dt);
+                state.scratch_rate[d] = state.scratch_filter[d].predicted_velocity();
+            } else if state.scratch_ramping[d] {
+                let target = state.scratch_ramp_target[d];
+                let cur = state.scratch_rate[d];
+                // Smooth exponential decay towards playback speed (tau = 0.065s)
+                let decay = (-block_dt / 0.065).exp();
+                let next = target + (cur - target) * decay;
+                state.scratch_rate[d] = next;
+                if (next - target).abs() < 0.005 {
+                    state.scratch_rate[d] = target;
+                    state.scratch_ramping[d] = false;
+                }
+            }
+        }
+
         for f in 0..frames {
             let mut deck_samples: [(f32, f32); 4] = [(0.0, 0.0); 4];
 
             for d in 0..4 {
                 state.engine.strips[d].playing = state.is_playing[d];
-                if !state.is_playing[d] {
+                if !state.is_playing[d] && !state.scratch_active[d] && !state.scratch_ramping[d] {
                     continue;
                 }
                 let mut advance_dt = 0.0_f64;
@@ -705,27 +875,32 @@ impl AudioSystem {
                 let mut raw_r = 0.0_f32;
                 let mut has_sample = false;
 
+                let effective_rate = if state.scratch_active[d] || state.scratch_ramping[d] {
+                    state.scratch_rate[d]
+                } else {
+                    state.pitch_ratio[d]
+                };
+
                 if let Some(track) = &state.loaded_tracks[d] {
                     track_dur = track.duration_sec.max(0.1);
-                    let total_pcm_frames = track.pcm_stereo.len() / 2;
-                    if total_pcm_frames >= 2 {
-                        let sample_pos = (state.playhead_sec[d] * track.sample_rate as f64)
-                            .clamp(0.0, (total_pcm_frames - 2) as f64);
-                        let f_floor = sample_pos.floor();
-                        let idx0 = (f_floor as usize) * 2;
-                        let frac = (sample_pos - f_floor) as f32;
-                        let idx1 = idx0 + 2;
-                        if idx1 + 1 < track.pcm_stereo.len() {
-                            raw_l = track.pcm_stereo[idx0] * (1.0 - frac) + track.pcm_stereo[idx1] * frac;
-                            raw_r = track.pcm_stereo[idx0 + 1] * (1.0 - frac) + track.pcm_stereo[idx1 + 1] * frac;
-                            has_sample = true;
-                        }
+                    let sample_pos = state.playhead_sec[d] * (track.sample_rate as f64);
+                    let (mut s_l, mut s_r) = sample_stereo_hermite(&track.pcm_stereo, sample_pos);
+
+                    // Phono cartridge magnetic induction scaling (output proportional to needle velocity)
+                    // Attenuates frozen sample buzz/clicks when platter is stopped
+                    if state.scratch_active[d] {
+                        let speed_abs = effective_rate.abs();
+                        let phono_gain = if speed_abs < 0.06 {
+                            (speed_abs / 0.06) as f32
+                        } else {
+                            1.0
+                        };
+                        s_l *= phono_gain;
+                        s_r *= phono_gain;
                     }
-                    let effective_rate = if state.scratch_active[d] {
-                        state.scratch_rate[d]
-                    } else {
-                        state.pitch_ratio[d]
-                    };
+                    raw_l = s_l;
+                    raw_r = s_r;
+                    has_sample = true;
                     advance_dt = dt * effective_rate;
                 }
 
@@ -814,11 +989,16 @@ impl AudioSystem {
                 state.playhead_sec[d] += advance_dt;
 
                 if state.loop_active[d] && state.loop_len_sec[d] > 0.05 {
-                    let loop_end = state.loop_start_sec[d] + state.loop_len_sec[d];
+                    let loop_start = state.loop_start_sec[d];
+                    let loop_end = loop_start + state.loop_len_sec[d];
                     if state.playhead_sec[d] >= loop_end {
-                        state.playhead_sec[d] = state.loop_start_sec[d];
+                        state.playhead_sec[d] = loop_start + (state.playhead_sec[d] - loop_end);
+                    } else if state.playhead_sec[d] < loop_start {
+                        state.playhead_sec[d] = loop_end - (loop_start - state.playhead_sec[d]);
                     }
                 } else if state.playhead_sec[d] >= track_dur {
+                    state.playhead_sec[d] = 0.0;
+                } else if state.playhead_sec[d] < 0.0 {
                     state.playhead_sec[d] = 0.0;
                 }
             }
@@ -911,5 +1091,48 @@ impl AudioSystem {
 impl Drop for AudioSystem {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_alpha_beta_filter_scratch_physics() {
+        let mut filter = AlphaBetaFilter::default();
+        let dt = 0.002; // 2ms
+        filter.init(dt, 0.0, 0.125, 0.125 / 32.0);
+
+        // Constant forward rotation at 1.0x vinyl speed (dx = dt * 1.0)
+        for _ in 0..100 {
+            filter.observation(dt * 1.0, dt);
+        }
+        let v = filter.predicted_velocity();
+        assert!((v - 1.0).abs() < 0.05, "Velocity should track ~1.0, got {v}");
+
+        // Stop platter (dx = 0)
+        for _ in 0..100 {
+            filter.observation(0.0, dt);
+        }
+        let v_stop = filter.predicted_velocity();
+        assert!(v_stop.abs() < 0.05, "Velocity should settle near 0.0, got {v_stop}");
+
+        // Reverse scratch at -2.0x vinyl speed (dx = dt * -2.0)
+        for _ in 0..100 {
+            filter.observation(dt * -2.0, dt);
+        }
+        let v_rev = filter.predicted_velocity();
+        assert!((v_rev - -2.0).abs() < 0.1, "Velocity should track ~ -2.0, got {v_rev}");
+    }
+
+    #[test]
+    fn test_hermite_cubic_interpolation() {
+        // Test a linear ramp signal: y = 2.0 * x
+        let pcm = vec![0.0, 0.0, 2.0, 2.0, 4.0, 4.0, 6.0, 6.0, 8.0, 8.0];
+        // At frame position 2.5, exact value should be 5.0
+        let (l, r) = sample_stereo_hermite(&pcm, 2.5);
+        assert!((l - 5.0).abs() < 1e-4);
+        assert!((r - 5.0).abs() < 1e-4);
     }
 }
