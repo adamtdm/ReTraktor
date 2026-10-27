@@ -111,6 +111,7 @@ pub struct ReTraktorApp {
     pub deck_loop_size_beats: [u32; 4],
     pub deck_hotcues: [Vec<(u8, f64)>; 4],
     pub deck_pad_mode: [DeckPadMode; 4],
+    pub deck_sync_enabled: [bool; 4],
 
     // Hybrid 4-Stem Separation State ([Drums, Bass, Instruments, Vocals])
     pub deck_stem_volumes: [[f32; 4]; 4],
@@ -220,6 +221,7 @@ impl Default for ReTraktorApp {
                 DeckPadMode::Hotcues,
                 DeckPadMode::Hotcues,
             ],
+            deck_sync_enabled: [false; 4],
             deck_stem_volumes: [[1.0; 4]; 4],
             deck_stem_muted: [[false; 4]; 4],
             deck_stem_fx_send: [[false; 4]; 4],
@@ -397,7 +399,28 @@ impl ReTraktorApp {
                 state.engine.strips[d].xfader_right = self.channel_xfader_assign[d] == 2;
 
                 let pitch_pct = self.deck_pitch_fader[d] as f64 / 100.0;
-                state.pitch_ratio[d] = 1.0 + pitch_pct;
+                let mut ratio = 1.0 + pitch_pct;
+
+                // Continuous Beat Phase Sync Lock:
+                if self.deck_sync_enabled[d] && state.is_playing[d] {
+                    let other_deck = if d == 0 { 1 } else { 0 };
+                    if state.is_playing[other_deck] {
+                        let target_bpm = self.master_tempo.max(20.0);
+                        let beat_sec = 60.0 / target_bpm;
+                        let master_phase = state.playhead_sec[other_deck].rem_euclid(beat_sec);
+                        let cur_phase = state.playhead_sec[d].rem_euclid(beat_sec);
+                        let mut diff = master_phase - cur_phase;
+                        if diff > 0.5 * beat_sec {
+                            diff -= beat_sec;
+                        } else if diff < -0.5 * beat_sec {
+                            diff += beat_sec;
+                        }
+                        // Gentle proportional correction nudge to keep beatgrids locked (< 2% nudge)
+                        let nudge = (diff / beat_sec * 0.05).clamp(-0.02, 0.02);
+                        ratio += nudge;
+                    }
+                }
+                state.pitch_ratio[d] = ratio;
 
                 let bpm = state.loaded_tracks[d]
                     .as_ref()
@@ -1033,12 +1056,62 @@ impl ReTraktorApp {
     }
 
     fn sync_deck(&mut self, deck_idx: usize) {
-        let d = deck_idx - 1;
-        if let Ok(state) = self.audio.shared.lock() {
+        let d = (deck_idx.saturating_sub(1)).min(3);
+        self.deck_sync_enabled[d] = !self.deck_sync_enabled[d];
+
+        // Update PropertyBus for hardware LED backlight
+        let bus_key = format!("app.traktor.decks.{}.sync.enabled", d + 1);
+        self.bus.set(&bus_key, PropValue::Bool(self.deck_sync_enabled[d]));
+
+        if !self.deck_sync_enabled[d] {
+            return;
+        }
+
+        if let Ok(mut state) = self.audio.shared.lock() {
+            let other_deck = if d == 0 { 1 } else { 0 };
+            let (target_bpm, target_phase_sec) = if state.is_playing[other_deck] {
+                let other_orig_bpm = state.loaded_tracks[other_deck]
+                    .as_ref()
+                    .map(|t| t.bpm)
+                    .unwrap_or(self.master_tempo);
+                let other_effective_bpm = other_orig_bpm * (1.0 + self.deck_pitch_fader[other_deck] as f64 / 100.0);
+                (other_effective_bpm, Some(state.playhead_sec[other_deck]))
+            } else {
+                (self.master_tempo, None)
+            };
+
+            // 1. Match the Tempo (BPM)
             if let Some(track) = &state.loaded_tracks[d] {
-                let target_bpm = self.master_tempo;
-                let pct = ((target_bpm - track.bpm) / track.bpm) * 100.0;
+                let orig_bpm = track.bpm.max(20.0);
+                let pct = ((target_bpm - orig_bpm) / orig_bpm) * 100.0;
                 self.deck_pitch_fader[d] = pct.clamp(-8.0, 8.0) as f32;
+
+                // 2. Put it on the beat (Beat Phase Alignment)
+                let beat_sec = 60.0 / target_bpm.max(20.0);
+                let cur_pos = state.playhead_sec[d];
+
+                let delta = if let Some(master_pos) = target_phase_sec {
+                    // Align to master deck's beat phase
+                    let master_phase = master_pos.rem_euclid(beat_sec);
+                    let cur_phase = cur_pos.rem_euclid(beat_sec);
+                    let mut diff = master_phase - cur_phase;
+                    if diff > 0.5 * beat_sec {
+                        diff -= beat_sec;
+                    } else if diff < -0.5 * beat_sec {
+                        diff += beat_sec;
+                    }
+                    diff
+                } else {
+                    // Snap to the nearest beat on this track's own grid
+                    let cur_phase = cur_pos.rem_euclid(beat_sec);
+                    if cur_phase > 0.5 * beat_sec {
+                        beat_sec - cur_phase
+                    } else {
+                        -cur_phase
+                    }
+                };
+
+                state.playhead_sec[d] = (cur_pos + delta).max(0.0);
             }
         }
     }
@@ -2257,15 +2330,26 @@ impl ReTraktorApp {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing = Vec2::new(3.0, 0.0);
 
+                    let is_synced = self.deck_sync_enabled[d];
+                    let sync_bg = if is_synced {
+                        accent_color
+                    } else {
+                        Color32::from_rgb(52, 55, 62)
+                    };
+                    let sync_fg = if is_synced {
+                        Color32::WHITE
+                    } else {
+                        TraktorTheme::TEXT_PRIMARY
+                    };
                     if ui
                         .add(
                             egui::Button::new(
                                 RichText::new("SYNC")
-                                    .color(TraktorTheme::TEXT_PRIMARY)
+                                    .color(sync_fg)
                                     .font(egui::FontId::monospace(8.5))
                                     .strong(),
                             )
-                            .fill(Color32::from_rgb(52, 55, 62))
+                            .fill(sync_bg)
                             .min_size(Vec2::new(36.0, 16.0)),
                         )
                         .clicked()
