@@ -265,7 +265,12 @@ impl eframe::App for ReTraktorApp {
         if self.library.open_prefs_requested {
             self.library.open_prefs_requested = false;
             self.preferences.is_open = true;
-            self.preferences.current_tab = PrefsTab::Controllers;
+            if self.library.open_prefs_file_management {
+                self.library.open_prefs_file_management = false;
+                self.preferences.current_tab = PrefsTab::FileManagement;
+            } else {
+                self.preferences.current_tab = PrefsTab::Controllers;
+            }
         }
 
         self.handle_keyboard_shortcuts(ctx);
@@ -346,6 +351,21 @@ impl eframe::App for ReTraktorApp {
             let report = self.mx2_driver.run_full_self_test();
             self.preferences.self_test_report = Some(report);
             self.preferences.trigger_self_test = false;
+        }
+
+        // Handle File Management background music folder rescan trigger
+        if self.preferences.trigger_music_rescan {
+            self.preferences.trigger_music_rescan = false;
+            let mut total_added = 0;
+            for folder in &self.preferences.music_folders {
+                total_added += self.library.scan_directory_audio(folder, true);
+            }
+            self.preferences.file_management_status = format!(
+                "✓ Scanned {} folder(s) — added {} new audio tracks.",
+                self.preferences.music_folders.len(),
+                total_added
+            );
+            self.library.status_message = self.preferences.file_management_status.clone();
         }
 
         // Synchronize visual remapper and controller settings from Preferences

@@ -97,6 +97,7 @@ pub struct LibraryManager {
     // Match Radar & Settings shortcut state
     pub show_match_radar: bool,
     pub open_prefs_requested: bool,
+    pub open_prefs_file_management: bool,
     pub status_message: String,
 }
 
@@ -136,6 +137,7 @@ impl Default for LibraryManager {
             dir_entries: Vec::new(),
             show_match_radar: false,
             open_prefs_requested: false,
+            open_prefs_file_management: false,
             status_message: "Ready — Click [A] or [B] to load a track, or [✦ Stems] to separate into 4 stems.".to_string(),
         };
         mgr.populate_default_collection();
@@ -1229,6 +1231,22 @@ impl LibraryManager {
                         target.display(),
                         count
                     );
+                }
+
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new("📁 Music Folders")
+                                .color(TraktorTheme::TEXT_PRIMARY)
+                                .font(egui::FontId::proportional(11.0)),
+                        )
+                        .fill(Color32::from_rgb(52, 55, 62)),
+                    )
+                    .on_hover_text("Configure directories to scan and watch in Preferences")
+                    .clicked()
+                {
+                    self.open_prefs_requested = true;
+                    self.open_prefs_file_management = true;
                 }
 
                 if ui

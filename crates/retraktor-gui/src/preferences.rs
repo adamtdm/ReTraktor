@@ -5,6 +5,7 @@ use eframe::egui::{self, Color32, RichText, Stroke, Ui, Vec2, Window};
 pub enum PrefsTab {
     AudioSetup,
     OutputRouting,
+    FileManagement,
     Mixer,
     StemsAndAi,
     Decks,
@@ -43,6 +44,14 @@ pub struct PreferencesDialog {
     pub trigger_self_test: bool,
     pub udev_command_copied: bool,
 
+    // File Management & Music Folders State
+    pub music_folders: Vec<std::path::PathBuf>,
+    pub new_folder_input: String,
+    pub scan_on_startup: bool,
+    pub analyze_new_tracks: bool,
+    pub trigger_music_rescan: bool,
+    pub file_management_status: String,
+
     // Interactive Visual Remapping & Color Customization
     pub selected_visual_control: Option<String>,
     pub custom_control_action: std::collections::HashMap<String, String>,
@@ -53,6 +62,18 @@ pub struct PreferencesDialog {
 
 impl Default for PreferencesDialog {
     fn default() -> Self {
+        let home = std::env::var("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from("/"));
+        let default_music = {
+            let m = home.join("Music");
+            if m.is_dir() {
+                m
+            } else {
+                home
+            }
+        };
+
         Self {
             is_open: false,
             current_tab: PrefsTab::Controllers,
@@ -81,6 +102,12 @@ impl Default for PreferencesDialog {
             trigger_led_test: false,
             trigger_self_test: false,
             udev_command_copied: false,
+            music_folders: vec![default_music],
+            new_folder_input: String::new(),
+            scan_on_startup: true,
+            analyze_new_tracks: true,
+            trigger_music_rescan: false,
+            file_management_status: "Ready".to_string(),
             selected_visual_control: None,
             custom_control_action: std::collections::HashMap::new(),
             custom_control_color: std::collections::HashMap::new(),
@@ -134,6 +161,7 @@ impl PreferencesDialog {
                             };
 
                             tab_btn("Controllers & MX2", PrefsTab::Controllers);
+                            tab_btn("File Management", PrefsTab::FileManagement);
                             tab_btn("Stems & Neural Mix", PrefsTab::StemsAndAi);
                             tab_btn("Audio Setup", PrefsTab::AudioSetup);
                             tab_btn("Output Routing", PrefsTab::OutputRouting);
@@ -153,6 +181,7 @@ impl PreferencesDialog {
                             match self.current_tab {
                                 PrefsTab::AudioSetup => self.show_audio_setup(ui),
                                 PrefsTab::OutputRouting => self.show_output_routing(ui),
+                                PrefsTab::FileManagement => self.show_file_management(ui),
                                 PrefsTab::Mixer => self.show_mixer_prefs(ui),
                                 PrefsTab::StemsAndAi => self.show_stems_prefs(ui),
                                 PrefsTab::Decks => self.show_deck_prefs(ui),
@@ -872,6 +901,182 @@ impl PreferencesDialog {
         });
     }
 
+    fn show_file_management(&mut self, ui: &mut Ui) {
+        ui.heading("File Management & Music Folders");
+        ui.label(
+            RichText::new("Configure directories to scan and import into your Track Collection.")
+                .color(TraktorTheme::TEXT_SECONDARY),
+        );
+        ui.add_space(8.0);
+
+        // 1. Music Folders Watchlist
+        ui.label(
+            RichText::new("MUSIC FOLDERS WATCHLIST")
+                .color(TraktorTheme::DECK_A)
+                .font(egui::FontId::monospace(10.5))
+                .strong(),
+        );
+
+        egui::Frame::none()
+            .fill(Color32::from_rgb(20, 24, 30))
+            .stroke(Stroke::new(1.0_f32, Color32::from_rgb(46, 52, 64)))
+            .rounding(4.0)
+            .inner_margin(egui::Margin::same(8.0))
+            .show(ui, |ui| {
+                if self.music_folders.is_empty() {
+                    ui.label(
+                        RichText::new("No music folders added yet. Add folders below to scan automatically.")
+                            .color(TraktorTheme::TEXT_MUTED),
+                    );
+                } else {
+                    let mut to_remove = None;
+                    for (idx, folder) in self.music_folders.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.label("📁");
+                            ui.label(
+                                RichText::new(folder.to_string_lossy().to_string())
+                                    .color(Color32::WHITE)
+                                    .strong(),
+                            );
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui
+                                    .button(RichText::new("✕").color(Color32::from_rgb(240, 80, 80)))
+                                    .on_hover_text("Remove this folder from scan list")
+                                    .clicked()
+                                {
+                                    to_remove = Some(idx);
+                                }
+                            });
+                        });
+                        ui.separator();
+                    }
+                    if let Some(idx) = to_remove {
+                        self.music_folders.remove(idx);
+                    }
+                }
+
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label("Add Path:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.new_folder_input)
+                            .hint_text("/path/to/music/folder")
+                            .desired_width(260.0),
+                    );
+                    if ui.button("+ Add Folder").clicked() {
+                        let trimmed = self.new_folder_input.trim();
+                        if !trimmed.is_empty() {
+                            let p = std::path::PathBuf::from(trimmed);
+                            if !self.music_folders.contains(&p) {
+                                self.music_folders.push(p);
+                                self.new_folder_input.clear();
+                            }
+                        }
+                    }
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Quick Presets:").color(TraktorTheme::TEXT_MUTED));
+                    let home = std::env::var("HOME").unwrap_or_else(|_| "/home".to_string());
+                    if ui.button("~/Music").clicked() {
+                        let p = std::path::PathBuf::from(&home).join("Music");
+                        if !self.music_folders.contains(&p) {
+                            self.music_folders.push(p);
+                        }
+                    }
+                    if ui.button("~/Downloads").clicked() {
+                        let p = std::path::PathBuf::from(&home).join("Downloads");
+                        if !self.music_folders.contains(&p) {
+                            self.music_folders.push(p);
+                        }
+                    }
+                    if ui.button("/media").clicked() {
+                        let p = std::path::PathBuf::from("/media");
+                        if !self.music_folders.contains(&p) {
+                            self.music_folders.push(p);
+                        }
+                    }
+                    if ui.button("/mnt").clicked() {
+                        let p = std::path::PathBuf::from("/mnt");
+                        if !self.music_folders.contains(&p) {
+                            self.music_folders.push(p);
+                        }
+                    }
+                });
+            });
+
+        ui.add_space(8.0);
+
+        // 2. Scan & Analysis Options
+        ui.label(
+            RichText::new("SCAN & ANALYSIS OPTIONS")
+                .color(TraktorTheme::DECK_A)
+                .font(egui::FontId::monospace(10.5))
+                .strong(),
+        );
+
+        ui.checkbox(
+            &mut self.scan_on_startup,
+            "Import & Scan Music Folders at Startup",
+        );
+        ui.checkbox(
+            &mut self.analyze_new_tracks,
+            "Analyze BPM, Transients, and Musical Key automatically",
+        );
+
+        ui.add_space(8.0);
+
+        // 3. Rescan Action Button & Status
+        ui.horizontal(|ui| {
+            if ui
+                .add(
+                    egui::Button::new(
+                        RichText::new("↻ Rescan All Music Folders Now")
+                            .color(Color32::WHITE)
+                            .strong(),
+                    )
+                    .fill(TraktorTheme::ROW_SELECTED)
+                    .min_size(Vec2::new(220.0, 26.0)),
+                )
+                .on_hover_text("Recursively scans all configured music folders and imports new tracks into Collection")
+                .clicked()
+            {
+                self.trigger_music_rescan = true;
+            }
+
+            ui.label(
+                RichText::new(&self.file_management_status)
+                    .color(TraktorTheme::PLAY_ACTIVE)
+                    .font(egui::FontId::monospace(10.5)),
+            );
+        });
+
+        ui.add_space(10.0);
+
+        // 4. Supported Audio Codecs
+        ui.label(
+            RichText::new("SUPPORTED AUDIO FORMATS")
+                .color(TraktorTheme::TEXT_MUTED)
+                .font(egui::FontId::monospace(10.0)),
+        );
+        ui.horizontal(|ui| {
+            for ext in &["MP3", "FLAC", "WAV", "OGG", "M4A", "AAC", "AIFF", "NML", "TSI"] {
+                egui::Frame::none()
+                    .fill(Color32::from_rgb(34, 38, 46))
+                    .rounding(2.0)
+                    .inner_margin(egui::Margin::symmetric(6.0, 2.0))
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new(*ext)
+                                .color(Color32::WHITE)
+                                .font(egui::FontId::monospace(9.5))
+                                .strong(),
+                        );
+                    });
+            }
+        });
+    }
+
     fn show_about(&mut self, ui: &mut Ui) {
         ui.heading("ReTraktor Pro 4.5.1");
         ui.add_space(8.0);
@@ -880,5 +1085,32 @@ impl PreferencesDialog {
         ui.add_space(8.0);
         ui.label("Repository: https://github.com/adamtdm/ReTraktor");
         ui.label("Target: Linux (Pop!_OS, Ubuntu, Debian, Fedora, Arch) on Wayland and X11");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn test_file_management_preferences_and_folders() {
+        let mut prefs = PreferencesDialog::default();
+        assert!(!prefs.music_folders.is_empty(), "Should initialize with default music folder");
+
+        // Add a new music folder
+        let custom_dir = PathBuf::from("/media/dj_usb/lossless");
+        prefs.music_folders.push(custom_dir.clone());
+        assert!(prefs.music_folders.contains(&custom_dir));
+
+        // Remove folder
+        if let Some(pos) = prefs.music_folders.iter().position(|p| p == &custom_dir) {
+            prefs.music_folders.remove(pos);
+        }
+        assert!(!prefs.music_folders.contains(&custom_dir));
+
+        // Switch to FileManagement tab
+        prefs.current_tab = PrefsTab::FileManagement;
+        assert_eq!(prefs.current_tab, PrefsTab::FileManagement);
     }
 }
