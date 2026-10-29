@@ -291,6 +291,12 @@ impl eframe::App for ReTraktorApp {
             .show(ctx, |ui| {
                 ui.spacing_mut().item_spacing = Vec2::new(4.0, 4.0);
 
+                // If Preferences is open, render as a full-page workspace view with maximum screen real estate
+                if self.preferences.is_open {
+                    self.preferences.show_full_page(ui, ctx);
+                    return;
+                }
+
                 // 1. Top FX Rack, Master Clock, Layout Switcher, Pattern Toggle & Mix Recorder
                 self.show_top_bar(ui);
 
@@ -1090,6 +1096,10 @@ impl ReTraktorApp {
     fn handle_keyboard_shortcuts(&mut self, ctx: &egui::Context) {
         if ctx.input(|i| i.modifiers.command && i.key_pressed(Key::Comma)) {
             self.preferences.is_open = !self.preferences.is_open;
+        }
+
+        if ctx.input(|i| i.key_pressed(Key::Escape)) && self.preferences.is_open {
+            self.preferences.is_open = false;
         }
 
         // Layout shortcuts F1..F6
