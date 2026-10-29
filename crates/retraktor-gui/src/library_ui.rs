@@ -378,29 +378,32 @@ impl LibraryManager {
 
     /// Scans a directory for audio files and adds them to the Track Collection.
     pub fn scan_directory_audio(&mut self, dir: &Path, recursive: bool) -> usize {
+        let mut queue = vec![(dir.to_path_buf(), 0usize)];
         let mut added = 0;
-        let Ok(rd) = fs::read_dir(dir) else {
-            return 0;
-        };
-
-        for entry in rd.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                if recursive {
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    if !name.starts_with('.') {
-                        added += self.scan_directory_audio(&path, true);
+        while let Some((curr_dir, depth)) = queue.pop() {
+            if depth > 8 || added >= 2000 {
+                break;
+            }
+            let Ok(rd) = fs::read_dir(&curr_dir) else {
+                continue;
+            };
+            for entry in rd.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    if recursive && depth < 8 {
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        if !name.starts_with('.') {
+                            queue.push((path, depth + 1));
+                        }
+                    }
+                } else if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+                    let ext_lower = ext.to_ascii_lowercase();
+                    if Self::is_supported_audio_ext(&ext_lower)
+                        && self.add_audio_file_to_collection(&path).is_some()
+                    {
+                        added += 1;
                     }
                 }
-                continue;
-            }
-            let ext = path
-                .extension()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            if Self::is_supported_audio_ext(&ext) && self.add_audio_file_to_collection(&path).is_some() {
-                added += 1;
             }
         }
         added
@@ -422,7 +425,7 @@ impl LibraryManager {
             .unwrap_or("Unknown Track");
 
         // Parse "Artist - Title" convention if present in filename
-        let (artist, title) = if let Some((a, t)) = stem.split_once(" - ") {
+        let (mut artist, mut title) = if let Some((a, t)) = stem.split_once(" - ") {
             (a.trim().to_string(), t.trim().to_string())
         } else {
             ("Local Audio".to_string(), stem.trim().to_string())
@@ -431,6 +434,46 @@ impl LibraryManager {
         let next_id = self.tracks.iter().map(|t| t.id).max().unwrap_or(0) + 1;
         let key_choices = ["4m", "5m", "3m", "4d", "6m", "2m", "1d", "8m"];
         let key = key_choices[next_id % key_choices.len()].to_string();
+        let mut dur_sec = 240.0;
+        let mut bpm = 124.0 + ((next_id % 7) * 2) as f64;
+
+        // Quick metadata probe via Symphonia without decoding PCM
+        if let Ok(file) = std::fs::File::open(path) {
+            let mss = symphonia::core::io::MediaSourceStream::new(Box::new(file), Default::default());
+            let mut hint = symphonia::core::probe::Hint::new();
+            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                hint.with_extension(ext);
+            }
+            if let Ok(mut probed) = symphonia::default::get_probe().format(
+                &hint,
+                mss,
+                &Default::default(),
+                &Default::default(),
+            ) {
+                if let Some(rev) = probed.format.metadata().current() {
+                    for tag in rev.tags() {
+                        let k = tag.key.to_ascii_lowercase();
+                        if (k == "title" || k == "tit2") && !tag.value.to_string().trim().is_empty() {
+                            title = tag.value.to_string();
+                        } else if (k == "artist" || k == "tpe1") && !tag.value.to_string().trim().is_empty() {
+                            artist = tag.value.to_string();
+                        } else if k == "bpm" || k == "tbpm" {
+                            if let Ok(b) = tag.value.to_string().trim().parse::<f64>() {
+                                if (40.0..=240.0).contains(&b) {
+                                    bpm = b;
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(t) = probed.format.default_track() {
+                    if let (Some(tb), Some(n_frames)) = (t.codec_params.time_base, t.codec_params.n_frames) {
+                        let time = tb.calc_time(n_frames);
+                        dur_sec = (time.seconds as f64 + time.frac).max(1.0);
+                    }
+                }
+            }
+        }
 
         let entry = UiTrackEntry {
             id: next_id,
@@ -442,9 +485,9 @@ impl LibraryManager {
                 .and_then(|s| s.to_str())
                 .unwrap_or("Local Folder")
                 .to_string(),
-            bpm: 128.00,
+            bpm,
             musical_key: key,
-            duration_sec: 240.0,
+            duration_sec: dur_sec,
             genre: path
                 .extension()
                 .and_then(|s| s.to_str())

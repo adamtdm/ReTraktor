@@ -33,7 +33,22 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-mod gui;
+fn launch_gui() -> Result<(), String> {
+    // Attempt to launch the native ReTraktor egui desktop binary
+    let current_exe = env::current_exe().unwrap_or_default();
+    let sibling_gui = current_exe.with_file_name("retraktor-gui");
+    let target = if sibling_gui.is_file() {
+        sibling_gui
+    } else {
+        std::path::PathBuf::from("retraktor-gui")
+    };
+
+    match Command::new(&target).status() {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(format!("Exited with code {status}")),
+        Err(e) => Err(format!("Could not spawn {}: {e}", target.display())),
+    }
+}
 
 fn log_trace(msg: &str) {
     if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open("/tmp/retraktor.log") {
@@ -50,7 +65,7 @@ fn main() {
     if args.len() < 2 || args[1] == "run" {
         log_trace("Launching ReTraktor default application");
         // Try native desktop GUI window first
-        if let Err(e) = gui::try_run_gui() {
+        if let Err(e) = launch_gui() {
             log_trace(&format!(
                 "GUI window unavailable ({e}), falling back to interactive terminal player"
             ));
@@ -61,7 +76,7 @@ fn main() {
 
     match args[1].as_str() {
         "gui" => {
-            if let Err(e) = gui::try_run_gui() {
+            if let Err(e) = launch_gui() {
                 eprintln!("Failed to launch GUI window: {e}");
                 process::exit(1);
             }

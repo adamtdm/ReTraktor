@@ -1,6 +1,6 @@
 use crate::audio::PEAKS_PER_SEC;
 use crate::theme::TraktorTheme;
-use eframe::egui::{self, Color32, Pos2, Rect, Response, Sense, Stroke, Ui, Vec2};
+use eframe::egui::{self, Color32, Pos2, Rect, Response, RichText, Sense, Stroke, Ui, Vec2};
 use std::f32::consts::PI;
 
 /// Custom Rotary Knob Widget (270° sweep, center detent, dB/percentage labels, mouse drag)
@@ -937,4 +937,187 @@ pub fn cue_pad(ui: &mut Ui, index: usize, has_cue: bool, active: bool, width: f3
     }
 
     response
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportAction {
+    TogglePlay,
+    Cue,
+    Cup,
+    ToggleFlux,
+    HalveLoop,
+    DoubleLoop,
+    SelectLoop(u32),
+}
+
+/// Accessible, high-contrast Traktor Pro 4 deck transport bar
+pub fn deck_transport_bar(
+    ui: &mut Ui,
+    is_playing: bool,
+    flux_active: bool,
+    loop_active: bool,
+    current_loop_beats: u32,
+) -> Option<TransportAction> {
+    let mut action = None;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing = Vec2::new(3.0, 0.0);
+
+        let play_color = if is_playing {
+            TraktorTheme::PLAY_ACTIVE
+        } else {
+            TraktorTheme::PLAY_INACTIVE
+        };
+        let play_text_color = if is_playing {
+            Color32::BLACK
+        } else {
+            TraktorTheme::TEXT_PRIMARY
+        };
+        if ui
+            .add(
+                egui::Button::new(
+                    RichText::new("▶")
+                        .color(play_text_color)
+                        .font(egui::FontId::proportional(12.0))
+                        .strong(),
+                )
+                .fill(play_color)
+                .stroke(Stroke::new(0.5_f32, TraktorTheme::BORDER_COLOR))
+                .min_size(Vec2::new(34.0, 22.0)),
+            )
+            .on_hover_text("Play / Pause Deck (Space)")
+            .clicked()
+        {
+            action = Some(TransportAction::TogglePlay);
+        }
+
+        if ui
+            .add(
+                egui::Button::new(
+                    RichText::new("CUE")
+                        .color(TraktorTheme::TEXT_PRIMARY)
+                        .font(egui::FontId::monospace(9.5))
+                        .strong(),
+                )
+                .fill(TraktorTheme::CUE_INACTIVE)
+                .stroke(Stroke::new(0.5_f32, TraktorTheme::BORDER_COLOR))
+                .min_size(Vec2::new(34.0, 22.0)),
+            )
+            .on_hover_text("Jump to Cue 1")
+            .clicked()
+        {
+            action = Some(TransportAction::Cue);
+        }
+
+        if ui
+            .add(
+                egui::Button::new(
+                    RichText::new("CUP")
+                        .color(TraktorTheme::TEXT_SECONDARY)
+                        .font(egui::FontId::monospace(9.0)),
+                )
+                .fill(TraktorTheme::CUE_INACTIVE)
+                .stroke(Stroke::new(0.5_f32, TraktorTheme::BORDER_COLOR))
+                .min_size(Vec2::new(32.0, 22.0)),
+            )
+            .on_hover_text("Cue Play (Jump to Cue 1 & Play)")
+            .clicked()
+        {
+            action = Some(TransportAction::Cup);
+        }
+
+        if ui
+            .add(
+                egui::Button::new(
+                    RichText::new("FLX")
+                        .color(if flux_active {
+                            Color32::BLACK
+                        } else {
+                            TraktorTheme::TEXT_SECONDARY
+                        })
+                        .font(egui::FontId::monospace(9.0))
+                        .strong(),
+                )
+                .fill(if flux_active {
+                    TraktorTheme::FLUX_ACTIVE
+                } else {
+                    TraktorTheme::CUE_INACTIVE
+                })
+                .stroke(Stroke::new(0.5_f32, TraktorTheme::BORDER_COLOR))
+                .min_size(Vec2::new(30.0, 22.0)),
+            )
+            .on_hover_text("Toggle Flux / Slip Mode")
+            .clicked()
+        {
+            action = Some(TransportAction::ToggleFlux);
+        }
+
+        ui.separator();
+
+        if ui
+            .add(
+                egui::Button::new(
+                    RichText::new("◄")
+                        .color(TraktorTheme::TEXT_SECONDARY)
+                        .font(egui::FontId::monospace(8.5)),
+                )
+                .fill(Color32::from_rgb(48, 51, 57))
+                .min_size(Vec2::new(18.0, 22.0)),
+            )
+            .on_hover_text("Halve Loop Size (/2)")
+            .clicked()
+        {
+            action = Some(TransportAction::HalveLoop);
+        }
+
+        for beats in [1u32, 2, 4, 8, 16] {
+            let is_selected_size = current_loop_beats == beats;
+            let is_active_loop = loop_active && is_selected_size;
+            let fill = if is_active_loop {
+                TraktorTheme::LOOP_ACTIVE
+            } else if is_selected_size {
+                Color32::from_rgb(64, 68, 76)
+            } else {
+                Color32::from_rgb(46, 49, 55)
+            };
+            let fg = if is_active_loop {
+                Color32::BLACK
+            } else if is_selected_size {
+                TraktorTheme::LOOP_ACTIVE
+            } else {
+                TraktorTheme::TEXT_SECONDARY
+            };
+            if ui
+                .add(
+                    egui::Button::new(
+                        RichText::new(format!("{beats}"))
+                            .color(fg)
+                            .font(egui::FontId::monospace(9.0))
+                            .strong(),
+                    )
+                    .fill(fill)
+                    .min_size(Vec2::new(20.0, 22.0)),
+                )
+                .clicked()
+            {
+                action = Some(TransportAction::SelectLoop(beats));
+            }
+        }
+
+        if ui
+            .add(
+                egui::Button::new(
+                    RichText::new("►")
+                        .color(TraktorTheme::TEXT_SECONDARY)
+                        .font(egui::FontId::monospace(8.5)),
+                )
+                .fill(Color32::from_rgb(48, 51, 57))
+                .min_size(Vec2::new(18.0, 22.0)),
+            )
+            .on_hover_text("Double Loop Size (*2)")
+            .clicked()
+        {
+            action = Some(TransportAction::DoubleLoop);
+        }
+    });
+    action
 }

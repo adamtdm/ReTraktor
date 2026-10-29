@@ -3,8 +3,8 @@ use crate::library_ui::{LibraryManager, UiTrackEntry};
 use crate::preferences::{PreferencesDialog, PrefsTab};
 use crate::theme::TraktorTheme;
 use crate::widgets::{
-    crossfader, cue_pad, rotary_knob_sized, scrolling_stem_waveforms, scrolling_waveform,
-    stripe_overview, vertical_fader, vu_meter,
+    crossfader, cue_pad, deck_transport_bar, rotary_knob_sized, scrolling_stem_waveforms, scrolling_waveform,
+    stripe_overview, vertical_fader, vu_meter, TransportAction,
 };
 use eframe::egui::{self, Align, Color32, Key, Layout, RichText, Stroke, Ui, Vec2};
 use retraktor_core::{PropValue, PropertyBus, SurfaceEvent};
@@ -18,6 +18,7 @@ use std::env;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::thread;
 
 /// Traktor Pro 4 + Next-Gen Workspace Layouts (switchable from Top Header or F1..F6)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -175,7 +176,7 @@ impl Default for ReTraktorApp {
         Self {
             audio: AudioSystem::new(),
             library: LibraryManager::default(),
-            preferences: PreferencesDialog::default(),
+            preferences: PreferencesDialog::load(),
             demucs: crate::demucs::DemucsManager::new(),
             bus,
             layout: TraktorLayout::Parallel, // Default to Parallel layout!
@@ -403,17 +404,25 @@ impl eframe::App for ReTraktorApp {
                     t.stems_ready = true;
                     self.library.status_message = format!("✓ AI Demucs separated 4 stems for '{}'!", t.title);
                 }
-                // Reload stems in any active deck currently playing this track
+                // Reload stems asynchronously without stalling audio or UI
                 if let Some(track) = self.library.tracks.iter().find(|t| t.id == track_id) {
-                    if let Ok(mut state) = self.audio.shared.lock() {
-                        for d in 0..4 {
-                            if let Some(ref mut loaded) = state.loaded_tracks[d] {
-                                if loaded.title == track.title && loaded.artist == track.artist {
-                                    let _ = loaded.load_stems_from_dir(&stem_dir);
-                                    self.deck_stem_view[d] = true;
+                    let track_title = track.title.clone();
+                    let track_artist = track.artist.clone();
+                    let shared_audio = self.audio.shared.clone();
+                    let stem_dir_buf = stem_dir.clone();
+                    thread::spawn(move || {
+                        if let Ok(mut state) = shared_audio.lock() {
+                            for d in 0..4 {
+                                if let Some(ref mut loaded) = state.loaded_tracks[d] {
+                                    if loaded.title == track_title && loaded.artist == track_artist {
+                                        let _ = loaded.load_stems_from_dir(&stem_dir_buf);
+                                    }
                                 }
                             }
                         }
+                    });
+                    for d in 0..4 {
+                        self.deck_stem_view[d] = true;
                     }
                 }
                 *self.demucs.separation_status.lock().unwrap() = crate::demucs::DemucsSeparationStatus::Idle;
@@ -1099,6 +1108,7 @@ impl ReTraktorApp {
         }
 
         if ctx.input(|i| i.key_pressed(Key::Escape)) && self.preferences.is_open {
+            self.preferences.save();
             self.preferences.is_open = false;
         }
 
@@ -1533,7 +1543,7 @@ impl ReTraktorApp {
                                     samples_to_save =
                                         Some(std::mem::take(&mut state.recorded_samples));
                                 } else {
-                                    state.recorded_samples.clear();
+                                    state.recorded_samples = Vec::with_capacity(48_000 * 2 * 1800);
                                     state.is_recording = true;
                                 }
                             }
@@ -2676,149 +2686,32 @@ impl ReTraktorApp {
                 // 4. Authentic Traktor Pro 4 Transport & Loop Selector Row:
                 //    Left: [▶] [CUE] [CUP] [FLX]   |   Right: [<] [1] [2] [4] [8] [16] [>] + Pitch Slider
                 ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing = Vec2::new(3.0, 0.0);
-
-                    let play_color = if is_playing {
-                        TraktorTheme::PLAY_ACTIVE
-                    } else {
-                        TraktorTheme::PLAY_INACTIVE
-                    };
-                    let play_text_color = if is_playing {
-                        Color32::BLACK
-                    } else {
-                        TraktorTheme::TEXT_PRIMARY
-                    };
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                RichText::new("▶")
-                                    .color(play_text_color)
-                                    .font(egui::FontId::proportional(12.0))
-                                    .strong(),
-                            )
-                            .fill(play_color)
-                            .stroke(Stroke::new(0.5_f32, TraktorTheme::BORDER_COLOR))
-                            .min_size(Vec2::new(34.0, 20.0)),
-                        )
-                        .on_hover_text("Play / Pause Deck")
-                        .clicked()
-                    {
-                        self.toggle_play(deck_idx);
-                    }
-
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                RichText::new("CUE")
-                                    .color(TraktorTheme::TEXT_PRIMARY)
-                                    .font(egui::FontId::monospace(9.5))
-                                    .strong(),
-                            )
-                            .fill(TraktorTheme::CUE_INACTIVE)
-                            .stroke(Stroke::new(0.5_f32, TraktorTheme::BORDER_COLOR))
-                            .min_size(Vec2::new(34.0, 20.0)),
-                        )
-                        .clicked()
-                    {
-                        self.jump_to_cue(deck_idx, 1);
-                    }
-
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                RichText::new("CUP")
-                                    .color(TraktorTheme::TEXT_SECONDARY)
-                                    .font(egui::FontId::monospace(9.0)),
-                            )
-                            .fill(TraktorTheme::CUE_INACTIVE)
-                            .stroke(Stroke::new(0.5_f32, TraktorTheme::BORDER_COLOR))
-                            .min_size(Vec2::new(32.0, 20.0)),
-                        )
-                        .on_hover_text("Cue Play (Jump to Cue 1 & Play)")
-                        .clicked()
-                    {
-                        self.jump_to_cue(deck_idx, 1);
-                        if let Ok(mut state) = self.audio.shared.lock() {
-                            state.is_playing[d] = true;
+                    if let Some(action) = deck_transport_bar(
+                        ui,
+                        is_playing,
+                        self.deck_flux_active[d],
+                        self.deck_loop_active[d],
+                        self.deck_loop_size_beats[d],
+                    ) {
+                    match action {
+                        TransportAction::TogglePlay => self.toggle_play(deck_idx),
+                        TransportAction::Cue => self.jump_to_cue(deck_idx, 1),
+                        TransportAction::Cup => {
+                            self.jump_to_cue(deck_idx, 1);
+                            if let Ok(mut state) = self.audio.shared.lock() {
+                                state.is_playing[d] = true;
+                            }
                         }
-                    }
-
-                    let flux_active = self.deck_flux_active[d];
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                RichText::new("FLX")
-                                    .color(if flux_active {
-                                        Color32::BLACK
-                                    } else {
-                                        TraktorTheme::TEXT_SECONDARY
-                                    })
-                                    .font(egui::FontId::monospace(9.0))
-                                    .strong(),
-                            )
-                            .fill(if flux_active {
-                                TraktorTheme::FLUX_ACTIVE
-                            } else {
-                                TraktorTheme::CUE_INACTIVE
-                            })
-                            .stroke(Stroke::new(0.5_f32, TraktorTheme::BORDER_COLOR))
-                            .min_size(Vec2::new(30.0, 20.0)),
-                        )
-                        .on_hover_text("Toggle Flux / Slip Mode")
-                        .clicked()
-                    {
-                        self.deck_flux_active[d] = !self.deck_flux_active[d];
-                    }
-
-                    ui.separator();
-
-                    // Traktor Loop Bar: [<] [1] [2] [4] [8] [16] [>]
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                RichText::new("◄")
-                                    .color(TraktorTheme::TEXT_SECONDARY)
-                                    .font(egui::FontId::monospace(8.5)),
-                            )
-                            .fill(Color32::from_rgb(48, 51, 57))
-                            .min_size(Vec2::new(18.0, 20.0)),
-                        )
-                        .on_hover_text("Halve Loop Size (/2)")
-                        .clicked()
-                    {
-                        self.deck_loop_size_beats[d] = (self.deck_loop_size_beats[d] / 2).max(1);
-                    }
-
-                    for beats in [1u32, 2, 4, 8, 16] {
-                        let is_selected_size = self.deck_loop_size_beats[d] == beats;
-                        let is_active_loop = self.deck_loop_active[d] && is_selected_size;
-                        let fill = if is_active_loop {
-                            TraktorTheme::LOOP_ACTIVE
-                        } else if is_selected_size {
-                            Color32::from_rgb(64, 68, 76)
-                        } else {
-                            Color32::from_rgb(46, 49, 55)
-                        };
-                        let fg = if is_active_loop {
-                            Color32::BLACK
-                        } else if is_selected_size {
-                            TraktorTheme::LOOP_ACTIVE
-                        } else {
-                            TraktorTheme::TEXT_SECONDARY
-                        };
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new(format!("{beats}"))
-                                        .color(fg)
-                                        .font(egui::FontId::monospace(9.0))
-                                        .strong(),
-                                )
-                                .fill(fill)
-                                .min_size(Vec2::new(20.0, 20.0)),
-                            )
-                            .clicked()
-                        {
+                        TransportAction::ToggleFlux => {
+                            self.deck_flux_active[d] = !self.deck_flux_active[d];
+                        }
+                        TransportAction::HalveLoop => {
+                            self.deck_loop_size_beats[d] = (self.deck_loop_size_beats[d] / 2).max(1);
+                        }
+                        TransportAction::DoubleLoop => {
+                            self.deck_loop_size_beats[d] = (self.deck_loop_size_beats[d] * 2).min(32);
+                        }
+                        TransportAction::SelectLoop(beats) => {
                             if self.deck_loop_size_beats[d] == beats {
                                 self.toggle_loop(deck_idx);
                             } else {
@@ -2829,22 +2722,7 @@ impl ReTraktorApp {
                             }
                         }
                     }
-
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                RichText::new("►")
-                                    .color(TraktorTheme::TEXT_SECONDARY)
-                                    .font(egui::FontId::monospace(8.5)),
-                            )
-                            .fill(Color32::from_rgb(48, 51, 57))
-                            .min_size(Vec2::new(18.0, 20.0)),
-                        )
-                        .on_hover_text("Double Loop Size (x2)")
-                        .clicked()
-                    {
-                        self.deck_loop_size_beats[d] = (self.deck_loop_size_beats[d] * 2).min(32);
-                    }
+                }
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui
@@ -3299,58 +3177,61 @@ impl ReTraktorApp {
                         four_deck_mode,
                         move |deck_idx, track: &UiTrackEntry| {
                             let d = (deck_idx - 1).min(3);
-                            // If track has a real audio file on disk, decode it with Symphonia!
-                            let loaded = if let Some(ref path) = track.file_path {
-                                if path.is_file() {
-                                    LoadedTrackAudio::from_file(
-                                        path,
-                                        &track.title,
-                                        &track.artist,
-                                        track.bpm,
-                                        &track.musical_key,
-                                    )
-                                    .unwrap_or_else(|_| {
-                                        let style = if track.bpm >= 130.0 { 1 } else { 0 };
+                            let track_entry = track.clone();
+                            let shared_audio = shared_audio.clone();
+                            thread::spawn(move || {
+                                let loaded = if let Some(ref path) = track_entry.file_path {
+                                    if path.is_file() {
+                                        LoadedTrackAudio::from_file(
+                                            path,
+                                            &track_entry.title,
+                                            &track_entry.artist,
+                                            track_entry.bpm,
+                                            &track_entry.musical_key,
+                                        )
+                                        .unwrap_or_else(|_| {
+                                            let style = if track_entry.bpm >= 130.0 { 1 } else { 0 };
+                                            LoadedTrackAudio::new_synthetic(
+                                                &track_entry.title,
+                                                &track_entry.artist,
+                                                track_entry.bpm,
+                                                &track_entry.musical_key,
+                                                track_entry.duration_sec,
+                                                style,
+                                            )
+                                        })
+                                    } else {
+                                        let style = if track_entry.bpm >= 130.0 { 1 } else { 0 };
                                         LoadedTrackAudio::new_synthetic(
-                                            &track.title,
-                                            &track.artist,
-                                            track.bpm,
-                                            &track.musical_key,
-                                            track.duration_sec,
+                                            &track_entry.title,
+                                            &track_entry.artist,
+                                            track_entry.bpm,
+                                            &track_entry.musical_key,
+                                            track_entry.duration_sec,
                                             style,
                                         )
-                                    })
+                                    }
                                 } else {
-                                    let style = if track.bpm >= 130.0 { 1 } else { 0 };
+                                    let style = match track_entry.id % 3 {
+                                        1 => 0,
+                                        2 => 1,
+                                        _ => 2,
+                                    };
                                     LoadedTrackAudio::new_synthetic(
-                                        &track.title,
-                                        &track.artist,
-                                        track.bpm,
-                                        &track.musical_key,
-                                        track.duration_sec,
+                                        &track_entry.title,
+                                        &track_entry.artist,
+                                        track_entry.bpm,
+                                        &track_entry.musical_key,
+                                        track_entry.duration_sec,
                                         style,
                                     )
-                                }
-                            } else {
-                                let style = match track.id % 3 {
-                                    1 => 0,
-                                    2 => 1,
-                                    _ => 2,
                                 };
-                                LoadedTrackAudio::new_synthetic(
-                                    &track.title,
-                                    &track.artist,
-                                    track.bpm,
-                                    &track.musical_key,
-                                    track.duration_sec,
-                                    style,
-                                )
-                            };
 
-                            if let Ok(mut state) = shared_audio.lock() {
-                                state.loaded_tracks[d] = Some(loaded);
-                                state.playhead_sec[d] = 0.0;
-                            }
+                                if let Ok(mut state) = shared_audio.lock() {
+                                    state.loaded_tracks[d] = Some(loaded);
+                                    state.playhead_sec[d] = 0.0;
+                                }
+                            });
                         },
                     );
 

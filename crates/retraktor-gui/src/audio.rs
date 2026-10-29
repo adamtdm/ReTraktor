@@ -1055,9 +1055,22 @@ impl AudioSystem {
         let dt = 1.0 / (sr as f64).max(1.0);
         let block_dt = (frames as f64) / (sr as f64).max(1.0);
 
-        let mut state = match shared.lock() {
-            Ok(s) => s,
-            Err(_) => return,
+        let mut state_opt = shared.try_lock().ok();
+        if state_opt.is_none() {
+            for _ in 0..100 {
+                std::hint::spin_loop();
+                if let Ok(s) = shared.try_lock() {
+                    state_opt = Some(s);
+                    break;
+                }
+            }
+        }
+        let mut state = match state_opt {
+            Some(s) => s,
+            None => {
+                output.fill(0.0);
+                return;
+            }
         };
         state.recording_sample_rate = sr;
 
@@ -1301,7 +1314,7 @@ impl AudioSystem {
             ml = (ml + pat_sample).clamp(-1.0, 1.0);
             mr = (mr + pat_sample).clamp(-1.0, 1.0);
 
-            if state.is_recording && state.recorded_samples.len() < (sr as usize) * 2 * 3600 {
+            if state.is_recording && state.recorded_samples.capacity() >= state.recorded_samples.len() + 2 {
                 state
                     .recorded_samples
                     .push((ml.clamp(-1.0, 1.0) * 32767.0) as i16);
@@ -1332,11 +1345,19 @@ impl AudioSystem {
         channels: usize,
         sr: u32,
     ) {
-        let mut float_buf = vec![0.0_f32; output.len()];
-        Self::render_audio_f32(shared, &mut float_buf, channels, sr);
-        for (i, &f) in float_buf.iter().enumerate() {
-            output[i] = (f.clamp(-1.0, 1.0) * 32767.0) as i16;
+        thread_local! {
+            static I16_FLOAT_SCRATCH: std::cell::RefCell<Vec<f32>> = std::cell::RefCell::new(Vec::with_capacity(4096));
         }
+        I16_FLOAT_SCRATCH.with(|cell| {
+            let mut float_buf = cell.borrow_mut();
+            if float_buf.len() != output.len() {
+                float_buf.resize(output.len(), 0.0);
+            }
+            Self::render_audio_f32(shared, &mut float_buf, channels, sr);
+            for (i, &f) in float_buf.iter().enumerate() {
+                output[i] = (f.clamp(-1.0, 1.0) * 32767.0) as i16;
+            }
+        });
     }
 }
 
@@ -1386,5 +1407,33 @@ mod tests {
         let (l, r) = sample_stereo_hermite(&pcm, 2.5);
         assert!((l - 5.0).abs() < 1e-4);
         assert!((r - 5.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_waveform_and_stem_peak_crossover_bounds() {
+        let silence = vec![0.0_f32; 48000 * 2];
+        let (wf_peaks, stem_peaks) = LoadedTrackAudio::compute_waveform_peaks(&silence, 48000);
+        assert!(!wf_peaks.is_empty());
+        assert!(!stem_peaks.is_empty());
+        for p in &wf_peaks {
+            assert!(p[0] >= 0.0 && p[0] <= 1.0 && !p[0].is_nan());
+            assert!(p[1] >= 0.0 && p[1] <= 1.0 && !p[1].is_nan());
+            assert!(p[2] >= 0.0 && p[2] <= 1.0 && !p[2].is_nan());
+        }
+        for s in &stem_peaks {
+            for &val in s {
+                assert!(val >= 0.0 && val <= 1.0 && !val.is_nan());
+            }
+        }
+
+        let square: Vec<f32> = (0..96000)
+            .map(|i| if (i / 100) % 2 == 0 { 1.0 } else { -1.0 })
+            .collect();
+        let (wf_peaks_sq, stem_peaks_sq) = LoadedTrackAudio::compute_waveform_peaks(&square, 48000);
+        assert!(!wf_peaks_sq.is_empty());
+        assert!(!stem_peaks_sq.is_empty());
+        for p in &wf_peaks_sq {
+            assert!(p[0] <= 1.0 && p[1] <= 1.0 && p[2] <= 1.0);
+        }
     }
 }

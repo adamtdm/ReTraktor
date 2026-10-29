@@ -503,7 +503,7 @@ impl DemucsManager {
                 cache_root.to_str().unwrap_or("/tmp"),
             ]);
             cmd.arg(&audio_path_buf);
-            cmd.stdout(Stdio::piped());
+            cmd.stdout(Stdio::null());
             cmd.stderr(Stdio::piped());
 
             let mut child = match cmd.spawn() {

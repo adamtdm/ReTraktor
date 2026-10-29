@@ -234,6 +234,110 @@ impl Default for PreferencesDialog {
 }
 
 impl PreferencesDialog {
+    /// Returns the standard path for user preferences (`~/.config/retraktor/preferences.json`).
+    pub fn config_path() -> std::path::PathBuf {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        std::path::PathBuf::from(home).join(".config/retraktor/preferences.json")
+    }
+
+    /// Loads persisted user preferences from disk, falling back to defaults if not found.
+    pub fn load() -> Self {
+        let mut prefs = Self::default();
+        let path = Self::config_path();
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            prefs.apply_json_str(&content);
+        }
+        prefs
+    }
+
+    /// Saves user preferences to disk.
+    pub fn save(&self) {
+        let path = Self::config_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let json = self.to_json_str();
+        let _ = std::fs::write(&path, json);
+    }
+
+    pub fn to_json_str(&self) -> String {
+        let folders_json = self
+            .music_folders
+            .iter()
+            .map(|f| format!("\"{}\"", f.display()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "{{\n  \"sample_rate\": {},\n  \"buffer_size\": {},\n  \"audio_device_name\": \"{}\",\n  \"four_deck_mode\": {},\n  \"waveform_color_mode\": {},\n  \"eq_model_idx\": {},\n  \"filter_model_idx\": {},\n  \"filter_resonance\": {},\n  \"xfader_curve_idx\": {},\n  \"autogain\": {},\n  \"limiter_enabled\": {},\n  \"scan_on_startup\": {},\n  \"analyze_new_tracks\": {},\n  \"key_notation_idx\": {},\n  \"music_folders\": [{}]\n}}",
+            self.sample_rate,
+            self.buffer_size,
+            self.audio_device_name.replace('"', "\\\""),
+            self.four_deck_mode,
+            self.waveform_color_mode,
+            self.eq_model_idx,
+            self.filter_model_idx,
+            self.filter_resonance,
+            self.xfader_curve_idx,
+            self.autogain,
+            self.limiter_enabled,
+            self.scan_on_startup,
+            self.analyze_new_tracks,
+            self.key_notation_idx,
+            folders_json,
+        )
+    }
+
+    pub fn apply_json_str(&mut self, text: &str) {
+        for line in text.lines() {
+            let trimmed = line.trim().trim_end_matches(',');
+            if let Some((k, v)) = trimmed.split_once(':') {
+                let key = k.trim().trim_matches('"');
+                let val = v.trim().trim_matches('"');
+                match key {
+                    "sample_rate" => if let Ok(n) = val.parse() { self.sample_rate = n; },
+                    "buffer_size" => if let Ok(n) = val.parse() { self.buffer_size = n; },
+                    "audio_device_name" => self.audio_device_name = val.to_string(),
+                    "four_deck_mode" => self.four_deck_mode = val == "true",
+                    "waveform_color_mode" => if let Ok(n) = val.parse() { self.waveform_color_mode = n; },
+                    "eq_model_idx" => if let Ok(n) = val.parse() { self.eq_model_idx = n; },
+                    "filter_model_idx" => if let Ok(n) = val.parse() { self.filter_model_idx = n; },
+                    "filter_resonance" => if let Ok(n) = val.parse() { self.filter_resonance = n; },
+                    "xfader_curve_idx" => if let Ok(n) = val.parse() { self.xfader_curve_idx = n; },
+                    "autogain" => self.autogain = val == "true",
+                    "limiter_enabled" => self.limiter_enabled = val == "true",
+                    "scan_on_startup" => self.scan_on_startup = val == "true",
+                    "analyze_new_tracks" => self.analyze_new_tracks = val == "true",
+                    "key_notation_idx" => if let Ok(n) = val.parse() { self.key_notation_idx = n; },
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// Renders an accessible, high-contrast settings card container with consistent border and padding.
+    pub fn render_card<R>(
+        ui: &mut Ui,
+        title: &str,
+        description: &str,
+        content: impl FnOnce(&mut Ui) -> R,
+    ) -> R {
+        egui::Frame::none()
+            .fill(TraktorTheme::BG_PANEL_ALT)
+            .stroke(Stroke::new(1.0_f32, TraktorTheme::BORDER_COLOR))
+            .rounding(4.0)
+            .inner_margin(12.0)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(title).strong().color(TraktorTheme::TEXT_PRIMARY));
+                    if !description.is_empty() {
+                        ui.label(RichText::new(format!("— {description}")).size(12.0).color(TraktorTheme::TEXT_MUTED));
+                    }
+                });
+                ui.add_space(8.0);
+                content(ui)
+            })
+            .inner
+    }
     pub fn get_tab_breadcrumb(&self, tab: PrefsTab) -> (&'static str, &'static str) {
         match tab {
             PrefsTab::AudioSetup => ("AUDIO & ROUTING", "Audio Setup"),
@@ -374,6 +478,7 @@ impl PreferencesDialog {
                                 .on_hover_text("Return to Decks and Performance View (Esc)")
                                 .clicked()
                             {
+                                self.save();
                                 self.is_open = false;
                             }
 
@@ -2052,5 +2157,23 @@ mod tests {
         assert_eq!(prefs.sample_rate, 48000);
         assert_eq!(prefs.mixing_mode, 0);
         assert_eq!(prefs.limiter_headroom, 1);
+    }
+
+    #[test]
+    fn test_preferences_persistence_roundtrip() {
+        let mut original = PreferencesDialog::default();
+        original.sample_rate = 96000;
+        original.buffer_size = 256;
+        original.four_deck_mode = true;
+        original.audio_device_name = "Focusrite Scarlett 4i4".to_string();
+
+        let json = original.to_json_str();
+        let mut restored = PreferencesDialog::default();
+        restored.apply_json_str(&json);
+
+        assert_eq!(restored.sample_rate, 96000);
+        assert_eq!(restored.buffer_size, 256);
+        assert!(restored.four_deck_mode);
+        assert_eq!(restored.audio_device_name, "Focusrite Scarlett 4i4");
     }
 }
