@@ -98,6 +98,8 @@ pub struct LibraryManager {
     pub show_match_radar: bool,
     pub open_prefs_requested: bool,
     pub open_prefs_file_management: bool,
+    pub stem_job_progress: Option<(usize, f32)>,
+    pub request_stem_separation: Option<usize>,
     pub status_message: String,
 }
 
@@ -138,6 +140,8 @@ impl Default for LibraryManager {
             show_match_radar: false,
             open_prefs_requested: false,
             open_prefs_file_management: false,
+            stem_job_progress: None,
+            request_stem_separation: None,
             status_message: "Ready — Click [A] or [B] to load a track, or [✦ Stems] to separate into 4 stems.".to_string(),
         };
         mgr.populate_default_collection();
@@ -1904,7 +1908,20 @@ impl LibraryManager {
                                         });
 
                                         // Col 6: Stems Status / Create Action
-                                        if track.stems_ready {
+                                        let is_separating = self.stem_job_progress.map(|(id, _)| id == track.id).unwrap_or(false);
+                                        if is_separating {
+                                            let pct = self.stem_job_progress.unwrap().1 * 100.0;
+                                            ui.add(
+                                                egui::Button::new(
+                                                    RichText::new(format!("● AI {:.0}%", pct))
+                                                        .color(Color32::from_rgb(255, 175, 45))
+                                                        .font(egui::FontId::monospace(9.5))
+                                                        .strong(),
+                                                )
+                                                .fill(Color32::from_rgb(48, 36, 16))
+                                                .stroke(Stroke::new(0.8_f32, Color32::from_rgb(255, 175, 45))),
+                                            ).on_hover_text("AI Demucs separation in progress in background...");
+                                        } else if track.stems_ready {
                                             let stem_resp = ui.add(
                                                 egui::Button::new(
                                                     RichText::new("✦ STEMS")
@@ -2208,11 +2225,11 @@ impl LibraryManager {
             });
 
             if let Some(track_id) = create_stems_cmd {
+                self.request_stem_separation = Some(track_id);
                 if let Some(t) = self.tracks.iter_mut().find(|t| t.id == track_id) {
-                    t.stems_ready = true;
                     self.last_stemmed_track_id = Some(track_id);
                     self.status_message = format!(
-                        "✓ Generated 4-Stem separation (Drums, Bass, Other, Vocals) for '{}'!",
+                        "Queued 4-Stem separation (Drums, Bass, Other, Vocals) for '{}'...",
                         t.title
                     );
                 }

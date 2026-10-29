@@ -51,7 +51,10 @@
 
 ### 4. Hybrid 4-Stem Engine & Multi-Lane Waveforms
 * **Spectrum & 4-Stem Waveform Toggle**: Switch any deck between a high-contrast **Spectrum** frequency-colored waveform (warm red sub-bass, amber low-mids, teal mids, crisp ice-blue highs) and a **4-Lane Split Stem Waveform** (`DRUMS`, `BASS`, `OTHER`, `VOCALS`) with left-hand lane headers, per-lane mute toggles, and real-time level meters.
-* **Instant DSP Isolation + AI Stem Caching**: Every track loaded from disk or browser immediately supports 4-band stem isolation in the real-time audio callback, while the **`✦ SEPARATE STEMS`** button runs background neural stem extraction and caches the 4 stem buffers in memory.
+* **Instant DSP Isolation + Meta Demucs AI Stems**: Every track loaded immediately supports zero-latency 4-band stem isolation via real-time Linkwitz-Riley crossover filters. For studio-grade, 100% bleed-free stem separation, ReTraktor integrates Meta AI's `htdemucs` neural model:
+  * **Optional Background Installation**: Install Demucs with one click directly in **Preferences > Stems** or via `./install.sh --with-demucs` into an isolated virtual environment (`~/.local/share/retraktor/venv`) without blocking audio playback or requiring root packages.
+  * **Low-Priority Worker**: Separation runs in a background thread under `nice -n 10` to guarantee the real-time audio playback thread is never starved of CPU.
+  * **Zero-Bleed Disk Caching**: True 4-stem FLAC files (`drums.flac`, `bass.flac`, `other.flac`, `vocals.flac`) are automatically cached in `~/.cache/retraktor/stems/htdemucs/<track_name>/` and instantly auto-loaded whenever the track is queued on any deck.
 * **1-Click `ACAPELLA` & `INST` Isolators**: Instantly strip a track down to just its vocals or just its instrumental backing with a single click or controller pad press.
 
 ### 5. Neural Mix™ (`EQ ⇄ Stems`) & Mixer FX

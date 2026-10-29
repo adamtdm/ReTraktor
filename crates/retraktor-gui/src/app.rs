@@ -73,6 +73,7 @@ pub struct ReTraktorApp {
     pub audio: AudioSystem,
     pub library: LibraryManager,
     pub preferences: PreferencesDialog,
+    pub demucs: crate::demucs::DemucsManager,
     pub bus: PropertyBus,
     pub layout: TraktorLayout,
 
@@ -175,6 +176,7 @@ impl Default for ReTraktorApp {
             audio: AudioSystem::new(),
             library: LibraryManager::default(),
             preferences: PreferencesDialog::default(),
+            demucs: crate::demucs::DemucsManager::new(),
             bus,
             layout: TraktorLayout::Parallel, // Default to Parallel layout!
             channel_gain: [0.5, 0.5, 0.5, 0.5],
@@ -373,6 +375,83 @@ impl eframe::App for ReTraktorApp {
         self.deck_turntable_mode[0] = self.preferences.jog_mode_turntable;
         self.deck_turntable_mode[1] = self.preferences.jog_mode_turntable;
         self.custom_mappings = self.preferences.custom_control_action.clone();
+
+        // Demucs background installer & separation worker synchronization
+        self.preferences.demucs_install_state = self.demucs.get_install_state();
+        if self.preferences.trigger_demucs_install {
+            self.preferences.trigger_demucs_install = false;
+            self.demucs.start_background_install();
+        }
+
+        // Poll Demucs background stem separation worker
+        let (sep_status, active_desc) = self.demucs.poll_separation();
+        self.preferences.demucs_active_separation = active_desc;
+
+        match sep_status {
+            crate::demucs::DemucsSeparationStatus::Running { track_id, percent, .. } => {
+                self.library.stem_job_progress = Some((track_id, percent));
+            }
+            crate::demucs::DemucsSeparationStatus::Completed { track_id, stem_dir } => {
+                self.library.stem_job_progress = None;
+                if let Some(t) = self.library.tracks.iter_mut().find(|t| t.id == track_id) {
+                    t.stems_ready = true;
+                    self.library.status_message = format!("✓ AI Demucs separated 4 stems for '{}'!", t.title);
+                }
+                // Reload stems in any active deck currently playing this track
+                if let Some(track) = self.library.tracks.iter().find(|t| t.id == track_id) {
+                    if let Ok(mut state) = self.audio.shared.lock() {
+                        for d in 0..4 {
+                            if let Some(ref mut loaded) = state.loaded_tracks[d] {
+                                if loaded.title == track.title && loaded.artist == track.artist {
+                                    let _ = loaded.load_stems_from_dir(&stem_dir);
+                                    self.deck_stem_view[d] = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                *self.demucs.separation_status.lock().unwrap() = crate::demucs::DemucsSeparationStatus::Idle;
+            }
+            crate::demucs::DemucsSeparationStatus::Failed { track_id: _, error } => {
+                self.library.stem_job_progress = None;
+                self.library.status_message = format!("⚠ Stem separation failed: {error}");
+                *self.demucs.separation_status.lock().unwrap() = crate::demucs::DemucsSeparationStatus::Idle;
+            }
+            crate::demucs::DemucsSeparationStatus::Idle => {}
+        }
+
+        // Handle user request to separate stems for a track
+        if let Some(track_id) = self.library.request_stem_separation.take() {
+            if let Some(track) = self.library.tracks.iter().find(|t| t.id == track_id).cloned() {
+                if let Some(ref file_path) = track.file_path {
+                    if self.demucs.is_installed() {
+                        let started = self.demucs.start_separation(track.id, &track.title, file_path);
+                        if started {
+                            self.library.status_message = format!("Queued Meta Demucs AI 4-stem separation for '{}'...", track.title);
+                        } else {
+                            self.library.status_message = format!("Could not start Demucs separation for '{}'.", track.title);
+                        }
+                    } else {
+                        // Demucs not installed: mark stems ready using real-time DSP crossover filter and inform user
+                        if let Some(t) = self.library.tracks.iter_mut().find(|t| t.id == track_id) {
+                            t.stems_ready = true;
+                        }
+                        self.library.last_stemmed_track_id = Some(track_id);
+                        self.library.status_message = format!(
+                            "✦ Real-time crossover stems enabled for '{}'. (Install Demucs in Preferences > Stems for true AI isolation)",
+                            track.title
+                        );
+                    }
+                } else {
+                    // Synthetic track: zero bleed synthesized stems are already loaded in memory
+                    if let Some(t) = self.library.tracks.iter_mut().find(|t| t.id == track_id) {
+                        t.stems_ready = true;
+                    }
+                    self.library.last_stemmed_track_id = Some(track_id);
+                    self.library.status_message = format!("✓ 4 isolated stem streams ready for '{}'", track.title);
+                }
+            }
+        }
 
         // Preferences Dialog
         self.preferences.show(ctx);

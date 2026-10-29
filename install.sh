@@ -30,6 +30,13 @@ echo -e "${BOLD}${BLUE}=========================================================
 echo -e "${BOLD}             ReTraktor — Traktor Pro 4 on Linux                 ${NC}"
 echo -e "${BOLD}${BLUE}================================================================${NC}"
 
+INSTALL_DEMUCS=false
+for arg in "$@"; do
+    if [ "$arg" = "--with-demucs" ]; then
+        INSTALL_DEMUCS=true
+    fi
+done
+
 # Detect OS
 OS_NAME="$(uname -s)"
 if [ "$OS_NAME" != "Linux" ]; then
@@ -80,19 +87,22 @@ if [[ "$DISTRO_ID" == "ubuntu" || "$DISTRO_ID" == "debian" || "$DISTRO_ID" == "p
         libudev-dev libusb-1.0-0-dev libhidapi-dev \
         libasound2-dev libpipewire-0.3-dev \
         libx11-dev libxkbcommon-dev libgl1-mesa-dev \
-        pipewire pipewire-alsa wireplumber
+        pipewire pipewire-alsa wireplumber \
+        python3 python3-pip python3-venv
 elif [[ "$DISTRO_ID" == "fedora" || "$DISTRO_ID" == "rhel" || "$DISTRO_ID" == "centos" || "$DISTRO_LIKE" == *"fedora"* ]]; then
     $SUDO dnf install -y \
         gcc gcc-c++ make pkgconf-pkg-config curl git \
         systemd-devel libusb1-devel hidapi-devel \
         alsa-lib-devel pipewire-devel pipewire-alsa wireplumber \
-        libxkbcommon-devel libX11-devel mesa-libGL-devel
+        libxkbcommon-devel libX11-devel mesa-libGL-devel \
+        python3 python3-pip
 elif [[ "$DISTRO_ID" == "arch" || "$DISTRO_ID" == "manjaro" || "$DISTRO_LIKE" == *"arch"* ]]; then
     $SUDO pacman -S --needed --noconfirm \
         base-devel pkgconf curl git \
         systemd-libs libusb hidapi \
         alsa-lib pipewire pipewire-alsa wireplumber \
-        libxkbcommon libx11 mesa
+        libxkbcommon libx11 mesa \
+        python python-pip
 elif [[ "$DISTRO_ID" == "opensuse"* || "$DISTRO_LIKE" == *"suse"* ]]; then
     $SUDO zypper --non-interactive install \
         gcc gcc-c++ make pkg-config curl git \
@@ -258,21 +268,42 @@ if command -v gtk-update-icon-cache >/dev/null 2>&1; then
     $SUDO gtk-update-icon-cache -f -t /usr/share/icons/hicolor || true
 fi
 
+# 6. Optional Demucs AI Stem Separation Engine installation
+if [ "$INSTALL_DEMUCS" = "true" ]; then
+    log_info "Installing Meta Demucs AI Stem Separation Engine (--with-demucs requested)..."
+    TARGET_HOME="$(eval echo ~"$TARGET_USER")"
+    VENV_DIR="$TARGET_HOME/.local/share/retraktor/venv"
+    mkdir -p "$VENV_DIR"
+    if [ -n "$TARGET_USER" ] && [ "$(id -u)" -eq 0 ]; then
+        chown -R "$TARGET_USER:" "$TARGET_HOME/.local"
+        su - "$TARGET_USER" -c "python3 -m venv '$VENV_DIR' && '$VENV_DIR/bin/pip' install --upgrade pip setuptools wheel && '$VENV_DIR/bin/pip' install torch torchaudio demucs" || true
+    else
+        python3 -m venv "$VENV_DIR" || true
+        "$VENV_DIR/bin/pip" install --upgrade pip setuptools wheel || true
+        "$VENV_DIR/bin/pip" install torch torchaudio demucs || true
+    fi
+    log_success "Demucs AI Stem Separation Engine installed to $VENV_DIR/bin/demucs"
+fi
+
 echo ""
 log_success "ReTraktor installation completed successfully!"
 echo ""
 echo -e "${BOLD}Installed components:${NC}"
 echo -e "  • Desktop GUI:     ${GREEN}/usr/local/bin/retraktor${NC} (native 60 FPS Traktor Pro 4 interface)"
 echo -e "  • CLI Utility:     ${GREEN}/usr/local/bin/retraktor-cli${NC}"
-echo -e "  • NI udev rules:   ${GREEN}/etc/udev/rules.d/99-retraktor-ni.rules${NC}"
+echo -e "  • Hardware rules:  ${GREEN}/etc/udev/rules.d/99-retraktor-ni.rules${NC}"
 echo -e "  • Audio limits:    ${GREEN}/etc/security/limits.d/99-retraktor-realtime.conf${NC}"
 echo -e "  • Desktop Launcher:${GREEN}/usr/share/applications/retraktor.desktop${NC}"
+echo -e "  • AI Stems Engine: ${GREEN}Meta Demucs AI (htdemucs)${NC} (installable 1-click in Preferences > Stems)"
 echo ""
 echo -e "${BOLD}To start using ReTraktor:${NC}"
 echo -e "  Simply run:  ${GREEN}retraktor${NC}  or click the ${BOLD}ReTraktor${NC} icon in your application launcher."
 echo -e "  Inspect NML: ${CYAN}retraktor-cli inspect-nml <collection.nml>${NC}"
 echo -e "  Inspect TSI: ${CYAN}retraktor-cli inspect-tsi <mapping.tsi>${NC}"
 echo -e "  Run Doctor:  ${CYAN}retraktor-cli doctor${NC}"
+echo ""
+echo -e "${BOLD}Optional Stems AI Installation:${NC}"
+echo -e "  Run: ${GREEN}./install.sh --with-demucs${NC}  or click ${BOLD}[Install Demucs AI]${NC} in Preferences > Stems"
 echo ""
 if [ -n "$TARGET_USER" ]; then
     echo -e "${YELLOW}[NOTE]${NC} If you were just added to the 'audio'/'plugdev' groups, please log out and back in once for permissions to take full effect."

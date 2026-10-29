@@ -13,6 +13,7 @@ use eframe::egui::{self, Vec2};
 
 mod app;
 mod audio;
+mod demucs;
 mod library_ui;
 mod preferences;
 mod theme;

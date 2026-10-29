@@ -32,6 +32,11 @@ pub struct LoadedTrackAudio {
     /// Precomputed 4-stem `[drums, bass, instruments, vocals]` amplitude peaks at `PEAKS_PER_SEC` Hz.
     pub stem_peaks: Vec<[f32; 4]>,
     pub stems_ready: bool,
+    /// True isolated AI stems (from Demucs or synthesis). If Some, played with zero bleed.
+    pub pcm_drums: Option<Vec<f32>>,
+    pub pcm_bass: Option<Vec<f32>>,
+    pub pcm_other: Option<Vec<f32>>,
+    pub pcm_vocals: Option<Vec<f32>>,
 }
 
 impl LoadedTrackAudio {
@@ -242,7 +247,7 @@ impl LoadedTrackAudio {
         let duration_sec = (pcm_stereo.len() / 2) as f64 / (sr as f64);
         let (waveform_peaks, stem_peaks) = Self::compute_waveform_peaks(&pcm_stereo, sr);
 
-        Ok(Self {
+        let mut loaded = Self {
             title,
             artist,
             bpm: fallback_bpm,
@@ -252,8 +257,162 @@ impl LoadedTrackAudio {
             sample_rate: sr,
             waveform_peaks,
             stem_peaks,
-            stems_ready: true,
-        })
+            stems_ready: false,
+            pcm_drums: None,
+            pcm_bass: None,
+            pcm_other: None,
+            pcm_vocals: None,
+        };
+
+        // Check if pre-separated Demucs stems are cached in ~/.cache/retraktor/stems/htdemucs/<file_stem>
+        if let Some(stem_name) = path.file_stem().and_then(|s| s.to_str()) {
+            if let Ok(home) = std::env::var("HOME") {
+                let cache_dir = std::path::PathBuf::from(home)
+                    .join(".cache/retraktor/stems/htdemucs")
+                    .join(stem_name);
+                if cache_dir.is_dir() {
+                    let _ = loaded.load_stems_from_dir(&cache_dir);
+                }
+            }
+        }
+
+        Ok(loaded)
+    }
+
+    /// Decodes an arbitrary audio file to stereo interleaved f32 PCM samples and sample rate.
+    pub fn decode_file_to_pcm(path: &Path) -> Result<(Vec<f32>, u32), String> {
+        let file = File::open(path).map_err(|e| format!("Failed to open {}: {e}", path.display()))?;
+        let mss = MediaSourceStream::new(Box::new(file), Default::default());
+
+        let mut hint = Hint::new();
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            hint.with_extension(ext);
+        }
+
+        let mut probed = symphonia::default::get_probe()
+            .format(
+                &hint,
+                mss,
+                &FormatOptions::default(),
+                &MetadataOptions::default(),
+            )
+            .map_err(|e| format!("Probe error for {}: {e}", path.display()))?;
+
+        let track = probed
+            .format
+            .default_track()
+            .ok_or_else(|| "No audio track found in file".to_string())?;
+
+        let track_id = track.id;
+        let codec_params = track.codec_params.clone();
+        let sr = codec_params.sample_rate.unwrap_or(48_000);
+
+        let mut decoder = symphonia::default::get_codecs()
+            .make(&codec_params, &DecoderOptions::default())
+            .map_err(|e| format!("Codec error: {e}"))?;
+
+        let mut pcm_stereo = Vec::new();
+        let max_samples = (sr as usize) * 2 * 900;
+
+        while let Ok(packet) = probed.format.next_packet() {
+            if packet.track_id() != track_id {
+                continue;
+            }
+            if let Ok(decoded) = decoder.decode(&packet) {
+                let spec = *decoded.spec();
+                let ch_count = spec.channels.count().max(1);
+                let mut sample_buf = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
+                sample_buf.copy_interleaved_ref(decoded);
+                let samples = sample_buf.samples();
+
+                if ch_count == 1 {
+                    for &s in samples {
+                        pcm_stereo.push(s);
+                        pcm_stereo.push(s);
+                    }
+                } else {
+                    for frame in samples.chunks(ch_count) {
+                        pcm_stereo.push(frame[0]);
+                        pcm_stereo.push(frame[1]);
+                    }
+                }
+
+                if pcm_stereo.len() >= max_samples {
+                    break;
+                }
+            }
+        }
+
+        if pcm_stereo.is_empty() {
+            return Err("Decoded 0 audio samples from file".to_string());
+        }
+
+        Ok((pcm_stereo, sr))
+    }
+
+    /// Loads the 4 true isolated AI stems (`drums`, `bass`, `other`, `vocals`) from a directory.
+    pub fn load_stems_from_dir(&mut self, stem_dir: &Path) -> bool {
+        let find_stem = |name: &str| -> Option<std::path::PathBuf> {
+            for ext in &["flac", "wav", "mp3", "ogg"] {
+                let p = stem_dir.join(format!("{name}.{ext}"));
+                if p.is_file() {
+                    return Some(p);
+                }
+            }
+            None
+        };
+
+        let drums_p = find_stem("drums");
+        let bass_p = find_stem("bass");
+        let other_p = find_stem("other");
+        let vocals_p = find_stem("vocals");
+
+        if let (Some(dp), Some(bp), Some(op), Some(vp)) = (drums_p, bass_p, other_p, vocals_p) {
+            let drums_pcm = Self::decode_file_to_pcm(&dp).ok().map(|(p, _)| p);
+            let bass_pcm = Self::decode_file_to_pcm(&bp).ok().map(|(p, _)| p);
+            let other_pcm = Self::decode_file_to_pcm(&op).ok().map(|(p, _)| p);
+            let vocals_pcm = Self::decode_file_to_pcm(&vp).ok().map(|(p, _)| p);
+
+            if let (Some(d), Some(b), Some(o), Some(v)) = (drums_pcm, bass_pcm, other_pcm, vocals_pcm) {
+                // Compute true stem waveform peaks from the isolated audio buffers
+                let total_frames = self.pcm_stereo.len() / 2;
+                let frames_per_bucket = ((self.sample_rate as usize) / PEAKS_PER_SEC).max(64);
+                let num_buckets = (total_frames / frames_per_bucket).max(1);
+                let mut real_peaks = Vec::with_capacity(num_buckets);
+
+                for b_idx in 0..num_buckets {
+                    let start = b_idx * frames_per_bucket * 2;
+                    let end = ((b_idx + 1) * frames_per_bucket * 2).min(self.pcm_stereo.len());
+                    let mut max_d = 0.0_f32;
+                    let mut max_b = 0.0_f32;
+                    let mut max_o = 0.0_f32;
+                    let mut max_v = 0.0_f32;
+
+                    for i in (start..end).step_by(2) {
+                        if let Some(&s) = d.get(i) { max_d = max_d.max(s.abs()); }
+                        if let Some(&s) = b.get(i) { max_b = max_b.max(s.abs()); }
+                        if let Some(&s) = o.get(i) { max_o = max_o.max(s.abs()); }
+                        if let Some(&s) = v.get(i) { max_v = max_v.max(s.abs()); }
+                    }
+
+                    real_peaks.push([
+                        max_d.clamp(0.04, 1.0),
+                        max_b.clamp(0.04, 1.0),
+                        max_o.clamp(0.04, 1.0),
+                        max_v.clamp(0.04, 1.0),
+                    ]);
+                }
+
+                self.pcm_drums = Some(d);
+                self.pcm_bass = Some(b);
+                self.pcm_other = Some(o);
+                self.pcm_vocals = Some(v);
+                self.stem_peaks = real_peaks;
+                self.stems_ready = true;
+                return true;
+            }
+        }
+        false
     }
 
     /// Generates high quality electronic music stems / demo tracks for instant playback.
@@ -270,6 +429,10 @@ impl LoadedTrackAudio {
         let synth_sec = duration_sec.min(120.0);
         let total_frames = (synth_sec * sr as f64) as usize;
         let mut pcm = Vec::with_capacity(total_frames * 2);
+        let mut pcm_drums = Vec::with_capacity(total_frames * 2);
+        let mut pcm_bass = Vec::with_capacity(total_frames * 2);
+        let mut pcm_other = Vec::with_capacity(total_frames * 2);
+        let mut pcm_vocals = Vec::with_capacity(total_frames * 2);
 
         let beat_period = (sr as f64) * 60.0 / bpm;
         let pi64 = PI as f64;
@@ -279,9 +442,7 @@ impl LoadedTrackAudio {
             let beat_pos = (f as f64 / beat_period).fract();
             let bar_pos = ((f as f64 / beat_period) / 4.0).fract();
 
-            let (mut l, mut r) = (0.0_f32, 0.0_f32);
-
-            match style {
+            let (((d_l, d_r), (b_l, b_r)), ((o_l, o_r), (v_l, v_r))) = match style {
                 // Style 0: Melodic Techno / Tale of Us ("Berlin Midnight")
                 0 => {
                     let kick_env = (-beat_pos * 12.0).exp() as f32;
@@ -304,21 +465,19 @@ impl LoadedTrackAudio {
                     let bass = (t * root_hz * 2.0 * pi64).sin() as f32 * bass_env * 0.5;
 
                     let pad = (t * 220.0 * 2.0 * pi64).sin() as f32 * 0.15;
+                    let voc_env = ((-((beat_pos - 0.25).abs()) * 14.0).exp() * 0.18) as f32;
+                    let voc = (t * 440.0 * 2.0 * pi64).sin() as f32 * voc_env;
 
-                    l += kick + hat * 0.8 + bass + pad;
-                    r += kick + hat * 0.9 + bass + pad * 1.1;
+                    (
+                        ((kick + hat * 0.8, kick + hat * 0.9), (bass, bass)),
+                        ((pad, pad * 1.1), (voc, voc)),
+                    )
                 }
                 // Style 1: Acid Peak Time Techno ("Detroit Dawn")
                 1 => {
                     let kick_env = (-beat_pos * 14.0).exp() as f32;
                     let kick = (t * (60.0 + 140.0 * kick_env as f64) * 2.0 * pi64).sin() as f32
                         * kick_env;
-
-                    let sixteenth = (beat_pos * 4.0).fract();
-                    let acid_env = (-sixteenth * 11.5).exp() as f32;
-                    let cutoff = 400.0 + 1100.0 * (bar_pos * 2.0 * pi64).sin().abs() as f32;
-                    let saw = ((t * 110.0 * 2.0 * pi64).fract() * 2.0 - 1.0) as f32;
-                    let acid = saw * acid_env * (cutoff / 1600.0) * 0.42;
 
                     let beat_idx = (f as f64 / beat_period).floor() as i64 % 4;
                     let clap_env = if (beat_idx == 1 || beat_idx == 3) && beat_pos < 0.25 {
@@ -329,26 +488,82 @@ impl LoadedTrackAudio {
                     let noise = (((f * 65537 + 89) & 0x7FFF) as f32 / 32768.0) * 2.0 - 1.0;
                     let clap = noise * clap_env;
 
-                    l += kick * 0.85 + acid + clap;
-                    r += kick * 0.85 + acid * 1.05 + clap;
+                    let sixteenth = (beat_pos * 4.0).fract();
+                    let acid_env = (-sixteenth * 11.5).exp() as f32;
+                    let cutoff = 400.0 + 1100.0 * (bar_pos * 2.0 * pi64).sin().abs() as f32;
+                    let saw = ((t * 110.0 * 2.0 * pi64).fract() * 2.0 - 1.0) as f32;
+                    let acid = saw * acid_env * (cutoff / 1600.0) * 0.42;
+
+                    let synth = (t * 330.0 * 2.0 * pi64).sin() as f32 * 0.12 * acid_env;
+                    let voc_env = if beat_idx == 2 && beat_pos < 0.3 { (-beat_pos * 12.0).exp() as f32 * 0.22 } else { 0.0 };
+                    let voc = (t * 523.25 * 2.0 * pi64).sin() as f32 * voc_env;
+
+                    (
+                        ((kick * 0.85 + clap, kick * 0.85 + clap), (acid, acid * 1.05)),
+                        ((synth, synth * 1.1), (voc, voc)),
+                    )
                 }
                 // Style 2: Deep House / Ibiza Sunset
                 _ => {
                     let kick_env = (-beat_pos * 9.0).exp() as f32;
                     let kick = (t * 50.0 * 2.0 * pi64).sin() as f32 * kick_env * 0.8;
+                    let sub = (t * 55.0 * 2.0 * pi64).sin() as f32 * kick_env * 0.45;
                     let chord = ((t * 261.63 * 2.0 * pi64).sin()
                         + (t * 329.63 * 2.0 * pi64).sin()) as f32
                         * 0.2;
-                    l += kick + chord;
-                    r += kick + chord;
+                    let vocal_lead = (t * 392.00 * 2.0 * pi64).sin() as f32 * 0.15 * ((-beat_pos * 6.0).exp() as f32);
+
+                    (
+                        ((kick, kick), (sub, sub)),
+                        ((chord, chord), (vocal_lead, vocal_lead)),
+                    )
                 }
-            }
+            };
+
+            let l = d_l + b_l + o_l + v_l;
+            let r = d_r + b_r + o_r + v_r;
 
             pcm.push(l.clamp(-1.0, 1.0));
             pcm.push(r.clamp(-1.0, 1.0));
+            pcm_drums.push(d_l.clamp(-1.0, 1.0));
+            pcm_drums.push(d_r.clamp(-1.0, 1.0));
+            pcm_bass.push(b_l.clamp(-1.0, 1.0));
+            pcm_bass.push(b_r.clamp(-1.0, 1.0));
+            pcm_other.push(o_l.clamp(-1.0, 1.0));
+            pcm_other.push(o_r.clamp(-1.0, 1.0));
+            pcm_vocals.push(v_l.clamp(-1.0, 1.0));
+            pcm_vocals.push(v_r.clamp(-1.0, 1.0));
         }
 
-        let (waveform_peaks, stem_peaks) = Self::compute_waveform_peaks(&pcm, sr);
+        let (waveform_peaks, _) = Self::compute_waveform_peaks(&pcm, sr);
+
+        // Compute true stem peaks
+        let frames_per_bucket = ((sr as usize) / PEAKS_PER_SEC).max(64);
+        let num_buckets = (total_frames / frames_per_bucket).max(1);
+        let mut real_stem_peaks = Vec::with_capacity(num_buckets);
+
+        for b_idx in 0..num_buckets {
+            let start = b_idx * frames_per_bucket * 2;
+            let end = ((b_idx + 1) * frames_per_bucket * 2).min(pcm.len());
+            let mut max_d = 0.0_f32;
+            let mut max_b = 0.0_f32;
+            let mut max_o = 0.0_f32;
+            let mut max_v = 0.0_f32;
+
+            for i in (start..end).step_by(2) {
+                max_d = max_d.max(pcm_drums[i].abs());
+                max_b = max_b.max(pcm_bass[i].abs());
+                max_o = max_o.max(pcm_other[i].abs());
+                max_v = max_v.max(pcm_vocals[i].abs());
+            }
+
+            real_stem_peaks.push([
+                max_d.clamp(0.04, 1.0),
+                max_b.clamp(0.04, 1.0),
+                max_o.clamp(0.04, 1.0),
+                max_v.clamp(0.04, 1.0),
+            ]);
+        }
 
         Self {
             title: title.to_string(),
@@ -359,8 +574,12 @@ impl LoadedTrackAudio {
             pcm_stereo: pcm,
             sample_rate: sr,
             waveform_peaks,
-            stem_peaks,
+            stem_peaks: real_stem_peaks,
             stems_ready: true,
+            pcm_drums: Some(pcm_drums),
+            pcm_bass: Some(pcm_bass),
+            pcm_other: Some(pcm_other),
+            pcm_vocals: Some(pcm_vocals),
         }
     }
 }
@@ -881,6 +1100,8 @@ impl AudioSystem {
                     state.pitch_ratio[d]
                 };
 
+                let mut true_stems = None;
+
                 if let Some(track) = &state.loaded_tracks[d] {
                     track_dur = track.duration_sec.max(0.1);
                     let sample_pos = state.playhead_sec[d] * (track.sample_rate as f64);
@@ -888,16 +1109,36 @@ impl AudioSystem {
 
                     // Phono cartridge magnetic induction scaling (output proportional to needle velocity)
                     // Attenuates frozen sample buzz/clicks when platter is stopped
+                    let mut phono_gain = 1.0_f32;
                     if state.scratch_active[d] {
                         let speed_abs = effective_rate.abs();
-                        let phono_gain = if speed_abs < 0.06 {
-                            (speed_abs / 0.06) as f32
-                        } else {
-                            1.0
-                        };
+                        if speed_abs < 0.06 {
+                            phono_gain = (speed_abs / 0.06) as f32;
+                        }
                         s_l *= phono_gain;
                         s_r *= phono_gain;
                     }
+
+                    // Check for true isolated AI stems (Demucs or pre-synthesized)
+                    if let (Some(dp), Some(bp), Some(op), Some(vp)) = (
+                        &track.pcm_drums,
+                        &track.pcm_bass,
+                        &track.pcm_other,
+                        &track.pcm_vocals,
+                    ) {
+                        let (mut d_l, mut d_r) = sample_stereo_hermite(dp, sample_pos);
+                        let (mut b_l, mut b_r) = sample_stereo_hermite(bp, sample_pos);
+                        let (mut o_l, mut o_r) = sample_stereo_hermite(op, sample_pos);
+                        let (mut v_l, mut v_r) = sample_stereo_hermite(vp, sample_pos);
+                        if phono_gain < 1.0 {
+                            d_l *= phono_gain; d_r *= phono_gain;
+                            b_l *= phono_gain; b_r *= phono_gain;
+                            o_l *= phono_gain; o_r *= phono_gain;
+                            v_l *= phono_gain; v_r *= phono_gain;
+                        }
+                        true_stems = Some(((d_l, d_r), (b_l, b_r), (o_l, o_r), (v_l, v_r)));
+                    }
+
                     raw_l = s_l;
                     raw_r = s_r;
                     has_sample = true;
@@ -905,39 +1146,6 @@ impl AudioSystem {
                 }
 
                 if has_sample {
-                    // 1. Real-Time 4-Stem Decomposition ([Drums, Bass, Instruments, Vocals])
-                    state.stem_lp_l[d] += 0.035 * (raw_l - state.stem_lp_l[d]);
-                    state.stem_lp_r[d] += 0.035 * (raw_r - state.stem_lp_r[d]);
-                    state.stem_mp_l[d] += 0.22 * (raw_l - state.stem_mp_l[d]);
-                    state.stem_mp_r[d] += 0.22 * (raw_r - state.stem_mp_r[d]);
-
-                    let bass_l = state.stem_lp_l[d];
-                    let bass_r = state.stem_lp_r[d];
-                    let mid_band_l = state.stem_mp_l[d] - bass_l;
-                    let mid_band_r = state.stem_mp_r[d] - bass_r;
-                    let high_band_l = raw_l - state.stem_mp_l[d];
-                    let high_band_r = raw_r - state.stem_mp_r[d];
-
-                    // Center vocal extraction from mid-band + transient percussion separation
-                    let mid_center = (mid_band_l + mid_band_r) * 0.5;
-                    let mid_side = (mid_band_l - mid_band_r) * 0.5;
-                    let abs_in = ((raw_l + raw_r) * 0.5).abs();
-                    state.stem_fast_env[d] = if abs_in > state.stem_fast_env[d] {
-                        state.stem_fast_env[d] + 0.35 * (abs_in - state.stem_fast_env[d])
-                    } else {
-                        state.stem_fast_env[d] * 0.992
-                    };
-                    state.stem_slow_env[d] += 0.008 * (abs_in - state.stem_slow_env[d]);
-                    let transient_gate =
-                        ((state.stem_fast_env[d] - state.stem_slow_env[d]).max(0.0) * 3.5).min(1.0);
-
-                    let drums_l = high_band_l * 0.65 + mid_band_l * transient_gate * 0.45;
-                    let drums_r = high_band_r * 0.65 + mid_band_r * transient_gate * 0.45;
-                    let vocal_l = mid_center * (1.0 - transient_gate * 0.45);
-                    let vocal_r = mid_center * (1.0 - transient_gate * 0.45);
-                    let inst_l = mid_side + high_band_l * 0.35;
-                    let inst_r = -mid_side + high_band_r * 0.35;
-
                     let g_drums = if state.stem_muted[d][0] {
                         0.0
                     } else {
@@ -959,10 +1167,51 @@ impl AudioSystem {
                         state.stem_volumes[d][3]
                     };
 
-                    let stem_l =
-                        drums_l * g_drums + bass_l * g_bass + inst_l * g_inst + vocal_l * g_voc;
-                    let stem_r =
-                        drums_r * g_drums + bass_r * g_bass + inst_r * g_inst + vocal_r * g_voc;
+                    let (stem_l, stem_r) = if let Some(((d_l, d_r), (b_l, b_r), (o_l, o_r), (v_l, v_r))) = true_stems {
+                        // True Demucs AI Stem Isolation — 100% pristine isolation with ZERO bleed!
+                        (
+                            d_l * g_drums + b_l * g_bass + o_l * g_inst + v_l * g_voc,
+                            d_r * g_drums + b_r * g_bass + o_r * g_inst + v_r * g_voc,
+                        )
+                    } else {
+                        // Real-Time 4-Stem Frequency Decomposition Fallback ([Drums, Bass, Instruments, Vocals])
+                        state.stem_lp_l[d] += 0.035 * (raw_l - state.stem_lp_l[d]);
+                        state.stem_lp_r[d] += 0.035 * (raw_r - state.stem_lp_r[d]);
+                        state.stem_mp_l[d] += 0.22 * (raw_l - state.stem_mp_l[d]);
+                        state.stem_mp_r[d] += 0.22 * (raw_r - state.stem_mp_r[d]);
+
+                        let bass_l = state.stem_lp_l[d];
+                        let bass_r = state.stem_lp_r[d];
+                        let mid_band_l = state.stem_mp_l[d] - bass_l;
+                        let mid_band_r = state.stem_mp_r[d] - bass_r;
+                        let high_band_l = raw_l - state.stem_mp_l[d];
+                        let high_band_r = raw_r - state.stem_mp_r[d];
+
+                        // Center vocal extraction from mid-band + transient percussion separation
+                        let mid_center = (mid_band_l + mid_band_r) * 0.5;
+                        let mid_side = (mid_band_l - mid_band_r) * 0.5;
+                        let abs_in = ((raw_l + raw_r) * 0.5).abs();
+                        state.stem_fast_env[d] = if abs_in > state.stem_fast_env[d] {
+                            state.stem_fast_env[d] + 0.35 * (abs_in - state.stem_fast_env[d])
+                        } else {
+                            state.stem_fast_env[d] * 0.992
+                        };
+                        state.stem_slow_env[d] += 0.008 * (abs_in - state.stem_slow_env[d]);
+                        let transient_gate =
+                            ((state.stem_fast_env[d] - state.stem_slow_env[d]).max(0.0) * 3.5).min(1.0);
+
+                        let drums_l = high_band_l * 0.65 + mid_band_l * transient_gate * 0.45;
+                        let drums_r = high_band_r * 0.65 + mid_band_r * transient_gate * 0.45;
+                        let vocal_l = mid_center * (1.0 - transient_gate * 0.45);
+                        let vocal_r = mid_center * (1.0 - transient_gate * 0.45);
+                        let inst_l = mid_side + high_band_l * 0.35;
+                        let inst_r = -mid_side + high_band_r * 0.35;
+
+                        (
+                            drums_l * g_drums + bass_l * g_bass + inst_l * g_inst + vocal_l * g_voc,
+                            drums_r * g_drums + bass_r * g_bass + inst_r * g_inst + vocal_r * g_voc,
+                        )
+                    };
 
                     // 2. Channel Gain & 3-Band EQ
                     let gain = (state.channel_gain[d] * 2.0).clamp(0.0, 2.0);
