@@ -267,11 +267,14 @@ impl LoadedTrackAudio {
         // Check if pre-separated Demucs stems are cached in ~/.cache/retraktor/stems/htdemucs/<file_stem>
         if let Some(stem_name) = path.file_stem().and_then(|s| s.to_str()) {
             if let Ok(home) = std::env::var("HOME") {
-                let cache_dir = std::path::PathBuf::from(home)
-                    .join(".cache/retraktor/stems/htdemucs")
-                    .join(stem_name);
-                if cache_dir.is_dir() {
-                    let _ = loaded.load_stems_from_dir(&cache_dir);
+                let cache_root = std::path::PathBuf::from(home).join(".cache/retraktor/stems/htdemucs");
+                let candidate_1 = cache_root.join(stem_name);
+                let candidate_2 = cache_root.join("htdemucs").join(stem_name);
+
+                if candidate_1.is_dir() {
+                    let _ = loaded.load_stems_from_dir(&candidate_1);
+                } else if candidate_2.is_dir() {
+                    let _ = loaded.load_stems_from_dir(&candidate_2);
                 }
             }
         }

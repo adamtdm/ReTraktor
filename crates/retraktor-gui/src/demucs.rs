@@ -79,10 +79,32 @@ impl DemucsManager {
 
     /// Finds the Demucs executable (checks local venv first, then system PATH).
     pub fn find_demucs_binary() -> Option<PathBuf> {
-        // 1. Check local dedicated venv
-        let venv_bin = Self::venv_path().join("bin/demucs");
+        let venv_dir = Self::venv_path();
+
+        // 1. Check local dedicated venv binary
+        let venv_bin = venv_dir.join("bin/demucs");
         if venv_bin.is_file() {
             return Some(venv_bin);
+        }
+
+        // 1b. Check if python3 in venv has demucs module installed and create wrapper
+        let venv_py = venv_dir.join("bin/python3");
+        if venv_py.is_file() {
+            if let Ok(test) = Command::new(&venv_py).args(["-m", "demucs", "--help"]).output() {
+                if test.status.success() {
+                    let wrapper = format!(
+                        "#!/usr/bin/env bash\nexec \"{}\" -m demucs \"$@\"\n",
+                        venv_py.display()
+                    );
+                    let _ = fs::write(&venv_bin, wrapper);
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ = fs::set_permissions(&venv_bin, fs::Permissions::from_mode(0o755));
+                    }
+                    return Some(venv_bin);
+                }
+            }
         }
 
         // 2. Check system PATH via `which demucs`
@@ -110,22 +132,20 @@ impl DemucsManager {
     pub fn refresh_status(&self) {
         if let Some(bin) = Self::find_demucs_binary() {
             // Verify execution
-            let ver = Command::new(&bin)
-                .arg("--help")
-                .output()
-                .map(|_| "HTDemucs v4 (Meta AI)".to_string())
-                .unwrap_or_else(|_| "Demucs".to_string());
-
-            let mut state = self.install_state.lock().unwrap();
-            *state = DemucsInstallState::Ready {
-                binary_path: bin,
-                version: ver,
-            };
-        } else {
-            let mut state = self.install_state.lock().unwrap();
-            if !matches!(*state, DemucsInstallState::Installing { .. }) {
-                *state = DemucsInstallState::NotInstalled;
+            let test = Command::new(&bin).arg("--help").output();
+            if test.as_ref().map(|o| o.status.success()).unwrap_or(false) {
+                let mut state = self.install_state.lock().unwrap();
+                *state = DemucsInstallState::Ready {
+                    binary_path: bin,
+                    version: "HTDemucs v4 (Meta AI)".to_string(),
+                };
+                return;
             }
+        }
+
+        let mut state = self.install_state.lock().unwrap();
+        if !matches!(*state, DemucsInstallState::Installing { .. }) {
+            *state = DemucsInstallState::NotInstalled;
         }
     }
 
@@ -154,23 +174,28 @@ impl DemucsManager {
     /// Checks if a given audio file already has pre-rendered stems in the cache.
     pub fn get_cached_stem_dir(audio_path: &Path) -> Option<PathBuf> {
         let file_stem = audio_path.file_stem()?.to_str()?;
-        let target_dir = Self::stems_cache_root().join(file_stem);
+        let cache_root = Self::stems_cache_root();
 
-        if !target_dir.is_dir() {
-            return None;
+        // Demucs can place stems in cache_root/<file_stem> or cache_root/htdemucs/<file_stem>
+        let candidate_dirs = [
+            cache_root.join(file_stem),
+            cache_root.join("htdemucs").join(file_stem),
+        ];
+
+        for target_dir in &candidate_dirs {
+            if target_dir.is_dir() {
+                let has_drums = target_dir.join("drums.flac").is_file() || target_dir.join("drums.wav").is_file();
+                let has_bass = target_dir.join("bass.flac").is_file() || target_dir.join("bass.wav").is_file();
+                let has_other = target_dir.join("other.flac").is_file() || target_dir.join("other.wav").is_file();
+                let has_vocals = target_dir.join("vocals.flac").is_file() || target_dir.join("vocals.wav").is_file();
+
+                if has_drums && has_bass && has_other && has_vocals {
+                    return Some(target_dir.clone());
+                }
+            }
         }
 
-        // Check for the 4 required stem files (.flac or .wav)
-        let has_drums = target_dir.join("drums.flac").is_file() || target_dir.join("drums.wav").is_file();
-        let has_bass = target_dir.join("bass.flac").is_file() || target_dir.join("bass.wav").is_file();
-        let has_other = target_dir.join("other.flac").is_file() || target_dir.join("other.wav").is_file();
-        let has_vocals = target_dir.join("vocals.flac").is_file() || target_dir.join("vocals.wav").is_file();
-
-        if has_drums && has_bass && has_other && has_vocals {
-            Some(target_dir)
-        } else {
-            None
-        }
+        None
     }
 
     /// Spawns the background installer in an isolated thread.
@@ -209,11 +234,23 @@ impl DemucsManager {
                 return;
             }
 
+            // 2. Verify ffmpeg exists (Demucs requirement)
+            let ffmpeg_check = Command::new("which").arg("ffmpeg").output();
+            let has_ffmpeg = ffmpeg_check.as_ref().map(|o| o.status.success()).unwrap_or(false);
+            if !has_ffmpeg {
+                if let Ok(mut st) = state_clone.lock() {
+                    *st = DemucsInstallState::Failed {
+                        error: "ffmpeg is missing! Demucs requires ffmpeg for audio separation. Run: sudo apt install ffmpeg".to_string(),
+                    };
+                }
+                return;
+            }
+
             let venv_dir = Self::venv_path();
             let parent = venv_dir.parent().unwrap();
             let _ = fs::create_dir_all(parent);
 
-            // 2. Create virtual environment
+            // 3. Create virtual environment
             update("Creating isolated virtualenv in ~/.local/share/retraktor/venv...", 0.15);
             let venv_status = Command::new("python3")
                 .arg("-m")
@@ -222,7 +259,7 @@ impl DemucsManager {
                 .status();
 
             if venv_status.is_err() || !venv_status.unwrap().success() {
-                // If python3-venv is missing, try with --without-pip then install pip
+                // If python3-venv is missing ensurepip, try with --without-pip
                 let retry = Command::new("python3")
                     .arg("-m")
                     .arg("venv")
@@ -241,18 +278,38 @@ impl DemucsManager {
             }
 
             let pip_bin = venv_dir.join("bin/pip");
+            let python_bin = venv_dir.join("bin/python3");
 
-            // 3. Upgrade pip
+            // If pip was not created (e.g. --without-pip), bootstrap it
+            if !pip_bin.is_file() {
+                update("Bootstrapping pip into virtualenv...", 0.20);
+                let _ = Command::new(&python_bin)
+                    .args(["-m", "ensurepip", "--upgrade"])
+                    .status();
+            }
+
+            if !pip_bin.is_file() {
+                if let Ok(mut st) = state_clone.lock() {
+                    *st = DemucsInstallState::Failed {
+                        error: "pip is missing inside virtualenv. Please run: sudo apt install python3-venv python3-pip".to_string(),
+                    };
+                }
+                return;
+            }
+
+            // 4. Upgrade pip
             update("Updating pip & wheel utilities...", 0.30);
             let _ = Command::new(&pip_bin)
                 .args(["install", "--upgrade", "pip", "setuptools", "wheel"])
                 .status();
 
-            // 4. Install PyTorch and Demucs
-            update("Downloading PyTorch and Meta Demucs model engine (~1.2 GB)...", 0.50);
+            // 5. Install PyTorch CPU and Demucs
+            update("Downloading lightweight PyTorch CPU & Meta Demucs (~250 MB)...", 0.50);
             let install_proc = Command::new(&pip_bin)
                 .args([
                     "install",
+                    "--extra-index-url",
+                    "https://download.pytorch.org/whl/cpu",
                     "torch",
                     "torchaudio",
                     "demucs",
@@ -261,10 +318,29 @@ impl DemucsManager {
                 .stderr(Stdio::piped())
                 .spawn();
 
+            let mut last_error_lines = Vec::new();
             match install_proc {
                 Ok(mut child) => {
-                    if let Some(stdout) = child.stdout.take() {
-                        let reader = BufReader::new(stdout);
+                    let stdout = child.stdout.take();
+                    let stderr = child.stderr.take();
+
+                    // Read stderr in a separate thread so buffers never deadlock
+                    let err_handle = thread::spawn(move || {
+                        let mut lines = Vec::new();
+                        if let Some(pipe) = stderr {
+                            let reader = BufReader::new(pipe);
+                            for line in reader.lines().flatten() {
+                                lines.push(line);
+                                if lines.len() > 10 {
+                                    lines.remove(0);
+                                }
+                            }
+                        }
+                        lines
+                    });
+
+                    if let Some(pipe) = stdout {
+                        let reader = BufReader::new(pipe);
                         for line in reader.lines().flatten() {
                             if line.contains("Downloading") {
                                 update(&format!("Downloading: {}", line.chars().take(40).collect::<String>()), 0.70);
@@ -273,7 +349,27 @@ impl DemucsManager {
                             }
                         }
                     }
-                    let _ = child.wait();
+
+                    let wait_res = child.wait();
+                    if let Ok(lines) = err_handle.join() {
+                        last_error_lines = lines;
+                    }
+
+                    if let Ok(st) = wait_res {
+                        if !st.success() {
+                            let detail = if !last_error_lines.is_empty() {
+                                last_error_lines.join(" | ")
+                            } else {
+                                format!("Pip exit code: {:?}", st.code())
+                            };
+                            if let Ok(mut state) = state_clone.lock() {
+                                *state = DemucsInstallState::Failed {
+                                    error: format!("Pip install failed: {detail}"),
+                                };
+                            }
+                            return;
+                        }
+                    }
                 }
                 Err(e) => {
                     if let Ok(mut st) = state_clone.lock() {
@@ -285,25 +381,67 @@ impl DemucsManager {
                 }
             }
 
-            // 5. Verify installation
+            // 6. Verify installation
             update("Verifying Demucs neural inference engine...", 0.95);
             let demucs_bin = venv_dir.join("bin/demucs");
+
+            let mut verified = false;
             if demucs_bin.is_file() {
-                let test = Command::new(&demucs_bin).arg("--help").output();
-                if test.is_ok() && test.unwrap().status.success() {
-                    if let Ok(mut st) = state_clone.lock() {
-                        *st = DemucsInstallState::Ready {
-                            binary_path: demucs_bin,
-                            version: "HTDemucs v4 (Meta AI)".to_string(),
-                        };
+                if let Ok(out) = Command::new(&demucs_bin).arg("--help").output() {
+                    if out.status.success() {
+                        verified = true;
                     }
-                    return;
                 }
             }
 
-            if let Ok(mut st) = state_clone.lock() {
+            if !verified && python_bin.is_file() {
+                let test = Command::new(&python_bin)
+                    .args(["-m", "demucs", "--help"])
+                    .output();
+                match test {
+                    Ok(out) if out.status.success() => {
+                        let wrapper = format!(
+                            "#!/usr/bin/env bash\nexec \"{}\" -m demucs \"$@\"\n",
+                            python_bin.display()
+                        );
+                        let _ = fs::write(&demucs_bin, wrapper);
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            let _ = fs::set_permissions(&demucs_bin, fs::Permissions::from_mode(0o755));
+                        }
+                        verified = true;
+                    }
+                    Ok(out) => {
+                        let err_text = String::from_utf8_lossy(&out.stderr);
+                        if let Ok(mut st) = state_clone.lock() {
+                            *st = DemucsInstallState::Failed {
+                                error: format!("Demucs verification failed: {err_text}"),
+                            };
+                        }
+                        return;
+                    }
+                    Err(e) => {
+                        if let Ok(mut st) = state_clone.lock() {
+                            *st = DemucsInstallState::Failed {
+                                error: format!("Python execution failed: {e}"),
+                            };
+                        }
+                        return;
+                    }
+                }
+            }
+
+            if verified {
+                if let Ok(mut st) = state_clone.lock() {
+                    *st = DemucsInstallState::Ready {
+                        binary_path: demucs_bin,
+                        version: "HTDemucs v4 (Meta AI)".to_string(),
+                    };
+                }
+            } else if let Ok(mut st) = state_clone.lock() {
                 *st = DemucsInstallState::Failed {
-                    error: "Demucs installed but binary verification failed. Check Python environment.".to_string(),
+                    error: "Demucs installed but binary verification failed. Run './install.sh --with-demucs' to resolve.".to_string(),
                 };
             }
         });

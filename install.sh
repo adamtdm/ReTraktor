@@ -88,26 +88,26 @@ if [[ "$DISTRO_ID" == "ubuntu" || "$DISTRO_ID" == "debian" || "$DISTRO_ID" == "p
         libasound2-dev libpipewire-0.3-dev \
         libx11-dev libxkbcommon-dev libgl1-mesa-dev \
         pipewire pipewire-alsa wireplumber \
-        python3 python3-pip python3-venv
+        python3 python3-pip python3-venv ffmpeg
 elif [[ "$DISTRO_ID" == "fedora" || "$DISTRO_ID" == "rhel" || "$DISTRO_ID" == "centos" || "$DISTRO_LIKE" == *"fedora"* ]]; then
     $SUDO dnf install -y \
         gcc gcc-c++ make pkgconf-pkg-config curl git \
         systemd-devel libusb1-devel hidapi-devel \
         alsa-lib-devel pipewire-devel pipewire-alsa wireplumber \
         libxkbcommon-devel libX11-devel mesa-libGL-devel \
-        python3 python3-pip
+        python3 python3-pip ffmpeg
 elif [[ "$DISTRO_ID" == "arch" || "$DISTRO_ID" == "manjaro" || "$DISTRO_LIKE" == *"arch"* ]]; then
     $SUDO pacman -S --needed --noconfirm \
         base-devel pkgconf curl git \
         systemd-libs libusb hidapi \
         alsa-lib pipewire pipewire-alsa wireplumber \
         libxkbcommon libx11 mesa \
-        python python-pip
+        python python-pip ffmpeg
 elif [[ "$DISTRO_ID" == "opensuse"* || "$DISTRO_LIKE" == *"suse"* ]]; then
     $SUDO zypper --non-interactive install \
         gcc gcc-c++ make pkg-config curl git \
         systemd-devel libusb-1_0-devel libhidapi-devel \
-        alsa-devel pipewire-devel
+        alsa-devel pipewire-devel ffmpeg
 else
     log_warn "Unknown Linux distribution. Ensure you have libudev, libusb, hidapi, alsa, and pipewire installed."
 fi
@@ -276,11 +276,11 @@ if [ "$INSTALL_DEMUCS" = "true" ]; then
     mkdir -p "$VENV_DIR"
     if [ -n "$TARGET_USER" ] && [ "$(id -u)" -eq 0 ]; then
         chown -R "$TARGET_USER:" "$TARGET_HOME/.local"
-        su - "$TARGET_USER" -c "python3 -m venv '$VENV_DIR' && '$VENV_DIR/bin/pip' install --upgrade pip setuptools wheel && '$VENV_DIR/bin/pip' install torch torchaudio demucs" || true
+        su - "$TARGET_USER" -c "python3 -m venv '$VENV_DIR' && '$VENV_DIR/bin/pip' install --upgrade pip setuptools wheel && '$VENV_DIR/bin/pip' install --extra-index-url https://download.pytorch.org/whl/cpu torch torchaudio demucs" || true
     else
         python3 -m venv "$VENV_DIR" || true
         "$VENV_DIR/bin/pip" install --upgrade pip setuptools wheel || true
-        "$VENV_DIR/bin/pip" install torch torchaudio demucs || true
+        "$VENV_DIR/bin/pip" install --extra-index-url https://download.pytorch.org/whl/cpu torch torchaudio demucs || true
     fi
     log_success "Demucs AI Stem Separation Engine installed to $VENV_DIR/bin/demucs"
 fi
