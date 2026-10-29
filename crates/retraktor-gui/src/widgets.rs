@@ -1121,3 +1121,131 @@ pub fn deck_transport_bar(
     });
     action
 }
+
+/// Renders a high-contrast Heads-Up Display (HUD) keyboard shortcut cheat-sheet.
+pub fn render_shortcuts_hud(ctx: &egui::Context, is_open: &mut bool) {
+    if !*is_open {
+        return;
+    }
+
+    egui::Window::new("⌨ ReTraktor Live Performance Keyboard Matrix")
+        .open(is_open)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+        .default_width(680.0)
+        .frame(
+            egui::Frame::window(&ctx.style())
+                .fill(Color32::from_rgb(26, 28, 32))
+                .stroke(Stroke::new(1.0_f32, TraktorTheme::BORDER_ACCENT))
+                .rounding(6.0)
+                .inner_margin(16.0),
+        )
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("LIVE PERFORMANCE SHORTCUTS")
+                        .color(TraktorTheme::TEXT_PRIMARY)
+                        .font(egui::FontId::monospace(14.0))
+                        .strong(),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        RichText::new("Press Esc or ? to close")
+                            .color(TraktorTheme::TEXT_MUTED)
+                            .font(egui::FontId::proportional(11.0)),
+                    );
+                });
+            });
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(8.0);
+
+            ui.columns(3, |cols| {
+                // Column 1: Deck A & Deck B Transports
+                cols[0].vertical(|ui| {
+                    ui.label(RichText::new("DECK A (Primary Left)").color(TraktorTheme::DECK_A).strong());
+                    ui.add_space(4.0);
+                    let key_row = |ui: &mut Ui, key: &str, desc: &str| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format!("[ {key} ]"))
+                                    .color(TraktorTheme::PLAY_ACTIVE)
+                                    .font(egui::FontId::monospace(11.0))
+                                    .strong(),
+                            );
+                            ui.label(RichText::new(desc).color(TraktorTheme::TEXT_PRIMARY).font(egui::FontId::proportional(11.5)));
+                        });
+                    };
+                    key_row(ui, "Space", "Play / Pause Deck A");
+                    key_row(ui, "C", "Cue Deck A");
+                    key_row(ui, "S", "Sync Deck A BPM");
+                    key_row(ui, "1..4", "Hotcues 1 to 4");
+
+                    ui.add_space(12.0);
+                    ui.label(RichText::new("DECK B (Primary Right)").color(TraktorTheme::DECK_B).strong());
+                    ui.add_space(4.0);
+                    key_row(ui, "Shift+Space", "Play / Pause Deck B");
+                    key_row(ui, "Shift+C", "Cue Deck B");
+                    key_row(ui, "Shift+S", "Sync Deck B BPM");
+                    key_row(ui, "5..8", "Hotcues 1 to 4");
+                });
+
+                // Column 2: Workspace Layouts
+                cols[1].vertical(|ui| {
+                    ui.label(RichText::new("WORKSPACE LAYOUTS").color(TraktorTheme::TEXT_PRIMARY).strong());
+                    ui.add_space(4.0);
+                    let layout_row = |ui: &mut Ui, key: &str, desc: &str| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format!("[ {key} ]"))
+                                    .color(Color32::from_rgb(180, 200, 240))
+                                    .font(egui::FontId::monospace(11.0))
+                                    .strong(),
+                            );
+                            ui.label(RichText::new(desc).color(TraktorTheme::TEXT_PRIMARY).font(egui::FontId::proportional(11.5)));
+                        });
+                    };
+                    layout_row(ui, "F1", "Parallel Full Waveforms");
+                    layout_row(ui, "F2", "Essential Compact");
+                    layout_row(ui, "F3", "Extended Mixer & FX");
+                    layout_row(ui, "F4", "Four-Deck Full Mix");
+                    layout_row(ui, "F5", "4-Stem Isolation View");
+                    layout_row(ui, "F6", "Full Music Browser");
+                });
+
+                // Column 3: Mixer, FX & Stems
+                cols[2].vertical(|ui| {
+                    ui.label(RichText::new("SYSTEM & STEMS").color(TraktorTheme::TEXT_PRIMARY).strong());
+                    ui.add_space(4.0);
+                    let sys_row = |ui: &mut Ui, key: &str, desc: &str| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format!("[ {key} ]"))
+                                    .color(Color32::from_rgb(240, 200, 140))
+                                    .font(egui::FontId::monospace(11.0))
+                                    .strong(),
+                            );
+                            ui.label(RichText::new(desc).color(TraktorTheme::TEXT_PRIMARY).font(egui::FontId::proportional(11.5)));
+                        });
+                    };
+                    sys_row(ui, "Cmd / Ctrl + ,", "Preferences & Setup");
+                    sys_row(ui, "?", "Toggle Shortcuts HUD");
+                    sys_row(ui, "Esc", "Dismiss HUD / Modals");
+                    sys_row(ui, "Click Platter", "Vinyl Scratch / Stop");
+                    sys_row(ui, "✦ Stems", "Separate Audio via AI");
+                });
+            });
+
+            ui.add_space(12.0);
+            ui.separator();
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("💡 Pro Tip: Hardware USB DJ controllers (Traktor Kontrol / MX2) operate at 1000 Hz alongside keyboard shortcuts.")
+                        .color(TraktorTheme::TEXT_MUTED)
+                        .font(egui::FontId::proportional(11.0)),
+                );
+            });
+        });
+}

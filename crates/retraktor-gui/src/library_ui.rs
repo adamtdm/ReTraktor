@@ -703,21 +703,22 @@ impl LibraryManager {
         ui: &mut Ui,
         current_deck_a_key: &str,
         four_deck_mode: bool,
+        locked_decks: [bool; 4],
         mut on_load_deck: impl FnMut(usize, &UiTrackEntry),
     ) {
         match self.selected_nav {
             NavItem::Explorer => {
-                self.show_file_explorer_view(ui, four_deck_mode, &mut on_load_deck);
+                self.show_file_explorer_view(ui, four_deck_mode, locked_decks, &mut on_load_deck);
             }
             NavItem::History => {
-                self.show_history_view(ui, four_deck_mode, &mut on_load_deck);
+                self.show_history_view(ui, four_deck_mode, locked_decks, &mut on_load_deck);
             }
             NavItem::AllTracks
             | NavItem::StemsCrate
             | NavItem::Preparation
             | NavItem::Playlist(_)
             | NavItem::Smartlists => {
-                self.show_tracks_table_view(ui, current_deck_a_key, four_deck_mode, &mut on_load_deck);
+                self.show_tracks_table_view(ui, current_deck_a_key, four_deck_mode, locked_decks, &mut on_load_deck);
             }
         }
     }
@@ -726,6 +727,7 @@ impl LibraryManager {
         &mut self,
         ui: &mut Ui,
         four_deck_mode: bool,
+        locked_decks: [bool; 4],
         on_load_deck: &mut impl FnMut(usize, &UiTrackEntry),
     ) {
         ui.vertical(|ui| {
@@ -1067,29 +1069,37 @@ impl LibraryManager {
                     if let Some(t) = self.tracks.iter_mut().find(|t| t.id == entry.id) {
                         t.stems_ready = true;
                     }
-                    self.last_stemmed_track_id = Some(entry.id);
-                    self.record_history(deck_idx, &entry);
                     let d = (deck_idx - 1).min(3);
-                    self.last_loaded_deck = Some((d, true));
-                    on_load_deck(deck_idx, &entry);
-                    self.status_message = format!(
-                        "✓ Generated 4 stems & loaded '{}' into Deck {}!",
-                        entry.title,
-                        ["A", "B", "C", "D"][d]
-                    );
+                    if locked_decks[d] {
+                        self.status_message = format!("⚠ Deck {} is playing! (Lock Playing Decks is active)", ["A", "B", "C", "D"][d]);
+                    } else {
+                        self.last_stemmed_track_id = Some(entry.id);
+                        self.record_history(deck_idx, &entry);
+                        self.last_loaded_deck = Some((d, true));
+                        on_load_deck(deck_idx, &entry);
+                        self.status_message = format!(
+                            "✓ Generated 4 stems & loaded '{}' into Deck {}!",
+                            entry.title,
+                            ["A", "B", "C", "D"][d]
+                        );
+                    }
                 }
             }
             if let Some((deck_idx, p)) = file_to_load {
                 if let Some(entry) = self.add_audio_file_to_collection(&p) {
-                    self.record_history(deck_idx, &entry);
                     let d = (deck_idx - 1).min(3);
-                    self.last_loaded_deck = Some((d, entry.stems_ready));
-                    on_load_deck(deck_idx, &entry);
-                    self.status_message = format!(
-                        "✓ Decoded & loaded '{}' into Deck {}!",
-                        entry.title,
-                        ["A", "B", "C", "D"][d]
-                    );
+                    if locked_decks[d] {
+                        self.status_message = format!("⚠ Deck {} is playing! (Lock Playing Decks is active)", ["A", "B", "C", "D"][d]);
+                    } else {
+                        self.record_history(deck_idx, &entry);
+                        self.last_loaded_deck = Some((d, entry.stems_ready));
+                        on_load_deck(deck_idx, &entry);
+                        self.status_message = format!(
+                            "✓ Decoded & loaded '{}' into Deck {}!",
+                            entry.title,
+                            ["A", "B", "C", "D"][d]
+                        );
+                    }
                 }
             }
             if let Some(nml_p) = nml_to_import {
@@ -1234,6 +1244,7 @@ impl LibraryManager {
         ui: &mut Ui,
         current_deck_a_key: &str,
         four_deck_mode: bool,
+        locked_decks: [bool; 4],
         on_load_deck: &mut impl FnMut(usize, &UiTrackEntry),
     ) {
         ui.vertical(|ui| {
@@ -2279,17 +2290,24 @@ impl LibraryManager {
             }
 
             if let Some((deck_idx, track)) = load_cmd {
-                self.record_history(deck_idx, &track);
                 let d = (deck_idx - 1).min(3);
-                self.last_loaded_deck = Some((d, track.stems_ready));
-                on_load_deck(deck_idx, &track);
-                self.status_message = format!(
-                    "✓ Loaded '{}' ({:.2} BPM, {}) into Deck {}",
-                    track.title,
-                    track.bpm,
-                    track.musical_key,
-                    ["A", "B", "C", "D"][d]
-                );
+                if locked_decks[d] {
+                    self.status_message = format!(
+                        "⚠ Deck {} is playing! (Lock Playing Decks is active in Preferences)",
+                        ["A", "B", "C", "D"][d]
+                    );
+                } else {
+                    self.record_history(deck_idx, &track);
+                    self.last_loaded_deck = Some((d, track.stems_ready));
+                    on_load_deck(deck_idx, &track);
+                    self.status_message = format!(
+                        "✓ Loaded '{}' ({:.2} BPM, {}) into Deck {}",
+                        track.title,
+                        track.bpm,
+                        track.musical_key,
+                        ["A", "B", "C", "D"][d]
+                    );
+                }
             }
 
             if let Some(track_id) = toggle_prep_cmd {
@@ -2339,6 +2357,7 @@ impl LibraryManager {
         &mut self,
         ui: &mut Ui,
         four_deck_mode: bool,
+        locked_decks: [bool; 4],
         on_load_deck: &mut impl FnMut(usize, &UiTrackEntry),
     ) {
         ui.vertical(|ui| {
@@ -2389,17 +2408,33 @@ impl LibraryManager {
                                 );
                                 ui.horizontal(|ui| {
                                     if ui.button("LOAD A").clicked() {
-                                        on_load_deck(1, &rec.track);
+                                        if locked_decks[0] {
+                                            self.status_message = "⚠ Deck A is playing! (Lock Playing Decks is active)".to_string();
+                                        } else {
+                                            on_load_deck(1, &rec.track);
+                                        }
                                     }
                                     if ui.button("LOAD B").clicked() {
-                                        on_load_deck(2, &rec.track);
+                                        if locked_decks[1] {
+                                            self.status_message = "⚠ Deck B is playing! (Lock Playing Decks is active)".to_string();
+                                        } else {
+                                            on_load_deck(2, &rec.track);
+                                        }
                                     }
                                     if four_deck_mode {
                                         if ui.button("C").clicked() {
-                                            on_load_deck(3, &rec.track);
+                                            if locked_decks[2] {
+                                                self.status_message = "⚠ Deck C is playing! (Lock Playing Decks is active)".to_string();
+                                            } else {
+                                                on_load_deck(3, &rec.track);
+                                            }
                                         }
                                         if ui.button("D").clicked() {
-                                            on_load_deck(4, &rec.track);
+                                            if locked_decks[3] {
+                                                self.status_message = "⚠ Deck D is playing! (Lock Playing Decks is active)".to_string();
+                                            } else {
+                                                on_load_deck(4, &rec.track);
+                                            }
                                         }
                                     }
                                 });

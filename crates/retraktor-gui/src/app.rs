@@ -3,8 +3,9 @@ use crate::library_ui::{LibraryManager, UiTrackEntry};
 use crate::preferences::{PreferencesDialog, PrefsTab};
 use crate::theme::TraktorTheme;
 use crate::widgets::{
-    crossfader, cue_pad, deck_transport_bar, rotary_knob_sized, scrolling_stem_waveforms, scrolling_waveform,
-    stripe_overview, vertical_fader, vu_meter, TransportAction,
+    crossfader, cue_pad, deck_transport_bar, render_shortcuts_hud, rotary_knob_sized,
+    scrolling_stem_waveforms, scrolling_waveform, stripe_overview, vertical_fader, vu_meter,
+    TransportAction,
 };
 use eframe::egui::{self, Align, Color32, Key, Layout, RichText, Stroke, Ui, Vec2};
 use retraktor_core::{PropValue, PropertyBus, SurfaceEvent};
@@ -77,6 +78,7 @@ pub struct ReTraktorApp {
     pub demucs: crate::demucs::DemucsManager,
     pub bus: PropertyBus,
     pub layout: TraktorLayout,
+    pub show_shortcuts_hud: bool,
 
     // Mixer UI State
     pub channel_gain: [f32; 4],
@@ -180,6 +182,7 @@ impl Default for ReTraktorApp {
             demucs: crate::demucs::DemucsManager::new(),
             bus,
             layout: TraktorLayout::Parallel, // Default to Parallel layout!
+            show_shortcuts_hud: false,
             channel_gain: [0.5, 0.5, 0.5, 0.5],
             channel_eq_hi: [0.5, 0.5, 0.5, 0.5],
             channel_eq_mid: [0.5, 0.5, 0.5, 0.5],
@@ -470,6 +473,9 @@ impl eframe::App for ReTraktorApp {
 
         // Preferences Dialog
         self.preferences.show(ctx);
+
+        // Live Performance Shortcuts HUD Overlay
+        render_shortcuts_hud(ctx, &mut self.show_shortcuts_hud);
     }
 }
 
@@ -1107,6 +1113,14 @@ impl ReTraktorApp {
             self.preferences.is_open = !self.preferences.is_open;
         }
 
+        if ctx.input(|i| (i.modifiers.shift && i.key_pressed(Key::Slash)) || i.key_pressed(Key::Questionmark)) {
+            self.show_shortcuts_hud = !self.show_shortcuts_hud;
+        }
+
+        if ctx.input(|i| i.key_pressed(Key::Escape)) && self.show_shortcuts_hud {
+            self.show_shortcuts_hud = false;
+        }
+
         if ctx.input(|i| i.key_pressed(Key::Escape)) && self.preferences.is_open {
             self.preferences.save();
             self.preferences.is_open = false;
@@ -1477,6 +1491,19 @@ impl ReTraktorApp {
                             .clicked()
                         {
                             self.preferences.is_open = !self.preferences.is_open;
+                        }
+
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("?").font(egui::FontId::proportional(14.0)).strong(),
+                                )
+                                .min_size(Vec2::new(24.0, 22.0)),
+                            )
+                            .on_hover_text("Live Performance Keyboard Shortcuts Cheat-Sheet (?)")
+                            .clicked()
+                        {
+                            self.show_shortcuts_hud = !self.show_shortcuts_hud;
                         }
 
                         rotary_knob_sized(
@@ -1857,15 +1884,24 @@ impl ReTraktorApp {
     /// Stacked full-width waveforms for Deck A and Deck B right on top of each other so beatgrids
     /// align pixel-for-pixel vertically, followed by Deck A controls | Center Mixer | Deck B controls.
     fn show_parallel_layout(&mut self, ui: &mut Ui) {
+        let four_deck = self.layout == TraktorLayout::FourDeck || self.preferences.four_deck_mode;
+        let wave_h = if four_deck { 50.0 } else { 72.0 };
+
         // A. Full-Width Stacked Parallel Waveforms Panel
         egui::Frame::none()
             .fill(TraktorTheme::BG_PANEL)
             .stroke(Stroke::new(1.0_f32, TraktorTheme::BORDER_COLOR))
             .inner_margin(egui::Margin::symmetric(6.0, 4.0))
             .show(ui, |ui| {
-                self.show_parallel_waveform_row(ui, 1, TraktorTheme::DECK_A, 66.0);
+                self.show_parallel_waveform_row(ui, 1, TraktorTheme::DECK_A, wave_h);
                 ui.add_space(2.0);
-                self.show_parallel_waveform_row(ui, 2, TraktorTheme::DECK_B, 66.0);
+                self.show_parallel_waveform_row(ui, 2, TraktorTheme::DECK_B, wave_h);
+                if four_deck {
+                    ui.add_space(2.0);
+                    self.show_parallel_waveform_row(ui, 3, TraktorTheme::DECK_C, wave_h);
+                    ui.add_space(2.0);
+                    self.show_parallel_waveform_row(ui, 4, TraktorTheme::DECK_D, wave_h);
+                }
             });
 
         // B. Deck Controls + Center Mixer Row (strictly top-aligned via horizontal_top!)
@@ -2730,10 +2766,12 @@ impl ReTraktorApp {
                                 egui::Button::new(
                                     RichText::new("0%")
                                         .color(TraktorTheme::TEXT_SECONDARY)
-                                        .font(egui::FontId::monospace(8.5)),
+                                        .font(egui::FontId::monospace(9.0))
+                                        .strong(),
                                 )
                                 .fill(Color32::from_rgb(48, 51, 57))
-                                .min_size(Vec2::new(24.0, 20.0)),
+                                .stroke(Stroke::new(0.5_f32, TraktorTheme::BORDER_COLOR))
+                                .min_size(Vec2::new(28.0, 22.0)),
                             )
                             .on_hover_text("Reset pitch to 0.0%")
                             .clicked()
@@ -3171,10 +3209,23 @@ impl ReTraktorApp {
                         self.layout == TraktorLayout::FourDeck || self.preferences.four_deck_mode;
                     let shared_audio = self.audio.shared.clone();
 
+                    let is_playing_decks = if let Ok(state) = self.audio.shared.lock() {
+                        state.is_playing
+                    } else {
+                        [false; 4]
+                    };
+                    let locked_decks = [
+                        self.preferences.lock_playing_decks && is_playing_decks[0],
+                        self.preferences.lock_playing_decks && is_playing_decks[1],
+                        self.preferences.lock_playing_decks && is_playing_decks[2],
+                        self.preferences.lock_playing_decks && is_playing_decks[3],
+                    ];
+
                     self.library.show_browser_content(
                         ui,
                         &current_deck_a_key,
                         four_deck_mode,
+                        locked_decks,
                         move |deck_idx, track: &UiTrackEntry| {
                             let d = (deck_idx - 1).min(3);
                             let track_entry = track.clone();

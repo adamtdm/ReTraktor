@@ -75,6 +75,7 @@ pub struct PreferencesDialog {
     pub auto_cue_on_load: bool,
     pub jog_scratch_sensitivity: f32,
     pub jog_mode_turntable: bool,
+    pub lock_playing_decks: bool,
 
     // Effects & Mixer FX
     pub fx_units_count: usize, // 0: 2 FX Units, 1: 4 FX Units
@@ -187,6 +188,7 @@ impl Default for PreferencesDialog {
             auto_cue_on_load: true,
             jog_scratch_sensitivity: 1.0,
             jog_mode_turntable: true,
+            lock_playing_decks: true,
             fx_units_count: 0, // 2 FX units
             fx_panel_mode: 0,  // Group
             mixer_fx_slots: [0, 1, 2, 3], // Filter, Reverb, Delay, Noise
@@ -268,7 +270,7 @@ impl PreferencesDialog {
             .collect::<Vec<_>>()
             .join(", ");
         format!(
-            "{{\n  \"sample_rate\": {},\n  \"buffer_size\": {},\n  \"audio_device_name\": \"{}\",\n  \"four_deck_mode\": {},\n  \"waveform_color_mode\": {},\n  \"eq_model_idx\": {},\n  \"filter_model_idx\": {},\n  \"filter_resonance\": {},\n  \"xfader_curve_idx\": {},\n  \"autogain\": {},\n  \"limiter_enabled\": {},\n  \"scan_on_startup\": {},\n  \"analyze_new_tracks\": {},\n  \"key_notation_idx\": {},\n  \"music_folders\": [{}]\n}}",
+            "{{\n  \"sample_rate\": {},\n  \"buffer_size\": {},\n  \"audio_device_name\": \"{}\",\n  \"four_deck_mode\": {},\n  \"waveform_color_mode\": {},\n  \"eq_model_idx\": {},\n  \"filter_model_idx\": {},\n  \"filter_resonance\": {},\n  \"xfader_curve_idx\": {},\n  \"autogain\": {},\n  \"limiter_enabled\": {},\n  \"lock_playing_decks\": {},\n  \"scan_on_startup\": {},\n  \"analyze_new_tracks\": {},\n  \"key_notation_idx\": {},\n  \"music_folders\": [{}]\n}}",
             self.sample_rate,
             self.buffer_size,
             self.audio_device_name.replace('"', "\\\""),
@@ -280,6 +282,7 @@ impl PreferencesDialog {
             self.xfader_curve_idx,
             self.autogain,
             self.limiter_enabled,
+            self.lock_playing_decks,
             self.scan_on_startup,
             self.analyze_new_tracks,
             self.key_notation_idx,
@@ -305,6 +308,7 @@ impl PreferencesDialog {
                     "xfader_curve_idx" => if let Ok(n) = val.parse() { self.xfader_curve_idx = n; },
                     "autogain" => self.autogain = val == "true",
                     "limiter_enabled" => self.limiter_enabled = val == "true",
+                    "lock_playing_decks" => self.lock_playing_decks = val == "true",
                     "scan_on_startup" => self.scan_on_startup = val == "true",
                     "analyze_new_tracks" => self.analyze_new_tracks = val == "true",
                     "key_notation_idx" => if let Ok(n) = val.parse() { self.key_notation_idx = n; },
@@ -1172,6 +1176,8 @@ impl PreferencesDialog {
 
                 ui.add_space(8.0);
                 ui.checkbox(&mut self.auto_cue_on_load, "Automatically jump to First Beat Cue point on track load");
+                ui.add_space(8.0);
+                ui.checkbox(&mut self.lock_playing_decks, "Lock Playing Decks (Prevents loading a track into a deck actively playing music live)");
             });
 
         ui.add_space(10.0);
@@ -2165,6 +2171,7 @@ mod tests {
         original.sample_rate = 96000;
         original.buffer_size = 256;
         original.four_deck_mode = true;
+        original.lock_playing_decks = false;
         original.audio_device_name = "Focusrite Scarlett 4i4".to_string();
 
         let json = original.to_json_str();
@@ -2174,6 +2181,7 @@ mod tests {
         assert_eq!(restored.sample_rate, 96000);
         assert_eq!(restored.buffer_size, 256);
         assert!(restored.four_deck_mode);
+        assert!(!restored.lock_playing_decks);
         assert_eq!(restored.audio_device_name, "Focusrite Scarlett 4i4");
     }
 }
