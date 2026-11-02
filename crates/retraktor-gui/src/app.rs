@@ -157,6 +157,10 @@ pub struct ReTraktorApp {
     pub deck_turntable_mode: [bool; 4],
     pub jog_scratch_sensitivity: f32,
     pub custom_mappings: std::collections::HashMap<String, String>,
+
+    // Exit Collection Save Prompt State
+    pub show_exit_prompt: bool,
+    pub exit_confirmed: bool,
 }
 
 impl Default for ReTraktorApp {
@@ -259,6 +263,8 @@ impl Default for ReTraktorApp {
             deck_turntable_mode: [true; 4],
             jog_scratch_sensitivity: 1.0,
             custom_mappings: std::collections::HashMap::new(),
+            show_exit_prompt: false,
+            exit_confirmed: false,
         }
     }
 }
@@ -268,12 +274,27 @@ impl eframe::App for ReTraktorApp {
         // Request 60 FPS continuous repaint for smooth scrolling waveforms and VU meters
         ctx.request_repaint();
 
+        // Intercept window close request to prompt whether to keep or discard added collection songs
+        if ctx.input(|i| i.viewport().close_requested()) && !self.exit_confirmed {
+            if self.preferences.prompt_save_on_exit {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.show_exit_prompt = true;
+            } else {
+                self.save_collection_according_to_prefs();
+                let _ = self.preferences.save();
+                self.exit_confirmed = true;
+            }
+        }
+
         if self.library.open_prefs_requested {
             self.library.open_prefs_requested = false;
             self.preferences.is_open = true;
             if self.library.open_prefs_file_management {
                 self.library.open_prefs_file_management = false;
                 self.preferences.current_tab = PrefsTab::FileManagement;
+            } else if self.library.open_prefs_browser_columns {
+                self.library.open_prefs_browser_columns = false;
+                self.preferences.current_tab = PrefsTab::BrowserColumns;
             } else {
                 self.preferences.current_tab = PrefsTab::Controllers;
             }
@@ -476,10 +497,168 @@ impl eframe::App for ReTraktorApp {
 
         // Live Performance Shortcuts HUD Overlay
         render_shortcuts_hud(ctx, &mut self.show_shortcuts_hud);
+
+        // Exit Collection Save Prompt Modal
+        if self.show_exit_prompt {
+            self.show_exit_collection_prompt(ctx);
+        }
     }
 }
 
 impl ReTraktorApp {
+    fn save_collection_according_to_prefs(&mut self) {
+        let fmt = self.preferences.collection_save_format;
+        if fmt == 0 || fmt == 2 {
+            let nml_path = LibraryManager::default_nml_path();
+            let _ = self.library.save_collection_nml(&nml_path);
+        }
+        if fmt == 1 || fmt == 2 {
+            let m3u_path = LibraryManager::default_m3u8_path();
+            let _ = self.library.save_collection_m3u8(&m3u_path);
+        }
+    }
+
+    fn show_exit_collection_prompt(&mut self, ctx: &egui::Context) {
+        let added_count = self.library.session_added_track_ids.len();
+        let total_count = self.library.tracks.len();
+        let nml_path = LibraryManager::default_nml_path();
+        let m3u_path = LibraryManager::default_m3u8_path();
+
+        egui::Window::new("Save Track Collection Before Closing?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .default_width(500.0)
+            .show(ctx, |ui| {
+                ui.vertical(|ui| {
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(if added_count > 0 {
+                            format!(
+                                "You added {added_count} song(s) to the Track Collection during this session ({total_count} tracks total)."
+                            )
+                        } else {
+                            format!(
+                                "Keep your current Track Collection ({total_count} tracks) saved before exiting ReTraktor?"
+                            )
+                        })
+                        .color(Color32::WHITE)
+                        .font(egui::FontId::proportional(13.0))
+                        .strong(),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(
+                            "Choose whether to keep or discard songs added in this session, and select the collection file format:",
+                        )
+                        .color(TraktorTheme::TEXT_SECONDARY)
+                        .font(egui::FontId::proportional(11.5)),
+                    );
+                    ui.add_space(8.0);
+
+                    egui::Frame::none()
+                        .fill(Color32::from_rgb(16, 18, 22))
+                        .stroke(Stroke::new(1.0_f32, TraktorTheme::BORDER_COLOR))
+                        .rounding(4.0)
+                        .inner_margin(egui::Margin::symmetric(12.0, 10.0))
+                        .show(ui, |ui| {
+                            ui.vertical(|ui| {
+                                ui.label(
+                                    RichText::new("COLLECTION EXPORT FORMAT")
+                                        .color(TraktorTheme::DECK_A)
+                                        .font(egui::FontId::monospace(10.5))
+                                        .strong(),
+                                );
+                                ui.add_space(4.0);
+                                ui.radio_value(
+                                    &mut self.preferences.collection_save_format,
+                                    0,
+                                    format!("Traktor .nml (v20 XML) — {}", nml_path.display()),
+                                );
+                                ui.radio_value(
+                                    &mut self.preferences.collection_save_format,
+                                    1,
+                                    format!(
+                                        "Industry Standard Extended .m3u8 (UTF-8 Playlist) — {}",
+                                        m3u_path.display()
+                                    ),
+                                );
+                                ui.radio_value(
+                                    &mut self.preferences.collection_save_format,
+                                    2,
+                                    "Both Traktor .nml + Extended .m3u8",
+                                );
+                            });
+                        });
+
+                    ui.add_space(8.0);
+                    ui.checkbox(
+                        &mut self.preferences.prompt_save_on_exit,
+                        "Always prompt whether to keep added songs when closing ReTraktor",
+                    );
+                    ui.add_space(10.0);
+
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("✓ Keep Added Songs & Save Collection")
+                                        .color(Color32::BLACK)
+                                        .font(egui::FontId::proportional(12.0))
+                                        .strong(),
+                                )
+                                .fill(TraktorTheme::PLAY_ACTIVE)
+                                .min_size(Vec2::new(220.0, 30.0)),
+                            )
+                            .clicked()
+                        {
+                            self.save_collection_according_to_prefs();
+                            let _ = self.preferences.save();
+                            self.show_exit_prompt = false;
+                            self.exit_confirmed = true;
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("✕ Discard Added Songs & Exit")
+                                        .color(Color32::WHITE)
+                                        .font(egui::FontId::proportional(11.5))
+                                        .strong(),
+                                )
+                                .fill(Color32::from_rgb(135, 42, 42))
+                                .min_size(Vec2::new(185.0, 30.0)),
+                            )
+                            .clicked()
+                        {
+                            self.library.discard_session_added_tracks();
+                            let _ = self.library.save_collection_nml(&nml_path);
+                            let _ = self.preferences.save();
+                            self.show_exit_prompt = false;
+                            self.exit_confirmed = true;
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("Cancel")
+                                        .color(TraktorTheme::TEXT_PRIMARY)
+                                        .font(egui::FontId::proportional(11.5)),
+                                )
+                                .fill(Color32::from_rgb(52, 56, 64))
+                                .min_size(Vec2::new(80.0, 30.0)),
+                            )
+                            .clicked()
+                        {
+                            self.show_exit_prompt = false;
+                        }
+                    });
+                });
+            });
+    }
+
     fn sync_audio_state(&mut self) {
         if let Ok(mut state) = self.audio.shared.lock() {
             state.crossfader = self.crossfader_pos;
@@ -3226,6 +3405,7 @@ impl ReTraktorApp {
                         &current_deck_a_key,
                         four_deck_mode,
                         locked_decks,
+                        self.preferences.library_columns,
                         move |deck_idx, track: &UiTrackEntry| {
                             let d = (deck_idx - 1).min(3);
                             let track_entry = track.clone();

@@ -13,10 +13,72 @@ pub enum PrefsTab {
     Effects,
     StemsAndAi,
     Recording,
+    BrowserColumns,
     FileManagement,
     AnalyzeOptions,
     Controllers,
     About,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct LibraryColumnsConfig {
+    pub album: bool,
+    pub bpm: bool,
+    pub key: bool,
+    pub stems: bool,
+    pub duration: bool,
+    pub genre: bool,
+    pub rating: bool,
+    pub comment: bool,
+    pub remixer: bool,
+    pub label: bool,
+    pub year: bool,
+    pub bitrate: bool,
+    pub format: bool,
+    pub track_number: bool,
+    pub playlist_actions: bool,
+}
+
+impl Default for LibraryColumnsConfig {
+    fn default() -> Self {
+        Self {
+            album: true,
+            bpm: true,
+            key: true,
+            stems: true,
+            duration: true,
+            genre: true,
+            rating: true,
+            comment: false,
+            remixer: false,
+            label: false,
+            year: false,
+            bitrate: false,
+            format: false,
+            track_number: false,
+            playlist_actions: true,
+        }
+    }
+}
+
+impl LibraryColumnsConfig {
+    pub fn set_all(&mut self, enabled: bool) {
+        self.album = enabled;
+        self.bpm = enabled;
+        self.key = enabled;
+        self.stems = enabled;
+        self.duration = enabled;
+        self.genre = enabled;
+        self.rating = enabled;
+        self.comment = enabled;
+        self.remixer = enabled;
+        self.label = enabled;
+        self.year = enabled;
+        self.bitrate = enabled;
+        self.format = enabled;
+        self.track_number = enabled;
+        self.playlist_actions = enabled;
+    }
 }
 
 pub struct PreferencesDialog {
@@ -104,6 +166,9 @@ pub struct PreferencesDialog {
     pub analyze_new_tracks: bool,
     pub trigger_music_rescan: bool,
     pub file_management_status: String,
+    pub library_columns: LibraryColumnsConfig,
+    pub collection_save_format: usize, // 0: Traktor .nml (v20), 1: Extended .m3u8, 2: Both (.nml + .m3u8)
+    pub prompt_save_on_exit: bool,
 
     // Analyze Options
     pub bpm_detection_range: usize, // 0: 70..140 BPM, 1: 60..120 BPM, 2: 90..180 BPM, 3: 110..220 BPM
@@ -210,6 +275,9 @@ impl Default for PreferencesDialog {
             analyze_new_tracks: true,
             trigger_music_rescan: false,
             file_management_status: "Ready".to_string(),
+            library_columns: LibraryColumnsConfig::default(),
+            collection_save_format: 0, // Traktor .nml (v20)
+            prompt_save_on_exit: true,
             bpm_detection_range: 0, // 70..140
             key_notation_idx: 0,    // Open Key
             tsi_path_input: String::new(),
@@ -269,8 +337,9 @@ impl PreferencesDialog {
             .map(|f| format!("\"{}\"", f.display()))
             .collect::<Vec<_>>()
             .join(", ");
+        let c = &self.library_columns;
         format!(
-            "{{\n  \"sample_rate\": {},\n  \"buffer_size\": {},\n  \"audio_device_name\": \"{}\",\n  \"four_deck_mode\": {},\n  \"waveform_color_mode\": {},\n  \"eq_model_idx\": {},\n  \"filter_model_idx\": {},\n  \"filter_resonance\": {},\n  \"xfader_curve_idx\": {},\n  \"autogain\": {},\n  \"limiter_enabled\": {},\n  \"lock_playing_decks\": {},\n  \"scan_on_startup\": {},\n  \"analyze_new_tracks\": {},\n  \"key_notation_idx\": {},\n  \"music_folders\": [{}]\n}}",
+            "{{\n  \"sample_rate\": {},\n  \"buffer_size\": {},\n  \"audio_device_name\": \"{}\",\n  \"four_deck_mode\": {},\n  \"waveform_color_mode\": {},\n  \"eq_model_idx\": {},\n  \"filter_model_idx\": {},\n  \"filter_resonance\": {},\n  \"xfader_curve_idx\": {},\n  \"autogain\": {},\n  \"limiter_enabled\": {},\n  \"lock_playing_decks\": {},\n  \"scan_on_startup\": {},\n  \"analyze_new_tracks\": {},\n  \"key_notation_idx\": {},\n  \"collection_save_format\": {},\n  \"prompt_save_on_exit\": {},\n  \"col_album\": {},\n  \"col_bpm\": {},\n  \"col_key\": {},\n  \"col_stems\": {},\n  \"col_duration\": {},\n  \"col_genre\": {},\n  \"col_rating\": {},\n  \"col_comment\": {},\n  \"col_remixer\": {},\n  \"col_label\": {},\n  \"col_year\": {},\n  \"col_bitrate\": {},\n  \"col_format\": {},\n  \"col_track_number\": {},\n  \"col_playlist_actions\": {},\n  \"music_folders\": [{}]\n}}",
             self.sample_rate,
             self.buffer_size,
             self.audio_device_name.replace('"', "\\\""),
@@ -286,6 +355,23 @@ impl PreferencesDialog {
             self.scan_on_startup,
             self.analyze_new_tracks,
             self.key_notation_idx,
+            self.collection_save_format,
+            self.prompt_save_on_exit,
+            c.album,
+            c.bpm,
+            c.key,
+            c.stems,
+            c.duration,
+            c.genre,
+            c.rating,
+            c.comment,
+            c.remixer,
+            c.label,
+            c.year,
+            c.bitrate,
+            c.format,
+            c.track_number,
+            c.playlist_actions,
             folders_json,
         )
     }
@@ -312,6 +398,23 @@ impl PreferencesDialog {
                     "scan_on_startup" => self.scan_on_startup = val == "true",
                     "analyze_new_tracks" => self.analyze_new_tracks = val == "true",
                     "key_notation_idx" => if let Ok(n) = val.parse() { self.key_notation_idx = n; },
+                    "collection_save_format" => if let Ok(n) = val.parse() { self.collection_save_format = n; },
+                    "prompt_save_on_exit" => self.prompt_save_on_exit = val == "true",
+                    "col_album" => self.library_columns.album = val == "true",
+                    "col_bpm" => self.library_columns.bpm = val == "true",
+                    "col_key" => self.library_columns.key = val == "true",
+                    "col_stems" => self.library_columns.stems = val == "true",
+                    "col_duration" => self.library_columns.duration = val == "true",
+                    "col_genre" => self.library_columns.genre = val == "true",
+                    "col_rating" => self.library_columns.rating = val == "true",
+                    "col_comment" => self.library_columns.comment = val == "true",
+                    "col_remixer" => self.library_columns.remixer = val == "true",
+                    "col_label" => self.library_columns.label = val == "true",
+                    "col_year" => self.library_columns.year = val == "true",
+                    "col_bitrate" => self.library_columns.bitrate = val == "true",
+                    "col_format" => self.library_columns.format = val == "true",
+                    "col_track_number" => self.library_columns.track_number = val == "true",
+                    "col_playlist_actions" => self.library_columns.playlist_actions = val == "true",
                     _ => {}
                 }
             }
@@ -331,17 +434,75 @@ impl PreferencesDialog {
             .rounding(4.0)
             .inner_margin(12.0)
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(title).strong().color(TraktorTheme::TEXT_PRIMARY));
-                    if !description.is_empty() {
-                        ui.label(RichText::new(format!("— {description}")).size(12.0).color(TraktorTheme::TEXT_MUTED));
-                    }
-                });
-                ui.add_space(8.0);
-                content(ui)
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(title).strong().color(TraktorTheme::TEXT_PRIMARY));
+                        if !description.is_empty() {
+                            ui.label(RichText::new(format!("— {description}")).size(12.0).color(TraktorTheme::TEXT_MUTED));
+                        }
+                    });
+                    ui.add_space(8.0);
+                    content(ui)
+                })
+                .inner
             })
             .inner
     }
+
+    /// Renders a single option row in a vertical list-type view: Label + Description on the left, Control on the right.
+    pub fn list_row<R>(
+        ui: &mut Ui,
+        label: &str,
+        description: &str,
+        control: impl FnOnce(&mut Ui) -> R,
+    ) -> R {
+        egui::Frame::none()
+            .fill(Color32::from_rgb(22, 26, 34))
+            .stroke(Stroke::new(1.0_f32, Color32::from_rgb(38, 44, 56)))
+            .rounding(3.0)
+            .inner_margin(egui::Margin::symmetric(14.0, 9.0))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        ui.label(
+                            RichText::new(label)
+                                .color(Color32::WHITE)
+                                .font(egui::FontId::proportional(13.0))
+                                .strong(),
+                        );
+                        if !description.is_empty() {
+                            ui.label(
+                                RichText::new(description)
+                                    .color(TraktorTheme::TEXT_SECONDARY)
+                                    .font(egui::FontId::proportional(11.0)),
+                            );
+                        }
+                    });
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        control(ui)
+                    })
+                    .inner
+                })
+                .inner
+            })
+            .inner
+    }
+
+    /// Renders a clean list section header divider.
+    pub fn list_section_header(ui: &mut Ui, title: &str) {
+        ui.add_space(10.0);
+        ui.label(
+            RichText::new(title)
+                .color(TraktorTheme::DECK_A)
+                .font(egui::FontId::monospace(11.0))
+                .strong(),
+        );
+        ui.add_space(4.0);
+    }
+
     pub fn get_tab_breadcrumb(&self, tab: PrefsTab) -> (&'static str, &'static str) {
         match tab {
             PrefsTab::AudioSetup => ("AUDIO & ROUTING", "Audio Setup"),
@@ -354,6 +515,7 @@ impl PreferencesDialog {
             PrefsTab::Effects => ("DECKS & MIXER", "Effects & Mixer FX"),
             PrefsTab::StemsAndAi => ("STEMS & RECORDING", "Stems & Demucs AI"),
             PrefsTab::Recording => ("STEMS & RECORDING", "Recording & Broadcast"),
+            PrefsTab::BrowserColumns => ("COLLECTION & HARDWARE", "Browser & Metadata Columns"),
             PrefsTab::FileManagement => ("COLLECTION & HARDWARE", "File Management & Folders"),
             PrefsTab::AnalyzeOptions => ("COLLECTION & HARDWARE", "Analyze & Musical Key"),
             PrefsTab::Controllers => ("COLLECTION & HARDWARE", "Controller Manager & Remapper"),
@@ -361,97 +523,91 @@ impl PreferencesDialog {
         }
     }
 
-    pub fn render_sidebar_navigation(&mut self, ui: &mut Ui) {
-        ui.spacing_mut().item_spacing = Vec2::new(2.0, 3.0);
-
+    /// Renders horizontal section tabs across the top of the Preferences page.
+    pub fn render_top_section_tabs(&mut self, ui: &mut Ui) {
         let query = self.search_query.trim().to_lowercase();
+        let all_tabs = [
+            ("Audio Setup", PrefsTab::AudioSetup),
+            ("Output Routing", PrefsTab::OutputRouting),
+            ("Input Routing", PrefsTab::InputRouting),
+            ("Sync & Clock", PrefsTab::ExternalSync),
+            ("Mixer & EQ", PrefsTab::Mixer),
+            ("Decks & Waveforms", PrefsTab::Decks),
+            ("Track Decks", PrefsTab::TrackDecks),
+            ("Effects", PrefsTab::Effects),
+            ("Stems & AI", PrefsTab::StemsAndAi),
+            ("Recording", PrefsTab::Recording),
+            ("Browser & Metadata", PrefsTab::BrowserColumns),
+            ("Music Folders", PrefsTab::FileManagement),
+            ("Analyze & Key", PrefsTab::AnalyzeOptions),
+            ("Controllers", PrefsTab::Controllers),
+            ("About", PrefsTab::About),
+        ];
 
-        let cat_header = |ui: &mut Ui, label: &str| {
-            ui.add_space(8.0);
-            ui.label(
-                RichText::new(label)
-                    .color(Color32::from_rgb(130, 138, 155))
-                    .font(egui::FontId::monospace(10.0))
-                    .strong(),
-            );
-            ui.add_space(2.0);
-        };
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+            for (label, tab) in all_tabs {
+                let (cat, sec) = self.get_tab_breadcrumb(tab);
+                let matches = query.is_empty()
+                    || label.to_lowercase().contains(&query)
+                    || sec.to_lowercase().contains(&query)
+                    || cat.to_lowercase().contains(&query);
+                if !matches {
+                    continue;
+                }
 
-        let mut nav_item = |ui: &mut Ui, label: &str, tab: PrefsTab, icon: &str| {
-            let matches_search = query.is_empty()
-                || label.to_lowercase().contains(&query)
-                || format!("{:?}", tab).to_lowercase().contains(&query);
+                let is_selected = self.current_tab == tab;
+                let bg = if is_selected {
+                    TraktorTheme::ROW_SELECTED
+                } else {
+                    Color32::from_rgb(24, 28, 36)
+                };
+                let fg = if is_selected {
+                    Color32::WHITE
+                } else {
+                    TraktorTheme::TEXT_PRIMARY
+                };
+                let stroke = if is_selected {
+                    Stroke::new(1.5_f32, TraktorTheme::DECK_A)
+                } else {
+                    Stroke::new(1.0_f32, Color32::from_rgb(44, 50, 62))
+                };
 
-            if !matches_search {
-                return;
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new(label)
+                                .color(fg)
+                                .font(egui::FontId::proportional(12.0))
+                                .strong(),
+                        )
+                        .fill(bg)
+                        .stroke(stroke)
+                        .rounding(4.0)
+                        .min_size(Vec2::new(92.0, 28.0)),
+                    )
+                    .clicked()
+                {
+                    self.current_tab = tab;
+                }
             }
-
-            let is_selected = self.current_tab == tab;
-            let text_color = if is_selected {
-                Color32::WHITE
-            } else {
-                TraktorTheme::TEXT_PRIMARY
-            };
-            let bg_color = if is_selected {
-                TraktorTheme::ROW_SELECTED
-            } else {
-                Color32::TRANSPARENT
-            };
-
-            let resp = ui.add(
-                egui::Button::new(
-                    RichText::new(format!("{icon}  {label}"))
-                        .color(text_color)
-                        .font(egui::FontId::proportional(12.0)),
-                )
-                .fill(bg_color)
-                .stroke(Stroke::NONE)
-                .min_size(Vec2::new(ui.available_width() - 4.0, 26.0)),
-            );
-
-            if resp.clicked() {
-                self.current_tab = tab;
-            }
-        };
-
-        cat_header(ui, "AUDIO & ROUTING");
-        nav_item(ui, "Audio Setup", PrefsTab::AudioSetup, "🔊");
-        nav_item(ui, "Output Routing", PrefsTab::OutputRouting, "🎚");
-        nav_item(ui, "Input Routing", PrefsTab::InputRouting, "🎙");
-        nav_item(ui, "External Sync & Clock", PrefsTab::ExternalSync, "⏱");
-
-        cat_header(ui, "DECKS & MIXER");
-        nav_item(ui, "Mixer & EQ", PrefsTab::Mixer, "🎛");
-        nav_item(ui, "Decks & Waveforms", PrefsTab::Decks, "📊");
-        nav_item(ui, "Track Decks & Scratch", PrefsTab::TrackDecks, "💿");
-        nav_item(ui, "Effects & Mixer FX", PrefsTab::Effects, "🪄");
-
-        cat_header(ui, "STEMS & RECORDING");
-        nav_item(ui, "Stems & Demucs AI", PrefsTab::StemsAndAi, "✦");
-        nav_item(ui, "Recording & Broadcast", PrefsTab::Recording, "🔴");
-
-        cat_header(ui, "COLLECTION & HARDWARE");
-        nav_item(ui, "File Management", PrefsTab::FileManagement, "📁");
-        nav_item(ui, "Analyze Options & Keys", PrefsTab::AnalyzeOptions, "🔍");
-        nav_item(ui, "Controller Manager & Remapper", PrefsTab::Controllers, "🎮");
-        nav_item(ui, "About & System Diagnostics", PrefsTab::About, "ℹ");
+        });
     }
 
-    /// Renders Preferences as a spacious, full-page view taking the entire application canvas.
+    /// Renders Preferences as a full-page view with top section tabs and a vertical list-type options view.
     pub fn show_full_page(&mut self, ui: &mut Ui, _ctx: &egui::Context) {
-        let avail_size = ui.available_size();
-
         ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+
             // 1. Top Header Bar
             egui::Frame::none()
-                .fill(Color32::from_rgb(18, 20, 26))
+                .fill(Color32::from_rgb(16, 18, 24))
                 .stroke(Stroke::new(1.0_f32, Color32::from_rgb(38, 42, 52)))
                 .inner_margin(egui::Margin::symmetric(16.0, 10.0))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        // Title & Breadcrumb
                         ui.label(
-                            RichText::new("⚙ PREFERENCES")
+                            RichText::new("PREFERENCES")
                                 .color(Color32::WHITE)
                                 .font(egui::FontId::monospace(15.0))
                                 .strong(),
@@ -462,12 +618,10 @@ impl PreferencesDialog {
                         ui.label(
                             RichText::new(format!("[ {category} ] › {section}"))
                                 .color(TraktorTheme::DECK_A)
-                                .font(egui::FontId::monospace(11.0)),
+                                .font(egui::FontId::monospace(11.5)),
                         );
 
-                        // Center / Right Controls
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            // Close Button
                             if ui
                                 .add(
                                     egui::Button::new(
@@ -479,26 +633,20 @@ impl PreferencesDialog {
                                     .fill(TraktorTheme::ROW_SELECTED)
                                     .min_size(Vec2::new(180.0, 28.0)),
                                 )
-                                .on_hover_text("Return to Decks and Performance View (Esc)")
+                                .on_hover_text("Save preferences and return to Decks (Esc)")
                                 .clicked()
                             {
                                 self.save();
                                 self.is_open = false;
                             }
 
-                            ui.add_space(16.0);
+                            ui.add_space(12.0);
 
-                            // Search bar
                             ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new("🔍")
-                                        .color(TraktorTheme::TEXT_MUTED)
-                                        .font(egui::FontId::proportional(12.0)),
-                                );
                                 ui.add(
                                     egui::TextEdit::singleline(&mut self.search_query)
-                                        .hint_text("Search settings (e.g. latency, stems, eq, pitch)...")
-                                        .desired_width(260.0),
+                                        .hint_text("Filter settings tabs...")
+                                        .desired_width(220.0),
                                 );
                                 if !self.search_query.is_empty() && ui.small_button("✕").clicked() {
                                     self.search_query.clear();
@@ -508,42 +656,33 @@ impl PreferencesDialog {
                     });
                 });
 
-            // 2. Full Page Body: Left Sidebar + Right Content Pane
-            ui.horizontal(|ui| {
-                // Left Navigation Sidebar
-                egui::Frame::none()
-                    .fill(Color32::from_rgb(16, 18, 24))
-                    .inner_margin(egui::Margin::symmetric(10.0, 12.0))
-                    .show(ui, |ui| {
-                        ui.set_width(230.0);
-                        ui.set_min_height(avail_size.y - 56.0);
+            // 2. Top Horizontal Section Tabs Strip
+            egui::Frame::none()
+                .fill(Color32::from_rgb(18, 21, 28))
+                .stroke(Stroke::new(1.0_f32, Color32::from_rgb(34, 38, 48)))
+                .inner_margin(egui::Margin::symmetric(16.0, 8.0))
+                .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    self.render_top_section_tabs(ui);
+                });
 
-                        egui::ScrollArea::vertical()
-                            .id_salt("prefs_nav_scroll")
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                self.render_sidebar_navigation(ui);
-                            });
-                    });
+            // 3. Full-Width Scrollable List-Type Options View
+            egui::Frame::none()
+                .fill(Color32::from_rgb(14, 16, 21))
+                .inner_margin(egui::Margin::symmetric(20.0, 12.0))
+                .show(ui, |ui| {
+                    let avail_w = ui.available_width();
+                    let avail_h = ui.available_height();
+                    ui.set_min_size(Vec2::new(avail_w, avail_h));
 
-                // Separator
-                ui.separator();
+                    egui::ScrollArea::vertical()
+                        .id_salt("prefs_main_scroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.vertical(|ui| {
+                                ui.set_min_width(avail_w - 16.0);
+                                ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
 
-                // Right Content Area
-                egui::Frame::none()
-                    .fill(Color32::from_rgb(20, 22, 28))
-                    .inner_margin(egui::Margin::symmetric(24.0, 16.0))
-                    .show(ui, |ui| {
-                        let content_w = ui.available_width();
-                        let content_h = ui.available_height();
-                        ui.set_width(content_w);
-                        ui.set_min_height(content_h);
-
-                        egui::ScrollArea::vertical()
-                            .id_salt("prefs_main_scroll")
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                ui.set_min_width(content_w - 24.0);
                                 match self.current_tab {
                                     PrefsTab::AudioSetup => self.show_audio_setup(ui),
                                     PrefsTab::OutputRouting => self.show_output_routing(ui),
@@ -555,14 +694,15 @@ impl PreferencesDialog {
                                     PrefsTab::Effects => self.show_effects_prefs(ui),
                                     PrefsTab::StemsAndAi => self.show_stems_prefs(ui),
                                     PrefsTab::Recording => self.show_recording_prefs(ui),
+                                    PrefsTab::BrowserColumns => self.show_browser_columns_prefs(ui),
                                     PrefsTab::FileManagement => self.show_file_management(ui),
                                     PrefsTab::AnalyzeOptions => self.show_analyze_prefs(ui),
                                     PrefsTab::Controllers => self.show_controller_prefs(ui),
                                     PrefsTab::About => self.show_about(ui),
                                 }
                             });
-                    });
-            });
+                        });
+                });
         });
     }
 
@@ -570,827 +710,974 @@ impl PreferencesDialog {
     pub fn show(&mut self, _ctx: &egui::Context) {}
 
     fn show_audio_setup(&mut self, ui: &mut Ui) {
-        ui.heading("Audio Setup — Hardware Interface & Latency");
-        ui.add_space(8.0);
+        Self::list_section_header(ui, "HARDWARE INTERFACE & BUFFER LATENCY");
 
-        egui::Frame::none()
-            .fill(Color32::from_rgb(24, 28, 36))
-            .stroke(Stroke::new(1.0_f32, Color32::from_rgb(46, 52, 66)))
-            .inner_margin(egui::Margin::same(12.0))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Audio Device:").strong());
-                    ui.add_space(8.0);
-                    egui::ComboBox::from_id_salt("audio_device_combo")
-                        .selected_text(&self.audio_device_name)
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                &mut self.audio_device_name,
-                                "PipeWire pro-audio / ALSA Default".to_string(),
-                                "PipeWire pro-audio / ALSA Default",
-                            );
-                            ui.selectable_value(
-                                &mut self.audio_device_name,
-                                "Traktor Kontrol / MX2 USB Audio (hw:MX2,0)".to_string(),
-                                "Traktor Kontrol / MX2 USB Audio (hw:MX2,0)",
-                            );
-                            ui.selectable_value(
-                                &mut self.audio_device_name,
-                                "USB Audio Class 2.0 Interface (hw:UAC2,0)".to_string(),
-                                "USB Audio Class 2.0 Interface (hw:UAC2,0)",
-                            );
-                        });
-                });
-
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Sample Rate:").strong());
-                    ui.add_space(8.0);
-                    egui::ComboBox::from_id_salt("sr_combo")
-                        .selected_text(format!("{} Hz", self.sample_rate))
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut self.sample_rate, 44100, "44100 Hz (CD Standard)");
-                            ui.selectable_value(&mut self.sample_rate, 48000, "48000 Hz (Pro Audio Default)");
-                            ui.selectable_value(&mut self.sample_rate, 88200, "88200 Hz");
-                            ui.selectable_value(&mut self.sample_rate, 96000, "96000 Hz (Studio Master)");
-                        });
-                });
-
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Buffer Size (Latency):").strong());
-                    ui.add_space(8.0);
-                    let latency_ms = (self.buffer_size as f64 / self.sample_rate as f64) * 1000.0;
-                    egui::ComboBox::from_id_salt("buf_combo")
-                        .selected_text(format!("{} frames ({:.1} ms)", self.buffer_size, latency_ms))
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut self.buffer_size, 64, "64 frames (1.3 ms — Ultra Low)");
-                            ui.selectable_value(&mut self.buffer_size, 128, "128 frames (2.7 ms — Performance)");
-                            ui.selectable_value(&mut self.buffer_size, 256, "256 frames (5.3 ms — Safe)");
-                            ui.selectable_value(&mut self.buffer_size, 512, "512 frames (10.7 ms — High)");
-                        });
-                });
-            });
-
-        ui.add_space(12.0);
-        let latency_ms = (self.buffer_size as f64 / self.sample_rate as f64) * 1000.0;
-        egui::Frame::none()
-            .fill(Color32::from_rgb(18, 26, 20))
-            .stroke(Stroke::new(1.0_f32, TraktorTheme::PLAY_ACTIVE))
-            .inner_margin(egui::Margin::symmetric(14.0, 10.0))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("✓ REAL-TIME AUDIO SCHEDULER ACTIVE")
-                            .color(TraktorTheme::PLAY_ACTIVE)
-                            .font(egui::FontId::monospace(11.0))
-                            .strong(),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(
-                            RichText::new(format!("Roundtrip: {:.2} ms | 0 XRuns", latency_ms))
-                                .color(TraktorTheme::PLAY_ACTIVE)
-                                .font(egui::FontId::monospace(11.0)),
+        Self::list_row(
+            ui,
+            "Audio Device",
+            "Select the hardware soundcard or PipeWire/ALSA pro-audio interface.",
+            |ui| {
+                egui::ComboBox::from_id_salt("audio_device_combo")
+                    .selected_text(&self.audio_device_name)
+                    .width(340.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.audio_device_name,
+                            "PipeWire pro-audio / ALSA Default".to_string(),
+                            "PipeWire pro-audio / ALSA Default",
+                        );
+                        ui.selectable_value(
+                            &mut self.audio_device_name,
+                            "Traktor Kontrol / MX2 USB Audio (hw:MX2,0)".to_string(),
+                            "Traktor Kontrol / MX2 USB Audio (hw:MX2,0)",
+                        );
+                        ui.selectable_value(
+                            &mut self.audio_device_name,
+                            "USB Audio Class 2.0 Interface (hw:UAC2,0)".to_string(),
+                            "USB Audio Class 2.0 Interface (hw:UAC2,0)",
                         );
                     });
-                });
-                ui.add_space(4.0);
-                ui.label("Lock-free SPSC command ring buffer running on dedicated SCHED_FIFO real-time thread.");
-                ui.label("Direct ALSA UAC2 hardware mmap integration with PipeWire fallback.");
-            });
+            },
+        );
+
+        Self::list_row(
+            ui,
+            "Sample Rate",
+            "Operating sample rate of the real-time DSP and hardware DAC.",
+            |ui| {
+                egui::ComboBox::from_id_salt("sr_combo")
+                    .selected_text(format!("{} Hz", self.sample_rate))
+                    .width(240.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.sample_rate, 44100, "44100 Hz (CD Standard)");
+                        ui.selectable_value(&mut self.sample_rate, 48000, "48000 Hz (Pro Audio Default)");
+                        ui.selectable_value(&mut self.sample_rate, 88200, "88200 Hz");
+                        ui.selectable_value(&mut self.sample_rate, 96000, "96000 Hz (Studio Master)");
+                    });
+            },
+        );
+
+        let latency_ms = (self.buffer_size as f64 / self.sample_rate as f64) * 1000.0;
+        Self::list_row(
+            ui,
+            "Buffer Size (Latency)",
+            "Smaller buffers reduce scratch/cue latency; larger buffers increase stability.",
+            |ui| {
+                egui::ComboBox::from_id_salt("buf_combo")
+                    .selected_text(format!("{} frames ({:.1} ms)", self.buffer_size, latency_ms))
+                    .width(240.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.buffer_size, 64, "64 frames (1.3 ms — Ultra Low)");
+                        ui.selectable_value(&mut self.buffer_size, 128, "128 frames (2.7 ms — Performance)");
+                        ui.selectable_value(&mut self.buffer_size, 256, "256 frames (5.3 ms — Safe)");
+                        ui.selectable_value(&mut self.buffer_size, 512, "512 frames (10.7 ms — High)");
+                    });
+            },
+        );
+
+        Self::list_row(
+            ui,
+            "Real-Time Audio Scheduler Status",
+            "Lock-free SPSC command ring buffer with non-blocking audio callback.",
+            |ui| {
+                ui.label(
+                    RichText::new(format!("ACTIVE • {:.2} ms Roundtrip • 0 XRuns", latency_ms))
+                        .color(TraktorTheme::PLAY_ACTIVE)
+                        .font(egui::FontId::monospace(11.5))
+                        .strong(),
+                );
+            },
+        );
     }
 
     fn show_output_routing(&mut self, ui: &mut Ui) {
-        ui.heading("Output Routing — Master, Monitor & Booth");
-        ui.add_space(8.0);
+        Self::list_section_header(ui, "OUTPUT ROUTING — MASTER, MONITOR & BOOTH");
 
-        ui.label(RichText::new("Mixing Mode:").strong());
-        ui.horizontal(|ui| {
-            ui.radio_value(&mut self.mixing_mode, 0, "Internal Mixer (Software Mixing — Decks A/B/C/D into Master)");
-            ui.radio_value(&mut self.mixing_mode, 1, "External Mixer (Direct Soundcard Channels to Hardware Mixer)");
-        });
+        Self::list_row(
+            ui,
+            "Mixing Mode",
+            "Route all 4 decks through the internal software mixer or separately to an external hardware mixer.",
+            |ui| {
+                let modes = [
+                    "Internal (Software Mixer)",
+                    "External (Hardware Mixer Channels)",
+                ];
+                egui::ComboBox::from_id_salt("mixing_mode_combo")
+                    .selected_text(modes[self.mixing_mode.min(1)])
+                    .width(260.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.mixing_mode, 0, modes[0]);
+                        ui.selectable_value(&mut self.mixing_mode, 1, modes[1]);
+                    });
+            },
+        );
 
-        ui.add_space(10.0);
-        egui::Grid::new("output_routing_grid")
-            .num_columns(2)
-            .spacing([16.0, 10.0])
-            .show(ui, |ui| {
-                ui.label(RichText::new("Output Master (Main Speakers):").strong());
-                ui.horizontal(|ui| {
-                    ui.label("L:");
-                    ui.text_edit_singleline(&mut self.master_out_l);
-                    ui.label("R:");
-                    ui.text_edit_singleline(&mut self.master_out_r);
-                });
-                ui.end_row();
+        Self::list_row(
+            ui,
+            "Output Master (Main PA Speakers)",
+            "Primary stereo bus output channels.",
+            |ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.master_out_r).desired_width(170.0));
+                ui.label("R:");
+                ui.add(egui::TextEdit::singleline(&mut self.master_out_l).desired_width(170.0));
+                ui.label("L:");
+            },
+        );
 
-                ui.label(RichText::new("Output Monitor (Headphone Cue):").strong());
-                ui.horizontal(|ui| {
-                    ui.label("L:");
-                    ui.text_edit_singleline(&mut self.monitor_out_l);
-                    ui.label("R:");
-                    ui.text_edit_singleline(&mut self.monitor_out_r);
-                });
-                ui.end_row();
+        Self::list_row(
+            ui,
+            "Output Monitor (Headphone Cue)",
+            "Stereo headphone cue bus for pre-listening.",
+            |ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.monitor_out_r).desired_width(170.0));
+                ui.label("R:");
+                ui.add(egui::TextEdit::singleline(&mut self.monitor_out_l).desired_width(170.0));
+                ui.label("L:");
+            },
+        );
 
-                ui.label(RichText::new("Output Booth (DJ Monitor):").strong());
-                ui.horizontal(|ui| {
-                    ui.label("L:");
-                    ui.text_edit_singleline(&mut self.booth_out_l);
-                    ui.label("R:");
-                    ui.text_edit_singleline(&mut self.booth_out_r);
-                });
-                ui.end_row();
-            });
+        Self::list_row(
+            ui,
+            "Output Booth (DJ Booth Monitor)",
+            "Secondary stereo output with independent booth level control.",
+            |ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.booth_out_r).desired_width(170.0));
+                ui.label("R:");
+                ui.add(egui::TextEdit::singleline(&mut self.booth_out_l).desired_width(170.0));
+                ui.label("L:");
+            },
+        );
 
-        ui.add_space(10.0);
-        ui.checkbox(&mut self.split_cue, "Enable Split Cue (Left Ear = Cue Monitor, Right Ear = Master)");
+        Self::list_row(
+            ui,
+            "Split Cue Mode",
+            "Sums Cue Monitor into the left headphone ear and Master Output into the right ear.",
+            |ui| {
+                ui.checkbox(&mut self.split_cue, "Enabled");
+            },
+        );
     }
 
     fn show_input_routing(&mut self, ui: &mut Ui) {
-        ui.heading("Input Routing — Live Inputs, DVS & Aux");
-        ui.add_space(8.0);
+        Self::list_section_header(ui, "INPUT ROUTING — LIVE INPUTS, DVS & AUX");
 
-        ui.label("Configure incoming audio channels from your Traktor hardware interface or external audio device:");
-        ui.add_space(8.0);
+        Self::list_row(
+            ui,
+            "Input Deck A (Live / DVS Timecode)",
+            "Hardware stereo input pair assigned to Deck A.",
+            |ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.deck_a_in_r).desired_width(170.0));
+                ui.label("R:");
+                ui.add(egui::TextEdit::singleline(&mut self.deck_a_in_l).desired_width(170.0));
+                ui.label("L:");
+            },
+        );
 
-        egui::Grid::new("input_routing_grid")
-            .num_columns(2)
-            .spacing([16.0, 10.0])
-            .show(ui, |ui| {
-                ui.label(RichText::new("Input Deck A (Live / DVS Timecode):").strong());
-                ui.horizontal(|ui| {
-                    ui.label("In L:");
-                    ui.text_edit_singleline(&mut self.deck_a_in_l);
-                    ui.label("In R:");
-                    ui.text_edit_singleline(&mut self.deck_a_in_r);
-                });
-                ui.end_row();
+        Self::list_row(
+            ui,
+            "Input Deck B (Live / DVS Timecode)",
+            "Hardware stereo input pair assigned to Deck B.",
+            |ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.deck_b_in_r).desired_width(170.0));
+                ui.label("R:");
+                ui.add(egui::TextEdit::singleline(&mut self.deck_b_in_l).desired_width(170.0));
+                ui.label("L:");
+            },
+        );
 
-                ui.label(RichText::new("Input Deck B (Live / DVS Timecode):").strong());
-                ui.horizontal(|ui| {
-                    ui.label("In L:");
-                    ui.text_edit_singleline(&mut self.deck_b_in_l);
-                    ui.label("In R:");
-                    ui.text_edit_singleline(&mut self.deck_b_in_r);
-                });
-                ui.end_row();
+        Self::list_row(
+            ui,
+            "Input Aux / Microphone",
+            "Auxiliary line or microphone input routed to the master bus.",
+            |ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.aux_in_r).desired_width(170.0));
+                ui.label("R:");
+                ui.add(egui::TextEdit::singleline(&mut self.aux_in_l).desired_width(170.0));
+                ui.label("L:");
+            },
+        );
 
-                ui.label(RichText::new("Input Aux / Mic (Microphone In):").strong());
-                ui.horizontal(|ui| {
-                    ui.label("In L:");
-                    ui.text_edit_singleline(&mut self.aux_in_l);
-                    ui.label("In R:");
-                    ui.text_edit_singleline(&mut self.aux_in_r);
-                });
-                ui.end_row();
-            });
-
-        ui.add_space(14.0);
-        egui::Frame::none()
-            .fill(Color32::from_rgb(22, 26, 34))
-            .stroke(Stroke::new(1.0_f32, Color32::from_rgb(45, 52, 68)))
-            .inner_margin(egui::Margin::same(10.0))
-            .show(ui, |ui| {
-                ui.label(RichText::new("DVS / Timecode Calibration Status").color(TraktorTheme::DECK_A).strong());
-                ui.label("• DVS Engine: Ready for 2.5 kHz MK2 Timecode vinyl / CD signals");
-                ui.label("• Traktor Scratch MK2 Vinyl Lead-in: 0.0 dB threshold");
-            });
+        Self::list_row(
+            ui,
+            "DVS Timecode Engine",
+            "2.5 kHz MK2 timecode vinyl & CD carrier tracking calibration.",
+            |ui| {
+                ui.label(
+                    RichText::new("READY (0.0 dB Lead-In)")
+                        .color(TraktorTheme::DECK_A)
+                        .font(egui::FontId::monospace(11.0))
+                        .strong(),
+                );
+            },
+        );
     }
 
     fn show_external_sync(&mut self, ui: &mut Ui) {
-        ui.heading("External Sync & MIDI Clock");
-        ui.add_space(8.0);
+        Self::list_section_header(ui, "EXTERNAL SYNC, MIDI CLOCK & ABLETON LINK");
 
-        ui.label(RichText::new("Master Clock Mode:").strong());
-        ui.horizontal(|ui| {
-            ui.radio_value(&mut self.clock_mode, 0, "Auto Master (Follows active master deck)");
-            ui.radio_value(&mut self.clock_mode, 1, "Manual Master (Fixed Master Clock tempo)");
-        });
-
-        ui.add_space(12.0);
-        ui.label(RichText::new("MIDI Clock Output:").strong());
-        ui.checkbox(&mut self.send_midi_clock, "Send MIDI Clock to connected hardware synthesizers / drum machines");
-
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            ui.label("MIDI Clock Offset (Latency Compensation):");
-            ui.add(egui::Slider::new(&mut self.midi_clock_offset_ms, -50.0..=50.0).suffix(" ms"));
-        });
-
-        ui.add_space(12.0);
-        egui::Frame::none()
-            .fill(Color32::from_rgb(20, 24, 32))
-            .stroke(Stroke::new(1.0_f32, TraktorTheme::DECK_B))
-            .inner_margin(egui::Margin::same(10.0))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("ABLETON LINK™ INTEGRATION").color(TraktorTheme::DECK_B).strong());
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let link_label = if self.ableton_link_enabled { "● Link: Active (0 Peers)" } else { "Link: Disabled" };
-                        ui.label(RichText::new(link_label).color(if self.ableton_link_enabled { TraktorTheme::DECK_B } else { TraktorTheme::TEXT_MUTED }));
+        Self::list_row(
+            ui,
+            "Master Clock Mode",
+            "Choose whether Master Tempo follows the active playing deck or remains manually fixed.",
+            |ui| {
+                let modes = ["Auto Master (Follows Active Deck)", "Manual Master (Fixed Tempo)"];
+                egui::ComboBox::from_id_salt("clock_mode_combo")
+                    .selected_text(modes[self.clock_mode.min(1)])
+                    .width(250.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.clock_mode, 0, modes[0]);
+                        ui.selectable_value(&mut self.clock_mode, 1, modes[1]);
                     });
-                });
-                ui.add_space(4.0);
-                ui.checkbox(&mut self.ableton_link_enabled, "Enable Ableton Link (Synchronize tempo over local Wi-Fi / Ethernet)");
-            });
+            },
+        );
+
+        Self::list_row(
+            ui,
+            "Send MIDI Clock Output",
+            "Transmit 24 PPQN MIDI Clock messages to external hardware drum machines and synths.",
+            |ui| {
+                ui.checkbox(&mut self.send_midi_clock, "Enabled");
+            },
+        );
+
+        Self::list_row(
+            ui,
+            "MIDI Clock Offset",
+            "Compensate for external hardware MIDI buffer latency (-50 ms to +50 ms).",
+            |ui| {
+                ui.add(egui::Slider::new(&mut self.midi_clock_offset_ms, -50.0..=50.0).suffix(" ms"));
+            },
+        );
+
+        Self::list_row(
+            ui,
+            "Ableton Link Integration",
+            "Synchronize beatgrid phase and tempo with peer applications over local LAN/Wi-Fi.",
+            |ui| {
+                ui.checkbox(&mut self.ableton_link_enabled, "Enable Link");
+            },
+        );
     }
 
     fn show_mixer_prefs(&mut self, ui: &mut Ui) {
-        ui.heading("Mixer Preferences — EQ Models, Filters & Limiter");
-        ui.add_space(8.0);
+        Self::list_section_header(ui, "MIXER EQ MODELS, FILTERS & MASTER LIMITER");
 
-        egui::Frame::none()
-            .fill(Color32::from_rgb(24, 28, 36))
-            .stroke(Stroke::new(1.0_f32, Color32::from_rgb(46, 52, 66)))
-            .inner_margin(egui::Margin::same(12.0))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("EQ Model:").strong());
-                    ui.add_space(8.0);
-                    let models = [
-                        "Z ISO (Full Kill 3-Band — Traktor Pro 4 Default)",
-                        "Classic (Standard Warm Curves)",
-                        "P600 (Club Standard Steep Roll-off)",
-                        "Nuo (Fat Analog Lows)",
-                        "Xone:92 (4-Band Dual-Mid Audiophile)",
-                    ];
-                    egui::ComboBox::from_id_salt("eq_model_combo")
-                        .selected_text(models[self.eq_model_idx])
-                        .show_ui(ui, |ui| {
-                            for (i, m) in models.iter().enumerate() {
-                                ui.selectable_value(&mut self.eq_model_idx, i, *m);
-                            }
-                        });
-                });
-
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Filter Model:").strong());
-                    ui.add_space(8.0);
-                    let filters = [
-                        "Ladder (Moog-style 4-Pole 24dB/oct resonant)",
-                        "State Variable (Clean 12dB/oct dual-slope)",
-                        "Pro-53 (Classic Analog Synth Filter)",
-                    ];
-                    egui::ComboBox::from_id_salt("filter_model_combo")
-                        .selected_text(filters[self.filter_model_idx])
-                        .show_ui(ui, |ui| {
-                            for (i, f) in filters.iter().enumerate() {
-                                ui.selectable_value(&mut self.filter_model_idx, i, *f);
-                            }
-                        });
-                });
-
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    ui.label("Filter Resonance (Q):");
-                    ui.add(egui::Slider::new(&mut self.filter_resonance, 0.0..=1.0).show_value(true));
-                });
-
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Crossfader Curve:").strong());
-                    ui.add_space(8.0);
-                    let curves = [
-                        "Smooth (Constant-Power blend — House/Trance)",
-                        "Steep (Linear Blend — Techno/Club)",
-                        "Scratch Cut (Sharp 5% cut-in lag — Hip-Hop/Turntablism)",
-                    ];
-                    egui::ComboBox::from_id_salt("xf_curve_combo")
-                        .selected_text(curves[self.xfader_curve_idx])
-                        .show_ui(ui, |ui| {
-                            for (i, c) in curves.iter().enumerate() {
-                                ui.selectable_value(&mut self.xfader_curve_idx, i, *c);
-                            }
-                        });
-                });
-            });
-
-        ui.add_space(10.0);
-        egui::Frame::none()
-            .fill(Color32::from_rgb(22, 26, 34))
-            .stroke(Stroke::new(1.0_f32, Color32::from_rgb(42, 48, 62)))
-            .inner_margin(egui::Margin::same(12.0))
-            .show(ui, |ui| {
-                ui.checkbox(&mut self.autogain, "Enable Traktor Per-Track Autogain Analysis");
-                ui.add_space(6.0);
-                ui.checkbox(&mut self.limiter_enabled, "Enable Master Bus Limiter (Ozone Maximizer limiter)");
-                if self.limiter_enabled {
-                    ui.horizontal(|ui| {
-                        ui.add_space(20.0);
-                        ui.label("Limiter Headroom Ceiling:");
-                        let headrooms = ["0.0 dB (Max Volume)", "-3.0 dB (Traktor Pro 4 Standard)", "-6.0 dB (Club PA Protection)"];
-                        egui::ComboBox::from_id_salt("limiter_headroom_combo")
-                            .selected_text(headrooms[self.limiter_headroom])
-                            .show_ui(ui, |ui| {
-                                for (i, h) in headrooms.iter().enumerate() {
-                                    ui.selectable_value(&mut self.limiter_headroom, i, *h);
-                                }
-                            });
+        let models = [
+            "Z ISO (Full Kill 3-Band — Traktor Pro 4 Default)",
+            "Classic (Standard Warm Curves)",
+            "P600 (Club Standard Steep Roll-off)",
+            "Nuo (Fat Analog Lows)",
+            "Xone:92 (4-Band Dual-Mid Audiophile)",
+        ];
+        Self::list_row(
+            ui,
+            "Channel EQ Model",
+            "Select the frequency crossover and kill behavior of the channel strip EQs.",
+            |ui| {
+                egui::ComboBox::from_id_salt("eq_model_combo")
+                    .selected_text(models[self.eq_model_idx.min(models.len() - 1)])
+                    .width(300.0)
+                    .show_ui(ui, |ui| {
+                        for (i, m) in models.iter().enumerate() {
+                            ui.selectable_value(&mut self.eq_model_idx, i, *m);
+                        }
                     });
-                }
-                ui.add_space(6.0);
-                ui.checkbox(
-                    &mut self.neural_mix_eq_mode,
-                    "Enable Neural Mix™ EQ ⇄ Stems Mode (HI=Vocals, MID=Instruments, LOW=Drums+Bass)",
-                );
-            });
+            },
+        );
+
+        let filters = [
+            "Ladder (Moog-style 4-Pole 24dB/oct resonant)",
+            "State Variable (Clean 12dB/oct dual-slope)",
+            "Pro-53 (Classic Analog Synth Filter)",
+        ];
+        Self::list_row(
+            ui,
+            "Channel Filter Model",
+            "Select the analog filter topology for the bipolar channel filter knob.",
+            |ui| {
+                egui::ComboBox::from_id_salt("filter_model_combo")
+                    .selected_text(filters[self.filter_model_idx.min(filters.len() - 1)])
+                    .width(300.0)
+                    .show_ui(ui, |ui| {
+                        for (i, f) in filters.iter().enumerate() {
+                            ui.selectable_value(&mut self.filter_model_idx, i, *f);
+                        }
+                    });
+            },
+        );
+
+        Self::list_row(
+            ui,
+            "Filter Resonance (Q)",
+            "Adjust peak emphasis at the filter cutoff frequency.",
+            |ui| {
+                ui.add(egui::Slider::new(&mut self.filter_resonance, 0.0..=1.0).show_value(true));
+            },
+        );
+
+        let curves = [
+            "Smooth (Constant-Power blend — House/Trance)",
+            "Steep (Linear Blend — Techno/Club)",
+            "Scratch Cut (Sharp 5% cut-in lag — Turntablism)",
+        ];
+        Self::list_row(
+            ui,
+            "Crossfader Curve",
+            "Adjust transition slope from smooth constant-power blend to instant scratch cut.",
+            |ui| {
+                egui::ComboBox::from_id_salt("xf_curve_combo")
+                    .selected_text(curves[self.xfader_curve_idx.min(curves.len() - 1)])
+                    .width(300.0)
+                    .show_ui(ui, |ui| {
+                        for (i, c) in curves.iter().enumerate() {
+                            ui.selectable_value(&mut self.xfader_curve_idx, i, *c);
+                        }
+                    });
+            },
+        );
+
+        Self::list_row(
+            ui,
+            "Per-Track Autogain",
+            "Automatically normalize perceived track loudness based on analyzed ReplayGain/LUFS.",
+            |ui| {
+                ui.checkbox(&mut self.autogain, "Enabled");
+            },
+        );
+
+        Self::list_row(
+            ui,
+            "Master Bus Brickwall Limiter",
+            "Prevent digital clipping on the master output bus.",
+            |ui| {
+                ui.checkbox(&mut self.limiter_enabled, "Enabled");
+            },
+        );
+
+        if self.limiter_enabled {
+            let headrooms = [
+                "0.0 dB (Max Volume)",
+                "-3.0 dB (Traktor Pro 4 Standard)",
+                "-6.0 dB (Club PA Protection)",
+            ];
+            Self::list_row(
+                ui,
+                "Limiter Headroom Ceiling",
+                "Attenuate pre-limiter master bus headroom to preserve transient punch.",
+                |ui| {
+                    egui::ComboBox::from_id_salt("limiter_headroom_combo")
+                        .selected_text(headrooms[self.limiter_headroom.min(2)])
+                        .width(240.0)
+                        .show_ui(ui, |ui| {
+                            for (i, h) in headrooms.iter().enumerate() {
+                                ui.selectable_value(&mut self.limiter_headroom, i, *h);
+                            }
+                        });
+                },
+            );
+        }
+
+        Self::list_row(
+            ui,
+            "Neural Mix EQ ⇄ Stems Mode",
+            "Map channel HI / MID / LOW EQ knobs directly to Vocals, Instruments, and Drums+Bass stems.",
+            |ui| {
+                ui.checkbox(&mut self.neural_mix_eq_mode, "Enabled");
+            },
+        );
     }
 
     fn show_stems_prefs(&mut self, ui: &mut Ui) {
-        ui.heading("Stems Creation & Neural Mix™ Engine");
-        ui.add_space(8.0);
+        Self::list_section_header(ui, "STEMS CREATION & META DEMUCS AI ENGINE");
 
-        // 1. Demucs AI Engine Status & Background Installer Card
-        egui::Frame::none()
-            .fill(Color32::from_rgb(22, 28, 38))
-            .stroke(Stroke::new(
-                1.0_f32,
-                match self.demucs_install_state {
-                    crate::demucs::DemucsInstallState::Ready { .. } => TraktorTheme::PLAY_ACTIVE,
-                    crate::demucs::DemucsInstallState::Installing { .. } => {
-                        Color32::from_rgb(255, 185, 45)
-                    }
-                    _ => Color32::from_rgb(70, 75, 88),
-                },
-            ))
-            .rounding(4.0)
-            .inner_margin(egui::Margin::same(10.0))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
+        Self::list_row(
+            ui,
+            "Meta Demucs AI Neural Separation Engine",
+            "Isolates tracks into 4 studio-grade stems (Drums, Bass, Other, Vocals) in the background.",
+            |ui| match &self.demucs_install_state {
+                crate::demucs::DemucsInstallState::Ready { version, .. } => {
                     ui.label(
-                        RichText::new("NEURAL STEM SEPARATION (META DEMUCS AI)")
-                            .color(TraktorTheme::DECK_A)
-                            .font(egui::FontId::monospace(11.0))
+                        RichText::new(format!("✓ {version} Ready"))
+                            .color(TraktorTheme::PLAY_ACTIVE)
                             .strong(),
                     );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        match &self.demucs_install_state {
-                            crate::demucs::DemucsInstallState::Ready { version, .. } => {
-                                ui.label(
-                                    RichText::new(format!("✓ {version} Ready"))
-                                        .color(TraktorTheme::PLAY_ACTIVE)
-                                        .strong(),
-                                );
-                            }
-                            crate::demucs::DemucsInstallState::Installing { .. } => {
-                                ui.label(
-                                    RichText::new("● Installing in Background...")
-                                        .color(Color32::from_rgb(255, 185, 45))
-                                        .strong(),
-                                );
-                            }
-                            crate::demucs::DemucsInstallState::NotInstalled => {
-                                ui.label(
-                                    RichText::new("Not Installed (Optional)")
-                                        .color(TraktorTheme::TEXT_MUTED),
-                                );
-                            }
-                            crate::demucs::DemucsInstallState::Failed { .. } => {
-                                ui.label(
-                                    RichText::new("⚠ Installation Failed")
-                                        .color(Color32::from_rgb(240, 80, 80)),
-                                );
-                            }
-                        }
-                    });
-                });
-
-                ui.add_space(6.0);
-                match &self.demucs_install_state {
-                    crate::demucs::DemucsInstallState::Ready { binary_path, .. } => {
-                        ui.label(
-                            RichText::new(format!("Inference Binary: {}", binary_path.display()))
-                                .color(TraktorTheme::TEXT_SECONDARY)
-                                .font(egui::FontId::monospace(10.0)),
-                        );
-                        ui.label(
-                            "✓ Generates studio-grade 4-stem FLAC streams (Drums, Bass, Other, Vocals) with 0% bleed.",
-                        );
-                        ui.label(
-                            "✓ Runs with low process priority (`nice -n 10`) so live audio playback is never starved.",
-                        );
-                    }
-                    crate::demucs::DemucsInstallState::Installing { step, percent } => {
-                        ui.label(
-                            RichText::new(step)
-                                .color(Color32::WHITE)
-                                .font(egui::FontId::proportional(11.0)),
-                        );
-                        ui.add(egui::ProgressBar::new(*percent).show_percentage());
-                        ui.label(
-                            RichText::new(
-                                "You can continue DJing and using ReTraktor normally while this installs quietly in the background.",
+                }
+                crate::demucs::DemucsInstallState::Installing { step, percent } => {
+                    ui.add(egui::ProgressBar::new(*percent).desired_width(140.0).show_percentage());
+                    ui.label(RichText::new(step).color(Color32::from_rgb(255, 185, 45)));
+                }
+                crate::demucs::DemucsInstallState::NotInstalled => {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("Install Demucs AI (~1.2 GB)")
+                                    .color(Color32::WHITE)
+                                    .strong(),
                             )
-                            .color(TraktorTheme::TEXT_MUTED)
-                            .font(egui::FontId::proportional(10.5)),
-                        );
-                    }
-                    crate::demucs::DemucsInstallState::NotInstalled => {
-                        ui.label(
-                            "Demucs is Meta AI's state-of-the-art neural music separation engine (MIT Licensed).",
-                        );
-                        ui.label(
-                            "Installing it gives ReTraktor 100% bleed-free stem isolation on your local tracks.",
-                        );
-                        ui.add_space(6.0);
-                        ui.horizontal(|ui| {
-                            if ui
-                                .add(
-                                    egui::Button::new(
-                                        RichText::new("✦ Install Demucs AI in Background (~1.2 GB)")
-                                            .color(Color32::WHITE)
-                                            .strong(),
-                                    )
-                                    .fill(TraktorTheme::ROW_SELECTED)
-                                    .min_size(Vec2::new(260.0, 26.0)),
-                                )
-                                .on_hover_text(
-                                    "Creates an isolated Python venv in ~/.local/share/retraktor/venv and installs PyTorch + Demucs without modifying system packages",
-                                )
-                                .clicked()
-                            {
-                                self.trigger_demucs_install = true;
-                            }
-                            ui.label(
-                                RichText::new(
-                                    "Runs completely in the background without interrupting audio.",
-                                )
-                                .color(TraktorTheme::TEXT_MUTED)
-                                .font(egui::FontId::proportional(10.5)),
-                            );
-                        });
-                    }
-                    crate::demucs::DemucsInstallState::Failed { error } => {
-                        ui.label(
-                            RichText::new(format!("Error: {error}"))
-                                .color(Color32::from_rgb(240, 80, 80)),
-                        );
-                        if ui.button("Retry Background Installation").clicked() {
-                            self.trigger_demucs_install = true;
-                        }
+                            .fill(TraktorTheme::ROW_SELECTED)
+                            .min_size(Vec2::new(210.0, 26.0)),
+                        )
+                        .clicked()
+                    {
+                        self.trigger_demucs_install = true;
                     }
                 }
-            });
-
-        ui.add_space(10.0);
-        ui.label(RichText::new("Stem Separation Mode:").strong());
-        ui.radio_value(
-            &mut self.stems_engine_mode,
-            0,
-            "Hybrid (Recommended): True Neural Demucs Stems (with real-time DSP fallback)",
-        );
-        ui.radio_value(
-            &mut self.stems_engine_mode,
-            1,
-            "Instant Real-Time DSP Stem Isolation Only (Zero external dependencies)",
-        );
-        ui.radio_value(
-            &mut self.stems_engine_mode,
-            2,
-            "Offline Pre-Computed 4-Stem Cache (.stem.m4a / HTDemucs)",
+                crate::demucs::DemucsInstallState::Failed { error } => {
+                    if ui.button("Retry Install").clicked() {
+                        self.trigger_demucs_install = true;
+                    }
+                    ui.label(RichText::new(error).color(Color32::from_rgb(240, 80, 80)));
+                }
+            },
         );
 
-        ui.add_space(10.0);
-        ui.checkbox(
-            &mut self.neural_mix_eq_mode,
-            "Neural Mix™ EQ ⇄ Stems Knob Swap (Map MX2 HI/MID/LOW knobs to Vocals/Inst/Drums+Bass)",
+        let stem_modes = [
+            "Hybrid (Neural Demucs AI + Real-Time DSP Fallback)",
+            "Real-Time DSP Isolation Only (Zero Dependencies)",
+            "Offline Pre-Computed 4-Stem Cache (.stem.m4a / FLAC)",
+        ];
+        Self::list_row(
+            ui,
+            "Stem Separation Mode",
+            "Choose between hybrid AI separation, zero-latency DSP crossover, or offline stem files.",
+            |ui| {
+                egui::ComboBox::from_id_salt("stem_engine_mode_combo")
+                    .selected_text(stem_modes[self.stems_engine_mode.min(2)])
+                    .width(320.0)
+                    .show_ui(ui, |ui| {
+                        for (i, m) in stem_modes.iter().enumerate() {
+                            ui.selectable_value(&mut self.stems_engine_mode, i, *m);
+                        }
+                    });
+            },
         );
 
-        ui.add_space(10.0);
-        egui::Frame::none()
-            .fill(Color32::from_rgb(18, 25, 34))
-            .stroke(Stroke::new(1.0_f32, TraktorTheme::DECK_A))
-            .inner_margin(egui::Margin::symmetric(10.0, 8.0))
-            .show(ui, |ui| {
-                ui.label(
-                    RichText::new("4-Stem Architecture (Drums | Bass | Other | Vocals)")
-                        .color(TraktorTheme::DECK_A)
-                        .strong(),
-                );
-                ui.label("• Deck Stems Bar: Mute/Unmute each stem, 1-click ACAPELLA & INST isolators");
-                ui.label("• 4-Lane Stem Waveform View: Toggle 'STEMS' on any deck or in Parallel layout");
-                ui.label("• Traktor MX2 STEMS Pad Mode: Pads 1..4 = Stem Mute | Pads 5..8 = Stem FX Send");
-            });
+        Self::list_row(
+            ui,
+            "Neural Mix EQ ⇄ Stems Knob Swap",
+            "Swap channel HI/MID/LOW EQ knobs to control Vocals, Instruments, and Drums+Bass levels.",
+            |ui| {
+                ui.checkbox(&mut self.neural_mix_eq_mode, "Enabled");
+            },
+        );
     }
 
     fn show_deck_prefs(&mut self, ui: &mut Ui) {
-        ui.heading("Decks Layout & Waveform Display");
-        ui.add_space(8.0);
+        Self::list_section_header(ui, "DECKS LAYOUT & WAVEFORM DISPLAY");
 
-        egui::Frame::none()
-            .fill(Color32::from_rgb(24, 28, 36))
-            .stroke(Stroke::new(1.0_f32, Color32::from_rgb(46, 52, 66)))
-            .inner_margin(egui::Margin::same(12.0))
-            .show(ui, |ui| {
-                ui.checkbox(&mut self.four_deck_mode, "Enable 4-Deck Workspace Mode (Decks A, B, C, D)");
-                ui.label("When active, displays four independent deck strips with master crossfader routing.");
+        Self::list_row(
+            ui,
+            "4-Deck Workspace Mode (Decks A, B, C, D)",
+            "Display four independent deck strips and stacked parallel waveforms.",
+            |ui| {
+                ui.checkbox(&mut self.four_deck_mode, "Enabled");
+            },
+        );
 
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Waveform Color Palette:").strong());
-                    ui.add_space(8.0);
-                    let palettes = [
-                        "Spectrum (Traktor Pro 4 Signature 3-Band Frequency Color)",
-                        "Ultraviolet (Neon Purple Mids & Ice Blue Highs)",
-                        "High Contrast RGB (Red Bass, Green Mids, Blue Highs)",
-                    ];
-                    egui::ComboBox::from_id_salt("wf_palette_combo")
-                        .selected_text(palettes[self.waveform_color_mode])
-                        .show_ui(ui, |ui| {
-                            for (i, p) in palettes.iter().enumerate() {
-                                ui.selectable_value(&mut self.waveform_color_mode, i, *p);
-                            }
-                        });
-                });
+        let palettes = [
+            "Spectrum (3-Band Frequency Color)",
+            "Ultraviolet (Neon Purple Mids & Ice Blue Highs)",
+            "High Contrast RGB (Red Bass, Green Mids, Blue Highs)",
+        ];
+        Self::list_row(
+            ui,
+            "Waveform Color Palette",
+            "Select the frequency-band color mapping used on scrolling and overview waveforms.",
+            |ui| {
+                egui::ComboBox::from_id_salt("wf_palette_combo")
+                    .selected_text(palettes[self.waveform_color_mode.min(2)])
+                    .width(300.0)
+                    .show_ui(ui, |ui| {
+                        for (i, p) in palettes.iter().enumerate() {
+                            ui.selectable_value(&mut self.waveform_color_mode, i, *p);
+                        }
+                    });
+            },
+        );
 
-                ui.add_space(8.0);
-                ui.checkbox(&mut self.show_minute_markers, "Show minute markers on track stripe overview");
-                ui.checkbox(&mut self.show_beatgrid_ticks, "Display beatgrid transient ticks on scrolling waveform");
-                ui.checkbox(&mut self.stripe_fit_full, "Fit full track length into stripe overview window");
-            });
+        Self::list_row(
+            ui,
+            "Minute Markers on Stripe Overview",
+            "Render vertical 60-second time division ticks across the full-track overview bar.",
+            |ui| {
+                ui.checkbox(&mut self.show_minute_markers, "Enabled");
+            },
+        );
 
-        ui.add_space(10.0);
-        egui::Frame::none()
-            .fill(Color32::from_rgb(22, 26, 34))
-            .stroke(Stroke::new(1.0_f32, Color32::from_rgb(42, 48, 62)))
-            .inner_margin(egui::Margin::same(10.0))
-            .show(ui, |ui| {
-                ui.label(RichText::new("Spectrum Color Scheme Legend").color(TraktorTheme::DECK_A).strong());
-                ui.label("• Red / Warm Orange: Sub-bass, Kick drums, Low basslines (< 250 Hz)");
-                ui.label("• Amber / Gold: Vocals, Guitars, Pianos, Lead Synths (250 Hz - 4 kHz)");
-                ui.label("• Ice Blue / Cyan: Hi-hats, Crash cymbals, Shakers, Air (> 4 kHz)");
-            });
+        Self::list_row(
+            ui,
+            "Beatgrid Transient Ticks",
+            "Display beatgrid bar and beat lines on scrolling waveforms for visual phase alignment.",
+            |ui| {
+                ui.checkbox(&mut self.show_beatgrid_ticks, "Enabled");
+            },
+        );
+
+        Self::list_row(
+            ui,
+            "Fit Full Track in Stripe Overview",
+            "Scale the mini overview waveform to always span 100% of the track duration.",
+            |ui| {
+                ui.checkbox(&mut self.stripe_fit_full, "Enabled");
+            },
+        );
     }
 
     fn show_track_decks_prefs(&mut self, ui: &mut Ui) {
-        ui.heading("Track Decks & Vinyl Scratching Physics");
-        ui.add_space(8.0);
+        Self::list_section_header(ui, "TRACK DECKS, SAFETY & VINYL SCRATCH PHYSICS");
 
-        egui::Frame::none()
-            .fill(Color32::from_rgb(24, 28, 36))
-            .stroke(Stroke::new(1.0_f32, Color32::from_rgb(46, 52, 66)))
-            .inner_margin(egui::Margin::same(12.0))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Tempo Pitch Fader Range:").strong());
-                    ui.add_space(8.0);
-                    let ranges = ["±8% (Club / House)", "±16% (Wide Range)", "±32% (Extreme)", "±50% (Breakbeat)", "±100% (Ultra Pitch)"];
-                    egui::ComboBox::from_id_salt("pitch_range_combo")
-                        .selected_text(ranges[self.pitch_range_idx])
-                        .show_ui(ui, |ui| {
-                            for (i, r) in ranges.iter().enumerate() {
-                                ui.selectable_value(&mut self.pitch_range_idx, i, *r);
-                            }
-                        });
-                });
+        Self::list_row(
+            ui,
+            "Lock Playing Decks",
+            "Prevent loading a new track into a deck that is currently playing live audio.",
+            |ui| {
+                ui.checkbox(&mut self.lock_playing_decks, "Enabled");
+            },
+        );
 
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Keylock Quality:").strong());
-                    ui.add_space(8.0);
-                    let modes = ["HiQ (Phase Vocoder — Scratch Preserving)", "ECO (Low CPU Usage)"];
-                    egui::ComboBox::from_id_salt("keylock_mode_combo")
-                        .selected_text(modes[self.keylock_quality])
-                        .show_ui(ui, |ui| {
-                            for (i, m) in modes.iter().enumerate() {
-                                ui.selectable_value(&mut self.keylock_quality, i, *m);
-                            }
-                        });
-                });
+        let ranges = [
+            "±8% (Club / House)",
+            "±16% (Wide Range)",
+            "±32% (Extreme)",
+            "±50% (Breakbeat)",
+            "±100% (Ultra Pitch)",
+        ];
+        Self::list_row(
+            ui,
+            "Tempo Pitch Fader Range",
+            "Maximum tempo bend percentage for deck pitch faders.",
+            |ui| {
+                egui::ComboBox::from_id_salt("pitch_range_combo")
+                    .selected_text(ranges[self.pitch_range_idx.min(4)])
+                    .width(220.0)
+                    .show_ui(ui, |ui| {
+                        for (i, r) in ranges.iter().enumerate() {
+                            ui.selectable_value(&mut self.pitch_range_idx, i, *r);
+                        }
+                    });
+            },
+        );
 
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Playhead Marker Position:").strong());
-                    ui.add_space(8.0);
-                    let positions = ["Centered (50% Center)", "Left-Weighted (30% Ahead)"];
-                    egui::ComboBox::from_id_salt("play_marker_combo")
-                        .selected_text(positions[self.play_marker_pos])
-                        .show_ui(ui, |ui| {
-                            for (i, p) in positions.iter().enumerate() {
-                                ui.selectable_value(&mut self.play_marker_pos, i, *p);
-                            }
-                        });
-                });
+        let modes = ["HiQ (Phase Vocoder — Scratch Preserving)", "ECO (Low CPU Usage)"];
+        Self::list_row(
+            ui,
+            "Keylock Time-Stretch Quality",
+            "Master tempo pitch-lock algorithm quality when changing BPM.",
+            |ui| {
+                egui::ComboBox::from_id_salt("keylock_mode_combo")
+                    .selected_text(modes[self.keylock_quality.min(1)])
+                    .width(260.0)
+                    .show_ui(ui, |ui| {
+                        for (i, m) in modes.iter().enumerate() {
+                            ui.selectable_value(&mut self.keylock_quality, i, *m);
+                        }
+                    });
+            },
+        );
 
-                ui.add_space(8.0);
-                ui.checkbox(&mut self.auto_cue_on_load, "Automatically jump to First Beat Cue point on track load");
-                ui.add_space(8.0);
-                ui.checkbox(&mut self.lock_playing_decks, "Lock Playing Decks (Prevents loading a track into a deck actively playing music live)");
-            });
+        let positions = ["Centered (50% Center)", "Left-Weighted (30% Ahead)"];
+        Self::list_row(
+            ui,
+            "Playhead Marker Position",
+            "Horizontal position of the red playhead cursor inside the scrolling waveform viewport.",
+            |ui| {
+                egui::ComboBox::from_id_salt("play_marker_combo")
+                    .selected_text(positions[self.play_marker_pos.min(1)])
+                    .width(220.0)
+                    .show_ui(ui, |ui| {
+                        for (i, p) in positions.iter().enumerate() {
+                            ui.selectable_value(&mut self.play_marker_pos, i, *p);
+                        }
+                    });
+            },
+        );
 
-        ui.add_space(10.0);
-        egui::Frame::none()
-            .fill(Color32::from_rgb(22, 26, 34))
-            .stroke(Stroke::new(1.0_f32, Color32::from_rgb(42, 48, 62)))
-            .inner_margin(egui::Margin::same(12.0))
-            .show(ui, |ui| {
-                ui.label(RichText::new("Turntable Scratch & Jogwheel Emulation").color(TraktorTheme::DECK_A).strong());
-                ui.horizontal(|ui| {
-                    ui.label("Jog Scratch Sensitivity:");
-                    ui.add(egui::Slider::new(&mut self.jog_scratch_sensitivity, 0.2..=3.0).show_value(true));
-                });
-                ui.add_space(4.0);
-                ui.checkbox(&mut self.jog_mode_turntable, "Turntable Mode: Top surface platter touch engages vinyl scratch (Alpha-Beta filter)");
-                ui.label(RichText::new("Outer rim turning always performs smooth CDJ-style pitch bend nudge.").color(TraktorTheme::TEXT_MUTED));
-            });
+        Self::list_row(
+            ui,
+            "Auto-Cue on Track Load",
+            "Automatically position playhead at the first beatgrid cue point when loading a track.",
+            |ui| {
+                ui.checkbox(&mut self.auto_cue_on_load, "Enabled");
+            },
+        );
+
+        Self::list_row(
+            ui,
+            "Jogwheel Scratch Sensitivity",
+            "Multiplier for capacitive platter vinyl scratch velocity.",
+            |ui| {
+                ui.add(egui::Slider::new(&mut self.jog_scratch_sensitivity, 0.2..=3.0).show_value(true));
+            },
+        );
+
+        Self::list_row(
+            ui,
+            "Turntable Mode (Vinyl Scratch)",
+            "Top platter touch engages alpha-beta vinyl scratch; outer rim performs pitch bend nudge.",
+            |ui| {
+                ui.checkbox(&mut self.jog_mode_turntable, "Enabled");
+            },
+        );
     }
 
     fn show_effects_prefs(&mut self, ui: &mut Ui) {
-        ui.heading("Effects Routing & Mixer FX Assignments");
-        ui.add_space(8.0);
+        Self::list_section_header(ui, "EFFECTS ROUTING & MIXER FX ASSIGNMENTS");
 
-        egui::Frame::none()
-            .fill(Color32::from_rgb(24, 28, 36))
-            .stroke(Stroke::new(1.0_f32, Color32::from_rgb(46, 52, 66)))
-            .inner_margin(egui::Margin::same(12.0))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Active Master FX Units:").strong());
-                    ui.radio_value(&mut self.fx_units_count, 0, "2 FX Units (Standard Decks A & B)");
-                    ui.radio_value(&mut self.fx_units_count, 1, "4 FX Units (Decks A, B, C, D Routing)");
-                });
-
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("FX Panel Display Mode:").strong());
-                    ui.radio_value(&mut self.fx_panel_mode, 0, "Group Mode (3 chained effects per FX Unit)");
-                    ui.radio_value(&mut self.fx_panel_mode, 1, "Single Mode (1 deep effect with parameter knobs)");
-                });
-            });
-
-        ui.add_space(10.0);
-        egui::Frame::none()
-            .fill(Color32::from_rgb(22, 26, 34))
-            .stroke(Stroke::new(1.0_f32, Color32::from_rgb(42, 48, 62)))
-            .inner_margin(egui::Margin::same(12.0))
-            .show(ui, |ui| {
-                ui.label(RichText::new("Mixer FX Slot Pre-selection").color(TraktorTheme::DECK_A).strong());
-                ui.label("Choose which 4 effects appear in the one-knob channel mixer FX selectors:");
-                ui.add_space(6.0);
-
-                let fx_options = [
-                    "Filter (92 Dual Resonant)",
-                    "Reverb (T3 Space Reverb)",
-                    "Dual Delay (Ping-Pong Stereo)",
-                    "White Noise Sweep",
-                    "Time Gater (Rhythmic Chop)",
-                    "Barber Pole (Infinite Phaser)",
-                    "Flanger Flux",
-                    "Dotted 8th Delay",
-                    "Bit Crush (Digital Lo-Fi)",
-                ];
-
-                for (idx, slot_val) in self.mixer_fx_slots.iter_mut().enumerate() {
-                    ui.horizontal(|ui| {
-                        ui.label(format!("Slot {}:", idx + 1));
-                        let sel_idx = (*slot_val).min(8);
-                        egui::ComboBox::from_id_salt(format!("mfx_slot_{idx}"))
-                            .selected_text(fx_options[sel_idx])
-                            .show_ui(ui, |ui| {
-                                for (opt_idx, name) in fx_options.iter().enumerate() {
-                                    ui.selectable_value(slot_val, opt_idx, *name);
-                                }
-                            });
+        let unit_counts = ["2 FX Units (Standard Decks A & B)", "4 FX Units (Decks A, B, C, D)"];
+        Self::list_row(
+            ui,
+            "Active Master FX Units",
+            "Number of assignable multi-effect units in the top rack.",
+            |ui| {
+                egui::ComboBox::from_id_salt("fx_units_count_combo")
+                    .selected_text(unit_counts[self.fx_units_count.min(1)])
+                    .width(250.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.fx_units_count, 0, unit_counts[0]);
+                        ui.selectable_value(&mut self.fx_units_count, 1, unit_counts[1]);
                     });
-                }
-            });
+            },
+        );
+
+        let panel_modes = [
+            "Group Mode (3 Chained Effects per Unit)",
+            "Single Mode (1 Deep Effect with Parameter Knobs)",
+        ];
+        Self::list_row(
+            ui,
+            "FX Panel Display Mode",
+            "Choose between 3 simultaneous macro effects or single-effect deep parameter control.",
+            |ui| {
+                egui::ComboBox::from_id_salt("fx_panel_mode_combo")
+                    .selected_text(panel_modes[self.fx_panel_mode.min(1)])
+                    .width(280.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.fx_panel_mode, 0, panel_modes[0]);
+                        ui.selectable_value(&mut self.fx_panel_mode, 1, panel_modes[1]);
+                    });
+            },
+        );
+
+        Self::list_section_header(ui, "ONE-KNOB MIXER FX SLOT ASSIGNMENTS");
+        let fx_options = [
+            "Filter (92 Dual Resonant)",
+            "Reverb (T3 Space Reverb)",
+            "Dual Delay (Ping-Pong Stereo)",
+            "White Noise Sweep",
+            "Time Gater (Rhythmic Chop)",
+            "Barber Pole (Infinite Phaser)",
+            "Flanger Flux",
+            "Dotted 8th Delay",
+            "Bit Crush (Digital Lo-Fi)",
+        ];
+
+        for idx in 0..4 {
+            let mut slot_val = self.mixer_fx_slots[idx].min(fx_options.len() - 1);
+            Self::list_row(
+                ui,
+                &format!("Mixer FX Slot {}", idx + 1),
+                "Effect assigned to channel strip Mixer FX selector button.",
+                |ui| {
+                    egui::ComboBox::from_id_salt(format!("mfx_slot_{idx}"))
+                        .selected_text(fx_options[slot_val])
+                        .width(240.0)
+                        .show_ui(ui, |ui| {
+                            for (opt_idx, name) in fx_options.iter().enumerate() {
+                                ui.selectable_value(&mut slot_val, opt_idx, *name);
+                            }
+                        });
+                },
+            );
+            self.mixer_fx_slots[idx] = slot_val;
+        }
     }
 
     fn show_recording_prefs(&mut self, ui: &mut Ui) {
-        ui.heading("Recording & Live Broadcast");
-        ui.add_space(8.0);
+        Self::list_section_header(ui, "MASTER MIX RECORDER & LIVE BROADCAST");
 
-        egui::Frame::none()
-            .fill(Color32::from_rgb(24, 28, 36))
-            .stroke(Stroke::new(1.0_f32, Color32::from_rgb(46, 52, 66)))
-            .inner_margin(egui::Margin::same(12.0))
-            .show(ui, |ui| {
-                ui.label(RichText::new("Master Mix Audio Recorder (● REC):").strong());
-                ui.horizontal(|ui| {
-                    ui.label("Save Directory:");
-                    let path_str = self.recording_dir.to_string_lossy().to_string();
-                    ui.label(RichText::new(path_str).monospace().color(TraktorTheme::DECK_A));
-                });
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.label("Audio Format:");
-                    let formats = ["WAV 16-bit / 48 kHz (Lossless CD Quality)", "WAV 24-bit / 48 kHz (Studio Master)"];
-                    egui::ComboBox::from_id_salt("rec_format_combo")
-                        .selected_text(formats[self.recording_format])
-                        .show_ui(ui, |ui| {
-                            for (i, f) in formats.iter().enumerate() {
-                                ui.selectable_value(&mut self.recording_format, i, *f);
-                            }
-                        });
-                });
-                ui.add_space(4.0);
-                ui.label("Captures post-limiter master output directly to disk with zero latency impact.");
-            });
+        let path_str = self.recording_dir.to_string_lossy().to_string();
+        Self::list_row(
+            ui,
+            "Mix Recording Directory",
+            "Destination folder where recorded live WAV mixes are saved.",
+            |ui| {
+                ui.label(RichText::new(path_str).monospace().color(TraktorTheme::DECK_A));
+            },
+        );
 
-        ui.add_space(10.0);
-        egui::Frame::none()
-            .fill(Color32::from_rgb(22, 26, 34))
-            .stroke(Stroke::new(1.0_f32, Color32::from_rgb(42, 48, 62)))
-            .inner_margin(egui::Margin::same(12.0))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("INTERNET BROADCAST (ICECAST / SHOUTCAST)").color(TraktorTheme::DECK_B).strong());
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let st = if self.broadcast_connected { "● Online" } else { "Offline" };
-                        ui.label(RichText::new(st).color(if self.broadcast_connected { TraktorTheme::PLAY_ACTIVE } else { TraktorTheme::TEXT_MUTED }));
-                    });
-                });
-                ui.add_space(6.0);
-
-                egui::Grid::new("broadcast_grid")
-                    .num_columns(2)
-                    .spacing([12.0, 8.0])
-                    .show(ui, |ui| {
-                        ui.label("Host Server:");
-                        ui.text_edit_singleline(&mut self.broadcast_host);
-                        ui.end_row();
-
-                        ui.label("Port:");
-                        let mut port_str = self.broadcast_port.to_string();
-                        if ui.text_edit_singleline(&mut port_str).changed() {
-                            if let Ok(p) = port_str.parse::<u16>() {
-                                self.broadcast_port = p;
-                            }
+        let formats = [
+            "WAV 16-bit / 48 kHz (Lossless CD Quality)",
+            "WAV 24-bit / 48 kHz (Studio Master)",
+        ];
+        Self::list_row(
+            ui,
+            "Recording Audio Format",
+            "Uncompressed PCM bit-depth for master mix recordings.",
+            |ui| {
+                egui::ComboBox::from_id_salt("rec_format_combo")
+                    .selected_text(formats[self.recording_format.min(1)])
+                    .width(260.0)
+                    .show_ui(ui, |ui| {
+                        for (i, f) in formats.iter().enumerate() {
+                            ui.selectable_value(&mut self.recording_format, i, *f);
                         }
-                        ui.end_row();
-
-                        ui.label("Mount Point:");
-                        ui.text_edit_singleline(&mut self.broadcast_mount);
-                        ui.end_row();
-
-                        ui.label("Stream Password:");
-                        ui.add(egui::TextEdit::singleline(&mut self.broadcast_password).password(true));
-                        ui.end_row();
                     });
-            });
+            },
+        );
+
+        Self::list_section_header(ui, "ICECAST / SHOUTCAST STREAMING SERVER");
+
+        Self::list_row(
+            ui,
+            "Broadcast Server Host",
+            "Hostname or IP address of your Icecast2 / Shoutcast server.",
+            |ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.broadcast_host).desired_width(200.0));
+            },
+        );
+
+        Self::list_row(
+            ui,
+            "Broadcast Server Port",
+            "TCP port for Icecast stream (default: 8000).",
+            |ui| {
+                let mut port_str = self.broadcast_port.to_string();
+                if ui
+                    .add(egui::TextEdit::singleline(&mut port_str).desired_width(100.0))
+                    .changed()
+                {
+                    if let Ok(p) = port_str.parse::<u16>() {
+                        self.broadcast_port = p;
+                    }
+                }
+            },
+        );
+
+        Self::list_row(
+            ui,
+            "Stream Mount Point",
+            "Icecast mount path (e.g. /retraktor.mp3 or /live.ogg).",
+            |ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.broadcast_mount).desired_width(200.0));
+            },
+        );
+
+        Self::list_row(
+            ui,
+            "Stream Source Password",
+            "Authentication password for the broadcast source client.",
+            |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.broadcast_password)
+                        .password(true)
+                        .desired_width(200.0),
+                );
+            },
+        );
+    }
+
+    fn show_browser_columns_prefs(&mut self, ui: &mut Ui) {
+        Self::list_section_header(ui, "LIBRARY METADATA COLUMNS & VIEW PRESETS");
+
+        Self::list_row(
+            ui,
+            "Quick Column Presets",
+            "Apply a preset column layout to the Track Collection browser table.",
+            |ui| {
+                if ui.button("Minimal Club View").clicked() {
+                    self.library_columns.set_all(false);
+                    self.library_columns.bpm = true;
+                    self.library_columns.key = true;
+                    self.library_columns.stems = true;
+                    self.library_columns.duration = true;
+                }
+                if ui.button("Show All Metadata Fields").clicked() {
+                    self.library_columns.set_all(true);
+                }
+                if ui.button("Standard DJ View (Default)").clicked() {
+                    self.library_columns = LibraryColumnsConfig::default();
+                }
+            },
+        );
+
+        Self::list_section_header(ui, "VISIBLE METADATA FIELDS IN LIBRARY TABLE");
+
+        Self::list_row(
+            ui,
+            "Album",
+            "Album or EP title (ID3 TALB / Vorbis ALBUM / NML ALBUM/@TITLE).",
+            |ui| {
+                ui.checkbox(&mut self.library_columns.album, "Show Column");
+            },
+        );
+        Self::list_row(
+            ui,
+            "BPM (Tempo)",
+            "Detected or tag-stored beats per minute (ID3 TBPM / NML TEMPO/@BPM).",
+            |ui| {
+                ui.checkbox(&mut self.library_columns.bpm, "Show Column");
+            },
+        );
+        Self::list_row(
+            ui,
+            "Musical Key",
+            "Harmonic key in Open Key, Camelot, or Musical notation (ID3 TKEY / NML MUSICAL_KEY).",
+            |ui| {
+                ui.checkbox(&mut self.library_columns.key, "Show Column");
+            },
+        );
+        Self::list_row(
+            ui,
+            "Stems Status",
+            "4-Stem separation availability and 1-click AI Demucs separation trigger.",
+            |ui| {
+                ui.checkbox(&mut self.library_columns.stems, "Show Column");
+            },
+        );
+        Self::list_row(
+            ui,
+            "Time (Duration)",
+            "Track playback length in MM:SS (NML INFO/@PLAYTIME).",
+            |ui| {
+                ui.checkbox(&mut self.library_columns.duration, "Show Column");
+            },
+        );
+        Self::list_row(
+            ui,
+            "Genre",
+            "Musical genre tag (ID3 TCON / Vorbis GENRE / NML INFO/@GENRE).",
+            |ui| {
+                ui.checkbox(&mut self.library_columns.genre, "Show Column");
+            },
+        );
+        Self::list_row(
+            ui,
+            "Rating",
+            "Track star rating 1–5 stars (ID3 POPM / NML INFO/@RANKING).",
+            |ui| {
+                ui.checkbox(&mut self.library_columns.rating, "Show Column");
+            },
+        );
+        Self::list_row(
+            ui,
+            "Comment",
+            "DJ notes, energy cues, and tag comments (ID3 COMM / Vorbis COMMENT / NML INFO/@COMMENT).",
+            |ui| {
+                ui.checkbox(&mut self.library_columns.comment, "Show Column");
+            },
+        );
+        Self::list_row(
+            ui,
+            "Remixer",
+            "Remix artist or producer credit (ID3 TPE4 / Vorbis REMIXER).",
+            |ui| {
+                ui.checkbox(&mut self.library_columns.remixer, "Show Column");
+            },
+        );
+        Self::list_row(
+            ui,
+            "Label (Publisher)",
+            "Record label or imprint (ID3 TPUB / Vorbis LABEL / NML INFO/@PRODUCER).",
+            |ui| {
+                ui.checkbox(&mut self.library_columns.label, "Show Column");
+            },
+        );
+        Self::list_row(
+            ui,
+            "Year (Release Date)",
+            "Release year or date (ID3 TDRC / TYER / Vorbis DATE / NML INFO/@RELEASE_DATE).",
+            |ui| {
+                ui.checkbox(&mut self.library_columns.year, "Show Column");
+            },
+        );
+        Self::list_row(
+            ui,
+            "Bitrate (kbps)",
+            "Audio stream bitrate in kbps (e.g. 320 kbps, 1411 kbps — NML INFO/@BITRATE).",
+            |ui| {
+                ui.checkbox(&mut self.library_columns.bitrate, "Show Column");
+            },
+        );
+        Self::list_row(
+            ui,
+            "Format (Codec)",
+            "Container and audio codec type (FLAC, MP3, WAV, AIFF, M4A, OGG).",
+            |ui| {
+                ui.checkbox(&mut self.library_columns.format, "Show Column");
+            },
+        );
+        Self::list_row(
+            ui,
+            "Track #",
+            "Album track number (ID3 TRCK / Vorbis TRACKNUMBER / NML ALBUM/@TRACK).",
+            |ui| {
+                ui.checkbox(&mut self.library_columns.track_number, "Show Column");
+            },
+        );
+        Self::list_row(
+            ui,
+            "Playlist & Preparation Actions",
+            "Quick buttons to add tracks to Preparation crate or user playlists.",
+            |ui| {
+                ui.checkbox(&mut self.library_columns.playlist_actions, "Show Column");
+            },
+        );
     }
 
     fn show_analyze_prefs(&mut self, ui: &mut Ui) {
-        ui.heading("Track Analyze Options & Musical Key Notation");
-        ui.add_space(8.0);
+        Self::list_section_header(ui, "TRACK ANALYZE OPTIONS & MUSICAL KEY NOTATION");
 
-        egui::Frame::none()
-            .fill(Color32::from_rgb(24, 28, 36))
-            .stroke(Stroke::new(1.0_f32, Color32::from_rgb(46, 52, 66)))
-            .inner_margin(egui::Margin::same(12.0))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("BPM Detection Range:").strong());
-                    ui.add_space(8.0);
-                    let ranges = [
-                        "70 - 140 BPM (Standard House / Techno / Pop)",
-                        "60 - 120 BPM (Downtempo / Hip-Hop / Reggae)",
-                        "90 - 180 BPM (Drum & Bass / Jungle)",
-                        "110 - 220 BPM (Hardcore / Speed Garage)",
-                    ];
-                    egui::ComboBox::from_id_salt("bpm_range_combo")
-                        .selected_text(ranges[self.bpm_detection_range])
-                        .show_ui(ui, |ui| {
-                            for (i, r) in ranges.iter().enumerate() {
-                                ui.selectable_value(&mut self.bpm_detection_range, i, *r);
-                            }
-                        });
-                });
+        let ranges = [
+            "70 - 140 BPM (Standard House / Techno / Pop)",
+            "60 - 120 BPM (Downtempo / Hip-Hop / Reggae)",
+            "90 - 180 BPM (Drum & Bass / Jungle)",
+            "110 - 220 BPM (Hardcore / Speed Garage)",
+        ];
+        Self::list_row(
+            ui,
+            "BPM Detection Range",
+            "Constrain automatic tempo detection to avoid half/double-time octave errors.",
+            |ui| {
+                egui::ComboBox::from_id_salt("bpm_range_combo")
+                    .selected_text(ranges[self.bpm_detection_range.min(3)])
+                    .width(290.0)
+                    .show_ui(ui, |ui| {
+                        for (i, r) in ranges.iter().enumerate() {
+                            ui.selectable_value(&mut self.bpm_detection_range, i, *r);
+                        }
+                    });
+            },
+        );
 
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Musical Key Display Notation:").strong());
-                    ui.add_space(8.0);
-                    let keys = [
-                        "Open Key (Traktor Standard: 1d..12d / 1m..12m)",
-                        "Camelot Notation (8A / 8B Wheel)",
-                        "Traditional Musical Key (Am, C, F#m)",
-                    ];
-                    egui::ComboBox::from_id_salt("key_notation_combo")
-                        .selected_text(keys[self.key_notation_idx])
-                        .show_ui(ui, |ui| {
-                            for (i, k) in keys.iter().enumerate() {
-                                ui.selectable_value(&mut self.key_notation_idx, i, *k);
-                            }
-                        });
-                });
+        let keys = [
+            "Open Key (Traktor Standard: 1d..12d / 1m..12m)",
+            "Camelot Notation (8A / 8B Wheel)",
+            "Traditional Musical Key (Am, C, F#m)",
+        ];
+        Self::list_row(
+            ui,
+            "Musical Key Display Notation",
+            "Choose how harmonic keys are formatted across Decks, Browser, and Match Radar.",
+            |ui| {
+                egui::ComboBox::from_id_salt("key_notation_combo")
+                    .selected_text(keys[self.key_notation_idx.min(2)])
+                    .width(290.0)
+                    .show_ui(ui, |ui| {
+                        for (i, k) in keys.iter().enumerate() {
+                            ui.selectable_value(&mut self.key_notation_idx, i, *k);
+                        }
+                    });
+            },
+        );
 
-                ui.add_space(8.0);
-                ui.checkbox(&mut self.analyze_new_tracks, "Analyze newly imported tracks automatically (BPM, Key, Transients)");
-            });
-
-        ui.add_space(10.0);
-        egui::Frame::none()
-            .fill(Color32::from_rgb(22, 26, 34))
-            .stroke(Stroke::new(1.0_f32, Color32::from_rgb(42, 48, 62)))
-            .inner_margin(egui::Margin::same(10.0))
-            .show(ui, |ui| {
-                ui.label(RichText::new("Harmonic Mixing & Circle-of-Fifths Key Wheel").color(TraktorTheme::DECK_A).strong());
-                ui.label("• In Open Key, '1m' corresponds to A Minor (8A Camelot) and '1d' corresponds to C Major (8B Camelot).");
-                ui.label("• ReTraktor's Harmonic Match Radar uses this notation to score harmonic compatibility up to 99%.");
-            });
+        Self::list_row(
+            ui,
+            "Auto-Analyze Imported Tracks",
+            "Automatically compute BPM, beatgrid transients, and musical key when adding files.",
+            |ui| {
+                ui.checkbox(&mut self.analyze_new_tracks, "Enabled");
+            },
+        );
     }
 
     fn show_controller_prefs(&mut self, ui: &mut Ui) {
@@ -1932,189 +2219,203 @@ impl PreferencesDialog {
     }
 
     fn show_file_management(&mut self, ui: &mut Ui) {
-        ui.heading("File Management & Music Folders");
-        ui.label(
-            RichText::new("Configure directories to scan and import into your Track Collection.")
-                .color(TraktorTheme::TEXT_SECONDARY),
-        );
-        ui.add_space(8.0);
+        Self::list_section_header(ui, "COLLECTION PERSISTENCE & EXIT BEHAVIOR");
 
-        // 1. Music Folders Watchlist
-        ui.label(
-            RichText::new("MUSIC FOLDERS WATCHLIST")
-                .color(TraktorTheme::DECK_A)
-                .font(egui::FontId::monospace(10.5))
-                .strong(),
+        Self::list_row(
+            ui,
+            "Prompt to Keep or Discard Added Songs on Exit",
+            "Ask whether to keep newly added tracks when closing ReTraktor and save to disk.",
+            |ui| {
+                ui.checkbox(&mut self.prompt_save_on_exit, "Enabled");
+            },
         );
 
-        egui::Frame::none()
-            .fill(Color32::from_rgb(20, 24, 30))
-            .stroke(Stroke::new(1.0_f32, Color32::from_rgb(46, 52, 64)))
-            .rounding(4.0)
-            .inner_margin(egui::Margin::same(8.0))
-            .show(ui, |ui| {
-                if self.music_folders.is_empty() {
-                    ui.label(
-                        RichText::new("No music folders added yet. Add folders below to scan automatically.")
-                            .color(TraktorTheme::TEXT_MUTED),
-                    );
-                } else {
-                    let mut to_remove = None;
-                    for (idx, folder) in self.music_folders.iter().enumerate() {
-                        ui.horizontal(|ui| {
-                            ui.label("📁");
-                            ui.label(
-                                RichText::new(folder.to_string_lossy().to_string())
-                                    .color(Color32::WHITE)
-                                    .strong(),
-                            );
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui
-                                    .button(RichText::new("✕").color(Color32::from_rgb(240, 80, 80)))
-                                    .on_hover_text("Remove this folder from scan list")
-                                    .clicked()
-                                {
-                                    to_remove = Some(idx);
-                                }
-                            });
-                        });
-                        ui.separator();
+        let save_formats = [
+            "Traktor .nml (collection.nml — Traktor Pro 4 v20 XML)",
+            "Extended .m3u8 (collection.m3u8 — Industry Standard UTF-8 Playlist)",
+            "Both Traktor .nml + Extended .m3u8",
+        ];
+        Self::list_row(
+            ui,
+            "Collection Save Format",
+            "Format used when saving your Track Collection (~/.local/share/retraktor/).",
+            |ui| {
+                egui::ComboBox::from_id_salt("collection_save_fmt_combo")
+                    .selected_text(save_formats[self.collection_save_format.min(2)])
+                    .width(340.0)
+                    .show_ui(ui, |ui| {
+                        for (i, fmt) in save_formats.iter().enumerate() {
+                            ui.selectable_value(&mut self.collection_save_format, i, *fmt);
+                        }
+                    });
+            },
+        );
+
+        Self::list_section_header(ui, "MUSIC FOLDERS WATCHLIST");
+
+        let mut to_remove = None;
+        for (idx, folder) in self.music_folders.iter().enumerate() {
+            let folder_str = folder.to_string_lossy().to_string();
+            Self::list_row(
+                ui,
+                &folder_str,
+                "Watched audio directory included in library scans.",
+                |ui| {
+                    if ui
+                        .button(RichText::new("Remove").color(Color32::from_rgb(240, 80, 80)))
+                        .clicked()
+                    {
+                        to_remove = Some(idx);
                     }
-                    if let Some(idx) = to_remove {
-                        self.music_folders.remove(idx);
+                },
+            );
+        }
+        if let Some(idx) = to_remove {
+            self.music_folders.remove(idx);
+        }
+
+        Self::list_row(
+            ui,
+            "Add Music Folder Path",
+            "Enter a directory path on disk or select a quick preset to include in library scans.",
+            |ui| {
+                if ui.button("+ Add Folder").clicked() {
+                    let trimmed = self.new_folder_input.trim();
+                    if !trimmed.is_empty() {
+                        let p = std::path::PathBuf::from(trimmed);
+                        if !self.music_folders.contains(&p) {
+                            self.music_folders.push(p);
+                            self.new_folder_input.clear();
+                        }
                     }
                 }
-
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.label("Add Path:");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.new_folder_input)
-                            .hint_text("/path/to/music/folder")
-                            .desired_width(260.0),
-                    );
-                    if ui.button("+ Add Folder").clicked() {
-                        let trimmed = self.new_folder_input.trim();
-                        if !trimmed.is_empty() {
-                            let p = std::path::PathBuf::from(trimmed);
-                            if !self.music_folders.contains(&p) {
-                                self.music_folders.push(p);
-                                self.new_folder_input.clear();
-                            }
-                        }
-                    }
-                });
-
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Quick Presets:").color(TraktorTheme::TEXT_MUTED));
-                    let home = std::env::var("HOME").unwrap_or_else(|_| "/home".to_string());
-                    if ui.button("~/Music").clicked() {
-                        let p = std::path::PathBuf::from(&home).join("Music");
-                        if !self.music_folders.contains(&p) {
-                            self.music_folders.push(p);
-                        }
-                    }
-                    if ui.button("~/Downloads").clicked() {
-                        let p = std::path::PathBuf::from(&home).join("Downloads");
-                        if !self.music_folders.contains(&p) {
-                            self.music_folders.push(p);
-                        }
-                    }
-                    if ui.button("/media").clicked() {
-                        let p = std::path::PathBuf::from("/media");
-                        if !self.music_folders.contains(&p) {
-                            self.music_folders.push(p);
-                        }
-                    }
-                    if ui.button("/mnt").clicked() {
-                        let p = std::path::PathBuf::from("/mnt");
-                        if !self.music_folders.contains(&p) {
-                            self.music_folders.push(p);
-                        }
-                    }
-                });
-            });
-
-        ui.add_space(8.0);
-
-        // 2. Scan & Analysis Options
-        ui.label(
-            RichText::new("SCAN & ANALYSIS OPTIONS")
-                .color(TraktorTheme::DECK_A)
-                .font(egui::FontId::monospace(10.5))
-                .strong(),
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.new_folder_input)
+                        .hint_text("/path/to/music/folder")
+                        .desired_width(220.0),
+                );
+            },
         );
 
-        ui.checkbox(
-            &mut self.scan_on_startup,
-            "Import & Scan Music Folders at Startup",
+        Self::list_row(
+            ui,
+            "Quick Directory Presets",
+            "One-click add standard Linux music and removable media mount points.",
+            |ui| {
+                let home = std::env::var("HOME").unwrap_or_else(|_| "/home".to_string());
+                if ui.button("/mnt").clicked() {
+                    let p = std::path::PathBuf::from("/mnt");
+                    if !self.music_folders.contains(&p) {
+                        self.music_folders.push(p);
+                    }
+                }
+                if ui.button("/media").clicked() {
+                    let p = std::path::PathBuf::from("/media");
+                    if !self.music_folders.contains(&p) {
+                        self.music_folders.push(p);
+                    }
+                }
+                if ui.button("~/Downloads").clicked() {
+                    let p = std::path::PathBuf::from(&home).join("Downloads");
+                    if !self.music_folders.contains(&p) {
+                        self.music_folders.push(p);
+                    }
+                }
+                if ui.button("~/Music").clicked() {
+                    let p = std::path::PathBuf::from(&home).join("Music");
+                    if !self.music_folders.contains(&p) {
+                        self.music_folders.push(p);
+                    }
+                }
+            },
         );
-        ui.checkbox(
-            &mut self.analyze_new_tracks,
-            "Analyze BPM, Transients, and Musical Key automatically",
+
+        Self::list_section_header(ui, "SCAN & IMPORT OPTIONS");
+
+        Self::list_row(
+            ui,
+            "Scan Music Folders on Startup",
+            "Automatically scan configured music folders when launching ReTraktor.",
+            |ui| {
+                ui.checkbox(&mut self.scan_on_startup, "Enabled");
+            },
         );
 
-        ui.add_space(8.0);
-
-        // 3. Rescan Action Button & Status
-        ui.horizontal(|ui| {
-            if ui
-                .add(
-                    egui::Button::new(
-                        RichText::new("↻ Rescan All Music Folders Now")
-                            .color(Color32::WHITE)
-                            .strong(),
-                    )
-                    .fill(TraktorTheme::ROW_SELECTED)
-                    .min_size(Vec2::new(220.0, 26.0)),
-                )
-                .on_hover_text("Recursively scans all configured music folders and imports new tracks into Collection")
-                .clicked()
-            {
-                self.trigger_music_rescan = true;
-            }
-
-            ui.label(
-                RichText::new(&self.file_management_status)
-                    .color(TraktorTheme::PLAY_ACTIVE)
-                    .font(egui::FontId::monospace(10.5)),
-            );
-        });
-
-        ui.add_space(10.0);
-
-        // 4. Supported Audio Codecs
-        ui.label(
-            RichText::new("SUPPORTED AUDIO FORMATS")
-                .color(TraktorTheme::TEXT_MUTED)
-                .font(egui::FontId::monospace(10.0)),
+        Self::list_row(
+            ui,
+            "Auto-Analyze New Tracks",
+            "Extract ID3/Vorbis/MP4 metadata, BPM, and key tags during folder scan.",
+            |ui| {
+                ui.checkbox(&mut self.analyze_new_tracks, "Enabled");
+            },
         );
-        ui.horizontal(|ui| {
-            for ext in &["MP3", "FLAC", "WAV", "OGG", "M4A", "AAC", "AIFF", "NML", "TSI"] {
-                egui::Frame::none()
-                    .fill(Color32::from_rgb(34, 38, 46))
-                    .rounding(2.0)
-                    .inner_margin(egui::Margin::symmetric(6.0, 2.0))
-                    .show(ui, |ui| {
-                        ui.label(
-                            RichText::new(*ext)
+
+        Self::list_row(
+            ui,
+            "Manual Library Rescan",
+            &self.file_management_status.clone(),
+            |ui| {
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new("Rescan All Music Folders")
                                 .color(Color32::WHITE)
-                                .font(egui::FontId::monospace(9.5))
                                 .strong(),
-                        );
-                    });
-            }
-        });
+                        )
+                        .fill(TraktorTheme::ROW_SELECTED)
+                        .min_size(Vec2::new(200.0, 26.0)),
+                    )
+                    .clicked()
+                {
+                    self.trigger_music_rescan = true;
+                }
+            },
+        );
     }
 
     fn show_about(&mut self, ui: &mut Ui) {
-        ui.heading("ReTraktor Pro 4.5.1");
-        ui.add_space(8.0);
-        ui.label("Clean-Room Linux Re-Implementation of Traktor Pro 4.");
-        ui.label("Pure Rust real-time audio DSP, CSI 1.0 QML engine, and eframe/egui interface.");
-        ui.add_space(8.0);
-        ui.label("Repository: https://github.com/adamtdm/ReTraktor");
-        ui.label("Target: Linux (Pop!_OS, Ubuntu, Debian, Fedora, Arch) on Wayland and X11");
+        Self::list_section_header(ui, "SYSTEM & APPLICATION DIAGNOSTICS");
+
+        Self::list_row(
+            ui,
+            "Application Version",
+            "Clean-Room Linux Re-Implementation of Traktor Pro 4.",
+            |ui| {
+                ui.label(
+                    RichText::new("ReTraktor Pro 4.5.1")
+                        .color(TraktorTheme::DECK_A)
+                        .font(egui::FontId::monospace(12.0))
+                        .strong(),
+                );
+            },
+        );
+
+        Self::list_row(
+            ui,
+            "Audio & DSP Architecture",
+            "Zero-allocation real-time callback with 4-stem Linkwitz-Riley crossover and Demucs AI.",
+            |ui| {
+                ui.label(RichText::new("Pure Rust • 64-bit / 32-bit Float DSP").monospace());
+            },
+        );
+
+        Self::list_row(
+            ui,
+            "Library & Collection Formats",
+            "Lossless round-trip support for Traktor .nml (v19/v20), .tsi, .stem.m4a, and Extended .m3u8.",
+            |ui| {
+                ui.label(RichText::new("NML v20 • M3U8 • Symphonia Tags").monospace());
+            },
+        );
+
+        Self::list_row(
+            ui,
+            "Target Platform",
+            "Wayland & X11 Desktop Linux with ALSA / PipeWire and hidraw NHL2 support.",
+            |ui| {
+                ui.label(RichText::new("Linux x86_64 / aarch64").monospace());
+            },
+        );
     }
 }
 
@@ -2155,6 +2456,10 @@ mod tests {
         assert_eq!(cat, "STEMS & RECORDING");
         assert_eq!(sec, "Stems & Demucs AI");
 
+        let (cat, sec) = prefs.get_tab_breadcrumb(PrefsTab::BrowserColumns);
+        assert_eq!(cat, "COLLECTION & HARDWARE");
+        assert_eq!(sec, "Browser & Metadata Columns");
+
         let (cat, sec) = prefs.get_tab_breadcrumb(PrefsTab::Controllers);
         assert_eq!(cat, "COLLECTION & HARDWARE");
         assert_eq!(sec, "Controller Manager & Remapper");
@@ -2173,6 +2478,10 @@ mod tests {
         original.four_deck_mode = true;
         original.lock_playing_decks = false;
         original.audio_device_name = "Focusrite Scarlett 4i4".to_string();
+        original.library_columns.comment = true;
+        original.library_columns.remixer = true;
+        original.library_columns.bitrate = true;
+        original.collection_save_format = 2;
 
         let json = original.to_json_str();
         let mut restored = PreferencesDialog::default();
@@ -2183,5 +2492,9 @@ mod tests {
         assert!(restored.four_deck_mode);
         assert!(!restored.lock_playing_decks);
         assert_eq!(restored.audio_device_name, "Focusrite Scarlett 4i4");
+        assert!(restored.library_columns.comment);
+        assert!(restored.library_columns.remixer);
+        assert!(restored.library_columns.bitrate);
+        assert_eq!(restored.collection_save_format, 2);
     }
 }

@@ -1,5 +1,7 @@
+use crate::preferences::LibraryColumnsConfig;
 use crate::theme::TraktorTheme;
 use eframe::egui::{self, Color32, RichText, Stroke, Ui, Vec2};
+use retraktor_formats::nml::{NmlEntry, NmlLocation, NmlPlaylistNode, NmlTempo};
 use retraktor_formats::NmlCollection;
 use retraktor_library::KeyWheel;
 use std::env;
@@ -17,6 +19,13 @@ pub struct UiTrackEntry {
     pub duration_sec: f64,
     pub genre: String,
     pub rating: u8,
+    pub comment: String,
+    pub remixer: String,
+    pub label: String,
+    pub year: String,
+    pub bitrate_kbps: u32,
+    pub format: String,
+    pub track_number: u32,
     pub file_path: Option<PathBuf>,
     pub stems_ready: bool,
 }
@@ -56,17 +65,27 @@ pub enum NavItem {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SortColumn {
+    TrackNum,
     Title,
     Artist,
+    Album,
+    Remixer,
     Bpm,
     Key,
     Duration,
     Genre,
+    Label,
+    Year,
     Rating,
+    Comment,
+    Bitrate,
+    Format,
 }
 
 pub struct LibraryManager {
     pub tracks: Vec<UiTrackEntry>,
+    pub saved_baseline_tracks: Vec<UiTrackEntry>,
+    pub session_added_track_ids: Vec<usize>,
     pub playlists: Vec<UserPlaylist>,
     pub prep_track_ids: Vec<usize>,
     pub history: Vec<HistoryRecord>,
@@ -98,6 +117,7 @@ pub struct LibraryManager {
     pub show_match_radar: bool,
     pub open_prefs_requested: bool,
     pub open_prefs_file_management: bool,
+    pub open_prefs_browser_columns: bool,
     pub stem_job_progress: Option<(usize, f32)>,
     pub request_stem_separation: Option<usize>,
     pub status_message: String,
@@ -119,6 +139,8 @@ impl Default for LibraryManager {
 
         let mut mgr = Self {
             tracks: Vec::new(),
+            saved_baseline_tracks: Vec::new(),
+            session_added_track_ids: Vec::new(),
             playlists: Vec::new(),
             prep_track_ids: Vec::new(),
             history: Vec::new(),
@@ -140,19 +162,181 @@ impl Default for LibraryManager {
             show_match_radar: false,
             open_prefs_requested: false,
             open_prefs_file_management: false,
+            open_prefs_browser_columns: false,
             stem_job_progress: None,
             request_stem_separation: None,
             status_message: "Ready — Click [A] or [B] to load a track, or [✦ Stems] to separate into 4 stems.".to_string(),
         };
-        mgr.populate_default_collection();
+        let nml_path = Self::default_nml_path();
+        if nml_path.is_file() {
+            let _ = mgr.import_nml_file(&nml_path);
+            mgr.session_added_track_ids.clear();
+            if mgr.playlists.is_empty() {
+                mgr.playlists = vec![
+                    UserPlaylist {
+                        name: "Peak Time Techno".to_string(),
+                        track_ids: Vec::new(),
+                    },
+                    UserPlaylist {
+                        name: "Deep & Melodic House".to_string(),
+                        track_ids: Vec::new(),
+                    },
+                ];
+            }
+        } else {
+            mgr.populate_default_collection();
+        }
         mgr.refresh_explorer_dir();
         // Automatically scan ~/Music (non-recursively) if audio files exist there
         let _ = mgr.scan_directory_audio(&mgr.current_dir.clone(), false);
+        mgr.saved_baseline_tracks = mgr.tracks.clone();
+        mgr.session_added_track_ids.clear();
         mgr
     }
 }
 
 impl LibraryManager {
+    /// Standard path for ReTraktor's persisted Traktor `.nml` v20 collection.
+    pub fn default_nml_path() -> PathBuf {
+        let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        PathBuf::from(home).join(".local/share/retraktor/collection.nml")
+    }
+
+    /// Standard path for ReTraktor's industry-standard Extended `.m3u8` collection playlist.
+    pub fn default_m3u8_path() -> PathBuf {
+        let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        PathBuf::from(home).join(".local/share/retraktor/collection.m3u8")
+    }
+
+    /// Reverts the track collection to the pre-session baseline, discarding songs added during this session.
+    pub fn discard_session_added_tracks(&mut self) {
+        if !self.session_added_track_ids.is_empty() {
+            let discarded = self.session_added_track_ids.clone();
+            self.tracks = self.saved_baseline_tracks.clone();
+            self.prep_track_ids.retain(|id| !discarded.contains(id));
+            for pl in &mut self.playlists {
+                pl.track_ids.retain(|id| !discarded.contains(id));
+            }
+            self.session_added_track_ids.clear();
+        }
+    }
+
+    /// Saves the current Track Collection and Playlists to disk in Traktor `.nml` (v20 XML) format.
+    pub fn save_collection_nml(&mut self, path: &Path) -> Result<usize, String> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let mut col = NmlCollection::new(20);
+        for t in &self.tracks {
+            let posix_str = t
+                .file_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| format!("/virtual/{}.flac", t.id));
+            let loc = NmlLocation::from_posix_path(&posix_str, "linux-root");
+            col.entries.push(NmlEntry {
+                title: t.title.clone(),
+                artist: t.artist.clone(),
+                audio_id: None,
+                location: loc,
+                album_title: if t.album.is_empty() {
+                    None
+                } else {
+                    Some(t.album.clone())
+                },
+                album_track: if t.track_number > 0 {
+                    Some(t.track_number)
+                } else {
+                    None
+                },
+                genre: if t.genre.is_empty() {
+                    None
+                } else {
+                    Some(t.genre.clone())
+                },
+                comment: if t.comment.is_empty() {
+                    None
+                } else {
+                    Some(t.comment.clone())
+                },
+                key_text: Some(t.musical_key.clone()),
+                playtime_sec: Some(t.duration_sec),
+                bitrate: if t.bitrate_kbps > 0 {
+                    Some(t.bitrate_kbps * 1000)
+                } else {
+                    None
+                },
+                tempo: Some(NmlTempo {
+                    bpm: t.bpm,
+                    bpm_quality: 100.0,
+                }),
+                loudness: None,
+                musical_key_value: None,
+                cues: Vec::new(),
+                stems_path: None,
+            });
+        }
+
+        let mut pl_nodes = Vec::new();
+        for (idx, pl) in self.playlists.iter().enumerate() {
+            let mut keys = Vec::new();
+            for &tid in &pl.track_ids {
+                if let Some(t) = self.tracks.iter().find(|tr| tr.id == tid) {
+                    let posix_str = t
+                        .file_path
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_else(|| format!("/virtual/{}.flac", t.id));
+                    let loc = NmlLocation::from_posix_path(&posix_str, "linux-root");
+                    keys.push(loc.primary_key());
+                }
+            }
+            pl_nodes.push(NmlPlaylistNode::Playlist {
+                name: pl.name.clone(),
+                uuid: format!("retraktor-pl-{idx}"),
+                track_keys: keys,
+            });
+        }
+        col.playlists.push(NmlPlaylistNode::Folder {
+            name: "$ROOT".to_string(),
+            subnodes: pl_nodes,
+        });
+
+        let xml = col.to_xml();
+        fs::write(path, xml).map_err(|e| e.to_string())?;
+        self.saved_baseline_tracks = self.tracks.clone();
+        self.session_added_track_ids.clear();
+        let count = self.tracks.len();
+        self.status_message = format!("✓ Saved {count} tracks to Traktor NML v20 ({})", path.display());
+        Ok(count)
+    }
+
+    /// Saves the current Track Collection in industry-standard Extended `.m3u8` (UTF-8 M3U) format.
+    pub fn save_collection_m3u8(&self, path: &Path) -> Result<usize, String> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let mut out = String::from("#EXTM3U\n#EXTENC:UTF-8\n#PLAYLIST:ReTraktor Collection\n");
+        for t in &self.tracks {
+            let dur = t.duration_sec.round() as i64;
+            out.push_str(&format!("#EXTINF:{dur},{} - {}\n", t.artist, t.title));
+            if !t.album.is_empty() {
+                out.push_str(&format!("#EXTALB:{}\n", t.album));
+            }
+            if !t.genre.is_empty() {
+                out.push_str(&format!("#EXTGENRE:{}\n", t.genre));
+            }
+            let p_str = t
+                .file_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| format!("/virtual/{}.flac", t.id));
+            out.push_str(&format!("{p_str}\n"));
+        }
+        fs::write(path, out).map_err(|e| e.to_string())?;
+        Ok(self.tracks.len())
+    }
+
     pub fn select_next_track(&mut self) {
         if self.tracks.is_empty() {
             return;
@@ -199,6 +383,13 @@ impl LibraryManager {
                 duration_sec: 380.0,
                 genre: "Melodic Techno".to_string(),
                 rating: 5,
+                comment: "Peak-time opener • Vocal breakdown".to_string(),
+                remixer: "Anyma Club Mix".to_string(),
+                label: "Afterlife".to_string(),
+                year: "2026".to_string(),
+                bitrate_kbps: 1411,
+                format: "FLAC".to_string(),
+                track_number: 1,
                 file_path: None,
                 stems_ready: true,
             },
@@ -212,6 +403,13 @@ impl LibraryManager {
                 duration_sec: 410.0,
                 genre: "Peak Time Techno".to_string(),
                 rating: 5,
+                comment: "909 percussion loop • High energy".to_string(),
+                remixer: "Original Mix".to_string(),
+                label: "Axis Records".to_string(),
+                year: "2025".to_string(),
+                bitrate_kbps: 1411,
+                format: "WAV".to_string(),
+                track_number: 2,
                 file_path: None,
                 stems_ready: true,
             },
@@ -225,6 +423,13 @@ impl LibraryManager {
                 duration_sec: 345.0,
                 genre: "Deep House".to_string(),
                 rating: 4,
+                comment: "Warm piano chords • Terrace groove".to_string(),
+                remixer: "Terrace Dub".to_string(),
+                label: "Defected".to_string(),
+                year: "2026".to_string(),
+                bitrate_kbps: 320,
+                format: "MP3".to_string(),
+                track_number: 3,
                 file_path: None,
                 stems_ready: true,
             },
@@ -238,6 +443,13 @@ impl LibraryManager {
                 duration_sec: 290.0,
                 genre: "Drum & Bass".to_string(),
                 rating: 5,
+                comment: "Heavy sub-bass roller".to_string(),
+                remixer: "VIP Dubplate".to_string(),
+                label: "RAM / MTA".to_string(),
+                year: "2025".to_string(),
+                bitrate_kbps: 1411,
+                format: "FLAC".to_string(),
+                track_number: 4,
                 file_path: None,
                 stems_ready: false,
             },
@@ -251,6 +463,13 @@ impl LibraryManager {
                 duration_sec: 360.0,
                 genre: "Techno".to_string(),
                 rating: 4,
+                comment: "Hypnotic synth arpeggio".to_string(),
+                remixer: "2026 Remaster".to_string(),
+                label: "R&S Records".to_string(),
+                year: "2026".to_string(),
+                bitrate_kbps: 1411,
+                format: "FLAC".to_string(),
+                track_number: 5,
                 file_path: None,
                 stems_ready: true,
             },
@@ -264,6 +483,13 @@ impl LibraryManager {
                 duration_sec: 420.0,
                 genre: "Melodic House".to_string(),
                 rating: 5,
+                comment: "Long atmospheric build".to_string(),
+                remixer: "Extended Mix".to_string(),
+                label: "UPPERGROUND".to_string(),
+                year: "2025".to_string(),
+                bitrate_kbps: 1411,
+                format: "AIFF".to_string(),
+                track_number: 6,
                 file_path: None,
                 stems_ready: true,
             },
@@ -277,6 +503,13 @@ impl LibraryManager {
                 duration_sec: 510.0,
                 genre: "Classic Techno".to_string(),
                 rating: 4,
+                comment: "Classic TB-303 acid line".to_string(),
+                remixer: "Club Remaster".to_string(),
+                label: "F Comm".to_string(),
+                year: "2024".to_string(),
+                bitrate_kbps: 320,
+                format: "MP3".to_string(),
+                track_number: 7,
                 file_path: None,
                 stems_ready: false,
             },
@@ -290,6 +523,13 @@ impl LibraryManager {
                 duration_sec: 395.0,
                 genre: "Minimal Techno".to_string(),
                 rating: 5,
+                comment: "Stripped minimal groove • Tool".to_string(),
+                remixer: "Plastikman Edit".to_string(),
+                label: "M_nus".to_string(),
+                year: "2025".to_string(),
+                bitrate_kbps: 1411,
+                format: "FLAC".to_string(),
+                track_number: 8,
                 file_path: None,
                 stems_ready: true,
             },
@@ -433,9 +673,27 @@ impl LibraryManager {
 
         let next_id = self.tracks.iter().map(|t| t.id).max().unwrap_or(0) + 1;
         let key_choices = ["4m", "5m", "3m", "4d", "6m", "2m", "1d", "8m"];
-        let key = key_choices[next_id % key_choices.len()].to_string();
+        let mut key = key_choices[next_id % key_choices.len()].to_string();
         let mut dur_sec = 240.0;
         let mut bpm = 124.0 + ((next_id % 7) * 2) as f64;
+        let mut album = path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|s| s.to_str())
+            .unwrap_or("Local Folder")
+            .to_string();
+        let format_ext = path
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("AUDIO")
+            .to_ascii_uppercase();
+        let mut genre = format_ext.clone();
+        let mut comment = String::new();
+        let mut remixer = String::new();
+        let mut label = String::new();
+        let mut year = String::new();
+        let mut track_number = 0u32;
+        let file_size_bytes = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
 
         // Quick metadata probe via Symphonia without decoding PCM
         if let Ok(file) = std::fs::File::open(path) {
@@ -450,20 +708,52 @@ impl LibraryManager {
                 &Default::default(),
                 &Default::default(),
             ) {
-                if let Some(rev) = probed.format.metadata().current() {
-                    for tag in rev.tags() {
+                let mut inspect_tags = |tags: &[symphonia::core::meta::Tag]| {
+                    for tag in tags {
                         let k = tag.key.to_ascii_lowercase();
-                        if (k == "title" || k == "tit2") && !tag.value.to_string().trim().is_empty() {
-                            title = tag.value.to_string();
-                        } else if (k == "artist" || k == "tpe1") && !tag.value.to_string().trim().is_empty() {
-                            artist = tag.value.to_string();
+                        let v = tag.value.to_string().trim().to_string();
+                        if v.is_empty() {
+                            continue;
+                        }
+                        if k == "title" || k == "tit2" {
+                            title = v;
+                        } else if k == "artist" || k == "tpe1" {
+                            artist = v;
+                        } else if k == "album" || k == "talb" {
+                            album = v;
+                        } else if k == "genre" || k == "tcon" {
+                            genre = v;
+                        } else if k == "comment" || k == "comm" || k == "description" {
+                            comment = v;
+                        } else if k == "remixer" || k == "tpe4" || k == "mixartist" {
+                            remixer = v;
+                        } else if k == "label" || k == "tpub" || k == "publisher" || k == "organization" {
+                            label = v;
+                        } else if k == "date" || k == "year" || k == "tdrc" || k == "tyer" {
+                            year = v.chars().take(4).collect();
+                        } else if k == "tracknumber" || k == "trck" || k == "track" {
+                            if let Some(num_part) = v.split('/').next() {
+                                if let Ok(n) = num_part.trim().parse::<u32>() {
+                                    track_number = n;
+                                }
+                            }
+                        } else if k == "initialkey" || k == "tkey" || k == "key" {
+                            key = v;
                         } else if k == "bpm" || k == "tbpm" {
-                            if let Ok(b) = tag.value.to_string().trim().parse::<f64>() {
+                            if let Ok(b) = v.parse::<f64>() {
                                 if (40.0..=240.0).contains(&b) {
                                     bpm = b;
                                 }
                             }
                         }
+                    }
+                };
+                if let Some(rev) = probed.format.metadata().current() {
+                    inspect_tags(rev.tags());
+                }
+                if let Some(meta_container) = probed.metadata.get() {
+                    if let Some(rev) = meta_container.current() {
+                        inspect_tags(rev.tags());
                     }
                 }
                 if let Some(t) = probed.format.default_track() {
@@ -475,29 +765,38 @@ impl LibraryManager {
             }
         }
 
+        let bitrate_kbps = if dur_sec > 1.0 && file_size_bytes > 0 {
+            ((file_size_bytes as f64 * 8.0) / (dur_sec * 1000.0)).round() as u32
+        } else if format_ext == "FLAC" || format_ext == "WAV" || format_ext == "AIFF" {
+            1411
+        } else {
+            320
+        };
+
         let entry = UiTrackEntry {
             id: next_id,
             title,
             artist,
-            album: path
-                .parent()
-                .and_then(|p| p.file_name())
-                .and_then(|s| s.to_str())
-                .unwrap_or("Local Folder")
-                .to_string(),
+            album,
             bpm,
             musical_key: key,
             duration_sec: dur_sec,
-            genre: path
-                .extension()
-                .and_then(|s| s.to_str())
-                .unwrap_or("Audio")
-                .to_ascii_uppercase(),
+            genre,
             rating: 5,
+            comment,
+            remixer,
+            label,
+            year,
+            bitrate_kbps,
+            format: format_ext,
+            track_number,
             file_path: Some(path.to_path_buf()),
             stems_ready: true,
         };
         self.tracks.push(entry.clone());
+        if !self.session_added_track_ids.contains(&entry.id) {
+            self.session_added_track_ids.push(entry.id);
+        }
         Some(entry)
     }
 
@@ -519,8 +818,19 @@ impl LibraryManager {
                 .unwrap_or_else(|| "4m".to_string());
             let bpm = entry.tempo.as_ref().map(|t| t.bpm).unwrap_or(128.0);
             let dur = entry.playtime_sec.unwrap_or(240.0);
+            let posix_path = PathBuf::from(entry.location.to_posix_path());
+            let fmt = posix_path
+                .extension()
+                .and_then(|s| s.to_str())
+                .unwrap_or("FLAC")
+                .to_ascii_uppercase();
+            let bitrate_kbps = entry
+                .bitrate
+                .map(|b| if b > 10_000 { b / 1000 } else { b })
+                .unwrap_or(1411);
+            let tid = start_id + i;
             self.tracks.push(UiTrackEntry {
-                id: start_id + i,
+                id: tid,
                 title: entry.title.clone(),
                 artist: entry.artist.clone(),
                 album: entry.album_title.clone().unwrap_or_default(),
@@ -529,9 +839,17 @@ impl LibraryManager {
                 duration_sec: dur,
                 genre: entry.genre.clone().unwrap_or_else(|| "Electronic".to_string()),
                 rating: 4,
-                file_path: Some(PathBuf::from(entry.location.to_posix_path())),
-                stems_ready: false,
+                comment: entry.comment.clone().unwrap_or_default(),
+                remixer: String::new(),
+                label: String::new(),
+                year: String::new(),
+                bitrate_kbps,
+                format: fmt,
+                track_number: entry.album_track.unwrap_or(0),
+                file_path: Some(posix_path),
+                stems_ready: entry.stems_path.is_some(),
             });
+            self.session_added_track_ids.push(tid);
             count += 1;
         }
         self.status_message = format!(
@@ -704,6 +1022,7 @@ impl LibraryManager {
         current_deck_a_key: &str,
         four_deck_mode: bool,
         locked_decks: [bool; 4],
+        columns: LibraryColumnsConfig,
         mut on_load_deck: impl FnMut(usize, &UiTrackEntry),
     ) {
         match self.selected_nav {
@@ -718,7 +1037,7 @@ impl LibraryManager {
             | NavItem::Preparation
             | NavItem::Playlist(_)
             | NavItem::Smartlists => {
-                self.show_tracks_table_view(ui, current_deck_a_key, four_deck_mode, locked_decks, &mut on_load_deck);
+                self.show_tracks_table_view(ui, current_deck_a_key, four_deck_mode, locked_decks, columns, &mut on_load_deck);
             }
         }
     }
@@ -1245,6 +1564,7 @@ impl LibraryManager {
         current_deck_a_key: &str,
         four_deck_mode: bool,
         locked_decks: [bool; 4],
+        columns: crate::preferences::LibraryColumnsConfig,
         on_load_deck: &mut impl FnMut(usize, &UiTrackEntry),
     ) {
         ui.vertical(|ui| {
@@ -1258,7 +1578,7 @@ impl LibraryManager {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.search_query)
                         .hint_text("Search Track Collection...")
-                        .desired_width(220.0),
+                        .desired_width(200.0),
                 );
                 if !self.search_query.is_empty() && ui.button("x").clicked() {
                     self.search_query.clear();
@@ -1305,6 +1625,52 @@ impl LibraryManager {
                 {
                     self.open_prefs_requested = true;
                     self.open_prefs_file_management = true;
+                }
+
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new("⚙ Metadata Columns")
+                                .color(TraktorTheme::DECK_A)
+                                .font(egui::FontId::proportional(11.0))
+                                .strong(),
+                        )
+                        .fill(Color32::from_rgb(38, 44, 52)),
+                    )
+                    .on_hover_text("Configure which metadata fields appear in the Library table (Preferences > Browser & Metadata)")
+                    .clicked()
+                {
+                    self.open_prefs_requested = true;
+                    self.open_prefs_browser_columns = true;
+                }
+
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new("💾 Save NML")
+                                .color(TraktorTheme::TEXT_PRIMARY)
+                                .font(egui::FontId::proportional(11.0)),
+                        )
+                        .fill(Color32::from_rgb(52, 55, 62)),
+                    )
+                    .on_hover_text("Save current Track Collection to Traktor collection.nml v20 XML")
+                    .clicked()
+                {
+                    let nml_path = Self::default_nml_path();
+                    match self.save_collection_nml(&nml_path) {
+                        Ok(n) => {
+                            self.saved_baseline_tracks = self.tracks.clone();
+                            self.session_added_track_ids.clear();
+                            self.status_message = format!(
+                                "✓ Saved {} tracks to {}",
+                                n,
+                                nml_path.display()
+                            );
+                        }
+                        Err(e) => {
+                            self.status_message = format!("⚠ Failed to save NML: {e}");
+                        }
+                    }
                 }
 
                 if ui
@@ -1475,10 +1841,22 @@ impl LibraryManager {
                     if !query.is_empty() {
                         let match_title = track.title.to_lowercase().contains(&query);
                         let match_artist = track.artist.to_lowercase().contains(&query);
+                        let match_album = track.album.to_lowercase().contains(&query);
                         let match_key = track.musical_key.to_lowercase().contains(&query);
                         let match_genre = track.genre.to_lowercase().contains(&query);
+                        let match_comment = track.comment.to_lowercase().contains(&query);
+                        let match_label = track.label.to_lowercase().contains(&query);
+                        let match_remixer = track.remixer.to_lowercase().contains(&query);
                         let match_bpm = format!("{:.1}", track.bpm).contains(&query);
-                        if !match_title && !match_artist && !match_key && !match_genre && !match_bpm
+                        if !match_title
+                            && !match_artist
+                            && !match_album
+                            && !match_key
+                            && !match_genre
+                            && !match_comment
+                            && !match_label
+                            && !match_remixer
+                            && !match_bpm
                         {
                             return false;
                         }
@@ -1490,12 +1868,24 @@ impl LibraryManager {
 
             let asc = self.sort_asc;
             match self.sort_col {
+                SortColumn::TrackNum => visible_tracks.sort_by(|a, b| {
+                    let cmp = a.track_number.cmp(&b.track_number);
+                    if asc { cmp } else { cmp.reverse() }
+                }),
                 SortColumn::Title => visible_tracks.sort_by(|a, b| {
                     let cmp = a.title.to_lowercase().cmp(&b.title.to_lowercase());
                     if asc { cmp } else { cmp.reverse() }
                 }),
                 SortColumn::Artist => visible_tracks.sort_by(|a, b| {
                     let cmp = a.artist.to_lowercase().cmp(&b.artist.to_lowercase());
+                    if asc { cmp } else { cmp.reverse() }
+                }),
+                SortColumn::Album => visible_tracks.sort_by(|a, b| {
+                    let cmp = a.album.to_lowercase().cmp(&b.album.to_lowercase());
+                    if asc { cmp } else { cmp.reverse() }
+                }),
+                SortColumn::Remixer => visible_tracks.sort_by(|a, b| {
+                    let cmp = a.remixer.to_lowercase().cmp(&b.remixer.to_lowercase());
                     if asc { cmp } else { cmp.reverse() }
                 }),
                 SortColumn::Bpm => visible_tracks.sort_by(|a, b| {
@@ -1520,8 +1910,28 @@ impl LibraryManager {
                     let cmp = a.genre.to_lowercase().cmp(&b.genre.to_lowercase());
                     if asc { cmp } else { cmp.reverse() }
                 }),
+                SortColumn::Label => visible_tracks.sort_by(|a, b| {
+                    let cmp = a.label.to_lowercase().cmp(&b.label.to_lowercase());
+                    if asc { cmp } else { cmp.reverse() }
+                }),
+                SortColumn::Year => visible_tracks.sort_by(|a, b| {
+                    let cmp = a.year.cmp(&b.year);
+                    if asc { cmp } else { cmp.reverse() }
+                }),
                 SortColumn::Rating => visible_tracks.sort_by(|a, b| {
                     let cmp = a.rating.cmp(&b.rating);
+                    if asc { cmp } else { cmp.reverse() }
+                }),
+                SortColumn::Comment => visible_tracks.sort_by(|a, b| {
+                    let cmp = a.comment.to_lowercase().cmp(&b.comment.to_lowercase());
+                    if asc { cmp } else { cmp.reverse() }
+                }),
+                SortColumn::Bitrate => visible_tracks.sort_by(|a, b| {
+                    let cmp = a.bitrate_kbps.cmp(&b.bitrate_kbps);
+                    if asc { cmp } else { cmp.reverse() }
+                }),
+                SortColumn::Format => visible_tracks.sort_by(|a, b| {
+                    let cmp = a.format.cmp(&b.format);
                     if asc { cmp } else { cmp.reverse() }
                 }),
             }
@@ -1718,25 +2128,63 @@ impl LibraryManager {
                                         }
                                     };
 
+                                    if columns.track_number {
+                                        sort_header(ui, "#", SortColumn::TrackNum);
+                                    }
                                     sort_header(ui, "Title", SortColumn::Title);
                                     sort_header(ui, "Artist", SortColumn::Artist);
-                                    sort_header(ui, "BPM", SortColumn::Bpm);
-                                    sort_header(ui, "Key", SortColumn::Key);
-                                    ui.label(
-                                        RichText::new("Stems")
-                                            .color(TraktorTheme::TEXT_SECONDARY)
-                                            .font(egui::FontId::proportional(11.0))
-                                            .strong(),
-                                    );
-                                    sort_header(ui, "Time", SortColumn::Duration);
-                                    sort_header(ui, "Genre", SortColumn::Genre);
-                                    sort_header(ui, "Rating", SortColumn::Rating);
-                                    ui.label(
-                                        RichText::new("Playlist")
-                                            .color(TraktorTheme::TEXT_SECONDARY)
-                                            .font(egui::FontId::proportional(11.0))
-                                            .strong(),
-                                    );
+                                    if columns.album {
+                                        sort_header(ui, "Album", SortColumn::Album);
+                                    }
+                                    if columns.remixer {
+                                        sort_header(ui, "Remixer", SortColumn::Remixer);
+                                    }
+                                    if columns.bpm {
+                                        sort_header(ui, "BPM", SortColumn::Bpm);
+                                    }
+                                    if columns.key {
+                                        sort_header(ui, "Key", SortColumn::Key);
+                                    }
+                                    if columns.stems {
+                                        ui.label(
+                                            RichText::new("Stems")
+                                                .color(TraktorTheme::TEXT_SECONDARY)
+                                                .font(egui::FontId::proportional(11.0))
+                                                .strong(),
+                                        );
+                                    }
+                                    if columns.duration {
+                                        sort_header(ui, "Time", SortColumn::Duration);
+                                    }
+                                    if columns.genre {
+                                        sort_header(ui, "Genre", SortColumn::Genre);
+                                    }
+                                    if columns.label {
+                                        sort_header(ui, "Label", SortColumn::Label);
+                                    }
+                                    if columns.year {
+                                        sort_header(ui, "Year", SortColumn::Year);
+                                    }
+                                    if columns.rating {
+                                        sort_header(ui, "Rating", SortColumn::Rating);
+                                    }
+                                    if columns.comment {
+                                        sort_header(ui, "Comment", SortColumn::Comment);
+                                    }
+                                    if columns.bitrate {
+                                        sort_header(ui, "Bitrate", SortColumn::Bitrate);
+                                    }
+                                    if columns.format {
+                                        sort_header(ui, "Format", SortColumn::Format);
+                                    }
+                                    if columns.playlist_actions {
+                                        ui.label(
+                                            RichText::new("Playlist")
+                                                .color(TraktorTheme::TEXT_SECONDARY)
+                                                .font(egui::FontId::proportional(11.0))
+                                                .strong(),
+                                        );
+                                    }
                                     ui.end_row();
 
                                     for track in &visible_tracks {
@@ -1818,7 +2266,26 @@ impl LibraryManager {
                                             }
                                         });
 
-                                        // Col 2: Title (Click to select, double-click Deck A, right-click menu)
+                                        if columns.track_number {
+                                            let tn_txt = if track.track_number > 0 {
+                                                format!("{:02}", track.track_number)
+                                            } else {
+                                                "-".to_string()
+                                            };
+                                            if ui
+                                                .add(egui::SelectableLabel::new(
+                                                    is_selected,
+                                                    RichText::new(tn_txt)
+                                                        .color(TraktorTheme::TEXT_SECONDARY)
+                                                        .font(egui::FontId::monospace(10.5)),
+                                                ))
+                                                .clicked()
+                                            {
+                                                self.selected_track_id = Some(track.id);
+                                            }
+                                        }
+
+                                        // Title (Click to select, double-click Deck A, right-click menu)
                                         let title_resp = ui.add(
                                             egui::SelectableLabel::new(
                                                 is_selected,
@@ -1854,7 +2321,7 @@ impl LibraryManager {
                                             );
                                         });
 
-                                        // Col 3: Artist (Click to select, double-click Deck B, right-click menu)
+                                        // Artist (Click to select, double-click Deck B, right-click menu)
                                         let artist_resp = ui.add(
                                             egui::SelectableLabel::new(
                                                 is_selected,
@@ -1889,104 +2356,56 @@ impl LibraryManager {
                                             );
                                         });
 
-                                        // Col 4: BPM
-                                        let bpm_resp = ui.add(
-                                            egui::SelectableLabel::new(
-                                                is_selected,
-                                                RichText::new(format!("{:.2}", track.bpm))
-                                                    .color(if is_selected {
-                                                        Color32::WHITE
-                                                    } else {
-                                                        TraktorTheme::TEXT_PRIMARY
-                                                    })
-                                                    .font(egui::FontId::monospace(11.0)),
-                                            ),
-                                        );
-                                        if bpm_resp.clicked() {
-                                            self.selected_track_id = Some(track.id);
+                                        if columns.album {
+                                            if ui
+                                                .add(egui::SelectableLabel::new(
+                                                    is_selected,
+                                                    RichText::new(&track.album)
+                                                        .color(TraktorTheme::TEXT_SECONDARY)
+                                                        .font(egui::FontId::proportional(11.0)),
+                                                ))
+                                                .clicked()
+                                            {
+                                                self.selected_track_id = Some(track.id);
+                                            }
                                         }
-                                        bpm_resp.context_menu(|ui| {
-                                            Self::render_track_context_menu(
-                                                ui,
-                                                track,
-                                                in_prep,
-                                                &playlist_names,
-                                                four_deck_mode,
-                                                &mut create_stems_cmd,
-                                                &mut load_cmd,
-                                                &mut toggle_prep_cmd,
-                                                &mut add_to_playlist_cmd,
-                                                &mut reveal_cmd,
-                                                &mut remove_cmd,
-                                            );
-                                        });
 
-                                        // Col 5: Key (Calm Traktor OpenKey text with subtle harmonic dot)
-                                        let (key_color, key_txt) = if is_harmonic {
-                                            (
-                                                TraktorTheme::PLAY_ACTIVE,
-                                                format!("● {}", track.musical_key),
-                                            )
-                                        } else {
-                                            (
-                                                TraktorTheme::TEXT_SECONDARY,
-                                                track.musical_key.clone(),
-                                            )
-                                        };
-                                        let key_resp = ui.add(
-                                            egui::SelectableLabel::new(
-                                                is_selected,
-                                                RichText::new(key_txt)
-                                                    .color(key_color)
-                                                    .font(egui::FontId::monospace(11.0))
-                                                    .strong(),
-                                            ),
-                                        );
-                                        if key_resp.clicked() {
-                                            self.selected_track_id = Some(track.id);
+                                        if columns.remixer {
+                                            let rem_txt = if track.remixer.is_empty() {
+                                                "-"
+                                            } else {
+                                                &track.remixer
+                                            };
+                                            if ui
+                                                .add(egui::SelectableLabel::new(
+                                                    is_selected,
+                                                    RichText::new(rem_txt)
+                                                        .color(TraktorTheme::TEXT_SECONDARY)
+                                                        .font(egui::FontId::proportional(11.0)),
+                                                ))
+                                                .clicked()
+                                            {
+                                                self.selected_track_id = Some(track.id);
+                                            }
                                         }
-                                        key_resp.context_menu(|ui| {
-                                            Self::render_track_context_menu(
-                                                ui,
-                                                track,
-                                                in_prep,
-                                                &playlist_names,
-                                                four_deck_mode,
-                                                &mut create_stems_cmd,
-                                                &mut load_cmd,
-                                                &mut toggle_prep_cmd,
-                                                &mut add_to_playlist_cmd,
-                                                &mut reveal_cmd,
-                                                &mut remove_cmd,
-                                            );
-                                        });
 
-                                        // Col 6: Stems Status / Create Action
-                                        let is_separating = self.stem_job_progress.map(|(id, _)| id == track.id).unwrap_or(false);
-                                        if is_separating {
-                                            let pct = self.stem_job_progress.unwrap().1 * 100.0;
-                                            ui.add(
-                                                egui::Button::new(
-                                                    RichText::new(format!("● AI {:.0}%", pct))
-                                                        .color(Color32::from_rgb(255, 175, 45))
-                                                        .font(egui::FontId::monospace(9.5))
-                                                        .strong(),
-                                                )
-                                                .fill(Color32::from_rgb(48, 36, 16))
-                                                .stroke(Stroke::new(0.8_f32, Color32::from_rgb(255, 175, 45))),
-                                            ).on_hover_text("AI Demucs separation in progress in background...");
-                                        } else if track.stems_ready {
-                                            let stem_resp = ui.add(
-                                                egui::Button::new(
-                                                    RichText::new("✦ STEMS")
-                                                        .color(TraktorTheme::DECK_A)
-                                                        .font(egui::FontId::monospace(9.5))
-                                                        .strong(),
-                                                )
-                                                .fill(Color32::from_rgb(50, 54, 62))
-                                                .stroke(Stroke::new(0.5_f32, TraktorTheme::DECK_A)),
-                                            ).on_hover_text("4 Stems separated (Drums, Bass, Other, Vocals). Right-click for options.");
-                                            stem_resp.context_menu(|ui| {
+                                        if columns.bpm {
+                                            let bpm_resp = ui.add(
+                                                egui::SelectableLabel::new(
+                                                    is_selected,
+                                                    RichText::new(format!("{:.2}", track.bpm))
+                                                        .color(if is_selected {
+                                                            Color32::WHITE
+                                                        } else {
+                                                            TraktorTheme::TEXT_PRIMARY
+                                                        })
+                                                        .font(egui::FontId::monospace(11.0)),
+                                                ),
+                                            );
+                                            if bpm_resp.clicked() {
+                                                self.selected_track_id = Some(track.id);
+                                            }
+                                            bpm_resp.context_menu(|ui| {
                                                 Self::render_track_context_menu(
                                                     ui,
                                                     track,
@@ -2001,137 +2420,310 @@ impl LibraryManager {
                                                     &mut remove_cmd,
                                                 );
                                             });
-                                        } else {
-                                            let stem_resp = ui
-                                                .add(
+                                        }
+
+                                        if columns.key {
+                                            let (key_color, key_txt) = if is_harmonic {
+                                                (
+                                                    TraktorTheme::PLAY_ACTIVE,
+                                                    format!("● {}", track.musical_key),
+                                                )
+                                            } else {
+                                                (
+                                                    TraktorTheme::TEXT_SECONDARY,
+                                                    track.musical_key.clone(),
+                                                )
+                                            };
+                                            let key_resp = ui.add(
+                                                egui::SelectableLabel::new(
+                                                    is_selected,
+                                                    RichText::new(key_txt)
+                                                        .color(key_color)
+                                                        .font(egui::FontId::monospace(11.0))
+                                                        .strong(),
+                                                ),
+                                            );
+                                            if key_resp.clicked() {
+                                                self.selected_track_id = Some(track.id);
+                                            }
+                                            key_resp.context_menu(|ui| {
+                                                Self::render_track_context_menu(
+                                                    ui,
+                                                    track,
+                                                    in_prep,
+                                                    &playlist_names,
+                                                    four_deck_mode,
+                                                    &mut create_stems_cmd,
+                                                    &mut load_cmd,
+                                                    &mut toggle_prep_cmd,
+                                                    &mut add_to_playlist_cmd,
+                                                    &mut reveal_cmd,
+                                                    &mut remove_cmd,
+                                                );
+                                            });
+                                        }
+
+                                        if columns.stems {
+                                            let is_separating = self.stem_job_progress.map(|(id, _)| id == track.id).unwrap_or(false);
+                                            if is_separating {
+                                                let pct = self.stem_job_progress.unwrap().1 * 100.0;
+                                                ui.add(
                                                     egui::Button::new(
-                                                        RichText::new("✦ Stems")
-                                                            .color(Color32::from_rgb(255, 185, 55))
-                                                            .font(egui::FontId::proportional(10.0))
+                                                        RichText::new(format!("● AI {:.0}%", pct))
+                                                            .color(Color32::from_rgb(255, 175, 45))
+                                                            .font(egui::FontId::monospace(9.5))
                                                             .strong(),
                                                     )
-                                                    .fill(Color32::from_rgb(46, 49, 55)),
-                                                )
-                                                .on_hover_text("Generate 4 stems (Drums, Bass, Other, Vocals) or right-click for full menu");
-                                            if stem_resp.clicked() {
-                                                create_stems_cmd = Some(track.id);
+                                                    .fill(Color32::from_rgb(48, 36, 16))
+                                                    .stroke(Stroke::new(0.8_f32, Color32::from_rgb(255, 175, 45))),
+                                                ).on_hover_text("AI Demucs separation in progress in background...");
+                                            } else if track.stems_ready {
+                                                let stem_resp = ui.add(
+                                                    egui::Button::new(
+                                                        RichText::new("✦ STEMS")
+                                                            .color(TraktorTheme::DECK_A)
+                                                            .font(egui::FontId::monospace(9.5))
+                                                            .strong(),
+                                                    )
+                                                    .fill(Color32::from_rgb(50, 54, 62))
+                                                    .stroke(Stroke::new(0.5_f32, TraktorTheme::DECK_A)),
+                                                ).on_hover_text("4 Stems separated (Drums, Bass, Other, Vocals). Right-click for options.");
+                                                stem_resp.context_menu(|ui| {
+                                                    Self::render_track_context_menu(
+                                                        ui,
+                                                        track,
+                                                        in_prep,
+                                                        &playlist_names,
+                                                        four_deck_mode,
+                                                        &mut create_stems_cmd,
+                                                        &mut load_cmd,
+                                                        &mut toggle_prep_cmd,
+                                                        &mut add_to_playlist_cmd,
+                                                        &mut reveal_cmd,
+                                                        &mut remove_cmd,
+                                                    );
+                                                });
+                                            } else {
+                                                let stem_resp = ui
+                                                    .add(
+                                                        egui::Button::new(
+                                                            RichText::new("✦ Stems")
+                                                                .color(Color32::from_rgb(255, 185, 55))
+                                                                .font(egui::FontId::proportional(10.0))
+                                                                .strong(),
+                                                        )
+                                                        .fill(Color32::from_rgb(46, 49, 55)),
+                                                    )
+                                                    .on_hover_text("Generate 4 stems (Drums, Bass, Other, Vocals) or right-click for full menu");
+                                                if stem_resp.clicked() {
+                                                    create_stems_cmd = Some(track.id);
+                                                }
+                                                stem_resp.context_menu(|ui| {
+                                                    Self::render_track_context_menu(
+                                                        ui,
+                                                        track,
+                                                        in_prep,
+                                                        &playlist_names,
+                                                        four_deck_mode,
+                                                        &mut create_stems_cmd,
+                                                        &mut load_cmd,
+                                                        &mut toggle_prep_cmd,
+                                                        &mut add_to_playlist_cmd,
+                                                        &mut reveal_cmd,
+                                                        &mut remove_cmd,
+                                                    );
+                                                });
                                             }
-                                            stem_resp.context_menu(|ui| {
-                                                Self::render_track_context_menu(
-                                                    ui,
-                                                    track,
-                                                    in_prep,
-                                                    &playlist_names,
-                                                    four_deck_mode,
-                                                    &mut create_stems_cmd,
-                                                    &mut load_cmd,
-                                                    &mut toggle_prep_cmd,
-                                                    &mut add_to_playlist_cmd,
-                                                    &mut reveal_cmd,
-                                                    &mut remove_cmd,
-                                                );
-                                            });
                                         }
 
-                                        // Col 7: Duration
-                                        let m = (track.duration_sec / 60.0).floor() as u32;
-                                        let s = (track.duration_sec % 60.0).floor() as u32;
-                                        let dur_resp = ui.add(
-                                            egui::SelectableLabel::new(
-                                                is_selected,
-                                                RichText::new(format!("{m:02}:{s:02}"))
-                                                    .color(if is_selected {
-                                                        Color32::WHITE
-                                                    } else {
-                                                        TraktorTheme::TEXT_SECONDARY
-                                                    })
-                                                    .font(egui::FontId::monospace(11.0)),
-                                            ),
-                                        );
-                                        if dur_resp.clicked() {
-                                            self.selected_track_id = Some(track.id);
-                                        }
-
-                                        // Col 8: Genre
-                                        let genre_resp = ui.add(
-                                            egui::SelectableLabel::new(
-                                                is_selected,
-                                                RichText::new(&track.genre)
-                                                    .color(if is_selected {
-                                                        Color32::WHITE
-                                                    } else {
-                                                        TraktorTheme::TEXT_SECONDARY
-                                                    })
-                                                    .font(egui::FontId::proportional(11.0)),
-                                            ),
-                                        );
-                                        if genre_resp.clicked() {
-                                            self.selected_track_id = Some(track.id);
-                                        }
-
-                                        // Col 9: Rating Stars (Traktor muted slate-blue stars)
-                                        let stars = "★".repeat(track.rating as usize);
-                                        let rating_resp = ui.add(
-                                            egui::SelectableLabel::new(
-                                                is_selected,
-                                                RichText::new(stars)
-                                                    .color(Color32::from_rgb(98, 144, 196))
-                                                    .font(egui::FontId::proportional(11.0)),
-                                            ),
-                                        );
-                                        if rating_resp.clicked() {
-                                            self.selected_track_id = Some(track.id);
-                                        }
-
-                                        // Col 10: Crate / Playlist Actions
-                                        ui.horizontal(|ui| {
-                                            let prep_btn = ui.add(
-                                                egui::Button::new(
-                                                    RichText::new(if in_prep { "★ Prep" } else { "+ Prep" })
-                                                        .color(if in_prep {
+                                        if columns.duration {
+                                            let m = (track.duration_sec / 60.0).floor() as u32;
+                                            let s = (track.duration_sec % 60.0).floor() as u32;
+                                            let dur_resp = ui.add(
+                                                egui::SelectableLabel::new(
+                                                    is_selected,
+                                                    RichText::new(format!("{m:02}:{s:02}"))
+                                                        .color(if is_selected {
                                                             Color32::WHITE
                                                         } else {
                                                             TraktorTheme::TEXT_SECONDARY
                                                         })
-                                                        .font(egui::FontId::proportional(10.0)),
-                                                )
-                                                .fill(if in_prep {
-                                                    TraktorTheme::ROW_SELECTED
-                                                } else {
-                                                    Color32::from_rgb(46, 49, 55)
-                                                }),
+                                                        .font(egui::FontId::monospace(11.0)),
+                                                ),
                                             );
-                                            if prep_btn.clicked() {
-                                                toggle_prep_cmd = Some(track.id);
+                                            if dur_resp.clicked() {
+                                                self.selected_track_id = Some(track.id);
                                             }
-                                            prep_btn.context_menu(|ui| {
-                                                Self::render_track_context_menu(
-                                                    ui,
-                                                    track,
-                                                    in_prep,
-                                                    &playlist_names,
-                                                    four_deck_mode,
-                                                    &mut create_stems_cmd,
-                                                    &mut load_cmd,
-                                                    &mut toggle_prep_cmd,
-                                                    &mut add_to_playlist_cmd,
-                                                    &mut reveal_cmd,
-                                                    &mut remove_cmd,
-                                                );
-                                            });
+                                        }
 
-                                            egui::ComboBox::from_id_salt(format!("pl_add_{}", track.id))
-                                                .selected_text("+ List")
-                                                .width(72.0)
-                                                .show_ui(ui, |ui| {
-                                                    for (p_idx, p_name) in playlist_names.iter().enumerate()
-                                                    {
-                                                        if ui.selectable_label(false, p_name).clicked() {
-                                                            add_to_playlist_cmd = Some((p_idx, track.id));
-                                                        }
-                                                    }
+                                        if columns.genre {
+                                            let genre_resp = ui.add(
+                                                egui::SelectableLabel::new(
+                                                    is_selected,
+                                                    RichText::new(&track.genre)
+                                                        .color(if is_selected {
+                                                            Color32::WHITE
+                                                        } else {
+                                                            TraktorTheme::TEXT_SECONDARY
+                                                        })
+                                                        .font(egui::FontId::proportional(11.0)),
+                                                ),
+                                            );
+                                            if genre_resp.clicked() {
+                                                self.selected_track_id = Some(track.id);
+                                            }
+                                        }
+
+                                        if columns.label {
+                                            let lbl_txt = if track.label.is_empty() {
+                                                "-"
+                                            } else {
+                                                &track.label
+                                            };
+                                            if ui
+                                                .add(egui::SelectableLabel::new(
+                                                    is_selected,
+                                                    RichText::new(lbl_txt)
+                                                        .color(TraktorTheme::TEXT_SECONDARY)
+                                                        .font(egui::FontId::proportional(11.0)),
+                                                ))
+                                                .clicked()
+                                            {
+                                                self.selected_track_id = Some(track.id);
+                                            }
+                                        }
+
+        if columns.year {
+                                            let yr_txt = if track.year.is_empty() {
+                                                "-"
+                                            } else {
+                                                &track.year
+                                            };
+                                            if ui
+                                                .add(egui::SelectableLabel::new(
+                                                    is_selected,
+                                                    RichText::new(yr_txt)
+                                                        .color(TraktorTheme::TEXT_SECONDARY)
+                                                        .font(egui::FontId::monospace(10.5)),
+                                                ))
+                                                .clicked()
+                                            {
+                                                self.selected_track_id = Some(track.id);
+                                            }
+                                        }
+
+                                        if columns.rating {
+                                            let stars = "★".repeat(track.rating as usize);
+                                            let rating_resp = ui.add(
+                                                egui::SelectableLabel::new(
+                                                    is_selected,
+                                                    RichText::new(stars)
+                                                        .color(Color32::from_rgb(98, 144, 196))
+                                                        .font(egui::FontId::proportional(11.0)),
+                                                ),
+                                            );
+                                            if rating_resp.clicked() {
+                                                self.selected_track_id = Some(track.id);
+                                            }
+                                        }
+
+                                        if columns.comment {
+                                            let cmt_txt = if track.comment.is_empty() {
+                                                "-"
+                                            } else {
+                                                &track.comment
+                                            };
+                                            if ui
+                                                .add(egui::SelectableLabel::new(
+                                                    is_selected,
+                                                    RichText::new(cmt_txt)
+                                                        .color(TraktorTheme::TEXT_SECONDARY)
+                                                        .font(egui::FontId::proportional(10.5)),
+                                                ))
+                                                .clicked()
+                                            {
+                                                self.selected_track_id = Some(track.id);
+                                            }
+                                        }
+
+                                        if columns.bitrate {
+                                            if ui
+                                                .add(egui::SelectableLabel::new(
+                                                    is_selected,
+                                                    RichText::new(format!("{} kbps", track.bitrate_kbps))
+                                                        .color(TraktorTheme::TEXT_SECONDARY)
+                                                        .font(egui::FontId::monospace(10.5)),
+                                                ))
+                                                .clicked()
+                                            {
+                                                self.selected_track_id = Some(track.id);
+                                            }
+                                        }
+
+                                        if columns.format {
+                                            if ui
+                                                .add(egui::SelectableLabel::new(
+                                                    is_selected,
+                                                    RichText::new(&track.format)
+                                                        .color(TraktorTheme::DECK_A)
+                                                        .font(egui::FontId::monospace(10.5)),
+                                                ))
+                                                .clicked()
+                                            {
+                                                self.selected_track_id = Some(track.id);
+                                            }
+                                        }
+
+                                        if columns.playlist_actions {
+                                            ui.horizontal(|ui| {
+                                                let prep_btn = ui.add(
+                                                    egui::Button::new(
+                                                        RichText::new(if in_prep { "★ Prep" } else { "+ Prep" })
+                                                            .color(if in_prep {
+                                                                Color32::WHITE
+                                                            } else {
+                                                                TraktorTheme::TEXT_SECONDARY
+                                                            })
+                                                            .font(egui::FontId::proportional(10.0)),
+                                                    )
+                                                    .fill(if in_prep {
+                                                        TraktorTheme::ROW_SELECTED
+                                                    } else {
+                                                        Color32::from_rgb(46, 49, 55)
+                                                    }),
+                                                );
+                                                if prep_btn.clicked() {
+                                                    toggle_prep_cmd = Some(track.id);
+                                                }
+                                                prep_btn.context_menu(|ui| {
+                                                    Self::render_track_context_menu(
+                                                        ui,
+                                                        track,
+                                                        in_prep,
+                                                        &playlist_names,
+                                                        four_deck_mode,
+                                                        &mut create_stems_cmd,
+                                                        &mut load_cmd,
+                                                        &mut toggle_prep_cmd,
+                                                        &mut add_to_playlist_cmd,
+                                                        &mut reveal_cmd,
+                                                        &mut remove_cmd,
+                                                    );
                                                 });
-                                        });
+
+                                                egui::ComboBox::from_id_salt(format!("pl_add_{}", track.id))
+                                                    .selected_text("+ List")
+                                                    .width(72.0)
+                                                    .show_ui(ui, |ui| {
+                                                        for (p_idx, p_name) in playlist_names.iter().enumerate()
+                                                        {
+                                                            if ui.selectable_label(false, p_name).clicked() {
+                                                                add_to_playlist_cmd = Some((p_idx, track.id));
+                                                            }
+                                                        }
+                                                    });
+                                            });
+                                        }
 
                                         ui.end_row();
                                     }
@@ -2486,5 +3078,68 @@ mod tests {
             t.stems_ready = true;
             assert!(t.stems_ready);
         }
+    }
+
+    #[test]
+    fn test_collection_nml_and_m3u8_persistence_and_discard() {
+        let mut mgr = LibraryManager::default();
+        let baseline_len = mgr.tracks.len();
+        mgr.saved_baseline_tracks = mgr.tracks.clone();
+
+        // Simulate adding a song in this session
+        let added_id = baseline_len + 99;
+        mgr.tracks.push(UiTrackEntry {
+            id: added_id,
+            title: "Session Added Song".to_string(),
+            artist: "Test DJ".to_string(),
+            album: "Club Promo EP".to_string(),
+            bpm: 132.0,
+            musical_key: "4m".to_string(),
+            duration_sec: 300.0,
+            genre: "Techno".to_string(),
+            rating: 5,
+            comment: "Peak Hour".to_string(),
+            remixer: "Extended Dub".to_string(),
+            label: "Berlin Underground".to_string(),
+            year: "2026".to_string(),
+            bitrate_kbps: 1411,
+            format: "FLAC".to_string(),
+            track_number: 1,
+            file_path: Some(PathBuf::from("/tmp/session_added_song.flac")),
+            stems_ready: true,
+        });
+        mgr.session_added_track_ids.push(added_id);
+        assert_eq!(mgr.tracks.len(), baseline_len + 1);
+
+        // Save to temporary NML & M3U8
+        let tmp_nml = std::env::temp_dir().join("retraktor_test_collection.nml");
+        let tmp_m3u = std::env::temp_dir().join("retraktor_test_collection.m3u8");
+        let n_nml = mgr.save_collection_nml(&tmp_nml).expect("NML save should succeed");
+        let n_m3u = mgr.save_collection_m3u8(&tmp_m3u).expect("M3U8 save should succeed");
+        assert_eq!(n_nml, baseline_len + 1);
+        assert_eq!(n_m3u, baseline_len + 1);
+
+        let nml_xml = fs::read_to_string(&tmp_nml).unwrap();
+        assert!(nml_xml.contains("Session Added Song"));
+        let m3u_txt = fs::read_to_string(&tmp_m3u).unwrap();
+        assert!(m3u_txt.contains("#EXTM3U"));
+        assert!(m3u_txt.contains("Test DJ - Session Added Song"));
+
+        // Simulate adding a second unsaved song in the session and discarding it
+        let unsaved_id = baseline_len + 100;
+        let mut unsaved_track = mgr.tracks[0].clone();
+        unsaved_track.id = unsaved_id;
+        unsaved_track.title = "Temporary Unsaved Track".to_string();
+        mgr.tracks.push(unsaved_track);
+        mgr.session_added_track_ids.push(unsaved_id);
+        assert_eq!(mgr.tracks.len(), baseline_len + 2);
+
+        // Verify discarding session-added tracks reverts to last saved baseline
+        mgr.discard_session_added_tracks();
+        assert_eq!(mgr.tracks.len(), baseline_len + 1);
+        assert!(mgr.session_added_track_ids.is_empty());
+
+        let _ = fs::remove_file(&tmp_nml);
+        let _ = fs::remove_file(&tmp_m3u);
     }
 }
