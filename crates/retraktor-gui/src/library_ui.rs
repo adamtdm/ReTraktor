@@ -871,6 +871,7 @@ impl LibraryManager {
             self.status_message = "No missing tracks".to_string();
             return;
         }
+        self.status_message = format!("Searching your music folders for {} missing tracks…", missing.len());
         self.spawn_job(move |tx| {
             let wanted: HashSet<&str> = missing.iter().map(|(_, n, _)| n.as_str()).collect();
             let mut found: HashMap<String, Vec<PathBuf>> = HashMap::new();
@@ -982,6 +983,7 @@ impl LibraryManager {
                     self.version += 1;
                 }
                 Msg::Relocated(fixed) => {
+                    self.status_message = format!("Re-linked {} tracks; reading their tags…", fixed.len());
                     for (id, p) in fixed {
                         if let Some(t) = self.track_mut(id) {
                             t.file_path = Some(p);

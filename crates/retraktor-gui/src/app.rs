@@ -1995,8 +1995,8 @@ impl ReTraktorApp {
                     (
                         format!("Deck {deck_letter} Empty"),
                         String::new(),
-                        128.0,
-                        "4m".to_string(),
+                        0.0,
+                        String::new(),
                         120.0,
                         0.0,
                         Vec::new(),
@@ -2285,7 +2285,7 @@ impl ReTraktorApp {
                 .unwrap_or(128.0);
             (t_name, b, state.is_playing[d])
         } else {
-            ("Empty".to_string(), 128.0, false)
+            ("Empty".to_string(), 0.0, false)
         };
 
         if ui
@@ -2366,8 +2366,8 @@ impl ReTraktorApp {
                     (
                         format!("Deck {deck_letter} Empty"),
                         "No Track Loaded".to_string(),
-                        128.0,
-                        "4m".to_string(),
+                        0.0,
+                        String::new(),
                         120.0,
                         0.0,
                         false,

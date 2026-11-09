@@ -405,14 +405,8 @@ pub fn scrolling_waveform(
                 p0[2] + (p1[2] - p0[2]) * frac,
             )
         } else {
-            let phase = time_at_col * (bpm / 60.0) * 2.0 * PI as f64;
-            let beat_frac = (time_at_col / beat_len_sec).fract();
-            let kick_env = (-beat_frac * 9.5).exp() as f32;
-            let low = (kick_env * 0.82 + 0.12 * (phase * 0.5).sin().abs() as f32).clamp(0.03, 0.95);
-            let mid = ((phase * 2.0).sin().abs() * 0.42 + 0.15).clamp(0.03, 0.78) as f32;
-            let hat_phase = (time_at_col / (beat_len_sec * 0.5)).fract();
-            let high = ((-hat_phase * 14.0).exp() * 0.55 + 0.06) as f32;
-            (low, mid, high)
+            // Empty deck: nothing to draw.
+            continue;
         };
 
         let (outer_col, mid_col, core_col) = spectrum_colors(low_amp, mid_amp, high_amp);
@@ -621,7 +615,7 @@ pub fn scrolling_stem_waveforms(
                 p0[3] + (p1[3] - p0[3]) * frac,
             ]
         } else {
-            [0.45, 0.5, 0.35, 0.3]
+            continue;
         };
 
         for lane in 0..4 {
@@ -816,8 +810,7 @@ pub fn stripe_overview(
                 let p = waveform_peaks[idx];
                 (p[0], p[1], p[2])
             } else {
-                let env = (frac * 6.0 * PI).sin().abs() * 0.55 + 0.2;
-                (env * 0.8, env * 0.7, env * 0.6)
+                continue;
             };
 
             let (outer_col, mid_col, core_col) = spectrum_colors(low, mid, high);
