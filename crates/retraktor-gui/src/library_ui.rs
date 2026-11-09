@@ -1305,6 +1305,14 @@ impl LibraryManager {
                 self.start_relocate(music_folders.to_vec());
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.small_button("rekordbox XML").on_hover_text("Export collection + playlists to ~/Music/ReTraktor-rekordbox.xml").clicked() {
+                    let path = env::var("HOME").map(PathBuf::from).unwrap_or_default().join("Music/ReTraktor-rekordbox.xml");
+                    let xml = retraktor_formats::to_rekordbox_xml(&self.snapshot());
+                    self.status_message = match fs::create_dir_all(path.parent().unwrap()).and_then(|_| fs::write(&path, xml)) {
+                        Ok(()) => format!("Exported rekordbox XML to {}", path.display()),
+                        Err(e) => format!("rekordbox export failed: {e}"),
+                    };
+                }
                 if ui.small_button("Columns").clicked() {
                     self.open_prefs_requested = true;
                     self.open_prefs_browser_columns = true;

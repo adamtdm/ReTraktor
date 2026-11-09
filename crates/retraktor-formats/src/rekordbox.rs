@@ -392,6 +392,7 @@ mod tests {
                 grid_bpm: Some(124.0),
             }],
             stems_path: None,
+            ..Default::default()
         });
 
         // Track 2: Hotcues and a Loop, Am key (21)
@@ -446,6 +447,7 @@ mod tests {
                 },
             ],
             stems_path: None,
+            ..Default::default()
         });
 
         // Folder with one playlist referencing both tracks
