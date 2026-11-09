@@ -8,7 +8,7 @@ use eframe::egui::{self, Align, Color32, Layout, RichText, Sense, Stroke, Ui};
 use egui_extras::{Column, TableBuilder};
 use retraktor_formats::nml::{NmlCue, NmlEntry, NmlLocation, NmlLoudness, NmlPlaylistNode, NmlTempo};
 use retraktor_formats::NmlCollection;
-use retraktor_library::KeyWheel;
+use retraktor_library::{analyze_mono, KeyWheel, TrackAnalysis};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -124,6 +124,42 @@ impl UiTrackEntry {
             play_count: (self.play_count > 0).then_some(self.play_count),
             energy: (self.energy > 0).then_some(self.energy),
         })
+    }
+
+    /// Applies detected values. Without `overwrite` only unknown values are filled.
+    /// Auto cues and a beatgrid are only added to tracks that have no cues of that kind.
+    pub fn apply_analysis(&mut self, a: &TrackAnalysis, overwrite: bool) {
+        if overwrite || self.bpm <= 0.0 {
+            self.bpm = a.bpm;
+        }
+        if overwrite || self.musical_key.is_empty() {
+            self.musical_key = a.key_open.clone();
+        }
+        if overwrite || self.energy == 0 {
+            self.energy = a.energy;
+        }
+        if overwrite || self.loudness.is_none() {
+            self.loudness = Some(NmlLoudness { analyzed_db: a.loudness_db as f64, perceived_db: a.loudness_db as f64, peak_db: a.peak_db as f64 });
+        }
+        let cue = |name: String, t: f64, kind, hotcue, grid| NmlCue {
+            name,
+            displ_order: 0,
+            cue_type: kind,
+            start_ms: t * 1000.0,
+            len_ms: 0.0,
+            repeats: -1,
+            hotcue,
+            grid_bpm: grid,
+        };
+        use retraktor_core::CueType;
+        if !self.cues.iter().any(|c| c.cue_type == CueType::Grid) {
+            self.cues.push(cue("AutoGrid".into(), a.beatgrid_offset_sec, CueType::Grid, -1, Some(a.bpm)));
+        }
+        if !self.cues.iter().any(|c| c.cue_type == CueType::Cue && c.hotcue >= 0) {
+            for (i, t) in a.cue_points_sec.iter().take(8).enumerate() {
+                self.cues.push(cue(format!("Auto {}", i + 1), *t, CueType::Cue, i as i64, None));
+            }
+        }
     }
 
     /// Copies values from `tags` into fields that are still empty; never overwrites.
@@ -265,6 +301,10 @@ fn write_track_tags(t: &UiTrackEntry) -> Result<(), String> {
         }
     }
     tag.save_to_path(path, WriteOptions::default()).map_err(|e| e.to_string())
+}
+
+pub fn stereo_to_mono(pcm: &[f32]) -> Vec<f32> {
+    pcm.chunks_exact(2).map(|f| 0.5 * (f[0] + f[1])).collect()
 }
 
 /// Reads tags for `items` and sends them in batches.
@@ -409,12 +449,14 @@ impl SortColumn {
     }
 }
 
-enum Msg {
+pub enum Msg {
     Status(String),
     Scanned(Vec<UiTrackEntry>),
     Checked(Vec<(usize, bool, bool)>),
     Relocated(Vec<(usize, PathBuf)>),
     Tags(Vec<(usize, UiTrackEntry)>),
+    /// (track id, analysis, overwrite existing values)
+    Analyzed(usize, TrackAnalysis, bool),
     Saved(Result<usize, String>),
     Done(String),
 }
@@ -427,6 +469,7 @@ enum Action {
     RemoveFromPlaylist(Vec<usize>),
     Edit(usize),
     FillTags(Vec<usize>),
+    Analyze(Vec<usize>),
     Stems(usize),
     Reveal(PathBuf),
     RemoveFromCollection(Vec<usize>),
@@ -459,6 +502,9 @@ pub struct LibraryManager {
     jobs: usize,
     pub job_status: String,
     relocate_after_check: Option<Vec<PathBuf>>,
+    /// Set by the app from preferences: analyse tracks found by a scan.
+    pub auto_analyze: bool,
+    scanned_ids: Vec<usize>,
 
     renaming: Option<(usize, String)>,
     editing: Option<UiTrackEntry>,
@@ -514,6 +560,8 @@ impl LibraryManager {
             jobs: 0,
             job_status: String::new(),
             relocate_after_check: None,
+            auto_analyze: false,
+            scanned_ids: Vec::new(),
             renaming: None,
             editing: None,
             import_path: Self::detect_traktor_collection().map(|p| p.display().to_string()).unwrap_or_default(),
@@ -849,6 +897,47 @@ impl LibraryManager {
         });
     }
 
+    /// Sender for results produced outside the library (e.g. analysis done while loading a deck).
+    pub fn sender(&self) -> Sender<Msg> {
+        self.tx.clone()
+    }
+
+    /// Tracks with a file whose BPM, key or energy is still unknown.
+    pub fn unanalyzed_ids(&self) -> Vec<usize> {
+        self.tracks
+            .iter()
+            .filter(|t| !t.missing && t.file_path.is_some() && (t.bpm <= 0.0 || t.musical_key.is_empty() || t.energy == 0))
+            .map(|t| t.id)
+            .collect()
+    }
+
+    /// Decodes and analyses tracks on a few low-priority worker threads.
+    pub fn start_analysis(&mut self, ids: Vec<usize>, overwrite: bool) {
+        let items: Vec<(usize, PathBuf)> = ids.iter().filter_map(|id| Some((*id, self.track(*id)?.file_path.clone()?))).collect();
+        let total = items.len();
+        // shortcut: ~100 MB of PCM per worker for a 6-minute track; cap at 2 workers for 8 GB machines
+        let workers = thread::available_parallelism().map_or(1, |n| (n.get() / 2).clamp(1, 2));
+        for chunk in items.chunks(total.div_ceil(workers).max(1)) {
+            let chunk = chunk.to_vec();
+            self.spawn_job(move |tx| {
+                let mut ok = 0;
+                for (n, (id, path)) in chunk.iter().enumerate() {
+                    if let Ok((pcm, sr)) = crate::audio::LoadedTrackAudio::decode_file_to_pcm(path) {
+                        let _ = tx.send(Msg::Analyzed(*id, analyze_mono(&stereo_to_mono(&pcm), sr), overwrite));
+                        ok += 1;
+                    }
+                    if n % 5 == 0 {
+                        let _ = tx.send(Msg::Status(format!("Analyzing: {} of {} in this batch…", n + 1, chunk.len())));
+                    }
+                }
+                format!("Analyzed {ok} of {} tracks", chunk.len())
+            });
+        }
+        if total == 0 {
+            self.status_message = "Nothing to analyze".to_string();
+        }
+    }
+
     /// Fills empty fields of `ids` from their files' tags in the background.
     fn start_tag_fill(&mut self, ids: &[usize]) {
         let items: Vec<(usize, PathBuf)> = ids.iter().filter_map(|id| Some((*id, self.track(*id)?.file_path.clone()?))).collect();
@@ -868,7 +957,8 @@ impl LibraryManager {
                     let known: HashSet<PathBuf> = self.tracks.iter().filter_map(|t| t.file_path.clone()).collect();
                     for t in batch {
                         if !t.file_path.as_ref().is_some_and(|p| known.contains(p)) {
-                            self.push_track(t);
+                            let id = self.push_track(t);
+                            self.scanned_ids.push(id);
                         }
                     }
                     self.touch();
@@ -899,6 +989,12 @@ impl LibraryManager {
                     }
                     self.touch();
                 }
+                Msg::Analyzed(id, a, overwrite) => {
+                    if let Some(t) = self.track_mut(id) {
+                        t.apply_analysis(&a, overwrite);
+                    }
+                    self.touch();
+                }
                 Msg::Saved(Err(e)) => {
                     self.saving = false;
                     self.status_message = format!("Could not save collection: {e}");
@@ -909,6 +1005,10 @@ impl LibraryManager {
                     self.status_message = s;
                     if self.jobs == 0 {
                         self.job_status.clear();
+                        let scanned = std::mem::take(&mut self.scanned_ids);
+                        if self.auto_analyze && !scanned.is_empty() {
+                            self.start_analysis(scanned, false);
+                        }
                         if self.missing_count() > 0 {
                             if let Some(roots) = self.relocate_after_check.take() {
                                 self.start_relocate(roots);
@@ -1091,6 +1191,7 @@ impl LibraryManager {
             }
             Action::Edit(id) => self.editing = self.track(id).cloned(),
             Action::FillTags(ids) => self.start_tag_fill(&ids),
+            Action::Analyze(ids) => self.start_analysis(ids, true),
             Action::Stems(id) => self.request_stem_separation = Some(id),
             Action::Reveal(p) => {
                 let dir = p.parent().unwrap_or(&p).to_path_buf();
@@ -1294,6 +1395,15 @@ impl LibraryManager {
             let busy = self.is_busy();
             if ui.add_enabled(!busy, egui::Button::new("Rescan folders")).on_hover_text("Add new files from your music folders").clicked() {
                 self.start_scan(music_folders.to_vec());
+            }
+            let pending = self.unanalyzed_ids();
+            if !pending.is_empty()
+                && ui
+                    .add_enabled(!busy, egui::Button::new(format!("Analyze {} tracks", pending.len())))
+                    .on_hover_text("Detect BPM, key and energy where they're unknown (existing values are kept)")
+                    .clicked()
+            {
+                self.start_analysis(pending, false);
             }
             let missing = self.missing_count();
             if missing > 0
@@ -1554,6 +1664,10 @@ impl LibraryManager {
                             actions.push(Action::Edit(t.id));
                             ui.close_menu();
                         }
+                        if ui.button("Analyze BPM, key, energy").on_hover_text("Replaces existing BPM/key/energy values").clicked() {
+                            actions.push(Action::Analyze(ids.clone()));
+                            ui.close_menu();
+                        }
                         if ui.button("Fill empty fields from file tags").clicked() {
                             actions.push(Action::FillTags(ids.clone()));
                             ui.close_menu();
@@ -1608,7 +1722,15 @@ impl LibraryManager {
                     ui.end_row();
                 }
                 ui.label("BPM");
-                ui.add(egui::DragValue::new(&mut draft.bpm).range(0.0..=250.0).speed(0.05).fixed_decimals(2));
+                ui.horizontal(|ui| {
+                    ui.add(egui::DragValue::new(&mut draft.bpm).range(0.0..=250.0).speed(0.05).fixed_decimals(2));
+                    if ui.small_button("×½").on_hover_text("Halve (fix double-time detection)").clicked() {
+                        draft.bpm /= 2.0;
+                    }
+                    if ui.small_button("×2").on_hover_text("Double (fix half-time detection)").clicked() {
+                        draft.bpm *= 2.0;
+                    }
+                });
                 ui.end_row();
                 ui.label("Rating");
                 ui.add(egui::Slider::new(&mut draft.rating, 0..=5));
@@ -1867,6 +1989,23 @@ mod tests {
         assert_eq!(lib.view.len(), 1, "only the harmonic, near-tempo track matches");
         assert_eq!(lib.tracks[lib.view[0]].title, "Zed");
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn analysis_fills_unknowns_and_keeps_user_cues() {
+        let a = TrackAnalysis { bpm: 126.0, beatgrid_offset_sec: 0.5, key_value: 21, key_open: "1m".into(), energy: 7, loudness_db: -9.0, peak_db: -0.3, cue_points_sec: vec![0.5, 31.0] };
+        let mut fresh = UiTrackEntry::default();
+        fresh.apply_analysis(&a, false);
+        assert_eq!((fresh.bpm, fresh.musical_key.as_str(), fresh.energy), (126.0, "1m", 7));
+        assert_eq!(fresh.cues.len(), 3, "grid + 2 auto cues");
+
+        let mut tagged = UiTrackEntry { bpm: 128.0, musical_key: "8m".into(), ..Default::default() };
+        tagged.cues.push(NmlCue { name: "Drop".into(), displ_order: 0, cue_type: retraktor_core::CueType::Cue, start_ms: 1.0, len_ms: 0.0, repeats: -1, hotcue: 0, grid_bpm: None });
+        tagged.apply_analysis(&a, false);
+        assert_eq!((tagged.bpm, tagged.musical_key.as_str(), tagged.energy), (128.0, "8m", 7));
+        assert_eq!(tagged.cues.iter().filter(|c| c.name.starts_with("Auto ")).count(), 0);
+        tagged.apply_analysis(&a, true);
+        assert_eq!(tagged.bpm, 126.0);
     }
 
     #[test]

@@ -315,6 +315,21 @@ fn main() {
         "simulate-mix" => {
             run_simulation();
         }
+        "analyze" => {
+            if args.len() < 3 {
+                eprintln!("Usage: retraktor-cli analyze <audio-file>...");
+                process::exit(1);
+            }
+            for f in &args[2..] {
+                match decode_mono_pcm(Path::new(f)) {
+                    Ok((pcm, sr)) => {
+                        let a = retraktor_library::analyze_mono(&pcm, sr);
+                        println!("{:7.2} BPM  {:>3}  energy {:2}  {:6.1} dB  {f}", a.bpm, a.key_open, a.energy, a.loudness_db);
+                    }
+                    Err(e) => eprintln!("{f}: {e}"),
+                }
+            }
+        }
         "analyze-bench" => {
             let Some(nml_path) = args.get(2) else {
                 eprintln!(

@@ -68,10 +68,12 @@
 * Click **`▶ Audition Transition`** to jump Deck A into the transition zone, sync Deck B's tempo and phase, and hear the automated stem transition live.
 
 ### 7. Native Audio Decoder & Collection Browser
-* **Multi-Format Local Audio Playback**: Powered by a pure-Rust `symphonia` decoder supporting `.mp3`, `.flac`, `.wav`, `.ogg`, `.m4a`, `.aac`, and `.aiff` files with automatic waveform peak-pyramid extraction, BPM estimation, and root key detection.
+* **Multi-Format Local Audio Playback**: Powered by a pure-Rust `symphonia` decoder supporting `.mp3`, `.flac`, `.wav`, `.ogg`, `.m4a`, `.aac`, and `.aiff` files with automatic waveform peak-pyramid extraction.
 * **Music Library**: Reads real tags (ID3, Vorbis, MP4, AIFF) — artist, title, album, genre, BPM, key, label, remixer, year — and never invents missing values. Scans music folders in the background, handles 20,000+ track collections in a virtualized table with multi-select, sortable/resizable columns, and right-click actions.
 * **Traktor Collection Import & Relocate**: Import an existing `collection.nml` (v19/v20) with cue points, loops, beatgrids, ratings and playlists intact; tracks whose files moved are re-linked by file name from your music folders.
 * **Playlists**: Create, rename, delete and export (`.m3u8`) playlists; drag tracks onto a playlist, onto a deck, or onto "new playlist". Everything autosaves to `~/.local/share/retraktor/collection.nml` (your Traktor files are never modified).
+* **Track Analysis**: Detects BPM + beatgrid, musical key (Open Key), a 1–10 energy level and up to 8 auto cue points at phrase changes. Runs in the background ("Analyze N tracks" fills only unknown values; right-click → Analyze replaces them) and automatically when an unanalysed track is loaded. Your existing cues are never replaced. Slow tracks are sometimes detected at double tempo — use ×½ in Edit track info. CLI: `retraktor-cli analyze <files>`.
+* **rekordbox Export**: One click writes `~/Music/ReTraktor-rekordbox.xml` (tracks, cues, loops, grids, playlists) for rekordbox / CDJ USB export.
 * **Suggestions**: Ranks your collection by harmonic and tempo compatibility with the track on deck A.
 * **Track Info Editor**: Edit metadata in the collection, and optionally write it back into the file's tags.
 * **Built-In Master `.WAV` Mix Recorder (`● REC`)**: Record your live set directly from the post-maximizer master bus to `~/Music/ReTraktor_Master_Mix.wav` (16-bit / 48 kHz stereo PCM).

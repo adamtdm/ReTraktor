@@ -366,6 +366,7 @@ impl eframe::App for ReTraktorApp {
         }
 
         // Handle File Management background music folder rescan trigger
+        self.library.auto_analyze = self.preferences.analyze_new_tracks;
         if self.preferences.trigger_music_rescan {
             self.preferences.trigger_music_rescan = false;
             self.library.start_scan(self.preferences.music_folders.clone());
@@ -479,15 +480,27 @@ impl ReTraktorApp {
 
     /// Decodes queued library loads on worker threads; real files only, never synthetic audio.
     fn drain_pending_loads(&mut self) {
-        for (deck_idx, track) in self.library.pending_loads.drain(..) {
+        let library_tx = self.library.sender();
+        for (deck_idx, track) in std::mem::take(&mut self.library.pending_loads) {
             let d = (deck_idx - 1).min(3);
             let shared_audio = self.audio.shared.clone();
+            let library_tx = library_tx.clone();
             thread::spawn(move || {
                 let Some(path) = track.file_path.as_ref() else { return };
-                // shortcut: unanalysed tracks get 120 BPM until analysis lands, then use detected tempo
-                let bpm = if track.bpm > 0.0 { track.bpm } else { 120.0 };
-                match LoadedTrackAudio::from_file(path, &track.title, &track.artist, bpm, &track.musical_key) {
-                    Ok(loaded) => {
+                match LoadedTrackAudio::from_file(path, &track.title, &track.artist, track.bpm, &track.musical_key) {
+                    Ok(mut loaded) => {
+                        // Unanalysed track: analyse the PCM we just decoded and report back to the library.
+                        if track.bpm <= 0.0 || track.musical_key.is_empty() {
+                            let mono = crate::library_ui::stereo_to_mono(&loaded.pcm_stereo);
+                            let a = retraktor_library::analyze_mono(&mono, loaded.sample_rate);
+                            if track.bpm <= 0.0 {
+                                loaded.bpm = a.bpm;
+                            }
+                            if track.musical_key.is_empty() {
+                                loaded.key = a.key_open.clone();
+                            }
+                            let _ = library_tx.send(crate::library_ui::Msg::Analyzed(track.id, a, false));
+                        }
                         if let Ok(mut state) = shared_audio.lock() {
                             state.loaded_tracks[d] = Some(loaded);
                             state.playhead_sec[d] = 0.0;
