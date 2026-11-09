@@ -17,7 +17,8 @@ use retraktor_core::{
     PropValue, PropertyBus, ScreenFlavor, SurfaceEvent, TraktorColor,
 };
 use retraktor_formats::{
-    NmlCollection, NmlEntry, NmlLocation, StemMetadata, TransientFile, TsiFile, WaveformStripe,
+    to_rekordbox_xml, NmlCollection, NmlEntry, NmlLocation, StemMetadata, TransientFile, TsiFile,
+    WaveformStripe,
 };
 use retraktor_hid::{
     generate_linux_udev_rules, KontrolScreenFramebuffer, S4Mk3HapticPlatterConfig, NI_DEVICES,
@@ -115,6 +116,39 @@ fn main() {
                     entry.location.to_posix_path()
                 );
             }
+        }
+        "export-rekordbox" => {
+            let Some(in_path) = args.get(2) else {
+                eprintln!("Usage: retraktor-cli export-rekordbox <in.nml> <out.xml>");
+                process::exit(1);
+            };
+            let Some(out_path) = args.get(3) else {
+                eprintln!("Usage: retraktor-cli export-rekordbox <in.nml> <out.xml>");
+                process::exit(1);
+            };
+            let xml = fs::read_to_string(in_path).unwrap_or_else(|e| {
+                eprintln!("Failed to read {in_path}: {e}");
+                process::exit(1);
+            });
+            let col = NmlCollection::parse_xml(&xml).unwrap_or_else(|e| {
+                eprintln!("Failed to parse NML: {e}");
+                process::exit(1);
+            });
+            let out_xml = to_rekordbox_xml(&col);
+            if let Some(parent) = Path::new(out_path).parent() {
+                if !parent.as_os_str().is_empty() {
+                    let _ = fs::create_dir_all(parent);
+                }
+            }
+            fs::write(out_path, out_xml).unwrap_or_else(|e| {
+                eprintln!("Failed to write {out_path}: {e}");
+                process::exit(1);
+            });
+            println!(
+                "Exported {} tracks to rekordbox XML at {}",
+                col.entries.len(),
+                out_path
+            );
         }
         "inspect-tsi" => {
             let Some(path) = args.get(2) else {
@@ -473,6 +507,7 @@ fn print_usage() {
     println!("  run                          Start interactive live 4-deck DJ player & audio engine (Default)");
     println!("  doctor                       Run system diagnostics, check audio, udev & permissions");
     println!("  inspect-nml <file.nml>       Parse and summarize a Traktor .nml collection");
+    println!("  export-rekordbox <in> <out>  Export Traktor .nml collection to rekordbox DJ_PLAYLISTS XML");
     println!("  inspect-tsi <file.tsi>       Decode and summarize a Traktor .tsi controller mapping");
     println!("  inspect-stripe <file>        Inspect a Traktor PRTS binary waveform stripe cache");
     println!("  inspect-transients <file>    Inspect a Traktor binary transient cache");
