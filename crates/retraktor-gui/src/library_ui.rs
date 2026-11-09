@@ -126,6 +126,38 @@ impl UiTrackEntry {
         })
     }
 
+    /// Copies values from `tags` into fields that are still empty; never overwrites.
+    fn fill_empty_from(&mut self, tags: UiTrackEntry) {
+        for (dst, src) in [
+            (&mut self.title, tags.title),
+            (&mut self.artist, tags.artist),
+            (&mut self.album, tags.album),
+            (&mut self.genre, tags.genre),
+            (&mut self.comment, tags.comment),
+            (&mut self.remixer, tags.remixer),
+            (&mut self.label, tags.label),
+            (&mut self.year, tags.year),
+            (&mut self.musical_key, tags.musical_key),
+        ] {
+            if dst.is_empty() {
+                *dst = src;
+            }
+        }
+        if self.bpm <= 0.0 {
+            self.bpm = tags.bpm;
+        }
+        if self.duration_sec <= 0.0 {
+            self.duration_sec = tags.duration_sec;
+        }
+        if self.bitrate_kbps == 0 {
+            self.bitrate_kbps = tags.bitrate_kbps;
+        }
+        if self.track_number == 0 {
+            self.track_number = tags.track_number;
+        }
+        self.stems_ready |= tags.stems_ready;
+    }
+
     fn search_blob(&self) -> String {
         format!(
             "{} {} {} {} {} {} {} {} {:.0}",
@@ -233,6 +265,15 @@ fn write_track_tags(t: &UiTrackEntry) -> Result<(), String> {
         }
     }
     tag.save_to_path(path, WriteOptions::default()).map_err(|e| e.to_string())
+}
+
+/// Reads tags for `items` and sends them in batches.
+fn read_tags_into(tx: &Sender<Msg>, items: &[(usize, PathBuf)]) {
+    for (n, chunk) in items.chunks(100).enumerate() {
+        let batch = chunk.iter().map(|(id, p)| (*id, read_track_file(p))).collect();
+        let _ = tx.send(Msg::Tags(batch));
+        let _ = tx.send(Msg::Status(format!("Reading tags: {} of {}…", n * 100 + chunk.len(), items.len())));
+    }
 }
 
 /// Iteratively walks `root` calling `f` for every audio file (hidden entries and symlinks skipped).
@@ -373,6 +414,7 @@ enum Msg {
     Scanned(Vec<UiTrackEntry>),
     Checked(Vec<(usize, bool, bool)>),
     Relocated(Vec<(usize, PathBuf)>),
+    Tags(Vec<(usize, UiTrackEntry)>),
     Saved(Result<usize, String>),
     Done(String),
 }
@@ -384,6 +426,7 @@ enum Action {
     AddToPlaylist(Vec<usize>, Option<usize>),
     RemoveFromPlaylist(Vec<usize>),
     Edit(usize),
+    FillTags(Vec<usize>),
     Stems(usize),
     Reveal(PathBuf),
     RemoveFromCollection(Vec<usize>),
@@ -800,8 +843,19 @@ impl LibraryManager {
                 })
                 .collect();
             let n = fixed.len();
-            let _ = tx.send(Msg::Relocated(fixed));
+            let _ = tx.send(Msg::Relocated(fixed.clone()));
+            read_tags_into(tx, &fixed);
             format!("Relocated {n} of {} missing tracks", missing.len())
+        });
+    }
+
+    /// Fills empty fields of `ids` from their files' tags in the background.
+    fn start_tag_fill(&mut self, ids: &[usize]) {
+        let items: Vec<(usize, PathBuf)> = ids.iter().filter_map(|id| Some((*id, self.track(*id)?.file_path.clone()?))).collect();
+        let n = items.len();
+        self.spawn_job(move |tx| {
+            read_tags_into(tx, &items);
+            format!("Read tags from {n} files")
         });
     }
 
@@ -833,6 +887,14 @@ impl LibraryManager {
                         if let Some(t) = self.track_mut(id) {
                             t.file_path = Some(p);
                             t.missing = false;
+                        }
+                    }
+                    self.touch();
+                }
+                Msg::Tags(batch) => {
+                    for (id, tags) in batch {
+                        if let Some(t) = self.track_mut(id) {
+                            t.fill_empty_from(tags);
                         }
                     }
                     self.touch();
@@ -1028,6 +1090,7 @@ impl LibraryManager {
                 }
             }
             Action::Edit(id) => self.editing = self.track(id).cloned(),
+            Action::FillTags(ids) => self.start_tag_fill(&ids),
             Action::Stems(id) => self.request_stem_separation = Some(id),
             Action::Reveal(p) => {
                 let dir = p.parent().unwrap_or(&p).to_path_buf();
@@ -1060,13 +1123,18 @@ impl LibraryManager {
 
     fn nav_button(&mut self, ui: &mut Ui, label: String, item: NavItem, drop_target: Option<Option<usize>>) -> egui::Response {
         let selected = self.selected_nav == item;
-        let resp = ui.add_sized(
-            [ui.available_width(), 22.0],
-            egui::Button::new(RichText::new(label).size(12.0).color(if selected { Color32::WHITE } else { TraktorTheme::TEXT_PRIMARY }))
-                .fill(if selected { TraktorTheme::ROW_SELECTED } else { Color32::TRANSPARENT })
-                .stroke(Stroke::NONE)
-                .wrap_mode(egui::TextWrapMode::Truncate),
-        );
+        // A left-aligned layout makes the full-width button's text left-aligned too.
+        let resp = ui
+            .with_layout(Layout::top_down(Align::Min), |ui| {
+                ui.add(
+                    egui::Button::new(RichText::new(label).size(12.0).color(if selected { Color32::WHITE } else { TraktorTheme::TEXT_PRIMARY }))
+                        .fill(if selected { TraktorTheme::ROW_SELECTED } else { Color32::TRANSPARENT })
+                        .stroke(Stroke::NONE)
+                        .wrap_mode(egui::TextWrapMode::Truncate)
+                        .min_size(egui::vec2(ui.available_width(), 22.0)),
+                )
+            })
+            .inner;
         if resp.clicked() {
             self.selected_nav = item;
             self.selection.clear();
@@ -1189,18 +1257,20 @@ impl LibraryManager {
             });
         });
 
-        if self.selected_nav == NavItem::Explorer {
-            self.show_explorer(ui, locked, deck_count, music_folders);
-        } else if self.tracks.is_empty() {
-            self.show_empty_state(ui, music_folders);
-        } else {
-            self.show_toolbar(ui, music_folders);
-            if self.selected_nav == NavItem::Suggestions && reference.is_none() {
-                ui.label(RichText::new("Load a track on deck A to see matching tracks.").color(TraktorTheme::TEXT_SECONDARY));
+        ui.vertical(|ui| {
+            if self.selected_nav == NavItem::Explorer {
+                self.show_explorer(ui, locked, deck_count, music_folders);
+            } else if self.tracks.is_empty() {
+                self.show_empty_state(ui, music_folders);
+            } else {
+                self.show_toolbar(ui, music_folders);
+                if self.selected_nav == NavItem::Suggestions && reference.is_none() {
+                    ui.label(RichText::new("Load a track on deck A to see matching tracks.").color(TraktorTheme::TEXT_SECONDARY));
+                }
+                self.ensure_view(reference);
+                self.show_table(ui, columns, locked, deck_count, four_deck_mode);
             }
-            self.ensure_view(reference);
-            self.show_table(ui, columns, locked, deck_count, four_deck_mode);
-        }
+        });
         self.show_editor(ui.ctx());
 
         if let Some(p) = egui::DragAndDrop::payload::<DragTracks>(ui.ctx()) {
@@ -1474,6 +1544,10 @@ impl LibraryManager {
                         ui.separator();
                         if ui.button("Edit track info…").clicked() {
                             actions.push(Action::Edit(t.id));
+                            ui.close_menu();
+                        }
+                        if ui.button("Fill empty fields from file tags").clicked() {
+                            actions.push(Action::FillTags(ids.clone()));
                             ui.close_menu();
                         }
                         if ui.button(if t.stems_ready { "Re-separate stems (Demucs)" } else { "Separate stems (Demucs)" }).clicked() {
@@ -1785,6 +1859,13 @@ mod tests {
         assert_eq!(lib.view.len(), 1, "only the harmonic, near-tempo track matches");
         assert_eq!(lib.tracks[lib.view[0]].title, "Zed");
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn tag_fill_never_overwrites() {
+        let mut t = UiTrackEntry { title: "Kept".into(), bpm: 128.0, ..Default::default() };
+        t.fill_empty_from(UiTrackEntry { title: "Other".into(), genre: "Garage".into(), bpm: 64.0, musical_key: "8m".into(), ..Default::default() });
+        assert_eq!((t.title.as_str(), t.genre.as_str(), t.bpm, t.musical_key.as_str()), ("Kept", "Garage", 128.0, "8m"));
     }
 
     #[test]

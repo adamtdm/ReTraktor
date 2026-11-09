@@ -18,8 +18,8 @@
 | **EQ ⇄ Stems Remapping** | Separate stem sub-mixers required | **Neural Mix™ Mode**: 1-click toggle dynamically swaps the 3-band EQ knobs (and your physical hardware EQ pots!) between **Classic 3-Band EQ** and **Neural Stem EQ** (`VOCALS`, `INSTRUMENTS`, `DRUMS+BASS`). |
 | **Vinyl Scratching Physics** | Choppy sample scrubbing or aliased audio | **Studio-Grade Turntable Simulation**: Alpha-Beta tracking filter (xwax/Mixxx model) with 4-point Hermite cubic anti-aliasing interpolation and magnetic cartridge velocity scaling ($V \propto v$). |
 | **Visual Controller Remapper** | Complex text/XML MIDI mapping tables | **Interactive 2D Surface Map**: Click any button, pad, knob, or jogwheel on an interactive graphical controller diagram in Preferences to assign actions and customize vibrant RGB LED colors. |
-| **Transition Studio** | Manual live mixing only | **DJ.Studio-Style Timeline Studio (`F6`)**: Horizontal multi-track transition arranger with automated stem crossfading (*Smooth Crossfade*, *Instant Bass-Swap*, *Vocal Bridge*) and live auditioning. |
-| **Smart Crate Digging** | Simple BPM/Key column sorting | **rekordbox-Style `Match Radar`**: Live harmonic and tempo compatibility radar scoring your collection in real time based on Circle-of-Fifths Open Key and BPM proximity. |
+| **Transition Studio** | Manual live mixing only | **DJ.Studio-Style Timeline Studio (`F4`)**: Horizontal multi-track transition arranger with automated stem crossfading (*Smooth Crossfade*, *Instant Bass-Swap*, *Vocal Bridge*) and live auditioning. |
+| **Smart Crate Digging** | Simple BPM/Key column sorting | **Suggestions**: harmonic + tempo match scores for your whole collection against the track on deck A (Open Key wheel, half/double-time aware). |
 | **Linux Native Engine** | Windows/macOS only (Wine/yabridge hacks) | **Pure Native Linux Stack**: Direct PipeWire / ALSA audio with real-time thread scheduling + plug-and-play USB HID / `hidraw` hardware engine with automatic udev permissions. |
 
 ---
@@ -33,13 +33,11 @@
 * **Magnetic Cartridge Attenuation**: Physical turntable cartridges produce voltage proportional to needle speed ($V \propto v$). When the platter halts, audio smoothly attenuates to silence, eliminating frozen-sample DC buzzing.
 * **CDJ Nudge vs Turntable Scratch**: Outer rim turning nudges pitch phase gently ($0.08\text{ s}$ scaling) without scratching. Easily switch between Vinyl Scratch (`TT`) and CDJ Pitch Bend (`JOG`) modes.
 
-### 2. 6 Instant Workspace Layouts (`F1` – `F6`)
-* **`F1` — Parallel (Default)**: Full-width stacked Deck A & Deck B waveforms across the top of the screen for pinpoint visual beatmatching and phrase alignment, with compact deck headers, central mixer, and library below.
-* **`F2` — Extended**: Classic 2-Deck performance view with full transport, Flux/Reverse, 4-Stem sub-mixers, 8 RGB Performance Pads (`HOTCUE`, `STEMS`, `PATTERN`, `LOOP`, `FLUX`), and Master FX unit.
-* **`F3` — Essential**: Streamlined 2-Deck + Mixer view maximizing screen space for crate digging.
-* **`F4` — 4-Deck (`A / B / C / D`)**: Full 4-channel mixing workspace with individual deck strips and master routing.
-* **`F5` — Browser**: Full-screen crate digging, harmonic Match Radar, and directory/collection management.
-* **`F6` — Timeline (`DJ.Studio` Mode)**: Horizontal Track A → Track B transition arranger with visual stem automation curves and 1-click transition auditioning.
+### 2. Four Workspace Layouts (`F1` – `F4`)
+* **`F1` — Mix (Default)**: Stacked Deck A & B waveforms for visual beatmatching, compact decks, a 2-channel mixer, and the library below.
+* **`F2` — 4-Deck (`A / B / C / D`)**: All four decks with a 4-channel mixer.
+* **`F3` — Browser**: Mini deck strips and a full-height library for preparing sets.
+* **`F4` — Timeline**: Track A → Track B transition arranger with stem automation presets and live auditioning.
 
 ### 3. Interactive Graphical Controller Surface Map & Remapper
 * Located in **Preferences** (`⚙ -> Controllers & MX2`).
@@ -61,7 +59,7 @@
 * **Dual-Mode Mixer Strips**: Click **`EQ: CLASSIC`** / **`EQ: STEMS (NEURAL)`** at the top of the central mixer to transform the 3-band EQ knobs on every channel (and on your connected hardware mixer) into real-time **Vocal**, **Instrument**, and **Drums+Bass** stem isolators.
 * **9 Mixer FX + 2-Slot Deck FX Rack**: One-knob per-channel **Mixer FX** (*Filter*, *Reverb*, *Delay*, *Noise*, *Time Gater*, *Flanger*, *Barber Pole*, *Dotted Delay*, *Crush*) plus a 40+ effect assignable **FX Unit** (*Ziqualizer*, *Beatmasher 2*, *Gater*, *Formant Filter*, *Delay T3*, *Reverb T3*) and Master **Ozone Maximizer** limiter (`BOOST` / `LIMIT`).
 
-### 6. DJ.Studio-Style Timeline Transition Studio (`F6`)
+### 6. DJ.Studio-Style Timeline Transition Studio (`F4`)
 * Visualize the overlap between **Deck A (Outgoing)** and **Deck B (Incoming)** over an adjustable **`8 Bars`**, **`16 Bars`**, or **`32 Bars`** transition window.
 * Apply one-click stem transition presets:
   * **Smooth Crossfade**: Gradual linear volume blend across the transition window.
@@ -71,8 +69,11 @@
 
 ### 7. Native Audio Decoder & Collection Browser
 * **Multi-Format Local Audio Playback**: Powered by a pure-Rust `symphonia` decoder supporting `.mp3`, `.flac`, `.wav`, `.ogg`, `.m4a`, `.aac`, and `.aiff` files with automatic waveform peak-pyramid extraction, BPM estimation, and root key detection.
-* **Built-In File Explorer & `.nml` Importer**: Scan `~/Music` in one click, browse any local directory in the built-in **File Explorer** tab, or import existing Traktor `collection.nml` (v19/v20) libraries with full cue points, loops, and beatgrids intact.
-* **rekordbox-Style `Match Radar`**: Toggle the `⚡ Match Radar` side panel in the browser to see your top harmonic and BPM matches for the current master deck, complete with `93%–99%` compatibility badges and 1-click loading to Deck A or B.
+* **Music Library**: Reads real tags (ID3, Vorbis, MP4, AIFF) — artist, title, album, genre, BPM, key, label, remixer, year — and never invents missing values. Scans music folders in the background, handles 20,000+ track collections in a virtualized table with multi-select, sortable/resizable columns, and right-click actions.
+* **Traktor Collection Import & Relocate**: Import an existing `collection.nml` (v19/v20) with cue points, loops, beatgrids, ratings and playlists intact; tracks whose files moved are re-linked by file name from your music folders.
+* **Playlists**: Create, rename, delete and export (`.m3u8`) playlists; drag tracks onto a playlist, onto a deck, or onto "new playlist". Everything autosaves to `~/.local/share/retraktor/collection.nml` (your Traktor files are never modified).
+* **Suggestions**: Ranks your collection by harmonic and tempo compatibility with the track on deck A.
+* **Track Info Editor**: Edit metadata in the collection, and optionally write it back into the file's tags.
 * **Built-In Master `.WAV` Mix Recorder (`● REC`)**: Record your live set directly from the post-maximizer master bus to `~/Music/ReTraktor_Master_Mix.wav` (16-bit / 48 kHz stereo PCM).
 
 ### 8. Full Hardware Controller Support
@@ -221,7 +222,7 @@ ReTraktor/
 | `Space` | Play / Pause active deck |
 | `C` | Jump to Cue point |
 | `S` | Sync BPM and phase with Master deck |
-| `F1` – `F6` | Switch Workspace Layout (Parallel, Extended, Essential, 4-Deck, Browser, Timeline) |
+| `F1` – `F4` | Switch Workspace Layout (Mix, 4-Deck, Browser, Timeline) |
 | `1` – `4` | Trigger Hotcues / Stem Mutes (Drums, Bass, Instruments, Vocals) |
 | `Shift + 1..4` | Delete Hotcue |
 | `L` | Toggle Active Loop |
@@ -230,6 +231,10 @@ ReTraktor/
 | `Enter` | Load selected track to Deck A |
 | `Shift + Enter` | Load selected track to Deck B |
 | `Ctrl + P` | Open Preferences Dialog |
+| `Ctrl + F` | Focus library search |
+| `Ctrl + A` | Select all tracks in the current view |
+| `Delete` | Remove selected tracks from the current playlist |
+| Double-click | Load track to the first deck that isn't playing |
 
 ---
 

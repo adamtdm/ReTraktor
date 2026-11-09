@@ -26,10 +26,6 @@ use std::thread;
 pub enum TraktorLayout {
     /// Stacked full-width parallel waveforms at top + transport/mixer row + browser
     Parallel,
-    /// Side-by-side Decks A & B + 4-channel center mixer + browser
-    Extended,
-    /// Clean 2-Deck + 2-Channel mixer + large browser
-    Essential,
     /// All 4 Decks (A, B, C, D) visible + 4-channel mixer + browser
     FourDeck,
     /// DJ.Studio-style Horizontal Timeline Transition Editor + Stem Automation
@@ -41,9 +37,7 @@ pub enum TraktorLayout {
 impl TraktorLayout {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Parallel => "Parallel",
-            Self::Extended => "Extended",
-            Self::Essential => "Essential",
+            Self::Parallel => "Mix",
             Self::FourDeck => "4-Deck",
             Self::Timeline => "Timeline",
             Self::Browser => "Browser",
@@ -329,14 +323,6 @@ impl eframe::App for ReTraktorApp {
                         self.show_parallel_layout(ui);
                         self.show_browser_panel(ui);
                     }
-                    TraktorLayout::Extended => {
-                        self.show_extended_layout(ui, false);
-                        self.show_browser_panel(ui);
-                    }
-                    TraktorLayout::Essential => {
-                        self.show_extended_layout(ui, true);
-                        self.show_browser_panel(ui);
-                    }
                     TraktorLayout::FourDeck => {
                         self.show_four_deck_layout(ui);
                         self.show_browser_panel(ui);
@@ -411,7 +397,7 @@ impl eframe::App for ReTraktorApp {
                 self.library.stem_job_progress = None;
                 if let Some(t) = self.library.tracks.iter_mut().find(|t| t.id == track_id) {
                     t.stems_ready = true;
-                    self.library.status_message = format!("✓ AI Demucs separated 4 stems for '{}'!", t.title);
+                    self.library.status_message = format!("✔ AI Demucs separated 4 stems for '{}'!", t.title);
                 }
                 // Reload stems asynchronously without stalling audio or UI
                 if let Some(track) = self.library.tracks.iter().find(|t| t.id == track_id) {
@@ -1159,24 +1145,17 @@ impl ReTraktorApp {
             self.preferences.is_open = false;
         }
 
-        // Layout shortcuts F1..F6
-        if ctx.input(|i| i.key_pressed(Key::F1)) {
-            self.layout = TraktorLayout::Parallel;
-        }
-        if ctx.input(|i| i.key_pressed(Key::F2)) {
-            self.layout = TraktorLayout::Extended;
-        }
-        if ctx.input(|i| i.key_pressed(Key::F3)) {
-            self.layout = TraktorLayout::Essential;
-        }
-        if ctx.input(|i| i.key_pressed(Key::F4)) {
-            self.layout = TraktorLayout::FourDeck;
-        }
-        if ctx.input(|i| i.key_pressed(Key::F5)) {
-            self.layout = TraktorLayout::Browser;
-        }
-        if ctx.input(|i| i.key_pressed(Key::F6)) {
-            self.layout = TraktorLayout::Timeline;
+        // Layout shortcuts F1..F4
+        for (key, lay) in [
+            (Key::F1, TraktorLayout::Parallel),
+            (Key::F2, TraktorLayout::FourDeck),
+            (Key::F3, TraktorLayout::Browser),
+            (Key::F4, TraktorLayout::Timeline),
+        ] {
+            if ctx.input(|i| i.key_pressed(key)) {
+                self.layout = lay;
+                self.preferences.four_deck_mode = lay == TraktorLayout::FourDeck;
+            }
         }
 
         // Only process single-key deck shortcuts when not typing in a text field
@@ -1302,14 +1281,8 @@ impl ReTraktorApp {
                 ui.horizontal(|ui| {
                     // 1. Brand Logo
                     ui.label(
-                        RichText::new("TRAKTOR")
+                        RichText::new("ReTraktor")
                             .color(Color32::WHITE)
-                            .font(egui::FontId::proportional(15.0))
-                            .strong(),
-                    );
-                    ui.label(
-                        RichText::new("PRO 4")
-                            .color(TraktorTheme::DECK_A)
                             .font(egui::FontId::proportional(15.0))
                             .strong(),
                     );
@@ -1357,11 +1330,9 @@ impl ReTraktorApp {
                     );
                     let layouts = [
                         TraktorLayout::Parallel,
-                        TraktorLayout::Extended,
-                        TraktorLayout::Essential,
                         TraktorLayout::FourDeck,
-                        TraktorLayout::Timeline,
                         TraktorLayout::Browser,
+                        TraktorLayout::Timeline,
                     ];
                     for lay in layouts {
                         let active = self.layout == lay;
@@ -1618,7 +1589,7 @@ impl ReTraktorApp {
                                 {
                                     Ok(dur_s) => {
                                         self.library.status_message = format!(
-                                            "✓ Saved Master Mix recording ({dur_s:.1}s) to {}",
+                                            "✔ Saved Master Mix recording ({dur_s:.1}s) to {}",
                                             out_path.display()
                                         );
                                     }
@@ -1957,7 +1928,7 @@ impl ReTraktorApp {
                 Layout::top_down(Align::Min),
                 |ui| {
                     ui.set_width(mixer_w);
-                    self.show_mixer_section(ui, false);
+                    self.show_mixer_section(ui, true);
                 },
             );
 
@@ -2214,49 +2185,6 @@ impl ReTraktorApp {
     }
 
     /// LAYOUT 2 & 3: EXTENDED / ESSENTIAL SIDE-BY-SIDE LAYOUT
-    fn show_extended_layout(&mut self, ui: &mut Ui, two_channel_mixer_only: bool) {
-        ui.horizontal_top(|ui| {
-            let avail_w = ui.available_width();
-            let mixer_w = if two_channel_mixer_only {
-                200.0_f32
-            } else {
-                348.0_f32
-            };
-            let deck_w = ((avail_w - mixer_w - 8.0) / 2.0).max(260.0);
-
-            // Left: Deck A (Cyan)
-            ui.allocate_ui_with_layout(
-                Vec2::new(deck_w, 235.0),
-                Layout::top_down(Align::Min),
-                |ui| {
-                    ui.set_width(deck_w);
-                    self.show_single_deck(ui, 1, TraktorTheme::DECK_A, true, 72.0);
-                },
-            );
-
-            // Center: Mixer
-            ui.allocate_ui_with_layout(
-                Vec2::new(mixer_w, 235.0),
-                Layout::top_down(Align::Min),
-                |ui| {
-                    ui.set_width(mixer_w);
-                    self.show_mixer_section(ui, two_channel_mixer_only);
-                },
-            );
-
-            // Right: Deck B (Orange)
-            ui.allocate_ui_with_layout(
-                Vec2::new(deck_w, 235.0),
-                Layout::top_down(Align::Min),
-                |ui| {
-                    ui.set_width(deck_w);
-                    self.show_single_deck(ui, 2, TraktorTheme::DECK_B, true, 72.0);
-                },
-            );
-        });
-    }
-
-    /// LAYOUT 4: 4-DECK PRO LAYOUT (Decks A & C on Left, 4-Ch Mixer in Center, Decks B & D on Right)
     fn show_four_deck_layout(&mut self, ui: &mut Ui) {
         ui.horizontal_top(|ui| {
             let avail_w = ui.available_width();
@@ -2638,7 +2566,8 @@ impl ReTraktorApp {
                         (2usize, "OTHER", Color32::from_rgb(96, 172, 132)),
                         (3usize, "VOCAL", Color32::from_rgb(214, 148, 56)),
                     ];
-                    for (s_idx, s_lbl, s_col) in stem_defs {
+                    // Stem mutes only show while the deck's STEMS view is on.
+                    for (s_idx, s_lbl, s_col) in stem_defs.into_iter().filter(|_| stem_view_on) {
                         let muted = self.deck_stem_muted[d][s_idx];
                         let resp = ui
                             .add(

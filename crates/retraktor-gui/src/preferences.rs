@@ -414,6 +414,17 @@ impl PreferencesDialog {
                     "col_bitrate" => self.library_columns.bitrate = val == "true",
                     "col_format" => self.library_columns.format = val == "true",
                     "col_track_number" => self.library_columns.track_number = val == "true",
+                    "music_folders" => {
+                        self.music_folders = v
+                            .trim()
+                            .trim_start_matches('[')
+                            .trim_end_matches(']')
+                            .split("\",")
+                            .map(|f| f.trim().trim_matches('"'))
+                            .filter(|f| !f.is_empty())
+                            .map(std::path::PathBuf::from)
+                            .collect();
+                    }
                     "col_energy" => self.library_columns.energy = val == "true",
                     _ => {}
                 }
@@ -523,75 +534,62 @@ impl PreferencesDialog {
         }
     }
 
-    /// Renders horizontal section tabs across the top of the Preferences page.
+    /// Settings pages grouped into the six top-level tabs.
+    pub const GROUPS: [(&'static str, &'static [PrefsTab]); 6] = [
+        ("Audio", &[PrefsTab::AudioSetup, PrefsTab::OutputRouting, PrefsTab::InputRouting, PrefsTab::ExternalSync]),
+        ("Decks & Mixer", &[PrefsTab::Decks, PrefsTab::TrackDecks, PrefsTab::Mixer, PrefsTab::Effects]),
+        ("Library", &[PrefsTab::FileManagement, PrefsTab::BrowserColumns, PrefsTab::AnalyzeOptions]),
+        ("Stems & Recording", &[PrefsTab::StemsAndAi, PrefsTab::Recording]),
+        ("Controllers", &[PrefsTab::Controllers]),
+        ("About", &[PrefsTab::About]),
+    ];
+
+    fn current_group(&self) -> &'static [PrefsTab] {
+        Self::GROUPS.iter().map(|g| g.1).find(|g| g.contains(&self.current_tab)).unwrap_or(&[PrefsTab::AudioSetup])
+    }
+
+    /// Renders the top-level tab strip; the search box filters tabs by any section they contain.
     pub fn render_top_section_tabs(&mut self, ui: &mut Ui) {
         let query = self.search_query.trim().to_lowercase();
-        let all_tabs = [
-            ("Audio Setup", PrefsTab::AudioSetup),
-            ("Output Routing", PrefsTab::OutputRouting),
-            ("Input Routing", PrefsTab::InputRouting),
-            ("Sync & Clock", PrefsTab::ExternalSync),
-            ("Mixer & EQ", PrefsTab::Mixer),
-            ("Decks & Waveforms", PrefsTab::Decks),
-            ("Track Decks", PrefsTab::TrackDecks),
-            ("Effects", PrefsTab::Effects),
-            ("Stems & AI", PrefsTab::StemsAndAi),
-            ("Recording", PrefsTab::Recording),
-            ("Browser & Metadata", PrefsTab::BrowserColumns),
-            ("Music Folders", PrefsTab::FileManagement),
-            ("Analyze & Key", PrefsTab::AnalyzeOptions),
-            ("Controllers", PrefsTab::Controllers),
-            ("About", PrefsTab::About),
-        ];
-
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
-            for (label, tab) in all_tabs {
-                let (cat, sec) = self.get_tab_breadcrumb(tab);
+            for (label, tabs) in Self::GROUPS {
                 let matches = query.is_empty()
                     || label.to_lowercase().contains(&query)
-                    || sec.to_lowercase().contains(&query)
-                    || cat.to_lowercase().contains(&query);
+                    || tabs.iter().any(|t| self.get_tab_breadcrumb(*t).1.to_lowercase().contains(&query));
                 if !matches {
                     continue;
                 }
-
-                let is_selected = self.current_tab == tab;
-                let bg = if is_selected {
-                    TraktorTheme::ROW_SELECTED
-                } else {
-                    Color32::from_rgb(24, 28, 36)
-                };
-                let fg = if is_selected {
-                    Color32::WHITE
-                } else {
-                    TraktorTheme::TEXT_PRIMARY
-                };
-                let stroke = if is_selected {
-                    Stroke::new(1.5_f32, TraktorTheme::DECK_A)
-                } else {
-                    Stroke::new(1.0_f32, Color32::from_rgb(44, 50, 62))
-                };
-
-                if ui
-                    .add(
-                        egui::Button::new(
-                            RichText::new(label)
-                                .color(fg)
-                                .font(egui::FontId::proportional(12.0))
-                                .strong(),
-                        )
-                        .fill(bg)
-                        .stroke(stroke)
-                        .rounding(4.0)
-                        .min_size(Vec2::new(92.0, 28.0)),
-                    )
-                    .clicked()
-                {
-                    self.current_tab = tab;
+                let selected = tabs.contains(&self.current_tab);
+                let button = egui::Button::new(RichText::new(label).size(13.0).color(if selected { Color32::WHITE } else { TraktorTheme::TEXT_PRIMARY }))
+                    .fill(if selected { TraktorTheme::ROW_SELECTED } else { Color32::from_rgb(24, 28, 36) })
+                    .rounding(4.0)
+                    .min_size(Vec2::new(110.0, 30.0));
+                if ui.add(button).clicked() {
+                    self.current_tab = tabs[0];
                 }
             }
         });
+    }
+
+    fn show_section(&mut self, ui: &mut Ui, tab: PrefsTab) {
+        match tab {
+            PrefsTab::AudioSetup => self.show_audio_setup(ui),
+            PrefsTab::OutputRouting => self.show_output_routing(ui),
+            PrefsTab::InputRouting => self.show_input_routing(ui),
+            PrefsTab::ExternalSync => self.show_external_sync(ui),
+            PrefsTab::Mixer => self.show_mixer_prefs(ui),
+            PrefsTab::Decks => self.show_deck_prefs(ui),
+            PrefsTab::TrackDecks => self.show_track_decks_prefs(ui),
+            PrefsTab::Effects => self.show_effects_prefs(ui),
+            PrefsTab::StemsAndAi => self.show_stems_prefs(ui),
+            PrefsTab::Recording => self.show_recording_prefs(ui),
+            PrefsTab::BrowserColumns => self.show_browser_columns_prefs(ui),
+            PrefsTab::FileManagement => self.show_file_management(ui),
+            PrefsTab::AnalyzeOptions => self.show_analyze_prefs(ui),
+            PrefsTab::Controllers => self.show_controller_prefs(ui),
+            PrefsTab::About => self.show_about(ui),
+        }
     }
 
     /// Renders Preferences as a full-page view with top section tabs and a vertical list-type options view.
@@ -614,24 +612,18 @@ impl PreferencesDialog {
                         );
                         ui.add_space(8.0);
 
-                        let (category, section) = self.get_tab_breadcrumb(self.current_tab);
-                        ui.label(
-                            RichText::new(format!("[ {category} ] › {section}"))
-                                .color(TraktorTheme::DECK_A)
-                                .font(egui::FontId::monospace(11.5)),
-                        );
 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui
                                 .add(
                                     egui::Button::new(
-                                        RichText::new("✕ Close Preferences (Esc)")
+                                        RichText::new("Close (Esc)")
                                             .color(Color32::WHITE)
                                             .font(egui::FontId::proportional(12.0))
                                             .strong(),
                                     )
                                     .fill(TraktorTheme::ROW_SELECTED)
-                                    .min_size(Vec2::new(180.0, 28.0)),
+                                    .min_size(Vec2::new(110.0, 28.0)),
                                 )
                                 .on_hover_text("Save preferences and return to Decks (Esc)")
                                 .clicked()
@@ -645,10 +637,10 @@ impl PreferencesDialog {
                             ui.horizontal(|ui| {
                                 ui.add(
                                     egui::TextEdit::singleline(&mut self.search_query)
-                                        .hint_text("Filter settings tabs...")
+                                        .hint_text("Search settings…")
                                         .desired_width(220.0),
                                 );
-                                if !self.search_query.is_empty() && ui.small_button("✕").clicked() {
+                                if !self.search_query.is_empty() && ui.small_button("Clear").clicked() {
                                     self.search_query.clear();
                                 }
                             });
@@ -683,22 +675,9 @@ impl PreferencesDialog {
                                 ui.set_min_width(avail_w - 16.0);
                                 ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
 
-                                match self.current_tab {
-                                    PrefsTab::AudioSetup => self.show_audio_setup(ui),
-                                    PrefsTab::OutputRouting => self.show_output_routing(ui),
-                                    PrefsTab::InputRouting => self.show_input_routing(ui),
-                                    PrefsTab::ExternalSync => self.show_external_sync(ui),
-                                    PrefsTab::Mixer => self.show_mixer_prefs(ui),
-                                    PrefsTab::Decks => self.show_deck_prefs(ui),
-                                    PrefsTab::TrackDecks => self.show_track_decks_prefs(ui),
-                                    PrefsTab::Effects => self.show_effects_prefs(ui),
-                                    PrefsTab::StemsAndAi => self.show_stems_prefs(ui),
-                                    PrefsTab::Recording => self.show_recording_prefs(ui),
-                                    PrefsTab::BrowserColumns => self.show_browser_columns_prefs(ui),
-                                    PrefsTab::FileManagement => self.show_file_management(ui),
-                                    PrefsTab::AnalyzeOptions => self.show_analyze_prefs(ui),
-                                    PrefsTab::Controllers => self.show_controller_prefs(ui),
-                                    PrefsTab::About => self.show_about(ui),
+                                for tab in self.current_group() {
+                                    self.show_section(ui, *tab);
+                                    ui.add_space(12.0);
                                 }
                             });
                         });
@@ -1097,7 +1076,7 @@ impl PreferencesDialog {
             |ui| match &self.demucs_install_state {
                 crate::demucs::DemucsInstallState::Ready { version, .. } => {
                     ui.label(
-                        RichText::new(format!("✓ {version} Ready"))
+                        RichText::new(format!("✔ {version} Ready"))
                             .color(TraktorTheme::PLAY_ACTIVE)
                             .strong(),
                     );
@@ -1736,7 +1715,7 @@ impl PreferencesDialog {
             .default_open(true)
             .show(ui, |ui| {
                 ui.label("• 🔌 Dedicated Power Supply: The Traktor MX2 requires the external 15V DC power adapter plugged into the back panel. USB-C bus power alone cannot power the audio DAC, platters, and RGB lighting.");
-                ui.label("• 🎛️ Native HID Mode vs MIDI Mode: If the unit is in MIDI mode, press and hold Left SHIFT + Right SHIFT together to switch back to Native HID mode.");
+                ui.label("• Native HID Mode vs MIDI Mode: If the unit is in MIDI mode, press and hold Left SHIFT + Right SHIFT together to switch back to Native HID mode.");
                 ui.label("• 🔒 Linux Permissions (udev): Requires /etc/udev/rules.d/60-retraktor-controllers.rules for non-root /dev/hidraw* read/write access.");
                 ui.horizontal(|ui| {
                     if ui.button("📋 Copy 1-Click udev Fix Command to Clipboard").clicked() {
@@ -1745,7 +1724,7 @@ impl PreferencesDialog {
                         self.udev_command_copied = true;
                     }
                     if self.udev_command_copied {
-                        ui.label(RichText::new("✓ Copied command to clipboard!").color(TraktorTheme::PLAY_ACTIVE));
+                        ui.label(RichText::new("✔ Copied command to clipboard!").color(TraktorTheme::PLAY_ACTIVE));
                     }
                 });
             });
@@ -1769,7 +1748,7 @@ impl PreferencesDialog {
                 .stroke(Stroke::new(1.0_f32, TraktorTheme::PLAY_ACTIVE))
                 .inner_margin(egui::Margin::symmetric(8.0, 4.0))
                 .show(ui, |ui| {
-                    ui.label(RichText::new("✓ Automated Hardware Protocol Verification Passed!").color(TraktorTheme::PLAY_ACTIVE).strong());
+                    ui.label(RichText::new("✔ Automated Hardware Protocol Verification Passed!").color(TraktorTheme::PLAY_ACTIVE).strong());
                     ui.label(format!(
                         "Tested: {} Buttons ({}), {} Encoders ({}), {} Pots/Faders ({}), {} Jogwheels ({}), {} LEDs ({})",
                         report.buttons_tested, report.buttons_passed,
@@ -1840,7 +1819,7 @@ impl PreferencesDialog {
                                     retraktor_hid::DeviceAccessLevel::ReadWriteOk => {
                                         let is_cur = self.mx2_connected_node.as_ref() == Some(&item.identifier);
                                         if is_cur {
-                                            ui.label(RichText::new("✓ Active").color(TraktorTheme::PLAY_ACTIVE).strong());
+                                            ui.label(RichText::new("✔ Active").color(TraktorTheme::PLAY_ACTIVE).strong());
                                         } else if ui.button("Connect").clicked() {
                                             self.trigger_connect_node = Some(item.identifier.clone());
                                         }
@@ -1866,7 +1845,7 @@ impl PreferencesDialog {
         ui.add_space(6.0);
 
         // 6. Interactive Visual Controller Surface Map & Custom Remapper
-        egui::CollapsingHeader::new(RichText::new("🎛️ Interactive Controller Surface Map (Click Any Control to Remap & Recolor)").strong())
+        egui::CollapsingHeader::new(RichText::new("Interactive Controller Surface Map (Click Any Control to Remap & Recolor)").strong())
             .default_open(true)
             .show(ui, |ui| {
                 ui.label(RichText::new("Click any button, pad, knob, or jogwheel below to reassign its target action and LED backlight color:").italics());
@@ -1983,7 +1962,7 @@ impl PreferencesDialog {
                                         if f_click(ui, "LOW EQ", "surface.mixer.channels.1.eq.low", &self.selected_visual_control) {
                                             self.selected_visual_control = Some("surface.mixer.channels.1.eq.low".to_string());
                                         }
-                                        if f_click(ui, "🎛 FILTER", "surface.mixer.channels.1.channel_fx.amount", &self.selected_visual_control) {
+                                        if f_click(ui, "FILTER", "surface.mixer.channels.1.channel_fx.amount", &self.selected_visual_control) {
                                             self.selected_visual_control = Some("surface.mixer.channels.1.channel_fx.amount".to_string());
                                         }
                                         if f_click(ui, "FLTR ON", "surface.mixer.channels.1.channel_fx.on", &self.selected_visual_control) {
@@ -2013,7 +1992,7 @@ impl PreferencesDialog {
                                         if f_click(ui, "LOW EQ", "surface.mixer.channels.2.eq.low", &self.selected_visual_control) {
                                             self.selected_visual_control = Some("surface.mixer.channels.2.eq.low".to_string());
                                         }
-                                        if f_click(ui, "🎛 FILTER", "surface.mixer.channels.2.channel_fx.amount", &self.selected_visual_control) {
+                                        if f_click(ui, "FILTER", "surface.mixer.channels.2.channel_fx.amount", &self.selected_visual_control) {
                                             self.selected_visual_control = Some("surface.mixer.channels.2.channel_fx.amount".to_string());
                                         }
                                         if f_click(ui, "FLTR ON", "surface.mixer.channels.2.channel_fx.on", &self.selected_visual_control) {
@@ -2132,7 +2111,7 @@ impl PreferencesDialog {
                             ui.horizontal(|ui| {
                                 ui.label(RichText::new(format!("⚙ Editing Control: {}", sel_id)).strong().color(TraktorTheme::DECK_A));
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if ui.button("✕ Close").clicked() {
+                                    if ui.button("× Close").clicked() {
                                         close_clicked = true;
                                     }
                                 });
@@ -2463,6 +2442,7 @@ mod tests {
         original.library_columns.remixer = true;
         original.library_columns.bitrate = true;
         original.collection_save_format = 2;
+        original.music_folders = vec!["/DATA/Media/Music".into(), "/home/dj/My Music, Old".into()];
 
         let json = original.to_json_str();
         let mut restored = PreferencesDialog::default();
@@ -2477,5 +2457,6 @@ mod tests {
         assert!(restored.library_columns.remixer);
         assert!(restored.library_columns.bitrate);
         assert_eq!(restored.collection_save_format, 2);
+        assert_eq!(restored.music_folders, original.music_folders);
     }
 }

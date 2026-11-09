@@ -24,7 +24,7 @@ use app::ReTraktorApp;
 fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("ReTraktor 4.5.1 — Traktor Pro 4 on Linux")
+            .with_title("ReTraktor")
             .with_inner_size(Vec2::new(1280.0, 820.0))
             .with_min_inner_size(Vec2::new(1024.0, 640.0))
             .with_active(true),
@@ -32,8 +32,16 @@ fn main() -> eframe::Result<()> {
     };
 
     eframe::run_native(
-        "ReTraktor Pro 4",
+        "ReTraktor",
         native_options,
-        Box::new(|_cc| Ok(Box::new(ReTraktorApp::default()))),
+        Box::new(|cc| {
+            // Symbols like ▲ ▾ ● live only in the monospace font; let proportional text fall back to it.
+            let mut fonts = egui::FontDefinitions::default();
+            if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+                family.push("Hack".to_owned());
+            }
+            cc.egui_ctx.set_fonts(fonts);
+            Ok(Box::new(ReTraktorApp::default()))
+        }),
     )
 }

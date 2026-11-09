@@ -1233,7 +1233,7 @@ pub fn render_shortcuts_hud(ctx: &egui::Context, is_open: &mut bool) {
                     sys_row(ui, "?", "Toggle Shortcuts HUD");
                     sys_row(ui, "Esc", "Dismiss HUD / Modals");
                     sys_row(ui, "Click Platter", "Vinyl Scratch / Stop");
-                    sys_row(ui, "✦ Stems", "Separate Audio via AI");
+                    sys_row(ui, "◆ Stems", "Separate Audio via AI");
                 });
             });
 
