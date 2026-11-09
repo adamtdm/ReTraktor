@@ -3208,15 +3208,11 @@ impl ReTraktorApp {
 
                     ui.separator();
 
-                    let reference = self.audio.shared.lock().ok().and_then(|state| {
-                        state.loaded_tracks[0].as_ref().map(|t| (t.key.clone(), t.bpm))
-                    });
                     let four_deck_mode =
                         self.layout == TraktorLayout::FourDeck || self.preferences.four_deck_mode;
                     let locked_decks = self.locked_decks();
                     self.library.show_browser_content(
                         ui,
-                        reference.as_ref().map(|(k, b)| (k.as_str(), *b)),
                         four_deck_mode,
                         locked_decks,
                         self.preferences.library_columns,

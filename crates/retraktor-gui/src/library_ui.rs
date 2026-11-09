@@ -345,8 +345,9 @@ fn write_atomic(path: &Path, contents: &str) -> Result<(), String> {
     fs::rename(&tmp, path).map_err(|e| e.to_string())
 }
 
-/// Harmonic + tempo compatibility of `t` with a reference track, `0.0..=1.0`.
-pub fn match_score(ref_key: &str, ref_bpm: f64, t: &UiTrackEntry) -> f32 {
+/// Harmonic + tempo (+ energy when known) compatibility of `t` with `r`, `0.0..=1.0`.
+pub fn match_score(r: &UiTrackEntry, t: &UiTrackEntry) -> f32 {
+    let (ref_key, ref_bpm) = (r.musical_key.as_str(), r.bpm);
     let key_s = match (KeyWheel::parse_open_key(ref_key), KeyWheel::parse_open_key(&t.musical_key)) {
         (Some(a), Some(b)) if a == b => 1.0,
         (Some(_), Some(_)) if KeyWheel::are_harmonically_compatible(ref_key, &t.musical_key) => 0.8,
@@ -365,7 +366,12 @@ pub fn match_score(ref_key: &str, ref_bpm: f64, t: &UiTrackEntry) -> f32 {
     } else {
         0.0
     };
-    0.55 * key_s + 0.45 * bpm_s
+    if r.energy > 0 && t.energy > 0 {
+        let energy_s = (1.0 - (t.energy as f32 - r.energy as f32).abs() / 4.0).max(0.0);
+        0.5 * key_s + 0.4 * bpm_s + 0.1 * energy_s
+    } else {
+        0.55 * key_s + 0.45 * bpm_s
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -505,6 +511,8 @@ pub struct LibraryManager {
     /// Set by the app from preferences: analyse tracks found by a scan.
     pub auto_analyze: bool,
     scanned_ids: Vec<usize>,
+    /// Library track currently on each deck.
+    deck_tracks: [Option<usize>; 4],
 
     renaming: Option<(usize, String)>,
     editing: Option<UiTrackEntry>,
@@ -562,6 +570,7 @@ impl LibraryManager {
             relocate_after_check: None,
             auto_analyze: false,
             scanned_ids: Vec::new(),
+            deck_tracks: [None; 4],
             renaming: None,
             editing: None,
             import_path: Self::detect_traktor_collection().map(|p| p.display().to_string()).unwrap_or_default(),
@@ -1023,8 +1032,14 @@ impl LibraryManager {
 
     // ---------------------------------------------------------------- selection & loading
 
-    fn ensure_view(&mut self, reference: Option<(&str, f64)>) {
-        let ref_s = reference.map(|(k, b)| format!("{k}@{b:.2}")).unwrap_or_default();
+    /// Track on deck A, the reference for Suggestions.
+    fn reference(&self) -> Option<UiTrackEntry> {
+        self.deck_tracks[0].and_then(|id| self.track(id)).cloned()
+    }
+
+    fn ensure_view(&mut self) {
+        let reference = self.reference();
+        let ref_s = reference.as_ref().map(|r| format!("{}@{}@{:.2}@{}", r.id, r.musical_key, r.bpm, r.energy)).unwrap_or_default();
         let stamp = (self.version, self.selected_nav, self.search_query.clone(), self.sort_col, self.sort_asc, ref_s);
         if self.view_stamp.as_ref() == Some(&stamp) {
             return;
@@ -1047,10 +1062,10 @@ impl LibraryManager {
                 let blob = self.tracks[i].search_blob();
                 terms.iter().all(|w| blob.contains(w.as_str()))
             })
-            .map(|i| (i, reference.map_or(0.0, |(k, b)| match_score(k, b, &self.tracks[i]))))
+            .map(|i| (i, reference.as_ref().map_or(0.0, |r| match_score(r, &self.tracks[i]))))
             .collect();
         if self.selected_nav == NavItem::Suggestions {
-            rows.retain(|&(i, s)| s >= 0.6 && !reference.is_some_and(|(k, b)| self.tracks[i].musical_key == k && self.tracks[i].bpm == b));
+            rows.retain(|&(i, s)| s >= 0.6 && reference.as_ref().is_some_and(|r| r.id != self.tracks[i].id));
         }
         let col = if self.selected_nav == NavItem::Suggestions && self.sort_col == SortColumn::Order { SortColumn::Match } else { self.sort_col };
         let t = &self.tracks;
@@ -1126,6 +1141,7 @@ impl LibraryManager {
             self.status_message = format!("File not found for '{}' — use Relocate", t.title);
         } else {
             self.history.push(id);
+            self.deck_tracks[d] = Some(id);
             self.last_loaded_deck = Some((d, t.stems_ready));
             self.status_message = format!("Loading '{}' on deck {}", t.title, DECK_NAMES[d]);
             self.pending_loads.push((deck, t));
@@ -1336,7 +1352,6 @@ impl LibraryManager {
     pub fn show_browser_content(
         &mut self,
         ui: &mut Ui,
-        reference: Option<(&str, f64)>,
         four_deck_mode: bool,
         locked: [bool; 4],
         columns: LibraryColumnsConfig,
@@ -1365,10 +1380,10 @@ impl LibraryManager {
                 self.show_empty_state(ui, music_folders);
             } else {
                 self.show_toolbar(ui, music_folders);
-                if self.selected_nav == NavItem::Suggestions && reference.is_none() {
+                if self.selected_nav == NavItem::Suggestions && self.deck_tracks[0].is_none() {
                     ui.label(RichText::new("Load a track on deck A to see matching tracks.").color(TraktorTheme::TEXT_SECONDARY));
                 }
-                self.ensure_view(reference);
+                self.ensure_view();
                 self.show_table(ui, columns, locked, deck_count, four_deck_mode);
             }
         });
@@ -1978,14 +1993,17 @@ mod tests {
         lib.push_track(t1);
         lib.push_track(t2);
         lib.sort_col = SortColumn::Title;
-        lib.ensure_view(None);
+        lib.ensure_view();
         assert_eq!(lib.tracks[lib.view[0]].title, "Ace");
         lib.search_query = "zed".into();
-        lib.ensure_view(None);
+        lib.ensure_view();
         assert_eq!(lib.view.len(), 1);
         lib.search_query.clear();
         lib.selected_nav = NavItem::Suggestions;
-        lib.ensure_view(Some(("8m", 125.0)));
+        let mut r = track("Ref", &dir.join("r.flac"));
+        r.bpm = 125.0;
+        lib.deck_tracks[0] = Some(lib.push_track(r));
+        lib.ensure_view();
         assert_eq!(lib.view.len(), 1, "only the harmonic, near-tempo track matches");
         assert_eq!(lib.tracks[lib.view[0]].title, "Zed");
         let _ = fs::remove_dir_all(dir);
@@ -2017,10 +2035,15 @@ mod tests {
 
     #[test]
     fn match_score_handles_half_tempo_and_keys() {
+        let r = UiTrackEntry { bpm: 128.0, musical_key: "8m".into(), ..Default::default() };
         let t = UiTrackEntry { bpm: 64.0, musical_key: "8m".into(), ..Default::default() };
-        assert!(match_score("8m", 128.0, &t) > 0.99);
+        assert!(match_score(&r, &t) > 0.99);
         let far = UiTrackEntry { bpm: 100.0, musical_key: "2d".into(), ..Default::default() };
-        assert_eq!(match_score("8m", 128.0, &far), 0.0);
+        assert_eq!(match_score(&r, &far), 0.0);
+        let r_e = UiTrackEntry { energy: 5, ..r.clone() };
+        let calm = UiTrackEntry { energy: 1, ..t.clone() };
+        let close = UiTrackEntry { energy: 6, ..t };
+        assert!(match_score(&r_e, &close) > match_score(&r_e, &calm));
     }
 
     #[test]
