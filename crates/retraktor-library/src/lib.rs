@@ -9,6 +9,9 @@ use retraktor_formats::{
 };
 use std::collections::BTreeMap;
 
+pub mod analysis;
+pub use analysis::{analyze_mono, TrackAnalysis};
+
 /// Harmonic Key Wheel mapping Traktor's `MUSICAL_KEY/@VALUE` (`0..=23`), Open Key (`1d..12d`, `1m..12m`),
 /// and Camelot (`1B..12B`, `1A..12A`) notation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,22 +133,18 @@ impl TrackAnalyzer {
         let frames = samples.len() / 2;
         let duration_sec = (frames as f32) / (sample_rate as f32).max(1.0);
 
-        let mut peak = 0.0_f32;
-        let mut sum_sq = 0.0_f64;
-        for &s in samples {
-            let a = s.abs();
-            if a > peak {
-                peak = a;
-            }
-            sum_sq += (s as f64) * (s as f64);
+        let mut mono_samples = Vec::with_capacity(frames);
+        for f in 0..frames {
+            mono_samples.push(0.5 * (samples[f * 2] + samples[f * 2 + 1]));
         }
-        let rms = if !samples.is_empty() {
-            (sum_sq / (samples.len() as f64)).sqrt() as f32
+        let analysis = analyze_mono(&mono_samples, sample_rate);
+        let bpm = if estimated_bpm > 0.0 {
+            estimated_bpm
         } else {
-            1e-6
+            analysis.bpm
         };
-        let peak_db = 20.0 * (peak.max(1e-6) as f64).log10();
-        let rms_db = 20.0 * (rms.max(1e-6) as f64).log10();
+        let rms_db = analysis.loudness_db as f64;
+        let peak_db = analysis.peak_db as f64;
         // Autogain target: -12 dBFS RMS reference
         let perceived_db = (-12.0 - rms_db).clamp(-18.0, 18.0);
 
@@ -155,18 +154,18 @@ impl TrackAnalyzer {
             peak_db,
         };
         let tempo = NmlTempo {
-            bpm: estimated_bpm,
+            bpm,
             bpm_quality: 100.0,
         };
         let grid_cue = NmlCue {
             name: "AutoGrid".to_string(),
             displ_order: 0,
             cue_type: CueType::Grid,
-            start_ms: 0.0,
+            start_ms: analysis.beatgrid_offset_sec * 1000.0,
             len_ms: 0.0,
             repeats: -1,
             hotcue: 0,
-            grid_bpm: Some(estimated_bpm),
+            grid_bpm: Some(bpm),
         };
 
         // Compute 3-band waveform stripe columns
