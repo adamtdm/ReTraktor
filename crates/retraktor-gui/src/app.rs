@@ -1,5 +1,5 @@
 use crate::audio::{AudioSystem, LoadedTrackAudio};
-use crate::library_ui::{LibraryManager, UiTrackEntry};
+use crate::library_ui::LibraryManager;
 use crate::preferences::{PreferencesDialog, PrefsTab};
 use crate::theme::TraktorTheme;
 use crate::widgets::{
@@ -159,7 +159,6 @@ pub struct ReTraktorApp {
     pub custom_mappings: std::collections::HashMap<String, String>,
 
     // Exit Collection Save Prompt State
-    pub show_exit_prompt: bool,
     pub exit_confirmed: bool,
 }
 
@@ -263,7 +262,6 @@ impl Default for ReTraktorApp {
             deck_turntable_mode: [true; 4],
             jog_scratch_sensitivity: 1.0,
             custom_mappings: std::collections::HashMap::new(),
-            show_exit_prompt: false,
             exit_confirmed: false,
         }
     }
@@ -274,16 +272,11 @@ impl eframe::App for ReTraktorApp {
         // Request 60 FPS continuous repaint for smooth scrolling waveforms and VU meters
         ctx.request_repaint();
 
-        // Intercept window close request to prompt whether to keep or discard added collection songs
+        // Flush the autosaved collection and preferences on close.
         if ctx.input(|i| i.viewport().close_requested()) && !self.exit_confirmed {
-            if self.preferences.prompt_save_on_exit {
-                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                self.show_exit_prompt = true;
-            } else {
-                self.save_collection_according_to_prefs();
-                let _ = self.preferences.save();
-                self.exit_confirmed = true;
-            }
+            self.save_collection_according_to_prefs();
+            let _ = self.preferences.save();
+            self.exit_confirmed = true;
         }
 
         if self.library.open_prefs_requested {
@@ -389,16 +382,8 @@ impl eframe::App for ReTraktorApp {
         // Handle File Management background music folder rescan trigger
         if self.preferences.trigger_music_rescan {
             self.preferences.trigger_music_rescan = false;
-            let mut total_added = 0;
-            for folder in &self.preferences.music_folders {
-                total_added += self.library.scan_directory_audio(folder, true);
-            }
-            self.preferences.file_management_status = format!(
-                "✓ Scanned {} folder(s) — added {} new audio tracks.",
-                self.preferences.music_folders.len(),
-                total_added
-            );
-            self.library.status_message = self.preferences.file_management_status.clone();
+            self.library.start_scan(self.preferences.music_folders.clone());
+            self.preferences.file_management_status = "Scanning in the background — see the browser status bar.".to_string();
         }
 
         // Synchronize visual remapper and controller settings from Preferences
@@ -471,23 +456,9 @@ impl eframe::App for ReTraktorApp {
                             self.library.status_message = format!("Could not start Demucs separation for '{}'.", track.title);
                         }
                     } else {
-                        // Demucs not installed: mark stems ready using real-time DSP crossover filter and inform user
-                        if let Some(t) = self.library.tracks.iter_mut().find(|t| t.id == track_id) {
-                            t.stems_ready = true;
-                        }
-                        self.library.last_stemmed_track_id = Some(track_id);
-                        self.library.status_message = format!(
-                            "✦ Real-time crossover stems enabled for '{}'. (Install Demucs in Preferences > Stems for true AI isolation)",
-                            track.title
-                        );
+                        self.library.status_message =
+                            "Install Demucs in Preferences > Stems & AI to separate stems (live crossover stems work without it).".to_string();
                     }
-                } else {
-                    // Synthetic track: zero bleed synthesized stems are already loaded in memory
-                    if let Some(t) = self.library.tracks.iter_mut().find(|t| t.id == track_id) {
-                        t.stems_ready = true;
-                    }
-                    self.library.last_stemmed_track_id = Some(track_id);
-                    self.library.status_message = format!("✓ 4 isolated stem streams ready for '{}'", track.title);
                 }
             }
         }
@@ -498,19 +469,16 @@ impl eframe::App for ReTraktorApp {
         // Live Performance Shortcuts HUD Overlay
         render_shortcuts_hud(ctx, &mut self.show_shortcuts_hud);
 
-        // Exit Collection Save Prompt Modal
-        if self.show_exit_prompt {
-            self.show_exit_collection_prompt(ctx);
-        }
     }
 }
 
 impl ReTraktorApp {
     fn save_collection_according_to_prefs(&mut self) {
         let fmt = self.preferences.collection_save_format;
-        if fmt == 0 || fmt == 2 {
-            let nml_path = LibraryManager::default_nml_path();
-            let _ = self.library.save_collection_nml(&nml_path);
+        // The .nml is the library's own store, so it is always written.
+        let nml_path = LibraryManager::default_nml_path();
+        if let Err(e) = self.library.save_collection_nml(&nml_path) {
+            eprintln!("retraktor: failed to save collection: {e}");
         }
         if fmt == 1 || fmt == 2 {
             let m3u_path = LibraryManager::default_m3u8_path();
@@ -518,145 +486,31 @@ impl ReTraktorApp {
         }
     }
 
-    fn show_exit_collection_prompt(&mut self, ctx: &egui::Context) {
-        let added_count = self.library.session_added_track_ids.len();
-        let total_count = self.library.tracks.len();
-        let nml_path = LibraryManager::default_nml_path();
-        let m3u_path = LibraryManager::default_m3u8_path();
+    fn locked_decks(&self) -> [bool; 4] {
+        let playing = self.audio.shared.lock().map(|s| s.is_playing).unwrap_or([false; 4]);
+        playing.map(|p| self.preferences.lock_playing_decks && p)
+    }
 
-        egui::Window::new("Save Track Collection Before Closing?")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-            .default_width(500.0)
-            .show(ctx, |ui| {
-                ui.vertical(|ui| {
-                    ui.add_space(4.0);
-                    ui.label(
-                        RichText::new(if added_count > 0 {
-                            format!(
-                                "You added {added_count} song(s) to the Track Collection during this session ({total_count} tracks total)."
-                            )
-                        } else {
-                            format!(
-                                "Keep your current Track Collection ({total_count} tracks) saved before exiting ReTraktor?"
-                            )
-                        })
-                        .color(Color32::WHITE)
-                        .font(egui::FontId::proportional(13.0))
-                        .strong(),
-                    );
-                    ui.add_space(4.0);
-                    ui.label(
-                        RichText::new(
-                            "Choose whether to keep or discard songs added in this session, and select the collection file format:",
-                        )
-                        .color(TraktorTheme::TEXT_SECONDARY)
-                        .font(egui::FontId::proportional(11.5)),
-                    );
-                    ui.add_space(8.0);
-
-                    egui::Frame::none()
-                        .fill(Color32::from_rgb(16, 18, 22))
-                        .stroke(Stroke::new(1.0_f32, TraktorTheme::BORDER_COLOR))
-                        .rounding(4.0)
-                        .inner_margin(egui::Margin::symmetric(12.0, 10.0))
-                        .show(ui, |ui| {
-                            ui.vertical(|ui| {
-                                ui.label(
-                                    RichText::new("COLLECTION EXPORT FORMAT")
-                                        .color(TraktorTheme::DECK_A)
-                                        .font(egui::FontId::monospace(10.5))
-                                        .strong(),
-                                );
-                                ui.add_space(4.0);
-                                ui.radio_value(
-                                    &mut self.preferences.collection_save_format,
-                                    0,
-                                    format!("Traktor .nml (v20 XML) — {}", nml_path.display()),
-                                );
-                                ui.radio_value(
-                                    &mut self.preferences.collection_save_format,
-                                    1,
-                                    format!(
-                                        "Industry Standard Extended .m3u8 (UTF-8 Playlist) — {}",
-                                        m3u_path.display()
-                                    ),
-                                );
-                                ui.radio_value(
-                                    &mut self.preferences.collection_save_format,
-                                    2,
-                                    "Both Traktor .nml + Extended .m3u8",
-                                );
-                            });
-                        });
-
-                    ui.add_space(8.0);
-                    ui.checkbox(
-                        &mut self.preferences.prompt_save_on_exit,
-                        "Always prompt whether to keep added songs when closing ReTraktor",
-                    );
-                    ui.add_space(10.0);
-
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new("✓ Keep Added Songs & Save Collection")
-                                        .color(Color32::BLACK)
-                                        .font(egui::FontId::proportional(12.0))
-                                        .strong(),
-                                )
-                                .fill(TraktorTheme::PLAY_ACTIVE)
-                                .min_size(Vec2::new(220.0, 30.0)),
-                            )
-                            .clicked()
-                        {
-                            self.save_collection_according_to_prefs();
-                            let _ = self.preferences.save();
-                            self.show_exit_prompt = false;
-                            self.exit_confirmed = true;
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    /// Decodes queued library loads on worker threads; real files only, never synthetic audio.
+    fn drain_pending_loads(&mut self) {
+        for (deck_idx, track) in self.library.pending_loads.drain(..) {
+            let d = (deck_idx - 1).min(3);
+            let shared_audio = self.audio.shared.clone();
+            thread::spawn(move || {
+                let Some(path) = track.file_path.as_ref() else { return };
+                // shortcut: unanalysed tracks get 120 BPM until analysis lands, then use detected tempo
+                let bpm = if track.bpm > 0.0 { track.bpm } else { 120.0 };
+                match LoadedTrackAudio::from_file(path, &track.title, &track.artist, bpm, &track.musical_key) {
+                    Ok(loaded) => {
+                        if let Ok(mut state) = shared_audio.lock() {
+                            state.loaded_tracks[d] = Some(loaded);
+                            state.playhead_sec[d] = 0.0;
                         }
-
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new("✕ Discard Added Songs & Exit")
-                                        .color(Color32::WHITE)
-                                        .font(egui::FontId::proportional(11.5))
-                                        .strong(),
-                                )
-                                .fill(Color32::from_rgb(135, 42, 42))
-                                .min_size(Vec2::new(185.0, 30.0)),
-                            )
-                            .clicked()
-                        {
-                            self.library.discard_session_added_tracks();
-                            let _ = self.library.save_collection_nml(&nml_path);
-                            let _ = self.preferences.save();
-                            self.show_exit_prompt = false;
-                            self.exit_confirmed = true;
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                        }
-
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new("Cancel")
-                                        .color(TraktorTheme::TEXT_PRIMARY)
-                                        .font(egui::FontId::proportional(11.5)),
-                                )
-                                .fill(Color32::from_rgb(52, 56, 64))
-                                .min_size(Vec2::new(80.0, 30.0)),
-                            )
-                            .clicked()
-                        {
-                            self.show_exit_prompt = false;
-                        }
-                    });
-                });
+                    }
+                    Err(e) => eprintln!("retraktor: could not load {}: {e}", path.display()),
+                }
             });
+        }
     }
 
     fn sync_audio_state(&mut self) {
@@ -2125,6 +1979,17 @@ impl ReTraktorApp {
         accent_color: Color32,
         height: f32,
     ) {
+        let rect = ui.scope(|ui| self.show_parallel_waveform_row_inner(ui, deck_idx, accent_color, height)).response.rect;
+        self.deck_drop(ui, rect, deck_idx);
+    }
+
+    fn show_parallel_waveform_row_inner(
+        &mut self,
+        ui: &mut Ui,
+        deck_idx: usize,
+        accent_color: Color32,
+        height: f32,
+    ) {
         let d = deck_idx - 1;
         let deck_letter = ["A", "B", "C", "D"][d.min(3)];
 
@@ -2452,6 +2317,20 @@ impl ReTraktorApp {
     }
 
     fn show_mini_deck_strip(&mut self, ui: &mut Ui, deck_idx: usize, accent: Color32) {
+        let rect = ui.scope(|ui| self.show_mini_deck_strip_inner(ui, deck_idx, accent)).response.rect;
+        self.deck_drop(ui, rect, deck_idx);
+    }
+
+    /// Loads a track dragged from the library onto this deck's area.
+    fn deck_drop(&mut self, ui: &Ui, rect: egui::Rect, deck_idx: usize) {
+        if let Some(id) = crate::library_ui::deck_drop_target(ui, rect) {
+            let locked = self.locked_decks();
+            self.library.load_to_deck(deck_idx, id, locked);
+            self.drain_pending_loads();
+        }
+    }
+
+    fn show_mini_deck_strip_inner(&mut self, ui: &mut Ui, deck_idx: usize, accent: Color32) {
         let d = deck_idx - 1;
         let letter = ["A", "B", "C", "D"][d.min(3)];
         let (title, bpm, is_playing) = if let Ok(state) = self.audio.shared.lock() {
@@ -2498,6 +2377,18 @@ impl ReTraktorApp {
     }
 
     fn show_single_deck(
+        &mut self,
+        ui: &mut Ui,
+        deck_idx: usize,
+        accent_color: Color32,
+        include_scrolling_waveform: bool,
+        waveform_height: f32,
+    ) {
+        let rect = ui.scope(|ui| self.show_single_deck_inner(ui, deck_idx, accent_color, include_scrolling_waveform, waveform_height)).response.rect;
+        self.deck_drop(ui, rect, deck_idx);
+    }
+
+    fn show_single_deck_inner(
         &mut self,
         ui: &mut Ui,
         deck_idx: usize,
@@ -3375,96 +3266,21 @@ impl ReTraktorApp {
 
                     ui.separator();
 
-                    let current_deck_a_key = if let Ok(state) = self.audio.shared.lock() {
-                        state.loaded_tracks[0]
-                            .as_ref()
-                            .map(|t| t.key.clone())
-                            .unwrap_or_else(|| "4m".to_string())
-                    } else {
-                        "4m".to_string()
-                    };
-
+                    let reference = self.audio.shared.lock().ok().and_then(|state| {
+                        state.loaded_tracks[0].as_ref().map(|t| (t.key.clone(), t.bpm))
+                    });
                     let four_deck_mode =
                         self.layout == TraktorLayout::FourDeck || self.preferences.four_deck_mode;
-                    let shared_audio = self.audio.shared.clone();
-
-                    let is_playing_decks = if let Ok(state) = self.audio.shared.lock() {
-                        state.is_playing
-                    } else {
-                        [false; 4]
-                    };
-                    let locked_decks = [
-                        self.preferences.lock_playing_decks && is_playing_decks[0],
-                        self.preferences.lock_playing_decks && is_playing_decks[1],
-                        self.preferences.lock_playing_decks && is_playing_decks[2],
-                        self.preferences.lock_playing_decks && is_playing_decks[3],
-                    ];
-
+                    let locked_decks = self.locked_decks();
                     self.library.show_browser_content(
                         ui,
-                        &current_deck_a_key,
+                        reference.as_ref().map(|(k, b)| (k.as_str(), *b)),
                         four_deck_mode,
                         locked_decks,
                         self.preferences.library_columns,
-                        move |deck_idx, track: &UiTrackEntry| {
-                            let d = (deck_idx - 1).min(3);
-                            let track_entry = track.clone();
-                            let shared_audio = shared_audio.clone();
-                            thread::spawn(move || {
-                                let loaded = if let Some(ref path) = track_entry.file_path {
-                                    if path.is_file() {
-                                        LoadedTrackAudio::from_file(
-                                            path,
-                                            &track_entry.title,
-                                            &track_entry.artist,
-                                            track_entry.bpm,
-                                            &track_entry.musical_key,
-                                        )
-                                        .unwrap_or_else(|_| {
-                                            let style = if track_entry.bpm >= 130.0 { 1 } else { 0 };
-                                            LoadedTrackAudio::new_synthetic(
-                                                &track_entry.title,
-                                                &track_entry.artist,
-                                                track_entry.bpm,
-                                                &track_entry.musical_key,
-                                                track_entry.duration_sec,
-                                                style,
-                                            )
-                                        })
-                                    } else {
-                                        let style = if track_entry.bpm >= 130.0 { 1 } else { 0 };
-                                        LoadedTrackAudio::new_synthetic(
-                                            &track_entry.title,
-                                            &track_entry.artist,
-                                            track_entry.bpm,
-                                            &track_entry.musical_key,
-                                            track_entry.duration_sec,
-                                            style,
-                                        )
-                                    }
-                                } else {
-                                    let style = match track_entry.id % 3 {
-                                        1 => 0,
-                                        2 => 1,
-                                        _ => 2,
-                                    };
-                                    LoadedTrackAudio::new_synthetic(
-                                        &track_entry.title,
-                                        &track_entry.artist,
-                                        track_entry.bpm,
-                                        &track_entry.musical_key,
-                                        track_entry.duration_sec,
-                                        style,
-                                    )
-                                };
-
-                                if let Ok(mut state) = shared_audio.lock() {
-                                    state.loaded_tracks[d] = Some(loaded);
-                                    state.playhead_sec[d] = 0.0;
-                                }
-                            });
-                        },
+                        &mut self.preferences.music_folders,
                     );
+                    self.drain_pending_loads();
 
                     // If a track was loaded and has stems ready, automatically enable deck stems view
                     if let Some((d, stems_ready)) = self.library.last_loaded_deck.take() {

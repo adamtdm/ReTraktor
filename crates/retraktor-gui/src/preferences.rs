@@ -36,7 +36,7 @@ pub struct LibraryColumnsConfig {
     pub bitrate: bool,
     pub format: bool,
     pub track_number: bool,
-    pub playlist_actions: bool,
+    pub energy: bool,
 }
 
 impl Default for LibraryColumnsConfig {
@@ -56,7 +56,7 @@ impl Default for LibraryColumnsConfig {
             bitrate: false,
             format: false,
             track_number: false,
-            playlist_actions: true,
+            energy: true,
         }
     }
 }
@@ -77,7 +77,7 @@ impl LibraryColumnsConfig {
         self.bitrate = enabled;
         self.format = enabled;
         self.track_number = enabled;
-        self.playlist_actions = enabled;
+        self.energy = enabled;
     }
 }
 
@@ -339,7 +339,7 @@ impl PreferencesDialog {
             .join(", ");
         let c = &self.library_columns;
         format!(
-            "{{\n  \"sample_rate\": {},\n  \"buffer_size\": {},\n  \"audio_device_name\": \"{}\",\n  \"four_deck_mode\": {},\n  \"waveform_color_mode\": {},\n  \"eq_model_idx\": {},\n  \"filter_model_idx\": {},\n  \"filter_resonance\": {},\n  \"xfader_curve_idx\": {},\n  \"autogain\": {},\n  \"limiter_enabled\": {},\n  \"lock_playing_decks\": {},\n  \"scan_on_startup\": {},\n  \"analyze_new_tracks\": {},\n  \"key_notation_idx\": {},\n  \"collection_save_format\": {},\n  \"prompt_save_on_exit\": {},\n  \"col_album\": {},\n  \"col_bpm\": {},\n  \"col_key\": {},\n  \"col_stems\": {},\n  \"col_duration\": {},\n  \"col_genre\": {},\n  \"col_rating\": {},\n  \"col_comment\": {},\n  \"col_remixer\": {},\n  \"col_label\": {},\n  \"col_year\": {},\n  \"col_bitrate\": {},\n  \"col_format\": {},\n  \"col_track_number\": {},\n  \"col_playlist_actions\": {},\n  \"music_folders\": [{}]\n}}",
+            "{{\n  \"sample_rate\": {},\n  \"buffer_size\": {},\n  \"audio_device_name\": \"{}\",\n  \"four_deck_mode\": {},\n  \"waveform_color_mode\": {},\n  \"eq_model_idx\": {},\n  \"filter_model_idx\": {},\n  \"filter_resonance\": {},\n  \"xfader_curve_idx\": {},\n  \"autogain\": {},\n  \"limiter_enabled\": {},\n  \"lock_playing_decks\": {},\n  \"scan_on_startup\": {},\n  \"analyze_new_tracks\": {},\n  \"key_notation_idx\": {},\n  \"collection_save_format\": {},\n  \"prompt_save_on_exit\": {},\n  \"col_album\": {},\n  \"col_bpm\": {},\n  \"col_key\": {},\n  \"col_stems\": {},\n  \"col_duration\": {},\n  \"col_genre\": {},\n  \"col_rating\": {},\n  \"col_comment\": {},\n  \"col_remixer\": {},\n  \"col_label\": {},\n  \"col_year\": {},\n  \"col_bitrate\": {},\n  \"col_format\": {},\n  \"col_track_number\": {},\n  \"col_energy\": {},\n  \"music_folders\": [{}]\n}}",
             self.sample_rate,
             self.buffer_size,
             self.audio_device_name.replace('"', "\\\""),
@@ -371,7 +371,7 @@ impl PreferencesDialog {
             c.bitrate,
             c.format,
             c.track_number,
-            c.playlist_actions,
+            c.energy,
             folders_json,
         )
     }
@@ -414,7 +414,7 @@ impl PreferencesDialog {
                     "col_bitrate" => self.library_columns.bitrate = val == "true",
                     "col_format" => self.library_columns.format = val == "true",
                     "col_track_number" => self.library_columns.track_number = val == "true",
-                    "col_playlist_actions" => self.library_columns.playlist_actions = val == "true",
+                    "col_energy" => self.library_columns.energy = val == "true",
                     _ => {}
                 }
             }
@@ -1616,10 +1616,10 @@ impl PreferencesDialog {
         );
         Self::list_row(
             ui,
-            "Playlist & Preparation Actions",
-            "Quick buttons to add tracks to Preparation crate or user playlists.",
+            "Energy",
+            "Perceived intensity 1–10 from track analysis (stored as NML INFO/@ENERGY).",
             |ui| {
-                ui.checkbox(&mut self.library_columns.playlist_actions, "Show Column");
+                ui.checkbox(&mut self.library_columns.energy, "Show Column");
             },
         );
     }
@@ -2219,35 +2219,16 @@ impl PreferencesDialog {
     }
 
     fn show_file_management(&mut self, ui: &mut Ui) {
-        Self::list_section_header(ui, "COLLECTION PERSISTENCE & EXIT BEHAVIOR");
-
+        Self::list_section_header(ui, "COLLECTION");
         Self::list_row(
             ui,
-            "Prompt to Keep or Discard Added Songs on Exit",
-            "Ask whether to keep newly added tracks when closing ReTraktor and save to disk.",
+            "Autosave",
+            "Your collection and playlists save automatically to ~/.local/share/retraktor/collection.nml (Traktor NML v20).",
             |ui| {
-                ui.checkbox(&mut self.prompt_save_on_exit, "Enabled");
-            },
-        );
-
-        let save_formats = [
-            "Traktor .nml (collection.nml — Traktor Pro 4 v20 XML)",
-            "Extended .m3u8 (collection.m3u8 — Industry Standard UTF-8 Playlist)",
-            "Both Traktor .nml + Extended .m3u8",
-        ];
-        Self::list_row(
-            ui,
-            "Collection Save Format",
-            "Format used when saving your Track Collection (~/.local/share/retraktor/).",
-            |ui| {
-                egui::ComboBox::from_id_salt("collection_save_fmt_combo")
-                    .selected_text(save_formats[self.collection_save_format.min(2)])
-                    .width(340.0)
-                    .show_ui(ui, |ui| {
-                        for (i, fmt) in save_formats.iter().enumerate() {
-                            ui.selectable_value(&mut self.collection_save_format, i, *fmt);
-                        }
-                    });
+                let mut m3u = self.collection_save_format == 2;
+                if ui.checkbox(&mut m3u, "Also export collection.m3u8 on exit").changed() {
+                    self.collection_save_format = if m3u { 2 } else { 0 };
+                }
             },
         );
 

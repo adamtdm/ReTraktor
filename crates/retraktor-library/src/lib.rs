@@ -29,6 +29,53 @@ impl KeyWheel {
         Self::OPEN_KEY_TABLE.get(key_id as usize).copied()
     }
 
+    /// Parses any common key notation — Open Key (`1m`), Camelot (`8A`), or musical (`Am`, `F#m`,
+    /// `Bb`, `C major`, `Ebmin`) — into a Traktor musical key ID `0..=23`.
+    pub fn normalize(text: &str) -> Option<u8> {
+        let s: String = text.split_whitespace().collect::<String>().to_ascii_lowercase();
+        let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if let Ok(n) = digits.parse::<u8>() {
+            if !(1..=12).contains(&n) {
+                return None;
+            }
+            let (open_num, minor) = match &s[digits.len()..] {
+                "m" => (n, true),
+                "d" => (n, false),
+                // Camelot 8A = Am = Open Key 1m (offset of 7 around the wheel)
+                "a" => ((n + 4) % 12 + 1, true),
+                "b" => ((n + 4) % 12 + 1, false),
+                _ => return None,
+            };
+            let open = format!("{open_num}{}", if minor { 'm' } else { 'd' });
+            return Self::OPEN_KEY_TABLE.iter().position(|k| *k == open).map(|i| i as u8);
+        }
+        let mut chars = s.chars();
+        let pc: i32 = match chars.next()? {
+            'c' => 0,
+            'd' => 2,
+            'e' => 4,
+            'f' => 5,
+            'g' => 7,
+            'a' => 9,
+            'b' => 11,
+            _ => return None,
+        };
+        let rest = chars.as_str();
+        let (pc, quality) = if let Some(r) = rest.strip_prefix('#') {
+            (pc + 1, r)
+        } else if let Some(r) = rest.strip_prefix('b').filter(|r| matches!(*r, "" | "m" | "min" | "minor" | "maj" | "major")) {
+            (pc - 1, r)
+        } else {
+            (pc, rest)
+        };
+        let minor = match quality {
+            "" | "maj" | "major" => false,
+            "m" | "min" | "minor" => true,
+            _ => return None,
+        };
+        Some(pc.rem_euclid(12) as u8 + if minor { 12 } else { 0 })
+    }
+
     /// Parses an Open Key string (`"1m".."12m"` or `"1d".."12d"`) into `(number: 1..=12, is_minor: bool)`.
     pub fn parse_open_key(open_key: &str) -> Option<(u8, bool)> {
         let s = open_key.trim();
@@ -403,6 +450,26 @@ mod tests {
     use retraktor_formats::NmlLocation;
 
     #[test]
+    fn key_normalize_handles_all_notations() {
+        let open = |t: &str| KeyWheel::normalize(t).and_then(KeyWheel::to_open_key);
+        assert_eq!(open("8A"), Some("1m")); // Am
+        assert_eq!(open("8B"), Some("1d")); // C
+        assert_eq!(open("1A"), Some("6m")); // Abm
+        assert_eq!(open("Am"), Some("1m"));
+        assert_eq!(open("A minor"), Some("1m"));
+        assert_eq!(open("Bbm"), Some("8m"));
+        assert_eq!(open("Bb"), Some("11d"));
+        assert_eq!(open("Bm"), Some("3m"));
+        assert_eq!(open("F#m"), Some("4m"));
+        assert_eq!(open("Ebmin"), Some("7m"));
+        assert_eq!(open("C"), Some("1d"));
+        assert_eq!(open("12m"), Some("12m"));
+        assert_eq!(open("13m"), None);
+        assert_eq!(open("H"), None);
+        assert_eq!(open(""), None);
+    }
+
+    #[test]
     fn test_library_harmonic_keywheel_and_analyzer() {
         assert!(KeyWheel::are_harmonically_compatible("4m", "4m"));
         assert!(KeyWheel::are_harmonically_compatible("4m", "5m"));
@@ -439,6 +506,7 @@ mod tests {
             musical_key_value: Some(12),
             cues: vec![grid],
             stems_path: None,
+            ..Default::default()
         });
 
         let mut lib = TrackLibrary::from_nml(&col);

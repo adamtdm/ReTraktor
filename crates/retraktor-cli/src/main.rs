@@ -319,6 +319,7 @@ fn run_simulation() {
         musical_key_value: Some(12),
         cues: vec![grid_a],
         stems_path: Some("/:home/:dj/:Music/:berlin_midnight.stem.m4a".to_string()),
+        ..Default::default()
     });
     col.entries.push(NmlEntry {
         title: "Detroit Dawn".to_string(),
@@ -340,6 +341,7 @@ fn run_simulation() {
         musical_key_value: Some(19),
         cues: Vec::new(),
         stems_path: None,
+        ..Default::default()
     });
 
     let mut lib = TrackLibrary::from_nml(&col);

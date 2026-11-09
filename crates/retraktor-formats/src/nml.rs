@@ -7,7 +7,7 @@ use crate::xml::{escape, XmlDocument, XmlNode};
 use retraktor_core::CueType;
 
 /// Represents `<LOCATION DIR="/:home/:dj/:Music/:" FILE="track.flac" VOLUME="linux-root" VOLUMEID="linux-root"></LOCATION>`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct NmlLocation {
     pub dir: String,
     pub file: String,
@@ -86,7 +86,7 @@ pub struct NmlCue {
 }
 
 /// `<ENTRY TITLE="..." ARTIST="...">` inside `<COLLECTION>`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct NmlEntry {
     pub title: String,
     pub artist: String,
@@ -104,6 +104,15 @@ pub struct NmlEntry {
     pub musical_key_value: Option<u8>,
     pub cues: Vec<NmlCue>,
     pub stems_path: Option<String>,
+    /// `INFO/@RANKING`: 0..=255 (Traktor stores stars × 51).
+    pub ranking: Option<u8>,
+    pub label: Option<String>,
+    pub remixer: Option<String>,
+    /// `INFO/@RELEASE_DATE` as written by Traktor (`YYYY/M/D`).
+    pub release_date: Option<String>,
+    pub play_count: Option<u32>,
+    /// `INFO/@ENERGY` 1..=10 (ReTraktor extension; Traktor ignores unknown attributes).
+    pub energy: Option<u8>,
 }
 
 /// `<NODE TYPE="FOLDER" | "PLAYLIST" | "SMARTLIST">` inside `<PLAYLISTS>`.
@@ -254,6 +263,24 @@ impl NmlCollection {
             }
             if let Some(b) = entry.bitrate {
                 out.push_str(&format!(" BITRATE=\"{b}\""));
+            }
+            for (attr, val) in [
+                ("LABEL", &entry.label),
+                ("REMIXER", &entry.remixer),
+                ("RELEASE_DATE", &entry.release_date),
+            ] {
+                if let Some(v) = val {
+                    out.push_str(&format!(" {attr}=\"{}\"", escape(v)));
+                }
+            }
+            if let Some(r) = entry.ranking {
+                out.push_str(&format!(" RANKING=\"{r}\""));
+            }
+            if let Some(n) = entry.play_count {
+                out.push_str(&format!(" PLAYCOUNT=\"{n}\""));
+            }
+            if let Some(e) = entry.energy {
+                out.push_str(&format!(" ENERGY=\"{e}\""));
             }
             out.push_str("></INFO>\n");
 
@@ -426,6 +453,12 @@ fn parse_entry_node(node: &XmlNode) -> NmlEntry {
         musical_key_value,
         cues,
         stems_path,
+        ranking: info.and_then(|i| i.attr("RANKING")).and_then(|v| v.parse().ok()),
+        label: info.and_then(|i| i.attr("LABEL")).map(str::to_string),
+        remixer: info.and_then(|i| i.attr("REMIXER")).map(str::to_string),
+        release_date: info.and_then(|i| i.attr("RELEASE_DATE")).map(str::to_string),
+        play_count: info.and_then(|i| i.attr("PLAYCOUNT")).and_then(|v| v.parse().ok()),
+        energy: info.and_then(|i| i.attr("ENERGY")).and_then(|v| v.parse().ok()),
     }
 }
 
