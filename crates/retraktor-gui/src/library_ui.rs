@@ -303,6 +303,31 @@ fn write_track_tags(t: &UiTrackEntry) -> Result<(), String> {
     tag.save_to_path(path, WriteOptions::default()).map_err(|e| e.to_string())
 }
 
+/// Breadth-first search for `collection.nml` under `roots`, bounded by depth and folders visited.
+fn find_collections(roots: &[PathBuf], max_depth: usize, max_dirs: usize) -> Vec<PathBuf> {
+    let mut queue: std::collections::VecDeque<(PathBuf, usize)> = roots.iter().map(|r| (r.clone(), 0)).collect();
+    let (mut found, mut seen, mut visited) = (Vec::new(), HashSet::new(), 0);
+    while let Some((dir, depth)) = queue.pop_front() {
+        if visited >= max_dirs || !seen.insert(dir.clone()) {
+            continue;
+        }
+        visited += 1;
+        let Ok(rd) = fs::read_dir(&dir) else { continue };
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            let Ok(ft) = e.file_type() else { continue };
+            if ft.is_file() && name.eq_ignore_ascii_case("collection.nml") {
+                found.push(e.path());
+            } else if ft.is_dir() && depth < max_depth && !name.starts_with('.') {
+                queue.push_back((e.path(), depth + 1));
+            }
+        }
+    }
+    found.sort();
+    found.dedup();
+    found
+}
+
 pub fn stereo_to_mono(pcm: &[f32]) -> Vec<f32> {
     pcm.chunks_exact(2).map(|f| 0.5 * (f[0] + f[1])).collect()
 }
@@ -455,7 +480,17 @@ impl SortColumn {
     }
 }
 
+/// What a native file dialog was opened for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pick {
+    Collection,
+    MusicFolder,
+    RelocateFolder,
+}
+
 pub enum Msg {
+    Picked(Pick, PathBuf),
+    Detected(Vec<PathBuf>),
     Status(String),
     Scanned(Vec<UiTrackEntry>),
     Checked(Vec<(usize, bool, bool)>),
@@ -516,8 +551,10 @@ pub struct LibraryManager {
 
     renaming: Option<(usize, String)>,
     editing: Option<UiTrackEntry>,
-    import_path: String,
-    folder_input: String,
+    /// Traktor collections found on this computer; `None` while still searching.
+    detected: Option<Vec<PathBuf>>,
+    picked: Vec<(Pick, PathBuf)>,
+    typed_path: Option<String>,
     explorer_dir: PathBuf,
     explorer_path_input: String,
     explorer_entries: Vec<(PathBuf, bool)>,
@@ -573,8 +610,9 @@ impl LibraryManager {
             deck_tracks: [None; 4],
             renaming: None,
             editing: None,
-            import_path: Self::detect_traktor_collection().map(|p| p.display().to_string()).unwrap_or_default(),
-            folder_input: String::new(),
+            detected: None,
+            picked: Vec::new(),
+            typed_path: None,
             explorer_path_input: home.display().to_string(),
             explorer_dir: home,
             explorer_entries: Vec::new(),
@@ -608,17 +646,66 @@ impl LibraryManager {
         Self::default_nml_path().with_extension("m3u8")
     }
 
-    /// Traktor's own collection in its standard Linux/Wine/macOS-style location, if present.
-    fn detect_traktor_collection() -> Option<PathBuf> {
-        let docs = PathBuf::from(env::var("HOME").ok()?).join("Documents/Native Instruments");
-        let mut found: Vec<PathBuf> = fs::read_dir(docs)
-            .ok()?
-            .flatten()
-            .map(|e| e.path().join("collection.nml"))
-            .filter(|p| p.is_file())
-            .collect();
-        found.sort();
-        found.pop()
+    /// Looks for Traktor `collection.nml` files in the usual places, a few folders deep.
+    pub fn start_detect(&mut self, music_folders: &[PathBuf]) {
+        let home = env::var("HOME").map(PathBuf::from).unwrap_or_default();
+        let user = env::var("USER").unwrap_or_default();
+        let mut roots = vec![home.join("Documents/Native Instruments"), home.join("Music")];
+        roots.extend(music_folders.iter().cloned());
+        for base in [PathBuf::from("/media").join(&user), PathBuf::from("/run/media").join(&user), PathBuf::from("/mnt"), home.join(".wine/drive_c/users")] {
+            roots.extend(fs::read_dir(base).into_iter().flatten().flatten().map(|e| e.path()));
+        }
+        self.spawn_job(move |tx| {
+            let found = find_collections(&roots, 4, 4000);
+            let n = found.len();
+            let _ = tx.send(Msg::Detected(found));
+            if n == 0 { String::new() } else { format!("Found {n} Traktor collection(s)") }
+        });
+    }
+
+    /// Opens the desktop's own file/folder chooser without blocking the UI.
+    pub fn pick(&self, kind: Pick) {
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let home = env::var("HOME").map(PathBuf::from).unwrap_or_default();
+            let dialog = rfd::FileDialog::new().set_directory(&home);
+            let picked = match kind {
+                Pick::Collection => dialog.set_title("Choose your Traktor collection.nml").add_filter("Traktor collection", &["nml"]).pick_file(),
+                Pick::MusicFolder => dialog.set_title("Choose a music folder").pick_folder(),
+                Pick::RelocateFolder => dialog.set_title("Choose the folder your missing tracks moved to").pick_folder(),
+            };
+            if let Some(p) = picked {
+                let _ = tx.send(Msg::Picked(kind, p));
+            }
+        });
+    }
+
+    /// Processes background results and chosen files; call every frame, even while preferences are open.
+    pub fn apply_picks(&mut self, music_folders: &mut Vec<PathBuf>) {
+        self.poll();
+        for (kind, path) in std::mem::take(&mut self.picked) {
+            self.handle_pick(kind, path, music_folders);
+        }
+    }
+
+    /// Acts on a chosen file or folder.
+    fn handle_pick(&mut self, kind: Pick, path: PathBuf, music_folders: &mut Vec<PathBuf>) {
+        match kind {
+            Pick::Collection => match self.import_nml_file(&path) {
+                Ok(_) => self.relocate_after_check = Some(music_folders.clone()),
+                Err(e) => self.status_message = format!("Couldn't read {}: {e}", path.display()),
+            },
+            Pick::MusicFolder | Pick::RelocateFolder => {
+                if !music_folders.contains(&path) {
+                    music_folders.push(path.clone());
+                }
+                if kind == Pick::MusicFolder {
+                    self.start_scan(vec![path]);
+                } else {
+                    self.start_relocate(vec![path]);
+                }
+            }
+        }
     }
 
     fn touch(&mut self) {
@@ -962,6 +1049,8 @@ impl LibraryManager {
     pub fn poll(&mut self) {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
+                Msg::Picked(kind, p) => self.picked.push((kind, p)),
+                Msg::Detected(found) => self.detected = Some(found),
                 Msg::Status(s) => self.job_status = s,
                 Msg::Scanned(batch) => {
                     let known: HashSet<PathBuf> = self.tracks.iter().filter_map(|t| t.file_path.clone()).collect();
@@ -1359,7 +1448,7 @@ impl LibraryManager {
         columns: LibraryColumnsConfig,
         music_folders: &mut Vec<PathBuf>,
     ) {
-        self.poll();
+        self.apply_picks(music_folders);
         let deck_count = if four_deck_mode { 4 } else { 2 };
         // Status bar first (bottom) so the table can take the remaining height.
         egui::TopBottomPanel::bottom("library_status").show_inside(ui, |ui| {
@@ -1431,6 +1520,9 @@ impl LibraryManager {
             {
                 self.start_relocate(music_folders.to_vec());
             }
+            if missing > 0 && ui.add_enabled(!busy, egui::Button::new("Search another folder…")).on_hover_text("Pick the folder your missing tracks moved to").clicked() {
+                self.pick(Pick::RelocateFolder);
+            }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui.small_button("rekordbox XML").on_hover_text("Export collection + playlists to ~/Music/ReTraktor-rekordbox.xml").clicked() {
                     let path = env::var("HOME").map(PathBuf::from).unwrap_or_default().join("Music/ReTraktor-rekordbox.xml");
@@ -1453,45 +1545,96 @@ impl LibraryManager {
     }
 
     fn show_empty_state(&mut self, ui: &mut Ui, music_folders: &mut Vec<PathBuf>) {
+        if self.detected.is_none() && !self.is_busy() {
+            self.detected = Some(Vec::new()); // filled in when the search reports back
+            self.start_detect(music_folders);
+        }
+        let home = env::var("HOME").unwrap_or_default();
+        let pretty = |p: &Path| p.display().to_string().replacen(&home, "~", 1);
+        let muted = TraktorTheme::TEXT_SECONDARY;
+        let column_w = 340.0;
+
+        ui.add_space(36.0);
         ui.vertical_centered(|ui| {
+            ui.label(RichText::new("Set up your library").size(22.0).color(TraktorTheme::TEXT_PRIMARY));
+            ui.add_space(4.0);
+            ui.label(RichText::new("Start from your Traktor collection, a music folder, or both.").size(13.0).color(muted));
+        });
+        ui.add_space(24.0);
+
+        let total_w = column_w * 2.0 + 40.0;
+        ui.horizontal_top(|ui| {
+            ui.add_space(((ui.available_width() - total_w) / 2.0).max(0.0));
+            ui.allocate_ui_with_layout(egui::vec2(column_w, 260.0), Layout::top_down(Align::Min), |ui| {
+                ui.set_width(column_w);
+                ui.label(RichText::new("Import from Traktor").size(15.0).strong().color(TraktorTheme::TEXT_PRIMARY));
+                ui.label(RichText::new("Brings across cue points, beatgrids, ratings and playlists. Your Traktor files aren't changed.").size(12.0).color(muted));
+                ui.add_space(12.0);
+                let found = self.detected.clone().unwrap_or_default();
+                if self.is_busy() && found.is_empty() {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(RichText::new("Looking for collections…").size(12.0).color(muted));
+                    });
+                }
+                for p in &found {
+                    let r = ui
+                        .add(egui::Button::new(RichText::new(format!("Import  {}", pretty(p))).size(12.5)).min_size(egui::vec2(column_w, 30.0)).wrap_mode(egui::TextWrapMode::Truncate))
+                        .on_hover_text(p.display().to_string());
+                    if r.clicked() {
+                        self.picked.push((Pick::Collection, p.clone()));
+                    }
+                }
+                if found.is_empty() && !self.is_busy() {
+                    ui.label(RichText::new("No collection found automatically.").size(12.0).color(muted));
+                }
+                ui.add_space(6.0);
+                if ui.add(egui::Button::new(RichText::new("Choose collection.nml…").size(12.5)).min_size(egui::vec2(column_w, 30.0))).clicked() {
+                    self.pick(Pick::Collection);
+                }
+            });
             ui.add_space(40.0);
-            ui.heading("Your collection is empty");
-            ui.add_space(6.0);
-            ui.label(RichText::new("Import an existing Traktor collection (keeps cue points, grids and playlists), or add a music folder.").color(TraktorTheme::TEXT_SECONDARY));
-            ui.add_space(16.0);
-            ui.horizontal(|ui| {
-                ui.add_space((ui.available_width() - 520.0).max(0.0) / 2.0);
-                ui.add(egui::TextEdit::singleline(&mut self.import_path).hint_text("/path/to/collection.nml").desired_width(400.0));
-                if ui.button("Import Traktor collection").clicked() {
-                    let p = PathBuf::from(self.import_path.trim());
-                    match self.import_nml_file(&p) {
-                        Ok(_) => self.relocate_after_check = Some(music_folders.clone()),
-                        Err(e) => self.status_message = format!("Import failed: {e}"),
-                    }
-                }
-            });
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                ui.add_space((ui.available_width() - 520.0).max(0.0) / 2.0);
-                ui.add(egui::TextEdit::singleline(&mut self.folder_input).hint_text("/path/to/music").desired_width(400.0));
-                if ui.button("Add music folder").clicked() {
-                    let p = PathBuf::from(self.folder_input.trim());
-                    if p.is_dir() {
-                        if !music_folders.contains(&p) {
-                            music_folders.push(p.clone());
-                        }
+            ui.allocate_ui_with_layout(egui::vec2(column_w, 260.0), Layout::top_down(Align::Min), |ui| {
+                ui.set_width(column_w);
+                ui.label(RichText::new("Add your music").size(15.0).strong().color(TraktorTheme::TEXT_PRIMARY));
+                ui.label(RichText::new("ReTraktor reads each file's tags and keeps watching these folders for new tracks.").size(12.0).color(muted));
+                ui.add_space(12.0);
+                for p in music_folders.clone() {
+                    let r = ui
+                        .add(egui::Button::new(RichText::new(format!("Scan  {}", pretty(&p))).size(12.5)).min_size(egui::vec2(column_w, 30.0)).wrap_mode(egui::TextWrapMode::Truncate))
+                        .on_hover_text(p.display().to_string());
+                    if r.clicked() {
                         self.start_scan(vec![p]);
-                    } else {
-                        self.status_message = format!("Not a folder: {}", p.display());
                     }
                 }
-            });
-            if !music_folders.is_empty() {
-                ui.add_space(8.0);
-                let list = music_folders.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ");
-                if ui.button(format!("Scan music folders ({list})")).clicked() {
-                    self.start_scan(music_folders.clone());
+                ui.add_space(6.0);
+                if ui.add(egui::Button::new(RichText::new("Choose music folder…").size(12.5)).min_size(egui::vec2(column_w, 30.0))).clicked() {
+                    self.pick(Pick::MusicFolder);
                 }
+            });
+        });
+
+        // Fallback for desktops without a file-chooser service.
+        ui.add_space(20.0);
+        ui.vertical_centered(|ui| match &mut self.typed_path {
+            None => {
+                if ui.add(egui::Label::new(RichText::new("No file dialog appeared? Type a path instead").size(11.5).color(TraktorTheme::TEXT_MUTED).underline()).sense(Sense::click())).clicked() {
+                    self.typed_path = Some(String::new());
+                }
+            }
+            Some(text) => {
+                ui.horizontal(|ui| {
+                    ui.add_space(((ui.available_width() - 520.0) / 2.0).max(0.0));
+                    let r = ui.add(egui::TextEdit::singleline(text).hint_text("A collection.nml file or a music folder").desired_width(420.0));
+                    if ui.button("Use").clicked() || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
+                        let p = PathBuf::from(text.trim().replacen('~', &home, 1));
+                        let kind = if p.is_dir() { Some(Pick::MusicFolder) } else if p.is_file() { Some(Pick::Collection) } else { None };
+                        match kind {
+                            Some(k) => self.picked.push((k, p)),
+                            None => self.status_message = format!("Nothing found at {}", p.display()),
+                        }
+                    }
+                });
             }
         });
     }
@@ -2026,6 +2169,17 @@ mod tests {
         assert_eq!(tagged.cues.iter().filter(|c| c.name.starts_with("Auto ")).count(), 0);
         tagged.apply_analysis(&a, true);
         assert_eq!(tagged.bpm, 126.0);
+    }
+
+    #[test]
+    fn finds_traktor_collections_a_few_levels_down() {
+        let (_, dir) = temp_lib("detect");
+        let deep = dir.join("nas/Music/Traktor/Library");
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("collection.nml"), "<NML/>").unwrap();
+        assert_eq!(find_collections(&[dir.clone()], 4, 100), vec![deep.join("collection.nml")]);
+        assert!(find_collections(&[dir.clone()], 2, 100).is_empty(), "depth limit respected");
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -154,6 +154,7 @@ pub struct ReTraktorApp {
 
     // Exit Collection Save Prompt State
     pub exit_confirmed: bool,
+    startup_scan_done: bool,
 }
 
 impl Default for ReTraktorApp {
@@ -257,6 +258,7 @@ impl Default for ReTraktorApp {
             jog_scratch_sensitivity: 1.0,
             custom_mappings: std::collections::HashMap::new(),
             exit_confirmed: false,
+            startup_scan_done: false,
         }
     }
 }
@@ -367,6 +369,16 @@ impl eframe::App for ReTraktorApp {
 
         // Handle File Management background music folder rescan trigger
         self.library.auto_analyze = self.preferences.analyze_new_tracks;
+        if std::mem::take(&mut self.preferences.request_folder_pick) {
+            self.library.pick(crate::library_ui::Pick::MusicFolder);
+        }
+        if !self.startup_scan_done {
+            self.startup_scan_done = true;
+            if self.preferences.scan_on_startup && !self.library.tracks.is_empty() {
+                self.library.start_scan(self.preferences.music_folders.clone());
+            }
+        }
+        self.library.apply_picks(&mut self.preferences.music_folders);
         if self.preferences.trigger_music_rescan {
             self.preferences.trigger_music_rescan = false;
             self.library.start_scan(self.preferences.music_folders.clone());
@@ -1621,8 +1633,8 @@ impl ReTraktorApp {
                             )
                         } else {
                             (
-                                "MX2 READY".to_string(),
-                                TraktorTheme::TEXT_SECONDARY,
+                                "No controller".to_string(),
+                                TraktorTheme::TEXT_MUTED,
                             )
                         };
                         if ui

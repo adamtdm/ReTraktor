@@ -82,6 +82,8 @@ impl LibraryColumnsConfig {
 }
 
 pub struct PreferencesDialog {
+    /// Set when the user asks for the folder chooser; the app opens it via the library.
+    pub request_folder_pick: bool,
     pub is_open: bool,
     pub current_tab: PrefsTab,
     pub search_query: String,
@@ -161,7 +163,6 @@ pub struct PreferencesDialog {
 
     // File Management & Folders
     pub music_folders: Vec<std::path::PathBuf>,
-    pub new_folder_input: String,
     pub scan_on_startup: bool,
     pub analyze_new_tracks: bool,
     pub trigger_music_rescan: bool,
@@ -201,14 +202,8 @@ impl Default for PreferencesDialog {
         let home = std::env::var("HOME")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| std::path::PathBuf::from("/"));
-        let default_music = {
-            let m = home.join("Music");
-            if m.is_dir() {
-                m
-            } else {
-                home
-            }
-        };
+        // Only default to ~/Music when it exists; never scan the whole home folder.
+        let default_music = Some(home.join("Music")).filter(|m| m.is_dir());
 
         Self {
             is_open: false,
@@ -262,15 +257,15 @@ impl Default for PreferencesDialog {
             demucs_install_state: crate::demucs::DemucsInstallState::NotInstalled,
             trigger_demucs_install: false,
             demucs_active_separation: None,
-            recording_dir: default_music.clone(),
+            recording_dir: home.join("Music"),
             recording_format: 0,
             broadcast_host: "localhost".to_string(),
             broadcast_port: 8000,
             broadcast_mount: "/retraktor.mp3".to_string(),
             broadcast_password: "hackme".to_string(),
             broadcast_connected: false,
-            music_folders: vec![default_music],
-            new_folder_input: String::new(),
+            music_folders: default_music.into_iter().collect(),
+            request_folder_pick: false,
             scan_on_startup: true,
             analyze_new_tracks: true,
             trigger_music_rescan: false,
@@ -2236,56 +2231,11 @@ impl PreferencesDialog {
 
         Self::list_row(
             ui,
-            "Add Music Folder Path",
-            "Enter a directory path on disk or select a quick preset to include in library scans.",
+            "Add a music folder",
+            "ReTraktor scans it for audio files and reads their tags.",
             |ui| {
-                if ui.button("+ Add Folder").clicked() {
-                    let trimmed = self.new_folder_input.trim();
-                    if !trimmed.is_empty() {
-                        let p = std::path::PathBuf::from(trimmed);
-                        if !self.music_folders.contains(&p) {
-                            self.music_folders.push(p);
-                            self.new_folder_input.clear();
-                        }
-                    }
-                }
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.new_folder_input)
-                        .hint_text("/path/to/music/folder")
-                        .desired_width(220.0),
-                );
-            },
-        );
-
-        Self::list_row(
-            ui,
-            "Quick Directory Presets",
-            "One-click add standard Linux music and removable media mount points.",
-            |ui| {
-                let home = std::env::var("HOME").unwrap_or_else(|_| "/home".to_string());
-                if ui.button("/mnt").clicked() {
-                    let p = std::path::PathBuf::from("/mnt");
-                    if !self.music_folders.contains(&p) {
-                        self.music_folders.push(p);
-                    }
-                }
-                if ui.button("/media").clicked() {
-                    let p = std::path::PathBuf::from("/media");
-                    if !self.music_folders.contains(&p) {
-                        self.music_folders.push(p);
-                    }
-                }
-                if ui.button("~/Downloads").clicked() {
-                    let p = std::path::PathBuf::from(&home).join("Downloads");
-                    if !self.music_folders.contains(&p) {
-                        self.music_folders.push(p);
-                    }
-                }
-                if ui.button("~/Music").clicked() {
-                    let p = std::path::PathBuf::from(&home).join("Music");
-                    if !self.music_folders.contains(&p) {
-                        self.music_folders.push(p);
-                    }
+                if ui.button("Choose folder…").clicked() {
+                    self.request_folder_pick = true;
                 }
             },
         );
@@ -2295,7 +2245,7 @@ impl PreferencesDialog {
         Self::list_row(
             ui,
             "Scan Music Folders on Startup",
-            "Automatically scan configured music folders when launching ReTraktor.",
+            "Look for new files in your music folders each time ReTraktor opens.",
             |ui| {
                 ui.checkbox(&mut self.scan_on_startup, "Enabled");
             },
@@ -2304,7 +2254,7 @@ impl PreferencesDialog {
         Self::list_row(
             ui,
             "Auto-Analyze New Tracks",
-            "Extract ID3/Vorbis/MP4 metadata, BPM, and key tags during folder scan.",
+            "Detect BPM, key and energy for tracks found by a folder scan (existing values are kept).",
             |ui| {
                 ui.checkbox(&mut self.analyze_new_tracks, "Enabled");
             },
