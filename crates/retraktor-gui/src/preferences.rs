@@ -1092,13 +1092,27 @@ impl PreferencesDialog {
                     }
                 }
                 crate::demucs::DemucsInstallState::Failed { error } => {
-                    if ui.button("Retry Install").clicked() {
+                    if ui.button("Retry install").clicked() {
                         self.trigger_demucs_install = true;
                     }
-                    ui.label(RichText::new(error).color(Color32::from_rgb(240, 80, 80)));
+                    ui.label(RichText::new(error_summary(error)).color(Color32::from_rgb(240, 110, 100)));
                 }
             },
         );
+        // Full log stays out of the row; available on request, selectable and copyable.
+        if let crate::demucs::DemucsInstallState::Failed { error } = &self.demucs_install_state {
+            egui::CollapsingHeader::new(RichText::new("Details").size(11.5).color(TraktorTheme::TEXT_SECONDARY))
+                .id_salt("demucs_error_details")
+                .show(ui, |ui| {
+                    if ui.small_button("Copy").clicked() {
+                        ui.ctx().copy_text(error.clone());
+                    }
+                    egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                        let mut text = error.as_str();
+                        ui.add(egui::TextEdit::multiline(&mut text).font(egui::TextStyle::Monospace).desired_width(f32::INFINITY));
+                    });
+                });
+        }
 
         let stem_modes = [
             "Hybrid (Neural Demucs AI + Real-Time DSP Fallback)",
@@ -2324,6 +2338,16 @@ impl PreferencesDialog {
     }
 }
 
+/// One readable line from a long installer error: the last line, e.g. "ModuleNotFoundError: No module named 'numpy'".
+fn error_summary(error: &str) -> String {
+    let last = error.lines().map(str::trim).filter(|l| !l.is_empty()).last().unwrap_or("Install failed");
+    let mut s: String = last.chars().take(110).collect();
+    if last.chars().count() > 110 {
+        s.push('…');
+    }
+    s
+}
+
 /// "SCAN & IMPORT OPTIONS" -> "Scan & import options", keeping acronyms upper-case.
 fn sentence_case(title: &str) -> String {
     const KEEP: [&str; 12] = ["MX2", "AI", "EQ", "FX", "MIDI", "HID", "USB", "BPM", "NML", "ALSA", "DJ", "LED"];
@@ -2347,6 +2371,12 @@ fn sentence_case(title: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn error_summary_takes_last_line() {
+        let e = "Demucs verification failed: Traceback (most recent call last):\n  File x\nModuleNotFoundError: No module named 'numpy'\n";
+        assert_eq!(super::error_summary(e), "ModuleNotFoundError: No module named 'numpy'");
+    }
+
     #[test]
     fn sentence_case_keeps_acronyms() {
         assert_eq!(super::sentence_case("SCAN & IMPORT OPTIONS"), "Scan & import options");

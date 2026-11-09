@@ -313,6 +313,8 @@ impl DemucsManager {
                     "torch",
                     "torchaudio",
                     "demucs",
+                    // demucs imports numpy but no longer pulls it in transitively
+                    "numpy",
                 ])
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
