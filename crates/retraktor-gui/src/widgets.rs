@@ -932,6 +932,56 @@ pub fn cue_pad(ui: &mut Ui, index: usize, has_cue: bool, active: bool, width: f3
     response
 }
 
+/// Small vector icons drawn with the painter, so they render identically on every system font.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Icon {
+    Play,
+    Pause,
+    Prev,
+    Next,
+    Dot,
+}
+
+/// Paints `icon` centred in `rect`.
+pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
+    let c = rect.center();
+    let r = rect.width().min(rect.height()) * 0.3;
+    let tri = |pts: [Pos2; 3]| egui::Shape::convex_polygon(pts.to_vec(), color, Stroke::NONE);
+    match icon {
+        Icon::Play => {
+            painter.add(tri([Pos2::new(c.x - r * 0.75, c.y - r), Pos2::new(c.x + r, c.y), Pos2::new(c.x - r * 0.75, c.y + r)]));
+        }
+        Icon::Pause => {
+            for dx in [-r * 0.5, r * 0.5] {
+                painter.rect_filled(Rect::from_center_size(Pos2::new(c.x + dx, c.y), Vec2::new(r * 0.55, r * 2.0)), 1.0, color);
+            }
+        }
+        Icon::Prev => {
+            painter.add(tri([Pos2::new(c.x + r * 0.6, c.y - r * 0.8), Pos2::new(c.x - r * 0.6, c.y), Pos2::new(c.x + r * 0.6, c.y + r * 0.8)]));
+        }
+        Icon::Next => {
+            painter.add(tri([Pos2::new(c.x - r * 0.6, c.y - r * 0.8), Pos2::new(c.x + r * 0.6, c.y), Pos2::new(c.x - r * 0.6, c.y + r * 0.8)]));
+        }
+        Icon::Dot => {
+            painter.circle_filled(c, r * 0.6, color);
+        }
+    }
+}
+
+/// Button showing a painted icon, optionally followed by a label.
+pub fn icon_button(ui: &mut Ui, icon: Icon, label: &str, fill: Color32, fg: Color32, min_size: Vec2) -> Response {
+    // Leading spaces reserve room for the icon when there's a label.
+    let text = if label.is_empty() { String::new() } else { format!("    {label}") };
+    let resp = ui.add(egui::Button::new(RichText::new(text).color(fg).size(11.5)).fill(fill).min_size(min_size));
+    let icon_rect = if label.is_empty() {
+        resp.rect
+    } else {
+        Rect::from_min_size(resp.rect.min + Vec2::new(4.0, 0.0), Vec2::new(resp.rect.height() * 0.8, resp.rect.height()))
+    };
+    paint_icon(ui.painter(), icon_rect, icon, fg);
+    resp
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportAction {
     TogglePlay,
@@ -950,6 +1000,7 @@ pub fn deck_transport_bar(
     flux_active: bool,
     loop_active: bool,
     current_loop_beats: u32,
+    compact: bool,
 ) -> Option<TransportAction> {
     let mut action = None;
     ui.horizontal(|ui| {
@@ -965,19 +1016,9 @@ pub fn deck_transport_bar(
         } else {
             TraktorTheme::TEXT_PRIMARY
         };
-        if ui
-            .add(
-                egui::Button::new(
-                    RichText::new("▶")
-                        .color(play_text_color)
-                        .font(egui::FontId::proportional(12.0))
-                        .strong(),
-                )
-                .fill(play_color)
-                .stroke(Stroke::new(0.5_f32, TraktorTheme::BORDER_COLOR))
-                .min_size(Vec2::new(34.0, 22.0)),
-            )
-            .on_hover_text("Play / Pause Deck (Space)")
+        let play_icon = if is_playing { Icon::Pause } else { Icon::Play };
+        if icon_button(ui, play_icon, "", play_color, play_text_color, Vec2::new(34.0, 22.0))
+            .on_hover_text(if is_playing { "Pause (Space)" } else { "Play (Space)" })
             .clicked()
         {
             action = Some(TransportAction::TogglePlay);
@@ -1001,7 +1042,7 @@ pub fn deck_transport_bar(
             action = Some(TransportAction::Cue);
         }
 
-        if ui
+        if !compact && ui
             .add(
                 egui::Button::new(
                     RichText::new("CUP")
@@ -1018,7 +1059,7 @@ pub fn deck_transport_bar(
             action = Some(TransportAction::Cup);
         }
 
-        if ui
+        if !compact && ui
             .add(
                 egui::Button::new(
                     RichText::new("FLX")
@@ -1046,23 +1087,17 @@ pub fn deck_transport_bar(
 
         ui.separator();
 
-        if ui
-            .add(
-                egui::Button::new(
-                    RichText::new("◄")
-                        .color(TraktorTheme::TEXT_SECONDARY)
-                        .font(egui::FontId::monospace(8.5)),
-                )
-                .fill(Color32::from_rgb(48, 51, 57))
-                .min_size(Vec2::new(18.0, 22.0)),
-            )
-            .on_hover_text("Halve Loop Size (/2)")
+        let chevron_fill = Color32::from_rgb(48, 51, 57);
+        if icon_button(ui, Icon::Prev, "", chevron_fill, TraktorTheme::TEXT_SECONDARY, Vec2::new(18.0, 22.0))
+            .on_hover_text("Halve loop length")
             .clicked()
         {
             action = Some(TransportAction::HalveLoop);
         }
 
-        for beats in [1u32, 2, 4, 8, 16] {
+        // Compact decks show only the current loop length; it toggles the loop.
+        let sizes: &[u32] = if compact { std::slice::from_ref(&current_loop_beats) } else { &[1, 2, 4, 8, 16] };
+        for &beats in sizes {
             let is_selected_size = current_loop_beats == beats;
             let is_active_loop = loop_active && is_selected_size;
             let fill = if is_active_loop {
@@ -1090,23 +1125,15 @@ pub fn deck_transport_bar(
                     .fill(fill)
                     .min_size(Vec2::new(20.0, 22.0)),
                 )
+                .on_hover_text(format!("Loop {beats} beats (L)"))
                 .clicked()
             {
                 action = Some(TransportAction::SelectLoop(beats));
             }
         }
 
-        if ui
-            .add(
-                egui::Button::new(
-                    RichText::new("►")
-                        .color(TraktorTheme::TEXT_SECONDARY)
-                        .font(egui::FontId::monospace(8.5)),
-                )
-                .fill(Color32::from_rgb(48, 51, 57))
-                .min_size(Vec2::new(18.0, 22.0)),
-            )
-            .on_hover_text("Double Loop Size (*2)")
+        if icon_button(ui, Icon::Next, "", chevron_fill, TraktorTheme::TEXT_SECONDARY, Vec2::new(18.0, 22.0))
+            .on_hover_text("Double loop length")
             .clicked()
         {
             action = Some(TransportAction::DoubleLoop);
@@ -1121,7 +1148,7 @@ pub fn render_shortcuts_hud(ctx: &egui::Context, is_open: &mut bool) {
         return;
     }
 
-    egui::Window::new("⌨ ReTraktor Live Performance Keyboard Matrix")
+    egui::Window::new("Keyboard shortcuts")
         .open(is_open)
         .collapsible(false)
         .resizable(false)

@@ -116,6 +116,10 @@ pub struct ReTraktorApp {
     pub deck_stem_muted: [[bool; 4]; 4],
     pub deck_stem_fx_send: [[bool; 4]; 4],
     pub deck_stem_view: [bool; 4],
+    /// Per-deck "More": hotcue pads, pad modes, cue-play, flux and all loop sizes.
+    pub deck_expanded: [bool; 4],
+    /// Switched from Browser to Mix after the first track load.
+    first_load_done: bool,
 
     // Traktor Pro 4 16-Step Pattern Player State
     pub show_pattern_player: bool,
@@ -179,7 +183,7 @@ impl Default for ReTraktorApp {
             preferences: PreferencesDialog::load(),
             demucs: crate::demucs::DemucsManager::new(),
             bus,
-            layout: TraktorLayout::Parallel, // Default to Parallel layout!
+            layout: TraktorLayout::Browser, // Library first; switches to Mix on the first load
             show_shortcuts_hud: false,
             channel_gain: [0.5, 0.5, 0.5, 0.5],
             channel_eq_hi: [0.5, 0.5, 0.5, 0.5],
@@ -230,6 +234,8 @@ impl Default for ReTraktorApp {
             deck_stem_muted: [[false; 4]; 4],
             deck_stem_fx_send: [[false; 4]; 4],
             deck_stem_view: [false, false, false, false],
+            deck_expanded: [false; 4],
+            first_load_done: false,
             show_pattern_player: false,
             pattern_enabled: false,
             pattern_selected_voice: 0,
@@ -493,6 +499,12 @@ impl ReTraktorApp {
     /// Decodes queued library loads on worker threads; real files only, never synthetic audio.
     fn drain_pending_loads(&mut self) {
         let library_tx = self.library.sender();
+        if !self.library.pending_loads.is_empty() && !self.first_load_done {
+            self.first_load_done = true;
+            if self.layout == TraktorLayout::Browser {
+                self.layout = TraktorLayout::Parallel;
+            }
+        }
         for (deck_idx, track) in std::mem::take(&mut self.library.pending_loads) {
             let d = (deck_idx - 1).min(3);
             let shared_audio = self.audio.shared.clone();
@@ -1392,7 +1404,7 @@ impl ReTraktorApp {
                     let pat_btn = ui.add(
                         egui::Button::new(
                             RichText::new(if self.pattern_enabled {
-                                "● PATTERN"
+                                "PATTERN"
                             } else {
                                 "PATTERN"
                             })
@@ -1565,9 +1577,9 @@ impl ReTraktorApp {
                         let rec_m = (rec_sec / 60.0).floor() as u32;
                         let rec_s = (rec_sec % 60.0).floor() as u32;
                         let rec_label = if is_rec {
-                            format!("■ REC {rec_m:02}:{rec_s:02}")
+                            format!("REC {rec_m:02}:{rec_s:02}")
                         } else {
-                            "● REC".to_string()
+                            "REC".to_string()
                         };
                         if ui
                             .add(
@@ -1628,7 +1640,7 @@ impl ReTraktorApp {
 
                         let (mx2_label, mx2_color) = if let Some(ref node) = self.mx2_dev_node {
                             (
-                                format!("● MX2 ({node})"),
+                                format!("MX2 ({node})"),
                                 TraktorTheme::PLAY_ACTIVE,
                             )
                         } else {
@@ -1659,7 +1671,7 @@ impl ReTraktorApp {
                         if ui
                             .add(
                                 egui::Button::new(
-                                    RichText::new("● PipeWire 48kHz")
+                                    RichText::new("PipeWire 48 kHz")
                                         .color(TraktorTheme::PLAY_ACTIVE)
                                         .font(egui::FontId::monospace(9.5)),
                                 )
@@ -1695,7 +1707,7 @@ impl ReTraktorApp {
                             RichText::new(if self.pattern_enabled {
                                 "⏸ PATTERN ON"
                             } else {
-                                "▶ PATTERN OFF"
+                                "PATTERN"
                             })
                             .color(if self.pattern_enabled {
                                 Color32::BLACK
@@ -1883,7 +1895,7 @@ impl ReTraktorApp {
                         if ui
                             .add(
                                 egui::Button::new(
-                                    RichText::new("▶ Audition Transition")
+                                    RichText::new("Audition transition")
                                         .color(Color32::BLACK)
                                         .strong(),
                                 )
@@ -1986,6 +1998,10 @@ impl ReTraktorApp {
         accent_color: Color32,
         height: f32,
     ) {
+        if !self.deck_loaded(deck_idx - 1) {
+            self.show_empty_deck(ui, deck_idx, accent_color, (height * 0.5).max(28.0));
+            return;
+        }
         let d = deck_idx - 1;
         let deck_letter = ["A", "B", "C", "D"][d.min(3)];
 
@@ -2300,29 +2316,17 @@ impl ReTraktorApp {
             ("Empty".to_string(), 0.0, false)
         };
 
-        if ui
-            .add(
-                egui::Button::new(
-                    RichText::new(if is_playing {
-                        format!("⏸ DECK {letter}")
-                    } else {
-                        format!("▶ DECK {letter}")
-                    })
-                    .color(if is_playing {
-                        Color32::BLACK
-                    } else {
-                        Color32::WHITE
-                    })
-                    .strong(),
-                )
-                .fill(if is_playing {
-                    TraktorTheme::PLAY_ACTIVE
-                } else {
-                    accent.gamma_multiply(0.4)
-                }),
-            )
-            .clicked()
-        {
+        if !self.deck_loaded(d) {
+            ui.label(RichText::new(format!("Deck {letter}")).strong().color(accent));
+            ui.label(RichText::new("empty").color(TraktorTheme::TEXT_MUTED));
+            return;
+        }
+        let (icon, fill, fg) = if is_playing {
+            (crate::widgets::Icon::Pause, TraktorTheme::PLAY_ACTIVE, Color32::BLACK)
+        } else {
+            (crate::widgets::Icon::Play, accent.gamma_multiply(0.4), Color32::WHITE)
+        };
+        if crate::widgets::icon_button(ui, icon, &format!("Deck {letter}"), fill, fg, Vec2::new(0.0, 20.0)).clicked() {
             self.toggle_play(deck_idx);
         }
         ui.label(RichText::new(title).color(Color32::WHITE).strong());
@@ -2341,6 +2345,32 @@ impl ReTraktorApp {
         self.deck_drop(ui, rect, deck_idx);
     }
 
+    fn deck_loaded(&self, d: usize) -> bool {
+        self.audio.shared.lock().map(|s| s.loaded_tracks[d].is_some()).unwrap_or(false)
+    }
+
+    /// An unloaded deck says how to load it, and shows nothing else.
+    fn show_empty_deck(&self, ui: &mut Ui, deck_idx: usize, accent: Color32, min_height: f32) {
+        let letter = ["A", "B", "C", "D"][(deck_idx - 1).min(3)];
+        egui::Frame::none()
+            .fill(TraktorTheme::BG_PANEL)
+            .stroke(Stroke::new(1.0_f32, TraktorTheme::BORDER_COLOR))
+            .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.add_space(((min_height - 18.0) / 2.0).max(0.0));
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("Deck {letter}")).size(13.0).strong().color(accent));
+                    ui.label(
+                        RichText::new("Drop a track here, or double-click one in the library")
+                            .size(12.0)
+                            .color(TraktorTheme::TEXT_SECONDARY),
+                    );
+                });
+                ui.add_space(((min_height - 18.0) / 2.0).max(0.0));
+            });
+    }
+
     fn show_single_deck_inner(
         &mut self,
         ui: &mut Ui,
@@ -2349,6 +2379,10 @@ impl ReTraktorApp {
         include_scrolling_waveform: bool,
         waveform_height: f32,
     ) {
+        if !self.deck_loaded(deck_idx - 1) {
+            self.show_empty_deck(ui, deck_idx, accent_color, 40.0);
+            return;
+        }
         let d = deck_idx - 1;
         let deck_letter = match deck_idx {
             1 => "A",
@@ -2631,6 +2665,17 @@ impl ReTraktorApp {
                     }
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let expanded = self.deck_expanded[d];
+                        if ui
+                            .add(egui::Button::new(RichText::new(if expanded { "Less" } else { "More" }).size(11.0).color(TraktorTheme::TEXT_SECONDARY)).frame(false))
+                            .on_hover_text(if expanded { "Hide hotcue pads and extra transport" } else { "Show hotcue pads, pad modes, cue-play, flux and loop sizes" })
+                            .clicked()
+                        {
+                            self.deck_expanded[d] = !expanded;
+                        }
+                        if !expanded {
+                            return;
+                        }
                         for mode in [
                             DeckPadMode::FluxLoop,
                             DeckPadMode::Pattern,
@@ -2752,6 +2797,7 @@ impl ReTraktorApp {
                         self.deck_flux_active[d],
                         self.deck_loop_active[d],
                         self.deck_loop_size_beats[d],
+                        !self.deck_expanded[d],
                     ) {
                     match action {
                         TransportAction::TogglePlay => self.toggle_play(deck_idx),
@@ -2812,8 +2858,8 @@ impl ReTraktorApp {
 
                 ui.add_space(2.0);
 
-                // 5. Slim Understated Hotcue / Performance Pads 1..8 Row (matching Traktor Pro 4 bottom deck strip)
-                ui.horizontal(|ui| {
+                // 5. Hotcue / performance pads, shown when the deck is expanded.
+                if self.deck_expanded[d] { ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing = Vec2::new(3.0, 0.0);
                     let cue_w = ((ui.available_width() - 21.0) / 8.0).max(16.0);
                     for i in 1..=8 {
@@ -2843,7 +2889,7 @@ impl ReTraktorApp {
                             self.deck_hotcues[d].retain(|(c, _)| *c != i as u8);
                         }
                     }
-                });
+                }); }
             });
     }
 
@@ -2858,37 +2904,19 @@ impl ReTraktorApp {
                 ui.vertical(|ui| {
                     // Algoriddim djay Pro-style Neural Mix™ EQ ⇄ STEMS Mode Toggle Bar
                     ui.horizontal(|ui| {
+                        // Two-segment switch: what the three knobs per channel control.
                         let neural = self.preferences.neural_mix_eq_mode;
-                        let mode_btn = ui.add(
-                            egui::Button::new(
-                                RichText::new(if neural {
-                                    "● KNOBS: NEURAL STEMS (VOC / INST / D+B)"
-                                } else {
-                                    "KNOBS: 3-BAND EQ (HI / MID / LOW)  |  STEMS"
-                                })
-                                .color(if neural {
-                                    Color32::WHITE
-                                } else {
-                                    TraktorTheme::TEXT_SECONDARY
-                                })
-                                .font(egui::FontId::monospace(8.5))
-                                .strong(),
-                            )
-                            .fill(if neural {
-                                TraktorTheme::ROW_SELECTED
-                            } else {
-                                Color32::from_rgb(42, 45, 50)
-                            })
-                            .min_size(Vec2::new(ui.available_width(), 16.0)),
-                        );
-                        if mode_btn
-                            .on_hover_text(
-                                "Swap Mixer & Traktor MX2 HI/MID/LOW EQ knobs between 3-Band EQ and Real-Time Stems (Vocals / Instruments / Drums+Bass)",
-                            )
-                            .clicked()
-                        {
-                            self.preferences.neural_mix_eq_mode =
-                                !self.preferences.neural_mix_eq_mode;
+                        ui.label(RichText::new("Knobs").size(11.0).color(TraktorTheme::TEXT_SECONDARY));
+                        for (label, on, tip) in [
+                            ("EQ", !neural, "High / mid / low equaliser"),
+                            ("Stems", neural, "Vocals / instruments / drums + bass"),
+                        ] {
+                            let b = egui::Button::new(RichText::new(label).size(11.0).color(if on { Color32::WHITE } else { TraktorTheme::TEXT_SECONDARY }))
+                                .fill(if on { TraktorTheme::ROW_SELECTED } else { Color32::from_rgb(42, 45, 50) })
+                                .min_size(Vec2::new(52.0, 18.0));
+                            if ui.add(b).on_hover_text(tip).clicked() && !on {
+                                self.preferences.neural_mix_eq_mode = !neural;
+                            }
                         }
                     });
 
@@ -2915,7 +2943,7 @@ impl ReTraktorApp {
                     // Master Crossfader Row
                     ui.horizontal(|ui| {
                         ui.label(
-                            RichText::new("◄ A")
+                            RichText::new("A")
                                 .color(TraktorTheme::DECK_A)
                                 .font(egui::FontId::monospace(10.5))
                                 .strong(),
@@ -2923,7 +2951,7 @@ impl ReTraktorApp {
                         let xf_w = (ui.available_width() - 48.0).max(90.0);
                         crossfader(ui, &mut self.crossfader_pos, xf_w);
                         ui.label(
-                            RichText::new("B ►")
+                            RichText::new("B")
                                 .color(TraktorTheme::DECK_B)
                                 .font(egui::FontId::monospace(10.5))
                                 .strong(),

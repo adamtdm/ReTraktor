@@ -462,11 +462,9 @@ impl PreferencesDialog {
         description: &str,
         control: impl FnOnce(&mut Ui) -> R,
     ) -> R {
-        egui::Frame::none()
-            .fill(Color32::from_rgb(22, 26, 34))
-            .stroke(Stroke::new(1.0_f32, Color32::from_rgb(38, 44, 56)))
-            .rounding(3.0)
-            .inner_margin(egui::Margin::symmetric(14.0, 9.0))
+        // Plain aligned row with a hairline under it; no card per setting.
+        let out = egui::Frame::none()
+            .inner_margin(egui::Margin::symmetric(4.0, 8.0))
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
                 ui.horizontal(|ui| {
@@ -493,20 +491,17 @@ impl PreferencesDialog {
                     .inner
                 })
                 .inner
-            })
-            .inner
+            });
+        let r = out.response.rect;
+        ui.painter().hline(r.x_range(), r.bottom(), Stroke::new(1.0_f32, TraktorTheme::BG_PANEL));
+        out.inner
     }
 
-    /// Renders a clean list section header divider.
+    /// Section heading: sentence case, more space above than below.
     pub fn list_section_header(ui: &mut Ui, title: &str) {
-        ui.add_space(10.0);
-        ui.label(
-            RichText::new(title)
-                .color(TraktorTheme::DECK_A)
-                .font(egui::FontId::monospace(11.0))
-                .strong(),
-        );
-        ui.add_space(4.0);
+        ui.add_space(18.0);
+        ui.label(RichText::new(sentence_case(title)).size(15.0).strong().color(TraktorTheme::TEXT_PRIMARY));
+        ui.add_space(2.0);
     }
 
     pub fn get_tab_breadcrumb(&self, tab: PrefsTab) -> (&'static str, &'static str) {
@@ -557,7 +552,7 @@ impl PreferencesDialog {
                 }
                 let selected = tabs.contains(&self.current_tab);
                 let button = egui::Button::new(RichText::new(label).size(13.0).color(if selected { Color32::WHITE } else { TraktorTheme::TEXT_PRIMARY }))
-                    .fill(if selected { TraktorTheme::ROW_SELECTED } else { Color32::from_rgb(24, 28, 36) })
+                    .fill(if selected { TraktorTheme::ROW_SELECTED } else { TraktorTheme::BG_PANEL })
                     .rounding(4.0)
                     .min_size(Vec2::new(110.0, 30.0));
                 if ui.add(button).clicked() {
@@ -594,15 +589,15 @@ impl PreferencesDialog {
 
             // 1. Top Header Bar
             egui::Frame::none()
-                .fill(Color32::from_rgb(16, 18, 24))
-                .stroke(Stroke::new(1.0_f32, Color32::from_rgb(38, 42, 52)))
+                .fill(TraktorTheme::BG_WINDOW)
+                .stroke(Stroke::NONE)
                 .inner_margin(egui::Margin::symmetric(16.0, 10.0))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(
-                            RichText::new("PREFERENCES")
+                            RichText::new("Preferences")
                                 .color(Color32::WHITE)
-                                .font(egui::FontId::monospace(15.0))
+                                .size(20.0)
                                 .strong(),
                         );
                         ui.add_space(8.0);
@@ -645,8 +640,8 @@ impl PreferencesDialog {
 
             // 2. Top Horizontal Section Tabs Strip
             egui::Frame::none()
-                .fill(Color32::from_rgb(18, 21, 28))
-                .stroke(Stroke::new(1.0_f32, Color32::from_rgb(34, 38, 48)))
+                .fill(TraktorTheme::BG_WINDOW)
+                .stroke(Stroke::NONE)
                 .inner_margin(egui::Margin::symmetric(16.0, 8.0))
                 .show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
@@ -655,7 +650,7 @@ impl PreferencesDialog {
 
             // 3. Full-Width Scrollable List-Type Options View
             egui::Frame::none()
-                .fill(Color32::from_rgb(14, 16, 21))
+                .fill(TraktorTheme::BG_WINDOW)
                 .inner_margin(egui::Margin::symmetric(20.0, 12.0))
                 .show(ui, |ui| {
                     let avail_w = ui.available_width();
@@ -1848,7 +1843,7 @@ impl PreferencesDialog {
 
                 // Graphical Representation of Traktor MX2 Hardware
                 egui::Frame::none()
-                    .fill(Color32::from_rgb(16, 18, 24))
+                    .fill(TraktorTheme::BG_WINDOW)
                     .stroke(Stroke::new(1.0_f32, Color32::from_rgb(45, 55, 75)))
                     .inner_margin(egui::Margin::symmetric(10.0, 8.0))
                     .show(ui, |ui| {
@@ -2329,8 +2324,35 @@ impl PreferencesDialog {
     }
 }
 
+/// "SCAN & IMPORT OPTIONS" -> "Scan & import options", keeping acronyms upper-case.
+fn sentence_case(title: &str) -> String {
+    const KEEP: [&str; 12] = ["MX2", "AI", "EQ", "FX", "MIDI", "HID", "USB", "BPM", "NML", "ALSA", "DJ", "LED"];
+    title
+        .split(' ')
+        .enumerate()
+        .map(|(i, w)| {
+            if KEEP.iter().any(|k| w.trim_matches(|c: char| !c.is_alphanumeric()).eq_ignore_ascii_case(k)) {
+                w.to_uppercase()
+            } else if i == 0 {
+                let lower = w.to_lowercase();
+                let mut c = lower.chars();
+                c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
+            } else {
+                w.to_lowercase()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sentence_case_keeps_acronyms() {
+        assert_eq!(super::sentence_case("SCAN & IMPORT OPTIONS"), "Scan & import options");
+        assert_eq!(super::sentence_case("MX2 MAIN EQ (HI)"), "MX2 main EQ (hi)");
+    }
+
     use super::*;
     use std::path::PathBuf;
 

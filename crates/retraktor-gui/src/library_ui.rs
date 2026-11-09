@@ -328,6 +328,10 @@ fn find_collections(roots: &[PathBuf], max_depth: usize, max_dirs: usize) -> Vec
     found
 }
 
+fn plural(n: usize) -> String {
+    if n == 1 { "1 track".to_string() } else { format!("{n} tracks") }
+}
+
 pub fn stereo_to_mono(pcm: &[f32]) -> Vec<f32> {
     pcm.chunks_exact(2).map(|f| 0.5 * (f[0] + f[1])).collect()
 }
@@ -548,6 +552,8 @@ pub struct LibraryManager {
     scanned_ids: Vec<usize>,
     /// Library track currently on each deck.
     deck_tracks: [Option<usize>; 4],
+    /// Last destructive change: (description, tracks, playlists) before it happened.
+    undo: Option<(String, Vec<UiTrackEntry>, Vec<UserPlaylist>)>,
 
     renaming: Option<(usize, String)>,
     editing: Option<UiTrackEntry>,
@@ -608,6 +614,7 @@ impl LibraryManager {
             auto_analyze: false,
             scanned_ids: Vec::new(),
             deck_tracks: [None; 4],
+            undo: None,
             renaming: None,
             editing: None,
             detected: None,
@@ -629,7 +636,7 @@ impl LibraryManager {
         let path = mgr.collection_path.clone();
         if path.is_file() {
             match mgr.import_nml_file(&path) {
-                Ok(n) => mgr.status_message = format!("Loaded {n} tracks"),
+                Ok(_) => mgr.status_message.clear(),
                 Err(e) => mgr.status_message = format!("Could not read {}: {e}", path.display()),
             }
             mgr.dirty_since = None;
@@ -1222,6 +1229,21 @@ impl LibraryManager {
         }
     }
 
+    fn remember_for_undo(&mut self, what: String) {
+        self.undo = Some((what, self.tracks.clone(), self.playlists.clone()));
+    }
+
+    pub fn undo(&mut self) {
+        if let Some((what, tracks, playlists)) = self.undo.take() {
+            self.tracks = tracks;
+            self.playlists = playlists;
+            self.selection.clear();
+            self.rebuild_index();
+            self.status_message = format!("Undid: {what}");
+            self.touch();
+        }
+    }
+
     /// Queues `id` for loading onto deck `deck` (1..=4) after safety checks.
     pub fn load_to_deck(&mut self, deck: usize, id: usize, locked: [bool; 4]) {
         let d = deck.clamp(1, 4) - 1;
@@ -1290,8 +1312,10 @@ impl LibraryManager {
             Action::AddToPlaylist(ids, pl) => self.add_to_playlist(&ids, pl),
             Action::RemoveFromPlaylist(ids) => {
                 if let NavItem::Playlist(i) = self.selected_nav {
-                    if let Some(pl) = self.playlists.get_mut(i) {
-                        pl.track_ids.retain(|id| !ids.contains(id));
+                    if let Some(name) = self.playlists.get(i).map(|p| p.name.clone()) {
+                        self.remember_for_undo(format!("removed {} from '{name}'", plural(ids.len())));
+                        self.playlists[i].track_ids.retain(|id| !ids.contains(id));
+                        self.status_message = format!("Removed {} from '{name}'", plural(ids.len()));
                         self.touch();
                     }
                 }
@@ -1307,13 +1331,14 @@ impl LibraryManager {
                 }
             }
             Action::RemoveFromCollection(ids) => {
+                self.remember_for_undo(format!("removed {} from the collection", plural(ids.len())));
                 self.tracks.retain(|t| !ids.contains(&t.id));
                 for pl in &mut self.playlists {
                     pl.track_ids.retain(|id| !ids.contains(id));
                 }
                 self.selection.clear();
                 self.rebuild_index();
-                self.status_message = format!("Removed {} tracks from the collection (files untouched)", ids.len());
+                self.status_message = format!("Removed {} from the collection (files untouched)", plural(ids.len()));
                 self.touch();
             }
             Action::Sort(col) => {
@@ -1432,6 +1457,8 @@ impl LibraryManager {
                 };
             }
             if let Some(i) = delete {
+                self.remember_for_undo(format!("deleted playlist '{}'", self.playlists[i].name));
+                self.status_message = format!("Deleted playlist '{}'", self.playlists[i].name);
                 self.playlists.remove(i);
                 self.selected_nav = NavItem::Collection;
                 self.touch();
@@ -1457,7 +1484,12 @@ impl LibraryManager {
                     ui.spinner();
                     ui.label(RichText::new(&self.job_status).size(11.0).color(TraktorTheme::TEXT_SECONDARY));
                 }
-                ui.label(RichText::new(&self.status_message).size(11.0).color(TraktorTheme::TEXT_SECONDARY));
+                let tip = self.history.is_empty() && !self.tracks.is_empty() && self.status_message.is_empty();
+                let msg = if tip { "Double-click a track, or drag it onto a deck, to load it." } else { self.status_message.as_str() };
+                ui.label(RichText::new(msg).size(12.0).color(TraktorTheme::TEXT_PRIMARY));
+                if self.undo.is_some() && ui.small_button("Undo").on_hover_text("Ctrl+Z").clicked() {
+                    self.undo();
+                }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.label(RichText::new(format!("{} shown", self.view.len())).size(11.0).color(TraktorTheme::TEXT_MUTED));
                 });
@@ -1471,6 +1503,9 @@ impl LibraryManager {
                 self.show_empty_state(ui, music_folders);
             } else {
                 self.show_toolbar(ui, music_folders);
+                if self.selected_nav == NavItem::Missing {
+                    self.show_missing_banner(ui, music_folders);
+                }
                 if self.selected_nav == NavItem::Suggestions && self.deck_tracks[0].is_none() {
                     ui.label(RichText::new("Load a track on deck A to see matching tracks.").color(TraktorTheme::TEXT_SECONDARY));
                 }
@@ -1486,6 +1521,29 @@ impl LibraryManager {
                 ui.label(if n == 1 { "1 track".to_string() } else { format!("{n} tracks") });
             });
         }
+    }
+
+    fn show_missing_banner(&mut self, ui: &mut Ui, music_folders: &[PathBuf]) {
+        let missing = self.missing_count();
+        if missing == 0 {
+            return;
+        }
+        let busy = self.is_busy();
+        egui::Frame::none().fill(Color32::from_rgb(52, 36, 34)).rounding(4.0).inner_margin(egui::Margin::symmetric(10.0, 8.0)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("{} can't be found where they were saved.", plural(missing))).size(12.5).color(TraktorTheme::TEXT_PRIMARY));
+                if ui.add_enabled(!busy, egui::Button::new("Search another folder…")).on_hover_text("Pick the folder they moved to").clicked() {
+                    self.pick(Pick::RelocateFolder);
+                }
+                if !music_folders.is_empty()
+                    && ui.add_enabled(!busy, egui::Button::new("Search my music folders")).on_hover_text(music_folders.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n")).clicked()
+                {
+                    self.start_relocate(music_folders.to_vec());
+                }
+            });
+        });
+        ui.add_space(4.0);
     }
 
     fn show_toolbar(&mut self, ui: &mut Ui, music_folders: &[PathBuf]) {
@@ -1512,16 +1570,8 @@ impl LibraryManager {
                 self.start_analysis(pending, false);
             }
             let missing = self.missing_count();
-            if missing > 0
-                && ui
-                    .add_enabled(!busy, egui::Button::new(format!("Relocate {missing} missing")))
-                    .on_hover_text("Find moved files by name in your music folders")
-                    .clicked()
-            {
-                self.start_relocate(music_folders.to_vec());
-            }
-            if missing > 0 && ui.add_enabled(!busy, egui::Button::new("Search another folder…")).on_hover_text("Pick the folder your missing tracks moved to").clicked() {
-                self.pick(Pick::RelocateFolder);
+            if missing > 0 && self.selected_nav != NavItem::Missing && ui.link(RichText::new(format!("{missing} missing")).color(Color32::from_rgb(214, 120, 100))).on_hover_text("Show tracks whose files can't be found").clicked() {
+                self.selected_nav = NavItem::Missing;
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui.small_button("rekordbox XML").on_hover_text("Export collection + playlists to ~/Music/ReTraktor-rekordbox.xml").clicked() {
@@ -1641,7 +1691,9 @@ impl LibraryManager {
 
     fn visible_columns(&self, c: &LibraryColumnsConfig) -> Vec<SortColumn> {
         use SortColumn::*;
-        let mut cols = vec![Order, Title, Artist];
+        // Row number only means something where order matters.
+        let ordered = matches!(self.selected_nav, NavItem::Playlist(_) | NavItem::History);
+        let mut cols = if ordered { vec![Order, Title, Artist] } else { vec![Title, Artist] };
         let opt = [
             (c.track_number, TrackNum),
             (c.album, Album),
@@ -1707,6 +1759,9 @@ impl LibraryManager {
         let mut actions: Vec<Action> = Vec::new();
 
         // Keyboard: arrows browse, Enter loads A / Shift+Enter loads B, Delete removes from playlist.
+        if !ui.ctx().wants_keyboard_input() && ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Z)) {
+            self.undo();
+        }
         if !ui.ctx().wants_keyboard_input() {
             let (down, up, enter, shift, del, all) = ui.input(|i| {
                 (
@@ -2179,6 +2234,20 @@ mod tests {
         fs::write(deep.join("collection.nml"), "<NML/>").unwrap();
         assert_eq!(find_collections(&[dir.clone()], 4, 100), vec![deep.join("collection.nml")]);
         assert!(find_collections(&[dir.clone()], 2, 100).is_empty(), "depth limit respected");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn remove_and_undo_restores_tracks_and_playlists() {
+        let (mut lib, dir) = temp_lib("undo");
+        let a = lib.push_track(track("A", &dir.join("a.flac")));
+        lib.push_track(track("B", &dir.join("b.flac")));
+        lib.add_to_playlist(&[a], None);
+        lib.apply(Action::RemoveFromCollection(vec![a]), [false; 4], 2);
+        assert_eq!((lib.tracks.len(), lib.playlists[0].track_ids.len()), (1, 0));
+        lib.undo();
+        assert_eq!((lib.tracks.len(), lib.playlists[0].track_ids.clone()), (2, vec![a]));
+        assert!(lib.track(a).is_some());
         let _ = fs::remove_dir_all(dir);
     }
 
