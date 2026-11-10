@@ -328,6 +328,39 @@ fn find_collections(roots: &[PathBuf], max_depth: usize, max_dirs: usize) -> Vec
     found
 }
 
+/// `lo-hi`, `>x`, `>=x`, `<x`, `<=x` or an exact number.
+fn in_range(v: f64, spec: &str) -> bool {
+    let num = |t: &str| t.trim().parse::<f64>().ok();
+    if let Some((lo, hi)) = spec.split_once('-') {
+        return matches!((num(lo), num(hi)), (Some(a), Some(b)) if v >= a && v <= b);
+    }
+    for (op, f) in [(">=", (|a: f64, b: f64| a >= b) as fn(f64, f64) -> bool), ("<=", |a, b| a <= b), (">", |a, b| a > b), ("<", |a, b| a < b)] {
+        if let Some(rest) = spec.strip_prefix(op) {
+            return num(rest).is_some_and(|b| f(v, b));
+        }
+    }
+    num(spec).is_some_and(|b| (v - b).abs() < 0.5)
+}
+
+/// Every term must match. Plain words search text; `bpm:`, `key:` (`~` = compatible),
+/// `energy:`, `rating:`, `year:`, `genre:`, `artist:` filter fields.
+fn matches_query(t: &UiTrackEntry, terms: &[String]) -> bool {
+    let blob = t.search_blob();
+    terms.iter().all(|term| match term.split_once(':') {
+        Some(("bpm", spec)) => t.bpm > 0.0 && (in_range(t.bpm, spec) || in_range(t.bpm * 2.0, spec) || in_range(t.bpm / 2.0, spec)),
+        Some(("key", spec)) => match spec.strip_prefix('~') {
+            Some(k) => KeyWheel::normalize(k).and_then(KeyWheel::to_open_key).is_some_and(|k| KeyWheel::are_harmonically_compatible(k, &t.musical_key)),
+            None => KeyWheel::normalize(spec).and_then(KeyWheel::to_open_key).is_some_and(|k| k == t.musical_key),
+        },
+        Some(("energy", spec)) => t.energy > 0 && in_range(t.energy as f64, spec),
+        Some(("rating", spec)) => in_range(t.rating as f64, spec),
+        Some(("year", spec)) => t.year.parse::<f64>().is_ok_and(|y| in_range(y, spec)),
+        Some(("genre", w)) => t.genre.to_lowercase().contains(w),
+        Some(("artist", w)) => t.artist.to_lowercase().contains(w),
+        _ => blob.contains(term.as_str()),
+    })
+}
+
 /// Tick-box list of optional library columns (title and artist are always shown).
 fn column_menu(ui: &mut Ui, c: &mut LibraryColumnsConfig) {
     ui.label(RichText::new("Show columns").size(11.0).color(TraktorTheme::TEXT_MUTED()));
@@ -1184,10 +1217,7 @@ impl LibraryManager {
         let mut rows: Vec<(usize, f32)> = ids
             .into_iter()
             .filter_map(|id| self.id_index.get(&id).map(|&i| i))
-            .filter(|&i| terms.is_empty() || {
-                let blob = self.tracks[i].search_blob();
-                terms.iter().all(|w| blob.contains(w.as_str()))
-            })
+            .filter(|&i| terms.is_empty() || matches_query(&self.tracks[i], &terms))
             .map(|i| (i, reference.as_ref().map_or(0.0, |r| match_score(r, &self.tracks[i]))))
             .collect();
         if self.selected_nav == NavItem::Suggestions {
@@ -1576,7 +1606,7 @@ impl LibraryManager {
 
     fn show_toolbar(&mut self, ui: &mut Ui, music_folders: &[PathBuf], columns: &mut LibraryColumnsConfig) {
         ui.horizontal(|ui| {
-            let r = ui.add(egui::TextEdit::singleline(&mut self.search_query).hint_text("Search title, artist, genre, key, BPM…").desired_width(260.0));
+            let r = ui.add(egui::TextEdit::singleline(&mut self.search_query).hint_text("Search… try bpm:120-128 key:~8m energy:>6").desired_width(260.0));
             if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F)) {
                 r.request_focus();
             }
@@ -2279,6 +2309,20 @@ mod tests {
         assert_eq!((lib.tracks.len(), lib.playlists[0].track_ids.clone()), (2, vec![a]));
         assert!(lib.track(a).is_some());
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn search_filters() {
+        let t = UiTrackEntry { title: "Deep Thing".into(), genre: "UK Garage".into(), bpm: 130.0, musical_key: "8m".into(), energy: 7, rating: 4, year: "2001".into(), ..Default::default() };
+        let q = |s: &str| matches_query(&t, &s.to_lowercase().split_whitespace().map(str::to_string).collect::<Vec<_>>());
+        assert!(q("bpm:128-132 key:8m"));
+        assert!(q("bpm:65")); // half-time counts
+        assert!(q("key:~9m energy:>6 rating:>=4 year:<2005 genre:garage deep"));
+        assert!(q("key:~Bbm")); // musical notation: Bbm is 8m
+        assert!(!q("key:~Am")); // Am is 1m, not next to 8m
+        assert!(!q("key:3d"));
+        assert!(!q("energy:<5"));
+        assert!(!q("bpm:140-150"));
     }
 
     #[test]
