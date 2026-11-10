@@ -435,16 +435,16 @@ impl PreferencesDialog {
         content: impl FnOnce(&mut Ui) -> R,
     ) -> R {
         egui::Frame::none()
-            .fill(TraktorTheme::BG_PANEL_ALT)
-            .stroke(Stroke::new(1.0_f32, TraktorTheme::BORDER_COLOR))
+            .fill(TraktorTheme::BG_PANEL_ALT())
+            .stroke(Stroke::new(1.0_f32, TraktorTheme::BORDER_COLOR()))
             .rounding(4.0)
             .inner_margin(12.0)
             .show(ui, |ui| {
                 ui.vertical(|ui| {
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(title).strong().color(TraktorTheme::TEXT_PRIMARY));
+                        ui.label(RichText::new(title).strong().color(TraktorTheme::TEXT_PRIMARY()));
                         if !description.is_empty() {
-                            ui.label(RichText::new(format!("— {description}")).size(12.0).color(TraktorTheme::TEXT_MUTED));
+                            ui.label(RichText::new(format!("— {description}")).size(12.0).color(TraktorTheme::TEXT_MUTED()));
                         }
                     });
                     ui.add_space(8.0);
@@ -479,7 +479,7 @@ impl PreferencesDialog {
                         if !description.is_empty() {
                             ui.label(
                                 RichText::new(description)
-                                    .color(TraktorTheme::TEXT_SECONDARY)
+                                    .color(TraktorTheme::TEXT_SECONDARY())
                                     .font(egui::FontId::proportional(11.0)),
                             );
                         }
@@ -493,14 +493,14 @@ impl PreferencesDialog {
                 .inner
             });
         let r = out.response.rect;
-        ui.painter().hline(r.x_range(), r.bottom(), Stroke::new(1.0_f32, TraktorTheme::BG_PANEL));
+        ui.painter().hline(r.x_range(), r.bottom(), Stroke::new(1.0_f32, TraktorTheme::BG_PANEL()));
         out.inner
     }
 
     /// Section heading: sentence case, more space above than below.
     pub fn list_section_header(ui: &mut Ui, title: &str) {
         ui.add_space(18.0);
-        ui.label(RichText::new(sentence_case(title)).size(15.0).strong().color(TraktorTheme::TEXT_PRIMARY));
+        ui.label(RichText::new(sentence_case(title)).size(15.0).strong().color(TraktorTheme::TEXT_PRIMARY()));
         ui.add_space(2.0);
     }
 
@@ -551,8 +551,8 @@ impl PreferencesDialog {
                     continue;
                 }
                 let selected = tabs.contains(&self.current_tab);
-                let button = egui::Button::new(RichText::new(label).size(13.0).color(if selected { Color32::WHITE } else { TraktorTheme::TEXT_PRIMARY }))
-                    .fill(if selected { TraktorTheme::ROW_SELECTED } else { TraktorTheme::BG_PANEL })
+                let button = egui::Button::new(RichText::new(label).size(13.0).color(if selected { Color32::WHITE } else { TraktorTheme::TEXT_PRIMARY() }))
+                    .fill(if selected { TraktorTheme::ROW_SELECTED() } else { TraktorTheme::BG_PANEL() })
                     .rounding(4.0)
                     .min_size(Vec2::new(110.0, 30.0));
                 if ui.add(button).clicked() {
@@ -589,7 +589,7 @@ impl PreferencesDialog {
 
             // 1. Top Header Bar
             egui::Frame::none()
-                .fill(TraktorTheme::BG_WINDOW)
+                .fill(TraktorTheme::BG_WINDOW())
                 .stroke(Stroke::NONE)
                 .inner_margin(egui::Margin::symmetric(16.0, 10.0))
                 .show(ui, |ui| {
@@ -612,7 +612,7 @@ impl PreferencesDialog {
                                             .font(egui::FontId::proportional(12.0))
                                             .strong(),
                                     )
-                                    .fill(TraktorTheme::ROW_SELECTED)
+                                    .fill(TraktorTheme::ROW_SELECTED())
                                     .min_size(Vec2::new(110.0, 28.0)),
                                 )
                                 .on_hover_text("Save preferences and return to Decks (Esc)")
@@ -640,7 +640,7 @@ impl PreferencesDialog {
 
             // 2. Top Horizontal Section Tabs Strip
             egui::Frame::none()
-                .fill(TraktorTheme::BG_WINDOW)
+                .fill(TraktorTheme::BG_WINDOW())
                 .stroke(Stroke::NONE)
                 .inner_margin(egui::Margin::symmetric(16.0, 8.0))
                 .show(ui, |ui| {
@@ -650,7 +650,7 @@ impl PreferencesDialog {
 
             // 3. Full-Width Scrollable List-Type Options View
             egui::Frame::none()
-                .fill(TraktorTheme::BG_WINDOW)
+                .fill(TraktorTheme::BG_WINDOW())
                 .inner_margin(egui::Margin::symmetric(20.0, 12.0))
                 .show(ui, |ui| {
                     let avail_w = ui.available_width();
@@ -751,7 +751,7 @@ impl PreferencesDialog {
             |ui| {
                 ui.label(
                     RichText::new(format!("ACTIVE • {:.2} ms Roundtrip • 0 XRuns", latency_ms))
-                        .color(TraktorTheme::PLAY_ACTIVE)
+                        .color(TraktorTheme::PLAY_ACTIVE())
                         .font(egui::FontId::monospace(11.5))
                         .strong(),
                 );
@@ -873,7 +873,7 @@ impl PreferencesDialog {
             |ui| {
                 ui.label(
                     RichText::new("READY (0.0 dB Lead-In)")
-                        .color(TraktorTheme::DECK_A)
+                        .color(TraktorTheme::DECK_A())
                         .font(egui::FontId::monospace(11.0))
                         .strong(),
                 );
@@ -1067,7 +1067,7 @@ impl PreferencesDialog {
                 crate::demucs::DemucsInstallState::Ready { version, .. } => {
                     ui.label(
                         RichText::new(format!("✔ {version} Ready"))
-                            .color(TraktorTheme::PLAY_ACTIVE)
+                            .color(TraktorTheme::PLAY_ACTIVE())
                             .strong(),
                     );
                 }
@@ -1083,7 +1083,7 @@ impl PreferencesDialog {
                                     .color(Color32::WHITE)
                                     .strong(),
                             )
-                            .fill(TraktorTheme::ROW_SELECTED)
+                            .fill(TraktorTheme::ROW_SELECTED())
                             .min_size(Vec2::new(210.0, 26.0)),
                         )
                         .clicked()
@@ -1101,7 +1101,7 @@ impl PreferencesDialog {
         );
         // Full log stays out of the row; available on request, selectable and copyable.
         if let crate::demucs::DemucsInstallState::Failed { error } = &self.demucs_install_state {
-            egui::CollapsingHeader::new(RichText::new("Details").size(11.5).color(TraktorTheme::TEXT_SECONDARY))
+            egui::CollapsingHeader::new(RichText::new("Details").size(11.5).color(TraktorTheme::TEXT_SECONDARY()))
                 .id_salt("demucs_error_details")
                 .show(ui, |ui| {
                     if ui.small_button("Copy").clicked() {
@@ -1384,7 +1384,7 @@ impl PreferencesDialog {
             "Mix Recording Directory",
             "Destination folder where recorded live WAV mixes are saved.",
             |ui| {
-                ui.label(RichText::new(path_str).monospace().color(TraktorTheme::DECK_A));
+                ui.label(RichText::new(path_str).monospace().color(TraktorTheme::DECK_A()));
             },
         );
 
@@ -1672,7 +1672,7 @@ impl PreferencesDialog {
         let (banner_bg, stroke_col, title_text, subtitle_text) = if is_connected {
             (
                 Color32::from_rgb(14, 32, 20),
-                TraktorTheme::PLAY_ACTIVE,
+                TraktorTheme::PLAY_ACTIVE(),
                 format!("● Traktor MX2 Connected ({})", self.mx2_connected_node.as_deref().unwrap_or("")),
                 format!(
                     "{} | {} Packets Received | NHL2 Reports 0x01/0x02/0x03 Active",
@@ -1728,7 +1728,7 @@ impl PreferencesDialog {
                         self.udev_command_copied = true;
                     }
                     if self.udev_command_copied {
-                        ui.label(RichText::new("✔ Copied command to clipboard!").color(TraktorTheme::PLAY_ACTIVE));
+                        ui.label(RichText::new("✔ Copied command to clipboard!").color(TraktorTheme::PLAY_ACTIVE()));
                     }
                 });
             });
@@ -1749,10 +1749,10 @@ impl PreferencesDialog {
             ui.add_space(4.0);
             egui::Frame::none()
                 .fill(Color32::from_rgb(18, 28, 20))
-                .stroke(Stroke::new(1.0_f32, TraktorTheme::PLAY_ACTIVE))
+                .stroke(Stroke::new(1.0_f32, TraktorTheme::PLAY_ACTIVE()))
                 .inner_margin(egui::Margin::symmetric(8.0, 4.0))
                 .show(ui, |ui| {
-                    ui.label(RichText::new("✔ Automated Hardware Protocol Verification Passed!").color(TraktorTheme::PLAY_ACTIVE).strong());
+                    ui.label(RichText::new("✔ Automated Hardware Protocol Verification Passed!").color(TraktorTheme::PLAY_ACTIVE()).strong());
                     ui.label(format!(
                         "Tested: {} Buttons ({}), {} Encoders ({}), {} Pots/Faders ({}), {} Jogwheels ({}), {} LEDs ({})",
                         report.buttons_tested, report.buttons_passed,
@@ -1772,7 +1772,7 @@ impl PreferencesDialog {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     let r_id = self.mx2_last_report_id.map(|id| format!("0x{:02X}", id)).unwrap_or_else(|| "None".to_string());
-                    ui.label(RichText::new(format!("Last Report: {}", r_id)).monospace().color(TraktorTheme::DECK_A));
+                    ui.label(RichText::new(format!("Last Report: {}", r_id)).monospace().color(TraktorTheme::DECK_A()));
                     ui.label(RichText::new(format!("Total Packets: {}", self.mx2_packets_count)).monospace());
                 });
                 if let Some(ref hex) = self.mx2_last_hex {
@@ -1781,7 +1781,7 @@ impl PreferencesDialog {
                 if !self.mx2_recent_events.is_empty() {
                     ui.label(RichText::new("Recent Control Events:").strong());
                     for ev in self.mx2_recent_events.iter().rev().take(4) {
-                        ui.label(RichText::new(format!("  • {}", ev)).monospace().color(TraktorTheme::PLAY_ACTIVE).font(egui::FontId::monospace(9.5)));
+                        ui.label(RichText::new(format!("  • {}", ev)).monospace().color(TraktorTheme::PLAY_ACTIVE()).font(egui::FontId::monospace(9.5)));
                     }
                 } else {
                     ui.label(RichText::new("Touch any button, fader, knob, or jogwheel on the hardware to see live events here.").italics());
@@ -1800,16 +1800,16 @@ impl PreferencesDialog {
                     .striped(true)
                     .spacing(Vec2::new(10.0, 3.0))
                     .show(ui, |ui| {
-                        ui.label(RichText::new("Type").color(TraktorTheme::TEXT_SECONDARY).strong());
-                        ui.label(RichText::new("Device Node / Path").color(TraktorTheme::TEXT_SECONDARY).strong());
-                        ui.label(RichText::new("Device Model").color(TraktorTheme::TEXT_SECONDARY).strong());
-                        ui.label(RichText::new("VID:PID").color(TraktorTheme::TEXT_SECONDARY).strong());
-                        ui.label(RichText::new("Access / Action").color(TraktorTheme::TEXT_SECONDARY).strong());
+                        ui.label(RichText::new("Type").color(TraktorTheme::TEXT_SECONDARY()).strong());
+                        ui.label(RichText::new("Device Node / Path").color(TraktorTheme::TEXT_SECONDARY()).strong());
+                        ui.label(RichText::new("Device Model").color(TraktorTheme::TEXT_SECONDARY()).strong());
+                        ui.label(RichText::new("VID:PID").color(TraktorTheme::TEXT_SECONDARY()).strong());
+                        ui.label(RichText::new("Access / Action").color(TraktorTheme::TEXT_SECONDARY()).strong());
                         ui.end_row();
 
                         for item in &self.discovered_hardware {
                             ui.label(RichText::new(item.category).monospace());
-                            ui.label(RichText::new(&item.identifier).monospace().color(TraktorTheme::DECK_A));
+                            ui.label(RichText::new(&item.identifier).monospace().color(TraktorTheme::DECK_A()));
                             ui.label(RichText::new(&item.name).strong());
                             ui.label(
                                 if let Some((v, p)) = item.vid_pid {
@@ -1823,7 +1823,7 @@ impl PreferencesDialog {
                                     retraktor_hid::DeviceAccessLevel::ReadWriteOk => {
                                         let is_cur = self.mx2_connected_node.as_ref() == Some(&item.identifier);
                                         if is_cur {
-                                            ui.label(RichText::new("✔ Active").color(TraktorTheme::PLAY_ACTIVE).strong());
+                                            ui.label(RichText::new("✔ Active").color(TraktorTheme::PLAY_ACTIVE()).strong());
                                         } else if ui.button("Connect").clicked() {
                                             self.trigger_connect_node = Some(item.identifier.clone());
                                         }
@@ -1857,18 +1857,18 @@ impl PreferencesDialog {
 
                 // Graphical Representation of Traktor MX2 Hardware
                 egui::Frame::none()
-                    .fill(TraktorTheme::BG_WINDOW)
+                    .fill(TraktorTheme::BG_WINDOW())
                     .stroke(Stroke::new(1.0_f32, Color32::from_rgb(45, 55, 75)))
                     .inner_margin(egui::Margin::symmetric(10.0, 8.0))
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             // --- DECK A (LEFT) ---
                             ui.vertical(|ui| {
-                                ui.label(RichText::new("DECK A (LEFT)").color(TraktorTheme::DECK_A).strong());
+                                ui.label(RichText::new("DECK A (LEFT)").color(TraktorTheme::DECK_A()).strong());
 
                                 // Platter / Jogwheel
                                 let jog_l_selected = self.selected_visual_control.as_deref() == Some("surface.left.jogwheel");
-                                let jog_bg = if jog_l_selected { TraktorTheme::DECK_A } else { Color32::from_rgb(26, 30, 40) };
+                                let jog_bg = if jog_l_selected { TraktorTheme::DECK_A() } else { Color32::from_rgb(26, 30, 40) };
                                 if ui.add(
                                     egui::Button::new(RichText::new("◎ JOGWHEEL PLATTER A\n(Touch = Vinyl Scratch | Rim = Pitch Nudge)").strong().color(Color32::WHITE))
                                         .fill(jog_bg)
@@ -1948,10 +1948,10 @@ impl PreferencesDialog {
                                 ui.horizontal(|ui| {
                                     // Ch 1 Controls
                                     ui.vertical(|ui| {
-                                        ui.label(RichText::new("CH 1").color(TraktorTheme::DECK_A).strong().font(egui::FontId::monospace(9.0)));
+                                        ui.label(RichText::new("CH 1").color(TraktorTheme::DECK_A()).strong().font(egui::FontId::monospace(9.0)));
                                         let f_click = |ui: &mut Ui, label: &str, id: &str, sel_ctrl: &Option<String>| -> bool {
                                             let sel = sel_ctrl.as_deref() == Some(id);
-                                            let bg = if sel { TraktorTheme::DECK_A } else { Color32::from_rgb(30, 36, 48) };
+                                            let bg = if sel { TraktorTheme::DECK_A() } else { Color32::from_rgb(30, 36, 48) };
                                             ui.add(egui::Button::new(RichText::new(label).font(egui::FontId::monospace(8.0))).fill(bg).min_size(Vec2::new(54.0, 18.0))).clicked()
                                         };
                                         if f_click(ui, "Gain", "surface.mixer.channels.1.gain", &self.selected_visual_control) {
@@ -1978,10 +1978,10 @@ impl PreferencesDialog {
 
                                     // Ch 2 Controls
                                     ui.vertical(|ui| {
-                                        ui.label(RichText::new("CH 2").color(TraktorTheme::DECK_B).strong().font(egui::FontId::monospace(9.0)));
+                                        ui.label(RichText::new("CH 2").color(TraktorTheme::DECK_B()).strong().font(egui::FontId::monospace(9.0)));
                                         let f_click = |ui: &mut Ui, label: &str, id: &str, sel_ctrl: &Option<String>| -> bool {
                                             let sel = sel_ctrl.as_deref() == Some(id);
-                                            let bg = if sel { TraktorTheme::DECK_B } else { Color32::from_rgb(30, 36, 48) };
+                                            let bg = if sel { TraktorTheme::DECK_B() } else { Color32::from_rgb(30, 36, 48) };
                                             ui.add(egui::Button::new(RichText::new(label).font(egui::FontId::monospace(8.0))).fill(bg).min_size(Vec2::new(54.0, 18.0))).clicked()
                                         };
                                         if f_click(ui, "Gain", "surface.mixer.channels.2.gain", &self.selected_visual_control) {
@@ -2028,10 +2028,10 @@ impl PreferencesDialog {
 
                             // --- DECK B (RIGHT) ---
                             ui.vertical(|ui| {
-                                ui.label(RichText::new("DECK B (RIGHT)").color(TraktorTheme::DECK_B).strong());
+                                ui.label(RichText::new("DECK B (RIGHT)").color(TraktorTheme::DECK_B()).strong());
 
                                 let jog_r_selected = self.selected_visual_control.as_deref() == Some("surface.right.jogwheel");
-                                let jog_bg = if jog_r_selected { TraktorTheme::DECK_B } else { Color32::from_rgb(26, 30, 40) };
+                                let jog_bg = if jog_r_selected { TraktorTheme::DECK_B() } else { Color32::from_rgb(26, 30, 40) };
                                 if ui.add(
                                     egui::Button::new(RichText::new("◎ JOGWHEEL PLATTER B\n(Touch = Vinyl Scratch | Rim = Pitch Nudge)").strong().color(Color32::WHITE))
                                         .fill(jog_bg)
@@ -2109,11 +2109,11 @@ impl PreferencesDialog {
                     ui.add_space(4.0);
                     egui::Frame::none()
                         .fill(Color32::from_rgb(22, 28, 38))
-                        .stroke(Stroke::new(1.0_f32, TraktorTheme::DECK_A))
+                        .stroke(Stroke::new(1.0_f32, TraktorTheme::DECK_A()))
                         .inner_margin(egui::Margin::symmetric(10.0, 6.0))
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
-                                ui.label(RichText::new(format!("⚙ Editing Control: {}", sel_id)).strong().color(TraktorTheme::DECK_A));
+                                ui.label(RichText::new(format!("⚙ Editing Control: {}", sel_id)).strong().color(TraktorTheme::DECK_A()));
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                     if ui.button("× Close").clicked() {
                                         close_clicked = true;
@@ -2281,7 +2281,7 @@ impl PreferencesDialog {
                                 .color(Color32::WHITE)
                                 .strong(),
                         )
-                        .fill(TraktorTheme::ROW_SELECTED)
+                        .fill(TraktorTheme::ROW_SELECTED())
                         .min_size(Vec2::new(200.0, 26.0)),
                     )
                     .clicked()
@@ -2302,7 +2302,7 @@ impl PreferencesDialog {
             |ui| {
                 ui.label(
                     RichText::new("ReTraktor Pro 4.5.1")
-                        .color(TraktorTheme::DECK_A)
+                        .color(TraktorTheme::DECK_A())
                         .font(egui::FontId::monospace(12.0))
                         .strong(),
                 );

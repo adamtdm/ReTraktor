@@ -104,7 +104,7 @@ pub fn rotary_knob_sized(
             egui::Align2::CENTER_CENTER,
             label,
             egui::FontId::proportional(8.5),
-            TraktorTheme::TEXT_SECONDARY,
+            TraktorTheme::TEXT_SECONDARY(),
         );
     }
 
@@ -229,7 +229,7 @@ pub fn crossfader(ui: &mut Ui, value: &mut f32, width: f32) -> Response {
                 Pos2::new(rect.center().x, slot_y - 5.0),
                 Pos2::new(rect.center().x, slot_y + 5.0),
             ],
-            Stroke::new(1.0_f32, TraktorTheme::TEXT_MUTED),
+            Stroke::new(1.0_f32, TraktorTheme::TEXT_MUTED()),
         );
 
         // Crossfader Cap
@@ -264,7 +264,7 @@ pub fn vu_meter(ui: &mut Ui, level_l: f32, level_r: f32, height: f32) {
     }
 
     let painter = ui.painter();
-    painter.rect_filled(rect, 1.0, TraktorTheme::METER_BG);
+    painter.rect_filled(rect, 1.0, TraktorTheme::METER_BG());
 
     let segments = 16;
     let seg_w = (width - 3.0) / 2.0;
@@ -278,11 +278,11 @@ pub fn vu_meter(ui: &mut Ui, level_l: f32, level_r: f32, height: f32) {
 
             let color = if seg_idx < lit_count {
                 if seg_idx >= segments - 2 {
-                    TraktorTheme::METER_RED
+                    TraktorTheme::METER_RED()
                 } else if seg_idx >= segments - 4 {
-                    TraktorTheme::METER_YELLOW
+                    TraktorTheme::METER_YELLOW()
                 } else {
-                    TraktorTheme::METER_GREEN
+                    TraktorTheme::METER_GREEN()
                 }
             } else {
                 Color32::from_rgb(35, 37, 41)
@@ -346,8 +346,8 @@ pub fn scrolling_waveform(
     }
 
     let painter = ui.painter();
-    painter.rect_filled(rect, 1.0, TraktorTheme::WAVEFORM_BG);
-    painter.rect_stroke(rect, 1.0, Stroke::new(1.0_f32, TraktorTheme::BORDER_COLOR));
+    painter.rect_filled(rect, 1.0, TraktorTheme::WAVEFORM_BG());
+    painter.rect_stroke(rect, 1.0, Stroke::new(1.0_f32, TraktorTheme::BORDER_COLOR()));
 
     let center_y = rect.center().y;
     let center_x = rect.center().x;
@@ -374,7 +374,7 @@ pub fn scrolling_waveform(
                 0.0,
                 Color32::from_rgba_unmultiplied(114, 182, 102, 28),
             );
-            painter.rect_stroke(loop_rect, 0.0, Stroke::new(1.0_f32, TraktorTheme::LOOP_ACTIVE));
+            painter.rect_stroke(loop_rect, 0.0, Stroke::new(1.0_f32, TraktorTheme::LOOP_ACTIVE()));
         }
     }
 
@@ -484,7 +484,7 @@ pub fn scrolling_waveform(
             Pos2::new(center_x, rect.top()),
             Pos2::new(center_x, rect.bottom()),
         ],
-        Stroke::new(1.5_f32, TraktorTheme::WAVEFORM_PLAYHEAD),
+        Stroke::new(1.5_f32, TraktorTheme::WAVEFORM_PLAYHEAD()),
     );
 
     // Optional Subtle Deck Letter on Left Edge (used in Parallel layout)
@@ -497,7 +497,7 @@ pub fn scrolling_waveform(
             egui::Align2::CENTER_CENTER,
             badge_txt,
             egui::FontId::proportional(11.0),
-            TraktorTheme::TEXT_PRIMARY,
+            TraktorTheme::TEXT_PRIMARY(),
         );
     }
 
@@ -546,9 +546,9 @@ pub fn scrolling_stem_waveforms(
     }
 
     let painter = ui.painter();
-    painter.rect_filled(wave_rect, 1.0, TraktorTheme::WAVEFORM_BG);
+    painter.rect_filled(wave_rect, 1.0, TraktorTheme::WAVEFORM_BG());
     painter.rect_filled(header_rect, 1.0, Color32::from_rgb(48, 51, 56));
-    painter.rect_stroke(rect, 1.0, Stroke::new(1.0_f32, TraktorTheme::BORDER_COLOR));
+    painter.rect_stroke(rect, 1.0, Stroke::new(1.0_f32, TraktorTheme::BORDER_COLOR()));
 
     let center_x = wave_rect.center().x;
     let pixels_per_sec = 92.0_f32;
@@ -585,7 +585,7 @@ pub fn scrolling_stem_waveforms(
                 0.0,
                 Color32::from_rgba_unmultiplied(114, 182, 102, 24),
             );
-            painter.rect_stroke(loop_rect, 0.0, Stroke::new(1.0_f32, TraktorTheme::LOOP_ACTIVE));
+            painter.rect_stroke(loop_rect, 0.0, Stroke::new(1.0_f32, TraktorTheme::LOOP_ACTIVE()));
         }
     }
 
@@ -689,7 +689,7 @@ pub fn scrolling_stem_waveforms(
             Pos2::new(center_x, wave_rect.top()),
             Pos2::new(center_x, wave_rect.bottom()),
         ],
-        Stroke::new(1.5_f32, TraktorTheme::WAVEFORM_PLAYHEAD),
+        Stroke::new(1.5_f32, TraktorTheme::WAVEFORM_PLAYHEAD()),
     );
 
     // 5. Left Stem Header Column (DRUMS / BASS / OTHER / VOCALS + Mini Knob/Mute Indicators)
@@ -698,7 +698,7 @@ pub fn scrolling_stem_waveforms(
             Pos2::new(header_rect.right(), header_rect.top()),
             Pos2::new(header_rect.right(), header_rect.bottom()),
         ],
-        Stroke::new(1.0_f32, TraktorTheme::BORDER_COLOR),
+        Stroke::new(1.0_f32, TraktorTheme::BORDER_COLOR()),
     );
 
     for lane in 0..4 {
@@ -713,9 +713,9 @@ pub fn scrolling_stem_waveforms(
 
         let muted = stem_muted[lane];
         let text_col = if muted {
-            TraktorTheme::TEXT_MUTED
+            TraktorTheme::TEXT_MUTED()
         } else {
-            TraktorTheme::TEXT_PRIMARY
+            TraktorTheme::TEXT_PRIMARY()
         };
         painter.text(
             Pos2::new(header_rect.left() + 6.0, lane_cy),
@@ -755,7 +755,7 @@ pub fn scrolling_stem_waveforms(
         painter.circle_stroke(
             ring2_c,
             ring_r,
-            Stroke::new(1.1_f32, TraktorTheme::DECK_B),
+            Stroke::new(1.1_f32, TraktorTheme::DECK_B()),
         );
     }
 
@@ -793,7 +793,7 @@ pub fn stripe_overview(
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
         painter.rect_filled(rect, 1.0, Color32::from_rgb(28, 30, 33));
-        painter.rect_stroke(rect, 1.0, Stroke::new(1.0_f32, TraktorTheme::BORDER_COLOR));
+        painter.rect_stroke(rect, 1.0, Stroke::new(1.0_f32, TraktorTheme::BORDER_COLOR()));
 
         let norm_pos = (*elapsed_sec / total).clamp(0.0, 1.0) as f32;
         let scrub_x = rect.left() + norm_pos * rect.width();
@@ -861,7 +861,7 @@ pub fn stripe_overview(
                 1.0,
                 Color32::from_rgba_unmultiplied(114, 182, 102, 35),
             );
-            painter.rect_stroke(loop_rect, 1.0, Stroke::new(1.0_f32, TraktorTheme::LOOP_ACTIVE));
+            painter.rect_stroke(loop_rect, 1.0, Stroke::new(1.0_f32, TraktorTheme::LOOP_ACTIVE()));
         }
 
         // Translucent Playhead Window Box + Red Center Hairline (matching Traktor Pro 4 stripe)
@@ -877,7 +877,7 @@ pub fn stripe_overview(
         );
         painter.line_segment(
             [Pos2::new(scrub_x, rect.top()), Pos2::new(scrub_x, rect.bottom())],
-            Stroke::new(1.5_f32, TraktorTheme::WAVEFORM_PLAYHEAD),
+            Stroke::new(1.5_f32, TraktorTheme::WAVEFORM_PLAYHEAD()),
         );
     }
 
@@ -892,7 +892,7 @@ pub fn cue_pad(ui: &mut Ui, index: usize, has_cue: bool, active: bool, width: f3
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
         let bg = if active {
-            TraktorTheme::DECK_A
+            TraktorTheme::DECK_A()
         } else if has_cue {
             Color32::from_rgb(64, 68, 74)
         } else {
@@ -900,7 +900,7 @@ pub fn cue_pad(ui: &mut Ui, index: usize, has_cue: bool, active: bool, width: f3
         };
 
         painter.rect_filled(rect, 1.0, bg);
-        painter.rect_stroke(rect, 1.0, Stroke::new(0.8_f32, TraktorTheme::BORDER_COLOR));
+        painter.rect_stroke(rect, 1.0, Stroke::new(0.8_f32, TraktorTheme::BORDER_COLOR()));
 
         // Subtle bottom accent bar when a cue/state is stored
         if has_cue {
@@ -915,9 +915,9 @@ pub fn cue_pad(ui: &mut Ui, index: usize, has_cue: bool, active: bool, width: f3
         let text_color = if active {
             Color32::BLACK
         } else if has_cue {
-            TraktorTheme::TEXT_PRIMARY
+            TraktorTheme::TEXT_PRIMARY()
         } else {
-            TraktorTheme::TEXT_MUTED
+            TraktorTheme::TEXT_MUTED()
         };
 
         painter.text(
@@ -1007,14 +1007,14 @@ pub fn deck_transport_bar(
         ui.spacing_mut().item_spacing = Vec2::new(3.0, 0.0);
 
         let play_color = if is_playing {
-            TraktorTheme::PLAY_ACTIVE
+            TraktorTheme::PLAY_ACTIVE()
         } else {
-            TraktorTheme::PLAY_INACTIVE
+            TraktorTheme::PLAY_INACTIVE()
         };
         let play_text_color = if is_playing {
             Color32::BLACK
         } else {
-            TraktorTheme::TEXT_PRIMARY
+            TraktorTheme::TEXT_PRIMARY()
         };
         let play_icon = if is_playing { Icon::Pause } else { Icon::Play };
         if icon_button(ui, play_icon, "", play_color, play_text_color, Vec2::new(34.0, 22.0))
@@ -1028,12 +1028,12 @@ pub fn deck_transport_bar(
             .add(
                 egui::Button::new(
                     RichText::new("CUE")
-                        .color(TraktorTheme::TEXT_PRIMARY)
+                        .color(TraktorTheme::TEXT_PRIMARY())
                         .font(egui::FontId::monospace(9.5))
                         .strong(),
                 )
-                .fill(TraktorTheme::CUE_INACTIVE)
-                .stroke(Stroke::new(0.5_f32, TraktorTheme::BORDER_COLOR))
+                .fill(TraktorTheme::CUE_INACTIVE())
+                .stroke(Stroke::new(0.5_f32, TraktorTheme::BORDER_COLOR()))
                 .min_size(Vec2::new(34.0, 22.0)),
             )
             .on_hover_text("Jump to Cue 1")
@@ -1046,11 +1046,11 @@ pub fn deck_transport_bar(
             .add(
                 egui::Button::new(
                     RichText::new("CUP")
-                        .color(TraktorTheme::TEXT_SECONDARY)
+                        .color(TraktorTheme::TEXT_SECONDARY())
                         .font(egui::FontId::monospace(9.0)),
                 )
-                .fill(TraktorTheme::CUE_INACTIVE)
-                .stroke(Stroke::new(0.5_f32, TraktorTheme::BORDER_COLOR))
+                .fill(TraktorTheme::CUE_INACTIVE())
+                .stroke(Stroke::new(0.5_f32, TraktorTheme::BORDER_COLOR()))
                 .min_size(Vec2::new(32.0, 22.0)),
             )
             .on_hover_text("Cue Play (Jump to Cue 1 & Play)")
@@ -1066,17 +1066,17 @@ pub fn deck_transport_bar(
                         .color(if flux_active {
                             Color32::BLACK
                         } else {
-                            TraktorTheme::TEXT_SECONDARY
+                            TraktorTheme::TEXT_SECONDARY()
                         })
                         .font(egui::FontId::monospace(9.0))
                         .strong(),
                 )
                 .fill(if flux_active {
-                    TraktorTheme::FLUX_ACTIVE
+                    TraktorTheme::FLUX_ACTIVE()
                 } else {
-                    TraktorTheme::CUE_INACTIVE
+                    TraktorTheme::CUE_INACTIVE()
                 })
-                .stroke(Stroke::new(0.5_f32, TraktorTheme::BORDER_COLOR))
+                .stroke(Stroke::new(0.5_f32, TraktorTheme::BORDER_COLOR()))
                 .min_size(Vec2::new(30.0, 22.0)),
             )
             .on_hover_text("Toggle Flux / Slip Mode")
@@ -1088,7 +1088,7 @@ pub fn deck_transport_bar(
         ui.separator();
 
         let chevron_fill = Color32::from_rgb(48, 51, 57);
-        if icon_button(ui, Icon::Prev, "", chevron_fill, TraktorTheme::TEXT_SECONDARY, Vec2::new(18.0, 22.0))
+        if icon_button(ui, Icon::Prev, "", chevron_fill, TraktorTheme::TEXT_SECONDARY(), Vec2::new(18.0, 22.0))
             .on_hover_text("Halve loop length")
             .clicked()
         {
@@ -1101,7 +1101,7 @@ pub fn deck_transport_bar(
             let is_selected_size = current_loop_beats == beats;
             let is_active_loop = loop_active && is_selected_size;
             let fill = if is_active_loop {
-                TraktorTheme::LOOP_ACTIVE
+                TraktorTheme::LOOP_ACTIVE()
             } else if is_selected_size {
                 Color32::from_rgb(64, 68, 76)
             } else {
@@ -1110,9 +1110,9 @@ pub fn deck_transport_bar(
             let fg = if is_active_loop {
                 Color32::BLACK
             } else if is_selected_size {
-                TraktorTheme::LOOP_ACTIVE
+                TraktorTheme::LOOP_ACTIVE()
             } else {
-                TraktorTheme::TEXT_SECONDARY
+                TraktorTheme::TEXT_SECONDARY()
             };
             if ui
                 .add(
@@ -1132,7 +1132,7 @@ pub fn deck_transport_bar(
             }
         }
 
-        if icon_button(ui, Icon::Next, "", chevron_fill, TraktorTheme::TEXT_SECONDARY, Vec2::new(18.0, 22.0))
+        if icon_button(ui, Icon::Next, "", chevron_fill, TraktorTheme::TEXT_SECONDARY(), Vec2::new(18.0, 22.0))
             .on_hover_text("Double loop length")
             .clicked()
         {
@@ -1157,7 +1157,7 @@ pub fn render_shortcuts_hud(ctx: &egui::Context, is_open: &mut bool) {
         .frame(
             egui::Frame::window(&ctx.style())
                 .fill(Color32::from_rgb(26, 28, 32))
-                .stroke(Stroke::new(1.0_f32, TraktorTheme::BORDER_ACCENT))
+                .stroke(Stroke::new(1.0_f32, TraktorTheme::BORDER_ACCENT()))
                 .rounding(6.0)
                 .inner_margin(16.0),
         )
@@ -1165,14 +1165,14 @@ pub fn render_shortcuts_hud(ctx: &egui::Context, is_open: &mut bool) {
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new("LIVE PERFORMANCE SHORTCUTS")
-                        .color(TraktorTheme::TEXT_PRIMARY)
+                        .color(TraktorTheme::TEXT_PRIMARY())
                         .font(egui::FontId::monospace(14.0))
                         .strong(),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
                         RichText::new("Press Esc or ? to close")
-                            .color(TraktorTheme::TEXT_MUTED)
+                            .color(TraktorTheme::TEXT_MUTED())
                             .font(egui::FontId::proportional(11.0)),
                     );
                 });
@@ -1184,17 +1184,17 @@ pub fn render_shortcuts_hud(ctx: &egui::Context, is_open: &mut bool) {
             ui.columns(3, |cols| {
                 // Column 1: Deck A & Deck B Transports
                 cols[0].vertical(|ui| {
-                    ui.label(RichText::new("DECK A (Primary Left)").color(TraktorTheme::DECK_A).strong());
+                    ui.label(RichText::new("DECK A (Primary Left)").color(TraktorTheme::DECK_A()).strong());
                     ui.add_space(4.0);
                     let key_row = |ui: &mut Ui, key: &str, desc: &str| {
                         ui.horizontal(|ui| {
                             ui.label(
                                 RichText::new(format!("[ {key} ]"))
-                                    .color(TraktorTheme::PLAY_ACTIVE)
+                                    .color(TraktorTheme::PLAY_ACTIVE())
                                     .font(egui::FontId::monospace(11.0))
                                     .strong(),
                             );
-                            ui.label(RichText::new(desc).color(TraktorTheme::TEXT_PRIMARY).font(egui::FontId::proportional(11.5)));
+                            ui.label(RichText::new(desc).color(TraktorTheme::TEXT_PRIMARY()).font(egui::FontId::proportional(11.5)));
                         });
                     };
                     key_row(ui, "Space", "Play / Pause Deck A");
@@ -1203,7 +1203,7 @@ pub fn render_shortcuts_hud(ctx: &egui::Context, is_open: &mut bool) {
                     key_row(ui, "1..4", "Hotcues 1 to 4");
 
                     ui.add_space(12.0);
-                    ui.label(RichText::new("DECK B (Primary Right)").color(TraktorTheme::DECK_B).strong());
+                    ui.label(RichText::new("DECK B (Primary Right)").color(TraktorTheme::DECK_B()).strong());
                     ui.add_space(4.0);
                     key_row(ui, "Shift+Space", "Play / Pause Deck B");
                     key_row(ui, "Shift+C", "Cue Deck B");
@@ -1213,7 +1213,7 @@ pub fn render_shortcuts_hud(ctx: &egui::Context, is_open: &mut bool) {
 
                 // Column 2: Workspace Layouts
                 cols[1].vertical(|ui| {
-                    ui.label(RichText::new("WORKSPACE LAYOUTS").color(TraktorTheme::TEXT_PRIMARY).strong());
+                    ui.label(RichText::new("WORKSPACE LAYOUTS").color(TraktorTheme::TEXT_PRIMARY()).strong());
                     ui.add_space(4.0);
                     let layout_row = |ui: &mut Ui, key: &str, desc: &str| {
                         ui.horizontal(|ui| {
@@ -1223,7 +1223,7 @@ pub fn render_shortcuts_hud(ctx: &egui::Context, is_open: &mut bool) {
                                     .font(egui::FontId::monospace(11.0))
                                     .strong(),
                             );
-                            ui.label(RichText::new(desc).color(TraktorTheme::TEXT_PRIMARY).font(egui::FontId::proportional(11.5)));
+                            ui.label(RichText::new(desc).color(TraktorTheme::TEXT_PRIMARY()).font(egui::FontId::proportional(11.5)));
                         });
                     };
                     layout_row(ui, "F1", "Parallel Full Waveforms");
@@ -1236,7 +1236,7 @@ pub fn render_shortcuts_hud(ctx: &egui::Context, is_open: &mut bool) {
 
                 // Column 3: Mixer, FX & Stems
                 cols[2].vertical(|ui| {
-                    ui.label(RichText::new("SYSTEM & STEMS").color(TraktorTheme::TEXT_PRIMARY).strong());
+                    ui.label(RichText::new("SYSTEM & STEMS").color(TraktorTheme::TEXT_PRIMARY()).strong());
                     ui.add_space(4.0);
                     let sys_row = |ui: &mut Ui, key: &str, desc: &str| {
                         ui.horizontal(|ui| {
@@ -1246,7 +1246,7 @@ pub fn render_shortcuts_hud(ctx: &egui::Context, is_open: &mut bool) {
                                     .font(egui::FontId::monospace(11.0))
                                     .strong(),
                             );
-                            ui.label(RichText::new(desc).color(TraktorTheme::TEXT_PRIMARY).font(egui::FontId::proportional(11.5)));
+                            ui.label(RichText::new(desc).color(TraktorTheme::TEXT_PRIMARY()).font(egui::FontId::proportional(11.5)));
                         });
                     };
                     sys_row(ui, "Cmd / Ctrl + ,", "Preferences & Setup");
@@ -1263,7 +1263,7 @@ pub fn render_shortcuts_hud(ctx: &egui::Context, is_open: &mut bool) {
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new("💡 Pro Tip: Hardware USB DJ controllers (Traktor Kontrol / MX2) operate at 1000 Hz alongside keyboard shortcuts.")
-                        .color(TraktorTheme::TEXT_MUTED)
+                        .color(TraktorTheme::TEXT_MUTED())
                         .font(egui::FontId::proportional(11.0)),
                 );
             });

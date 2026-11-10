@@ -35,12 +35,7 @@ fn main() -> eframe::Result<()> {
         "ReTraktor",
         native_options,
         Box::new(|cc| {
-            // Symbols like ▲ ▾ ● live only in the monospace font; let proportional text fall back to it.
-            let mut fonts = egui::FontDefinitions::default();
-            if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
-                family.push("Hack".to_owned());
-            }
-            cc.egui_ctx.set_fonts(fonts);
+            theme::install_fonts(&cc.egui_ctx);
             Ok(Box::new(ReTraktorApp::default()))
         }),
     )

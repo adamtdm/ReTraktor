@@ -1360,8 +1360,8 @@ impl LibraryManager {
         let resp = ui
             .with_layout(Layout::top_down(Align::Min), |ui| {
                 ui.add(
-                    egui::Button::new(RichText::new(label).size(12.0).color(if selected { Color32::WHITE } else { TraktorTheme::TEXT_PRIMARY }))
-                        .fill(if selected { TraktorTheme::ROW_SELECTED } else { Color32::TRANSPARENT })
+                    egui::Button::new(RichText::new(label).size(12.0).color(if selected { Color32::WHITE } else { TraktorTheme::TEXT_PRIMARY() }))
+                        .fill(if selected { TraktorTheme::ROW_SELECTED() } else { Color32::TRANSPARENT })
                         .stroke(Stroke::NONE)
                         .wrap_mode(egui::TextWrapMode::Truncate)
                         .min_size(egui::vec2(ui.available_width(), 22.0)),
@@ -1374,7 +1374,7 @@ impl LibraryManager {
         }
         if let Some(target) = drop_target {
             if resp.dnd_hover_payload::<DragTracks>().is_some() {
-                ui.painter().rect_stroke(resp.rect, 3.0, Stroke::new(1.5_f32, TraktorTheme::DECK_A));
+                ui.painter().rect_stroke(resp.rect, 3.0, Stroke::new(1.5_f32, TraktorTheme::DECK_A()));
             }
             if let Some(p) = resp.dnd_release_payload::<DragTracks>() {
                 self.add_to_playlist(&p.0, target);
@@ -1399,7 +1399,7 @@ impl LibraryManager {
 
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                ui.label(RichText::new("PLAYLISTS").size(10.5).color(TraktorTheme::TEXT_MUTED));
+                ui.label(RichText::new("PLAYLISTS").size(10.5).color(TraktorTheme::TEXT_MUTED()));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui.small_button("+").on_hover_text("New playlist (or drop tracks here)").clicked() {
                         self.add_to_playlist(&[], None);
@@ -1482,16 +1482,16 @@ impl LibraryManager {
             ui.horizontal(|ui| {
                 if self.is_busy() {
                     ui.spinner();
-                    ui.label(RichText::new(&self.job_status).size(11.0).color(TraktorTheme::TEXT_SECONDARY));
+                    ui.label(RichText::new(&self.job_status).size(11.0).color(TraktorTheme::TEXT_SECONDARY()));
                 }
                 let tip = self.history.is_empty() && !self.tracks.is_empty() && self.status_message.is_empty();
                 let msg = if tip { "Double-click a track, or drag it onto a deck, to load it." } else { self.status_message.as_str() };
-                ui.label(RichText::new(msg).size(12.0).color(TraktorTheme::TEXT_PRIMARY));
+                ui.label(RichText::new(msg).size(12.0).color(TraktorTheme::TEXT_PRIMARY()));
                 if self.undo.is_some() && ui.small_button("Undo").on_hover_text("Ctrl+Z").clicked() {
                     self.undo();
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(RichText::new(format!("{} shown", self.view.len())).size(11.0).color(TraktorTheme::TEXT_MUTED));
+                    ui.label(RichText::new(format!("{} shown", self.view.len())).size(11.0).color(TraktorTheme::TEXT_MUTED()));
                 });
             });
         });
@@ -1507,7 +1507,7 @@ impl LibraryManager {
                     self.show_missing_banner(ui, music_folders);
                 }
                 if self.selected_nav == NavItem::Suggestions && self.deck_tracks[0].is_none() {
-                    ui.label(RichText::new("Load a track on deck A to see matching tracks.").color(TraktorTheme::TEXT_SECONDARY));
+                    ui.label(RichText::new("Load a track on deck A to see matching tracks.").color(TraktorTheme::TEXT_SECONDARY()));
                 }
                 self.ensure_view();
                 self.show_table(ui, columns, locked, deck_count, four_deck_mode);
@@ -1532,7 +1532,7 @@ impl LibraryManager {
         egui::Frame::none().fill(Color32::from_rgb(52, 36, 34)).rounding(4.0).inner_margin(egui::Margin::symmetric(10.0, 8.0)).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                ui.label(RichText::new(format!("{} can't be found where they were saved.", plural(missing))).size(12.5).color(TraktorTheme::TEXT_PRIMARY));
+                ui.label(RichText::new(format!("{} can't be found where they were saved.", plural(missing))).size(12.5).color(TraktorTheme::TEXT_PRIMARY()));
                 if ui.add_enabled(!busy, egui::Button::new("Search another folder…")).on_hover_text("Pick the folder they moved to").clicked() {
                     self.pick(Pick::RelocateFolder);
                 }
@@ -1601,12 +1601,12 @@ impl LibraryManager {
         }
         let home = env::var("HOME").unwrap_or_default();
         let pretty = |p: &Path| p.display().to_string().replacen(&home, "~", 1);
-        let muted = TraktorTheme::TEXT_SECONDARY;
+        let muted = TraktorTheme::TEXT_SECONDARY();
         let column_w = 340.0;
 
         ui.add_space(36.0);
         ui.vertical_centered(|ui| {
-            ui.label(RichText::new("Set up your library").size(22.0).color(TraktorTheme::TEXT_PRIMARY));
+            ui.label(RichText::new("Set up your library").size(22.0).color(TraktorTheme::TEXT_PRIMARY()));
             ui.add_space(4.0);
             ui.label(RichText::new("Start from your Traktor collection, a music folder, or both.").size(13.0).color(muted));
         });
@@ -1617,7 +1617,7 @@ impl LibraryManager {
             ui.add_space(((ui.available_width() - total_w) / 2.0).max(0.0));
             ui.allocate_ui_with_layout(egui::vec2(column_w, 260.0), Layout::top_down(Align::Min), |ui| {
                 ui.set_width(column_w);
-                ui.label(RichText::new("Import from Traktor").size(15.0).strong().color(TraktorTheme::TEXT_PRIMARY));
+                ui.label(RichText::new("Import from Traktor").size(15.0).strong().color(TraktorTheme::TEXT_PRIMARY()));
                 ui.label(RichText::new("Brings across cue points, beatgrids, ratings and playlists. Your Traktor files aren't changed.").size(12.0).color(muted));
                 ui.add_space(12.0);
                 let found = self.detected.clone().unwrap_or_default();
@@ -1646,7 +1646,7 @@ impl LibraryManager {
             ui.add_space(40.0);
             ui.allocate_ui_with_layout(egui::vec2(column_w, 260.0), Layout::top_down(Align::Min), |ui| {
                 ui.set_width(column_w);
-                ui.label(RichText::new("Add your music").size(15.0).strong().color(TraktorTheme::TEXT_PRIMARY));
+                ui.label(RichText::new("Add your music").size(15.0).strong().color(TraktorTheme::TEXT_PRIMARY()));
                 ui.label(RichText::new("ReTraktor reads each file's tags and keeps watching these folders for new tracks.").size(12.0).color(muted));
                 ui.add_space(12.0);
                 for p in music_folders.clone() {
@@ -1668,7 +1668,7 @@ impl LibraryManager {
         ui.add_space(20.0);
         ui.vertical_centered(|ui| match &mut self.typed_path {
             None => {
-                if ui.add(egui::Label::new(RichText::new("No file dialog appeared? Type a path instead").size(11.5).color(TraktorTheme::TEXT_MUTED).underline()).sense(Sense::click())).clicked() {
+                if ui.add(egui::Label::new(RichText::new("No file dialog appeared? Type a path instead").size(11.5).color(TraktorTheme::TEXT_MUTED()).underline()).sense(Sense::click())).clicked() {
                     self.typed_path = Some(String::new());
                 }
             }
@@ -1719,11 +1719,11 @@ impl LibraryManager {
     }
 
     fn cell_text(t: &UiTrackEntry, col: SortColumn, row: usize, score: f32) -> RichText {
-        let dim = TraktorTheme::TEXT_SECONDARY;
+        let dim = TraktorTheme::TEXT_SECONDARY();
         let txt = |s: String| RichText::new(s).size(12.0);
         match col {
-            SortColumn::Order => txt((row + 1).to_string()).color(TraktorTheme::TEXT_MUTED),
-            SortColumn::Title => txt(t.title.clone()).color(if t.missing { Color32::from_rgb(200, 90, 80) } else { TraktorTheme::TEXT_PRIMARY }),
+            SortColumn::Order => txt((row + 1).to_string()).color(TraktorTheme::TEXT_MUTED()),
+            SortColumn::Title => txt(t.title.clone()).color(if t.missing { Color32::from_rgb(200, 90, 80) } else { TraktorTheme::TEXT_PRIMARY() }),
             SortColumn::Artist => txt(t.artist.clone()),
             SortColumn::Album => txt(t.album.clone()).color(dim),
             SortColumn::Bpm if t.bpm > 0.0 => txt(format!("{:.1}", t.bpm)).monospace(),
@@ -1746,9 +1746,9 @@ impl LibraryManager {
             SortColumn::Year => txt(t.year.clone()).color(dim),
             SortColumn::Bitrate if t.bitrate_kbps > 0 => txt(t.bitrate_kbps.to_string()).monospace().color(dim),
             SortColumn::Format => txt(t.format.clone()).color(dim),
-            SortColumn::Stems if t.stems_ready => txt("S".to_string()).strong().color(TraktorTheme::DECK_A),
-            SortColumn::Match => txt(format!("{:.0}%", score * 100.0)).monospace().color(TraktorTheme::DECK_A),
-            _ => txt("–".to_string()).color(TraktorTheme::TEXT_MUTED),
+            SortColumn::Stems if t.stems_ready => txt("S".to_string()).strong().color(TraktorTheme::DECK_A()),
+            SortColumn::Match => txt(format!("{:.0}%", score * 100.0)).monospace().color(TraktorTheme::DECK_A()),
+            _ => txt("–".to_string()).color(TraktorTheme::TEXT_MUTED()),
         }
     }
 
@@ -1812,7 +1812,7 @@ impl LibraryManager {
                 for &c in &cols {
                     header.col(|ui| {
                         let arrow = if c == sort_col { if sort_asc { " ▲" } else { " ▼" } } else { "" };
-                        let r = ui.add(egui::Label::new(RichText::new(format!("{}{arrow}", c.header())).size(11.0).strong().color(TraktorTheme::TEXT_SECONDARY)).sense(Sense::click()));
+                        let r = ui.add(egui::Label::new(RichText::new(format!("{}{arrow}", c.header())).size(11.0).strong().color(TraktorTheme::TEXT_SECONDARY())).sense(Sense::click()));
                         if r.clicked() {
                             actions.push(Action::Sort(c));
                         }
@@ -1955,7 +1955,7 @@ impl LibraryManager {
                 ui.end_row();
             });
             if let Some(p) = &draft.file_path {
-                ui.label(RichText::new(p.display().to_string()).size(10.5).color(TraktorTheme::TEXT_MUTED));
+                ui.label(RichText::new(p.display().to_string()).size(10.5).color(TraktorTheme::TEXT_MUTED()));
             }
             ui.horizontal(|ui| {
                 if ui.button("Save").clicked() {
@@ -2122,7 +2122,7 @@ pub fn deck_drop_target(ui: &Ui, rect: egui::Rect) -> Option<usize> {
     if !egui::DragAndDrop::has_payload_of_type::<DragTracks>(ui.ctx()) || !ui.rect_contains_pointer(rect) {
         return None;
     }
-    ui.painter().rect_stroke(rect.shrink(1.0), 4.0, Stroke::new(2.0_f32, TraktorTheme::DECK_A));
+    ui.painter().rect_stroke(rect.shrink(1.0), 4.0, Stroke::new(2.0_f32, TraktorTheme::DECK_A()));
     if ui.input(|i| i.pointer.any_released()) {
         return egui::DragAndDrop::take_payload::<DragTracks>(ui.ctx()).and_then(|p| p.0.first().copied());
     }
