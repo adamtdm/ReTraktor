@@ -368,9 +368,13 @@ fn paint_3band_waveform(
     style: crate::theme::WaveformStyle,
     max_dot_cols: usize,
     max_dot_half_rows: usize,
+    scroll_px: f64,
     sample_at_x: impl Fn(f32) -> Option<(f32, f32, f32)>,
 ) {
     use crate::theme::WaveformStyle;
+    // Columns sit on fixed track positions and glide with the audio; screen-fixed columns shimmer.
+    let shift = |pitch: f32| scroll_px.rem_euclid(pitch as f64) as f32;
+    let painter = &painter.with_clip_rect(rect);
     let center_y = rect.center().y;
     let max_half_h = rect.height() * 0.45;
 
@@ -378,8 +382,8 @@ fn paint_3band_waveform(
         WaveformStyle::Classic => {
             let col_w = 1.5_f32;
             let cols = (rect.width() / col_w).ceil() as usize;
-            for i in 0..cols {
-                let col_x = rect.left() + (i as f32) * col_w;
+            for i in 0..cols + 2 {
+                let col_x = rect.left() + (i as f32) * col_w - shift(col_w);
                 let Some((low_amp, mid_amp, high_amp)) = sample_at_x(col_x) else { continue };
                 let (outer_col, mid_col, core_col) = spectrum_colors(low_amp, mid_amp, high_amp);
                 let total_env = low_amp.max(mid_amp * 0.92).max(high_amp * 0.85);
@@ -405,8 +409,8 @@ fn paint_3band_waveform(
                 dot_grid_metrics(rect.width(), rect.height(), max_dot_cols, max_dot_half_rows);
             let unlit = crate::theme::mix(TraktorTheme::WAVEFORM_BG(), TraktorTheme::WAVEFORM_GRID(), 0.22);
             let glow_w = (step_x * 4.5).max(18.0);
-            for c in 0..cols {
-                let col_x = rect.left() + (c as f32 + 0.5) * step_x;
+            for c in 0..cols + 2 {
+                let col_x = rect.left() + (c as f32 + 0.5) * step_x - shift(step_x);
                 let near = (1.0 - ((col_x - playhead_x).abs() / glow_w)).clamp(0.0, 1.0);
                 let sampled = sample_at_x(col_x);
                 let (lit_outer, lit_mid, lit_core, outer_col, mid_col, core_col) =
@@ -450,8 +454,8 @@ fn paint_3band_waveform(
             let rounding = bar_w * 0.5;
             let cols = (rect.width() / pitch).floor() as usize;
             let glow_w = pitch * 4.0;
-            for c in 0..cols {
-                let col_x = rect.left() + (c as f32 + 0.5) * pitch;
+            for c in 0..cols + 2 {
+                let col_x = rect.left() + (c as f32 + 0.5) * pitch - shift(pitch);
                 let Some((low, mid, high)) = sample_at_x(col_x) else { continue };
                 let (outer_col, mid_col, core_col) = spectrum_colors(low, mid, high);
                 let near = (1.0 - ((col_x - playhead_x).abs() / glow_w)).clamp(0.0, 1.0);
@@ -489,8 +493,8 @@ fn paint_3band_waveform(
             let step = 2.0_f32;
             let cols = (rect.width() / step).ceil() as usize;
             let mut prev: Option<(Pos2, Pos2, Color32)> = None;
-            for c in 0..=cols {
-                let col_x = (rect.left() + (c as f32) * step).min(rect.right());
+            for c in 0..=cols + 1 {
+                let col_x = (rect.left() + (c as f32) * step - shift(step)).min(rect.right());
                 if let Some((low, mid, high)) = sample_at_x(col_x) {
                     let (outer_col, mid_col, core_col) = spectrum_colors(low, mid, high);
                     let env = low.max(mid * 0.92).max(high * 0.85);
@@ -544,7 +548,7 @@ pub fn paint_waveform_style_preview(
         let high = (offbeat * 0.78 + 0.22 * (t * PI * 7.0).cos().abs()).clamp(0.08, 0.90);
         Some((low, mid, high))
     };
-    paint_3band_waveform(painter, rect, cx, style, 22, 4, sample_at_x);
+    paint_3band_waveform(painter, rect, cx, style, 22, 4, 0.0, sample_at_x);
     for b in 1..4 {
         let bx = rect.left() + (b as f32 / 4.0) * rect.width();
         painter.line_segment(
@@ -617,7 +621,8 @@ pub fn scrolling_waveform(
     // 2. Waveform body in active style
     let beat_len_sec = 60.0 / bpm.max(30.0);
     let style = crate::theme::waveform_style();
-    paint_3band_waveform(painter, rect, center_x, style, 120, 7, |col_x| {
+    let scroll_px = (elapsed_sec + ((rect.left() - center_x) / pixels_per_sec) as f64) * pixels_per_sec as f64;
+    paint_3band_waveform(painter, rect, center_x, style, 120, 7, scroll_px, |col_x| {
         let time_at_col = elapsed_sec + ((col_x - center_x) / pixels_per_sec) as f64;
         sample_scrolling_3band(waveform_peaks, time_at_col)
     });
@@ -791,12 +796,16 @@ pub fn scrolling_stem_waveforms(
     };
 
     let muted_col = TraktorTheme::WAVEFORM_GRID().gamma_multiply(0.4);
+    let scroll_px = (elapsed_sec + ((wave_rect.left() - center_x) / pixels_per_sec) as f64) * pixels_per_sec as f64;
+    let shift = |pitch: f32| scroll_px.rem_euclid(pitch as f64) as f32;
+    let full_painter = painter;
+    let painter = &full_painter.with_clip_rect(wave_rect);
     match crate::theme::waveform_style() {
         crate::theme::WaveformStyle::Classic => {
             let col_w = 1.5_f32;
             let cols = (wave_rect.width() / col_w).ceil() as usize;
-            for i in 0..cols {
-                let col_x = wave_rect.left() + (i as f32) * col_w;
+            for i in 0..cols + 2 {
+                let col_x = wave_rect.left() + (i as f32) * col_w - shift(col_w);
                 let Some(amps) = sample_stems_at_x(col_x) else { continue };
                 for lane in 0..4 {
                     let lane_cy = wave_rect.top() + (lane as f32 + 0.5) * lane_h;
@@ -826,8 +835,8 @@ pub fn scrolling_stem_waveforms(
                 dot_grid_metrics(wave_rect.width(), lane_h, 96, 3);
             let unlit = crate::theme::mix(TraktorTheme::WAVEFORM_BG(), TraktorTheme::WAVEFORM_GRID(), 0.22);
             let glow_w = (step_x * 4.5).max(18.0);
-            for c in 0..cols {
-                let col_x = wave_rect.left() + (c as f32 + 0.5) * step_x;
+            for c in 0..cols + 2 {
+                let col_x = wave_rect.left() + (c as f32 + 0.5) * step_x - shift(step_x);
                 let near = (1.0 - ((col_x - center_x).abs() / glow_w)).clamp(0.0, 1.0);
                 let amps = sample_stems_at_x(col_x);
                 for lane in 0..4 {
@@ -860,8 +869,8 @@ pub fn scrolling_stem_waveforms(
             let rounding = bar_w * 0.5;
             let cols = (wave_rect.width() / pitch).floor() as usize;
             let glow_w = pitch * 4.0;
-            for c in 0..cols {
-                let col_x = wave_rect.left() + (c as f32 + 0.5) * pitch;
+            for c in 0..cols + 2 {
+                let col_x = wave_rect.left() + (c as f32 + 0.5) * pitch - shift(pitch);
                 let Some(amps) = sample_stems_at_x(col_x) else { continue };
                 let near = (1.0 - ((col_x - center_x).abs() / glow_w)).clamp(0.0, 1.0);
                 for lane in 0..4 {
@@ -887,8 +896,8 @@ pub fn scrolling_stem_waveforms(
             let step = 2.0_f32;
             let cols = (wave_rect.width() / step).ceil() as usize;
             let mut prev: [Option<(Pos2, Pos2)>; 4] = [None; 4];
-            for c in 0..=cols {
-                let col_x = (wave_rect.left() + (c as f32) * step).min(wave_rect.right());
+            for c in 0..=cols + 1 {
+                let col_x = (wave_rect.left() + (c as f32) * step - shift(step)).min(wave_rect.right());
                 if let Some(amps) = sample_stems_at_x(col_x) {
                     for lane in 0..4 {
                         let lane_cy = wave_rect.top() + (lane as f32 + 0.5) * lane_h;
@@ -909,6 +918,7 @@ pub fn scrolling_stem_waveforms(
             }
         }
     }
+    let painter = full_painter;
 
     // 3. Beatgrid Lines in Waveform Area
     let beat_len_sec = 60.0 / bpm.max(30.0);
@@ -1082,7 +1092,7 @@ pub fn stripe_overview(
                 );
             }
         } else {
-            paint_3band_waveform(painter, rect, scrub_x, style, 64, 2, |col_x| {
+            paint_3band_waveform(painter, rect, scrub_x, style, 64, 2, 0.0, |col_x| {
                 if waveform_peaks.is_empty() {
                     return None;
                 }

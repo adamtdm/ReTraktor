@@ -776,6 +776,17 @@ impl LibraryManager {
         }
     }
 
+    /// Stores a deck-side beatgrid or tempo correction on the track so it survives a reload.
+    pub fn set_grid(&mut self, id: usize, offset_sec: f64, bpm: f64) {
+        let Some(t) = self.tracks.iter_mut().find(|t| t.id == id) else { return };
+        t.bpm = bpm;
+        if let Some(grid) = t.cues.iter_mut().find(|c| c.cue_type == retraktor_core::CueType::Grid) {
+            grid.start_ms = offset_sec * 1000.0;
+            grid.grid_bpm = Some(bpm);
+        }
+        self.touch();
+    }
+
     fn touch(&mut self) {
         self.version += 1;
         self.dirty_since = Some(Instant::now());
@@ -1901,7 +1912,8 @@ impl LibraryManager {
                         actions.push(Action::Select(t.id, ui_modifiers(&resp)));
                     }
                     if resp.double_clicked() {
-                        actions.push(Action::LoadAuto(t.id));
+                        // Shift sends it to deck B; plain double-click takes the first free deck.
+                        actions.push(if ui_modifiers(&resp).shift { Action::Load(2, t.id) } else { Action::LoadAuto(t.id) });
                     }
                     if resp.drag_started() {
                         resp.dnd_set_drag_payload(DragTracks(self.selected_or(t.id)));

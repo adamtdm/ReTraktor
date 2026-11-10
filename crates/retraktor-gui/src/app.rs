@@ -1550,6 +1550,19 @@ impl ReTraktorApp {
         }
     }
 
+    /// Shifts a loaded track's beatgrid and/or scales its tempo, on the deck and in the library entry.
+    fn adjust_deck_grid(&mut self, d: usize, shift_sec: f64, bpm_factor: f64) {
+        let Ok(mut state) = self.audio.shared.lock() else { return };
+        let Some(t) = state.loaded_tracks[d].as_mut() else { return };
+        t.grid_offset_sec += shift_sec;
+        t.bpm = (t.bpm * bpm_factor).clamp(20.0, 400.0);
+        let (offset, bpm) = (t.grid_offset_sec, t.bpm);
+        drop(state);
+        if let Some(id) = self.deck_track_ids[d] {
+            self.library.set_grid(id, offset, bpm);
+        }
+    }
+
     fn toggle_loop(&mut self, deck_idx: usize) {
         let d = deck_idx - 1;
         self.deck_loop_active[d] = !self.deck_loop_active[d];
@@ -1631,15 +1644,13 @@ impl ReTraktorApp {
                     self.deck_strip(ui, 1);
                     ui.separator();
 
-                    if ui
-                        .add(egui::Button::new(RichText::new("⚙").size(14.0)).min_size(Vec2::new(26.0, HIT)))
+                    if pill(ui, if roomy { "SETUP" } else { "SET" }, self.preferences.is_open, TraktorTheme::ROW_SELECTED(), 0.0)
                         .on_hover_text("Preferences (Ctrl+,)")
                         .clicked()
                     {
                         self.preferences.is_open = !self.preferences.is_open;
                     }
-                    if ui
-                        .add(egui::Button::new(RichText::new("?").size(13.0)).min_size(Vec2::new(24.0, HIT)))
+                    if pill(ui, "KEYS", self.show_shortcuts_hud, TraktorTheme::ROW_SELECTED(), 0.0)
                         .on_hover_text("Keyboard shortcuts (?)")
                         .clicked()
                     {
@@ -2278,8 +2289,8 @@ impl ReTraktorApp {
                 self.stem_buttons(ui, d);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let expanded = self.deck_expanded[d];
-                    if pill(ui, "MORE", expanded, TraktorTheme::ROW_SELECTED(), 0.0)
-                        .on_hover_text("Hotcue pads, pad modes, cue-play, flux and every loop size")
+                    if pill(ui, "TOOLS", expanded, TraktorTheme::ROW_SELECTED(), 0.0)
+                        .on_hover_text("Track tools: create stems, fix the beatgrid or tempo, and the hotcue pads")
                         .clicked()
                     {
                         self.deck_expanded[d] = !expanded;
@@ -2415,34 +2426,44 @@ impl ReTraktorApp {
                 });
             }
 
-            // 8. Pad mode and the eight performance pads, behind "MORE".
+            // 8. Track tools and the hotcue pads, behind "TOOLS".
             if !self.deck_expanded[d] {
                 return;
             }
             ui.multiply_opacity(pads_t);
             let gap = ui.spacing().item_spacing.x;
             ui.horizontal(|ui| {
-                let w = (ui.available_width() - 3.0 * gap) / 4.0;
-                for mode in [DeckPadMode::Hotcues, DeckPadMode::Stems, DeckPadMode::Pattern, DeckPadMode::FluxLoop] {
-                    if pill(ui, mode.label(), self.deck_pad_mode[d] == mode, TraktorTheme::ROW_SELECTED(), w)
-                        .on_hover_text(match mode {
-                            DeckPadMode::Hotcues => "Pads jump to hotcues 1-8",
-                            DeckPadMode::Stems => "Pads 1-4 mute stems, pads 5-8 send them to the FX",
-                            DeckPadMode::Pattern => "Pads toggle pattern player steps",
-                            DeckPadMode::FluxLoop => "Pads hold a loop roll of 1 to 32 beats",
-                        })
-                        .clicked()
-                    {
-                        self.deck_pad_mode[d] = mode;
-                        if mode == DeckPadMode::Pattern {
-                            self.show_pattern_player = true;
-                        }
+                let shift = if d == 1 { "Shift+" } else { "" };
+                let progress = self.library.stem_job_progress.filter(|(id, _)| self.deck_track_ids[d] == Some(*id));
+                let label = match progress {
+                    Some((_, p)) => format!("STEMS {:.0}%", p * 100.0),
+                    None => "CREATE STEMS".to_string(),
+                };
+                if pill(ui, &label, progress.is_some(), TraktorTheme::ACCENT(), 0.0)
+                    .on_hover_text(format!("Separate this track into drums, bass, other and vocals with Demucs ({shift}G). Takes a few minutes; saved for next time."))
+                    .clicked()
+                    && progress.is_none()
+                {
+                    self.request_deck_stems(deck_idx);
+                }
+                ui.separator();
+                ui.label(caps("GRID"));
+                for (label, step, tip) in [("◀", -0.005, "Move the beatgrid 5 ms earlier"), ("▶", 0.005, "Move the beatgrid 5 ms later")] {
+                    if pill(ui, label, false, Color32::TRANSPARENT, HIT).on_hover_text(tip).clicked() {
+                        self.adjust_deck_grid(d, step, 1.0);
+                    }
+                }
+                ui.label(caps("BPM"));
+                for (label, factor, tip) in [("×½", 0.5, "Halve the track's tempo (analysis found double time)"), ("×2", 2.0, "Double the track's tempo (analysis found half time)")] {
+                    if pill(ui, label, false, Color32::TRANSPARENT, HIT).on_hover_text(tip).clicked() {
+                        self.adjust_deck_grid(d, 0.0, factor);
                     }
                 }
             });
             ui.horizontal(|ui| {
                 let w = (ui.available_width() - 7.0 * gap) / 8.0;
-                let mode = self.deck_pad_mode[d];
+                // Always hotcues on screen; the other pad modes belong to the hardware pads.
+                let mode = DeckPadMode::Hotcues;
                 for i in 1..=8usize {
                     let (lit, fill, tip) = match mode {
                         DeckPadMode::Hotcues => (
