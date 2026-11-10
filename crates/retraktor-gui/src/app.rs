@@ -582,6 +582,12 @@ impl ReTraktorApp {
             "stemsA" => self.deck_stem_view[0] = true,
             "pattern" => self.show_pattern_player = true,
             "help" => self.show_shortcuts_hud = true,
+            // Held mid-animation so a still can show it.
+            s if s.starts_with("cheer:") => {
+                let cheer_index = s[6..].parse().unwrap_or(0);
+                self.active_cheer = Some(dot::ActiveCheer { deck: 1, cheer_index, start_sec: ctx.input(|i| i.time) - 0.7 });
+            }
+            "muteA" if first => self.deck_stem_muted[0][0] ^= true,
             "relocate" if first => self.library.start_relocate(self.preferences.music_folders.clone()),
             _ => {}
         }
