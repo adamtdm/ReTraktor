@@ -1,11 +1,11 @@
-use crate::audio::{AudioSystem, LoadedTrackAudio};
+use crate::audio::{AudioSystem, LoadedTrackAudio, PEAKS_PER_SEC};
+use crate::dot;
 use crate::library_ui::LibraryManager;
 use crate::preferences::{PreferencesDialog, PrefsTab};
 use crate::theme::TraktorTheme;
 use crate::widgets::{
     crossfader, deck_transport_bar, icon_button, render_shortcuts_hud, rotary_knob_sized,
-    scrolling_stem_waveforms, scrolling_waveform, stripe_overview, vertical_fader, vu_meter, Icon,
-    TransportAction,
+    scrolling_stem_waveforms, scrolling_waveform, stripe_overview, Icon, TransportAction,
 };
 use eframe::egui::{self, Align, Color32, Key, Layout, RichText, Sense, Stroke, Ui, Vec2};
 use retraktor_core::{PropValue, PropertyBus, SurfaceEvent};
@@ -116,6 +116,7 @@ pub struct ReTraktorApp {
     pub deck_stem_muted: [[bool; 4]; 4],
     pub deck_stem_fx_send: [[bool; 4]; 4],
     pub deck_stem_view: [bool; 4],
+    pub deck_track_ids: [Option<usize>; 4],
     /// Per-deck "More": hotcue pads, pad modes, cue-play, flux and all loop sizes.
     pub deck_expanded: [bool; 4],
     /// Switched from Browser to Mix after the first track load.
@@ -237,6 +238,7 @@ impl Default for ReTraktorApp {
             deck_stem_fx_send: [[false; 4]; 4],
             deck_stem_view: [false, false, false, false],
             deck_expanded: [false; 4],
+            deck_track_ids: [None; 4],
             first_load_done: false,
             show_pattern_player: false,
             pattern_enabled: false,
@@ -469,7 +471,9 @@ impl eframe::App for ReTraktorApp {
                         }
                     });
                     for d in 0..4 {
-                        self.deck_stem_view[d] = true;
+                        if self.deck_track_ids[d] == Some(track_id) {
+                            self.deck_stem_view[d] = true;
+                        }
                     }
                 }
                 *self.demucs.separation_status.lock().unwrap() = crate::demucs::DemucsSeparationStatus::Idle;
@@ -680,6 +684,7 @@ impl ReTraktorApp {
         }
         for (deck_idx, track) in std::mem::take(&mut self.library.pending_loads) {
             let d = (deck_idx - 1).min(3);
+            self.deck_track_ids[d] = Some(track.id);
             let shared_audio = self.audio.shared.clone();
             let library_tx = library_tx.clone();
             thread::spawn(move || {
@@ -1372,26 +1377,129 @@ impl ReTraktorApp {
             }
         }
 
-        // Only process single-key deck shortcuts when not typing in a text field
-        if !ctx.wants_keyboard_input() {
-            if ctx.input(|i| !i.modifiers.shift && i.key_pressed(Key::Space)) {
-                self.toggle_play(1);
-            }
-            if ctx.input(|i| i.modifiers.shift && i.key_pressed(Key::Space)) {
-                self.toggle_play(2);
-            }
-            if ctx.input(|i| !i.modifiers.shift && i.key_pressed(Key::C)) {
-                self.jump_to_cue(1, 1);
-            }
-            if ctx.input(|i| i.modifiers.shift && i.key_pressed(Key::C)) {
-                self.jump_to_cue(2, 1);
-            }
-            if ctx.input(|i| !i.modifiers.shift && i.key_pressed(Key::S)) {
-                self.sync_deck(1);
-            }
-            if ctx.input(|i| i.modifiers.shift && i.key_pressed(Key::S)) {
-                self.sync_deck(2);
-            }
+        // Only process single-key deck and mixer shortcuts when not typing in a text field or in Preferences
+        if !ctx.wants_keyboard_input() && !self.preferences.is_open {
+            ctx.input(|i| {
+                if i.modifiers.command || i.modifiers.ctrl || i.modifiers.alt {
+                    return;
+                }
+                let shift = i.modifiers.shift;
+                let deck = if shift { 2 } else { 1 };
+                let ch = deck - 1;
+
+                if i.key_pressed(Key::Space) {
+                    self.toggle_play(deck);
+                }
+                if i.key_pressed(Key::C) {
+                    self.jump_to_cue(deck, 1);
+                }
+                if i.key_pressed(Key::S) {
+                    self.sync_deck(deck);
+                }
+                if i.key_pressed(Key::L) {
+                    self.toggle_loop(deck);
+                }
+
+                // Hotcues 1..4 on Deck A (1..4) and Deck B (5..8)
+                for (key, d_idx, cue) in [
+                    (Key::Num1, 1, 1u8),
+                    (Key::Num2, 1, 2),
+                    (Key::Num3, 1, 3),
+                    (Key::Num4, 1, 4),
+                    (Key::Num5, 2, 1),
+                    (Key::Num6, 2, 2),
+                    (Key::Num7, 2, 3),
+                    (Key::Num8, 2, 4),
+                ] {
+                    if !shift && i.key_pressed(key) {
+                        self.jump_to_cue(d_idx, cue);
+                    }
+                }
+
+                // EQ / Stems view toggle
+                if i.key_pressed(Key::T) {
+                    self.deck_stem_view[ch] = !self.deck_stem_view[ch];
+                }
+                // Create Demucs AI Stems
+                if i.key_pressed(Key::G) {
+                    self.request_deck_stems(deck);
+                }
+
+                // Stem Mute 1..4 (Drums, Bass, Other, Vocals)
+                for (s, key) in [(0usize, Key::Q), (1, Key::W), (2, Key::E), (3, Key::R)] {
+                    if i.key_pressed(key) {
+                        self.deck_stem_muted[ch][s] = !self.deck_stem_muted[ch][s];
+                    }
+                }
+
+                // EQ Kill Low / Mid / Hi
+                if i.key_pressed(Key::Z) {
+                    self.eq_kill_low[ch] = !self.eq_kill_low[ch];
+                }
+                if i.key_pressed(Key::X) {
+                    self.eq_kill_mid[ch] = !self.eq_kill_mid[ch];
+                }
+                if i.key_pressed(Key::V) {
+                    self.eq_kill_hi[ch] = !self.eq_kill_hi[ch];
+                }
+
+                // Headphone Cue On/Off
+                if i.key_pressed(Key::H) {
+                    self.channel_cue[ch] = !self.channel_cue[ch];
+                }
+
+                // Filter On/Off
+                if i.key_pressed(Key::F) {
+                    self.channel_filter_on[ch] = !self.channel_filter_on[ch];
+                }
+
+                // FX Unit On/Off
+                if i.key_pressed(Key::D) {
+                    if ch == 0 {
+                        self.fx1_on = !self.fx1_on;
+                    } else {
+                        self.fx2_on = !self.fx2_on;
+                    }
+                }
+
+                // Channel Fader Down / Up
+                if i.key_pressed(Key::Minus) {
+                    self.channel_volume[ch] = (self.channel_volume[ch] - 0.05).clamp(0.0, 1.0);
+                }
+                if i.key_pressed(Key::Equals) || i.key_pressed(Key::Plus) {
+                    self.channel_volume[ch] = (self.channel_volume[ch] + 0.05).clamp(0.0, 1.0);
+                }
+
+                // Crossfader Nudge Left / Centre / Right
+                if i.key_pressed(Key::OpenBracket) {
+                    self.crossfader_pos = (self.crossfader_pos - 0.08).clamp(0.0, 1.0);
+                }
+                if i.key_pressed(Key::Backslash) {
+                    self.crossfader_pos = 0.5;
+                }
+                if i.key_pressed(Key::CloseBracket) {
+                    self.crossfader_pos = (self.crossfader_pos + 0.08).clamp(0.0, 1.0);
+                }
+            });
+        }
+    }
+
+    fn request_deck_stems(&mut self, deck_idx: usize) {
+        let d = (deck_idx.saturating_sub(1)).min(3);
+        let track_id = self.deck_track_ids[d].or_else(|| {
+            let state = self.audio.shared.lock().ok()?;
+            let loaded = state.loaded_tracks[d].as_ref()?;
+            self.library
+                .tracks
+                .iter()
+                .find(|t| t.title == loaded.title && t.artist == loaded.artist)
+                .map(|t| t.id)
+        });
+        if let Some(id) = track_id {
+            self.library.request_stem_separation = Some(id);
+            self.deck_stem_view[d] = true;
+        } else {
+            self.library.status_message = format!("Load a track onto Deck {} first to create stems.", DECK_LETTERS[d]);
         }
     }
 
@@ -1450,155 +1558,229 @@ impl ReTraktorApp {
         }
     }
 
-    /// Top bar, left to right: layout tabs, master tempo, FX units, pattern player;
-    /// right-aligned: status lamps, recorder, main level, help and settings.
+    /// Top bar: Deck A strip on the left (`A`, `GAIN`, `FILTER`, `FX` + `ON`), Master tempo & layout tabs
+    /// in the centre, Deck B strip mirrored on the right (`ON`, `FX`, `FILTER`, `GAIN`, `B`) plus utilities.
     fn show_top_bar(&mut self, ui: &mut Ui) {
+        let screen_w = ui.ctx().screen_rect().width();
+        let roomy = screen_w >= 1180.0;
+        let show_rec = screen_w >= 1080.0;
+
         panel(TraktorTheme::BG_PANEL()).show(ui, |ui| {
-            row(ui, 40.0, |ui| {
-                // The wordmark is the first thing to go when the window is narrow.
-                if ui.available_width() >= 1180.0 {
-                    ui.label(RichText::new("ReTraktor").size(14.0).color(TraktorTheme::TEXT_HIGHLIGHT()));
-                    ui.separator();
+            row(ui, 56.0, |ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+
+                // ---- Left: Deck A strip (A | GAIN | FILTER | FX + ON/OFF) ----
+                let col_a = TraktorTheme::DECK_A();
+                deck_badge(ui, "A", col_a);
+                let gain_a_txt = dot::format_eq_db(self.channel_gain[0]);
+                dot::dot_ring(ui, "GAIN", &mut self.channel_gain[0], 0.5, false, &gain_a_txt, col_a, true)
+                    .on_hover_text(format!("Deck A input gain ({gain_a_txt} dB). {KNOB_TIP}"));
+
+                let fltr_a_txt = dot::format_filter_val(self.channel_filter[0], self.channel_filter_on[0]);
+                let fltr_a_resp = dot::dot_ring(
+                    ui,
+                    "FILTER",
+                    &mut self.channel_filter[0],
+                    0.5,
+                    true,
+                    &fltr_a_txt,
+                    col_a,
+                    self.channel_filter_on[0],
+                )
+                .on_hover_text(format!("Deck A filter (F to toggle, right-click to toggle). {KNOB_TIP}"));
+                if fltr_a_resp.changed() {
+                    self.channel_filter_on[0] = (self.channel_filter[0] - 0.5).abs() > 0.02;
+                }
+                if fltr_a_resp.secondary_clicked() {
+                    self.channel_filter_on[0] = !self.channel_filter_on[0];
                 }
 
-                for (lay, key) in [
-                    (TraktorLayout::Parallel, "F1"),
-                    (TraktorLayout::FourDeck, "F2"),
-                    (TraktorLayout::Browser, "F3"),
-                    (TraktorLayout::Timeline, "F4"),
-                ] {
-                    if pill(ui, lay.label(), self.layout == lay, TraktorTheme::ROW_SELECTED(), 54.0)
-                        .on_hover_text(format!("{} layout ({key})", lay.label()))
+                let fx1_txt = format!("{}", (self.fx1_dry_wet * 100.0).round() as i32);
+                dot::dot_ring(ui, "FX", &mut self.fx1_dry_wet, 0.3, false, &fx1_txt, col_a, self.fx1_on)
+                    .on_hover_text(format!("Deck A FX dry/wet mix ({fx1_txt}%). {KNOB_TIP}"));
+                if dot::dot_lamp(ui, if self.fx1_on { "ON" } else { "OFF" }, self.fx1_on, col_a)
+                    .on_hover_text("Deck A FX unit on / off (D)")
+                    .clicked()
+                {
+                    self.fx1_on = !self.fx1_on;
+                }
+
+                ui.separator();
+
+                // ---- Centre-left: compact layout tabs ----
+                ui.scope(|ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    for (lay, short, key) in [
+                        (TraktorLayout::Parallel, "Mix", "F1"),
+                        (TraktorLayout::FourDeck, "4-Deck", "F2"),
+                        (TraktorLayout::Browser, "Browse", "F3"),
+                        (TraktorLayout::Timeline, "Timeline", "F4"),
+                    ] {
+                        let label = if roomy { lay.label() } else { short };
+                        let min_w = if roomy { 46.0 } else { 36.0 };
+                        if pill(ui, label, self.layout == lay, TraktorTheme::ROW_SELECTED(), min_w)
+                            .on_hover_text(format!("{} layout ({key})", lay.label()))
+                            .clicked()
+                        {
+                            self.layout = lay;
+                            self.preferences.four_deck_mode = lay == TraktorLayout::FourDeck;
+                        }
+                    }
+                });
+
+                // ---- Centre: Master tempo readout in dot font ----
+                display(ui, |ui, ink| {
+                    readout(ui, "MASTER BPM", &format!("{:.1}", self.master_tempo), 20.0, ink);
+                });
+                ui.scope(|ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    if pill(ui, "−", false, Color32::TRANSPARENT, HIT)
+                        .on_hover_text("Master tempo down 0.5 BPM")
                         .clicked()
                     {
-                        self.layout = lay;
-                        self.preferences.four_deck_mode = lay == TraktorLayout::FourDeck;
+                        self.master_tempo = (self.master_tempo - 0.5).max(40.0);
                     }
-                }
-                ui.separator();
-
-                display(ui, |ui, ink| {
-                    readout(ui, "MASTER BPM", &format!("{:.2}", self.master_tempo), 20.0, ink);
-                });
-                if pill(ui, "−", false, Color32::TRANSPARENT, HIT).on_hover_text("Master tempo down 0.5 BPM").clicked() {
-                    self.master_tempo = (self.master_tempo - 0.5).max(40.0);
-                }
-                if pill(ui, "+", false, Color32::TRANSPARENT, HIT).on_hover_text("Master tempo up 0.5 BPM").clicked() {
-                    self.master_tempo = (self.master_tempo + 0.5).min(240.0);
-                }
-                // Below ~1150 px the bar drops its least-used items rather than overlap.
-                let roomy = ui.ctx().screen_rect().width() >= 1150.0;
-                if roomy
-                    && pill(ui, "ROUND", false, Color32::TRANSPARENT, 0.0)
-                        .on_hover_text("Round the master tempo to a whole BPM")
+                    if pill(ui, "+", false, Color32::TRANSPARENT, HIT)
+                        .on_hover_text("Master tempo up 0.5 BPM")
                         .clicked()
-                {
-                    self.master_tempo = self.master_tempo.round().clamp(60.0, 200.0);
-                }
-                ui.separator();
+                    {
+                        self.master_tempo = (self.master_tempo + 0.5).min(240.0);
+                    }
+                });
 
-                fx_unit(ui, 1, &mut self.fx1_on, &mut self.fx1_dry_wet, &mut self.fx1_param[0], "REV", "reverb amount");
-                ui.separator();
-                fx_unit(ui, 2, &mut self.fx2_on, &mut self.fx2_dry_wet, &mut self.fx2_param[0], "DLY", "delay amount");
-                ui.separator();
-
-                // Lit in the signal colour while the pattern is sounding, even if its strip is hidden.
+                let pat_label = if roomy { "PATTERN" } else { "PAT" };
                 let pattern_fill = if self.pattern_enabled { TraktorTheme::ACCENT() } else { TraktorTheme::ROW_SELECTED() };
-                if pill(ui, "PATTERN", self.show_pattern_player || self.pattern_enabled, pattern_fill, 0.0)
+                if pill(ui, pat_label, self.show_pattern_player || self.pattern_enabled, pattern_fill, 0.0)
                     .on_hover_text("Show or hide the 16-step pattern player (drum machine)")
                     .clicked()
                 {
                     self.show_pattern_player = !self.show_pattern_player;
                 }
 
+                // ---- Right: utilities + mirrored Deck B strip (ON/OFF + FX | FILTER | GAIN | B) ----
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+
                     if ui
-                        .add(egui::Button::new(RichText::new("⚙").size(15.0)).min_size(Vec2::new(28.0, HIT)))
+                        .add(egui::Button::new(RichText::new("⚙").size(14.0)).min_size(Vec2::new(26.0, HIT)))
                         .on_hover_text("Preferences (Ctrl+,)")
                         .clicked()
                     {
                         self.preferences.is_open = !self.preferences.is_open;
                     }
                     if ui
-                        .add(egui::Button::new(RichText::new("?").size(14.0)).min_size(Vec2::new(28.0, HIT)))
+                        .add(egui::Button::new(RichText::new("?").size(13.0)).min_size(Vec2::new(24.0, HIT)))
                         .on_hover_text("Keyboard shortcuts (?)")
                         .clicked()
                     {
                         self.show_shortcuts_hud = !self.show_shortcuts_hud;
                     }
 
-                    rotary_knob_sized(ui, &mut self.master_volume, 0.0, 1.0, 0.8, "MAIN", TraktorTheme::TEXT_PRIMARY(), 28.0)
-                        .on_hover_text(format!("Main output level. {KNOB_TIP}"));
+                    let main_txt = format!("{}", (self.master_volume * 100.0).round() as i32);
+                    dot::dot_ring(ui, "MAIN", &mut self.master_volume, 0.8, false, &main_txt, TraktorTheme::TEXT_PRIMARY(), true)
+                        .on_hover_text(format!("Main output level ({main_txt}%). {KNOB_TIP}"));
 
-                    let (peak_l, peak_r, is_rec, rec_sec) = if let Ok(state) = self.audio.shared.lock() {
-                        let secs = state.recorded_samples.len() as f64 / (48_000.0 * 2.0);
-                        (state.master_peak_l, state.master_peak_r, state.is_recording, secs)
-                    } else {
-                        (0.0, 0.0, false, 0.0)
-                    };
-                    vu_meter(ui, peak_l, peak_r, 30.0);
-
-                    // Recording shows as a filled button with a running clock, not by colour alone.
-                    let rec_label = if is_rec {
-                        format!("REC {:02}:{:02}", (rec_sec / 60.0).floor() as u32, (rec_sec % 60.0).floor() as u32)
-                    } else {
-                        "REC".to_string()
-                    };
-                    let (rec_fill, rec_fg) = if is_rec {
-                        (TraktorTheme::ACCENT(), on(TraktorTheme::ACCENT()))
-                    } else {
-                        (TraktorTheme::CONTROL(), TraktorTheme::TEXT_SECONDARY())
-                    };
-                    if icon_pill(ui, Icon::Dot, &rec_label, rec_fill, rec_fg, Vec2::new(0.0, HIT))
-                        .on_hover_text(if is_rec {
-                            "Stop and save the recording to ~/Music/ReTraktor_Master_Mix.wav"
+                    let is_rec = self.audio.shared.lock().map(|s| s.is_recording).unwrap_or(false);
+                    let rec_sec = self
+                        .audio
+                        .shared
+                        .lock()
+                        .map(|s| s.recorded_samples.len() as f64 / (48_000.0 * 2.0))
+                        .unwrap_or(0.0);
+                    if show_rec || is_rec {
+                        let rec_label = if is_rec {
+                            format!("REC {:02}:{:02}", (rec_sec / 60.0).floor() as u32, (rec_sec % 60.0).floor() as u32)
                         } else {
-                            "Record the main mix (16-bit 48 kHz WAV in ~/Music)"
-                        })
+                            "REC".to_string()
+                        };
+                        let (rec_fill, rec_fg) = if is_rec {
+                            (TraktorTheme::ACCENT(), on(TraktorTheme::ACCENT()))
+                        } else {
+                            (TraktorTheme::CONTROL(), TraktorTheme::TEXT_SECONDARY())
+                        };
+                        if icon_pill(ui, Icon::Dot, &rec_label, rec_fill, rec_fg, Vec2::new(0.0, HIT))
+                            .on_hover_text(if is_rec {
+                                "Stop and save the recording to ~/Music/ReTraktor_Master_Mix.wav"
+                            } else {
+                                "Record the main mix (16-bit 48 kHz WAV in ~/Music)"
+                            })
+                            .clicked()
+                        {
+                            let mut samples_to_save: Option<Vec<i16>> = None;
+                            if let Ok(mut state) = self.audio.shared.lock() {
+                                if state.is_recording {
+                                    state.is_recording = false;
+                                    samples_to_save = Some(std::mem::take(&mut state.recorded_samples));
+                                } else {
+                                    state.recorded_samples = Vec::with_capacity(48_000 * 2 * 1800);
+                                    state.is_recording = true;
+                                }
+                            }
+                            if let Some(samples) = samples_to_save {
+                                let home = env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("."));
+                                let music_dir = home.join("Music");
+                                let out_dir = if music_dir.is_dir() { music_dir } else { home };
+                                let out_path = out_dir.join("ReTraktor_Master_Mix.wav");
+                                match AudioSystem::write_stereo_wav_file(&out_path, &samples, 48_000) {
+                                    Ok(dur_s) => {
+                                        self.library.status_message =
+                                            format!("✔ Saved Master Mix recording ({dur_s:.1}s) to {}", out_path.display());
+                                    }
+                                    Err(e) => {
+                                        self.library.status_message = format!("⚠ Failed to save WAV recording: {e}");
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if roomy {
+                        let controller_tip = match &self.mx2_dev_node {
+                            Some(node) => format!("Traktor MX2 connected ({node}). Click for controller settings"),
+                            None => "No controller connected. Click for controller settings".to_string(),
+                        };
+                        if lamp(ui, "MX2", self.mx2_dev_node.is_some()).on_hover_text(controller_tip).clicked() {
+                            self.preferences.is_open = true;
+                            self.preferences.current_tab = PrefsTab::Controllers;
+                        }
+                    }
+
+                    ui.separator();
+
+                    // Mirrored Deck B strip: in right-to-left layout, add B first (rightmost), then GAIN, FILTER, FX, ON/OFF
+                    let col_b = TraktorTheme::DECK_B();
+                    deck_badge(ui, "B", col_b);
+                    let gain_b_txt = dot::format_eq_db(self.channel_gain[1]);
+                    dot::dot_ring(ui, "GAIN", &mut self.channel_gain[1], 0.5, false, &gain_b_txt, col_b, true)
+                        .on_hover_text(format!("Deck B input gain ({gain_b_txt} dB). {KNOB_TIP}"));
+
+                    let fltr_b_txt = dot::format_filter_val(self.channel_filter[1], self.channel_filter_on[1]);
+                    let fltr_b_resp = dot::dot_ring(
+                        ui,
+                        "FILTER",
+                        &mut self.channel_filter[1],
+                        0.5,
+                        true,
+                        &fltr_b_txt,
+                        col_b,
+                        self.channel_filter_on[1],
+                    )
+                    .on_hover_text(format!("Deck B filter (Shift+F to toggle, right-click to toggle). {KNOB_TIP}"));
+                    if fltr_b_resp.changed() {
+                        self.channel_filter_on[1] = (self.channel_filter[1] - 0.5).abs() > 0.02;
+                    }
+                    if fltr_b_resp.secondary_clicked() {
+                        self.channel_filter_on[1] = !self.channel_filter_on[1];
+                    }
+
+                    let fx2_txt = format!("{}", (self.fx2_dry_wet * 100.0).round() as i32);
+                    dot::dot_ring(ui, "FX", &mut self.fx2_dry_wet, 0.3, false, &fx2_txt, col_b, self.fx2_on)
+                        .on_hover_text(format!("Deck B FX dry/wet mix ({fx2_txt}%). {KNOB_TIP}"));
+                    if dot::dot_lamp(ui, if self.fx2_on { "ON" } else { "OFF" }, self.fx2_on, col_b)
+                        .on_hover_text("Deck B FX unit on / off (Shift+D)")
                         .clicked()
                     {
-                        let mut samples_to_save: Option<Vec<i16>> = None;
-                        if let Ok(mut state) = self.audio.shared.lock() {
-                            if state.is_recording {
-                                state.is_recording = false;
-                                samples_to_save = Some(std::mem::take(&mut state.recorded_samples));
-                            } else {
-                                state.recorded_samples = Vec::with_capacity(48_000 * 2 * 1800);
-                                state.is_recording = true;
-                            }
-                        }
-                        if let Some(samples) = samples_to_save {
-                            let home = env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("."));
-                            let music_dir = home.join("Music");
-                            let out_dir = if music_dir.is_dir() { music_dir } else { home };
-                            let out_path = out_dir.join("ReTraktor_Master_Mix.wav");
-                            match AudioSystem::write_stereo_wav_file(&out_path, &samples, 48_000) {
-                                Ok(dur_s) => {
-                                    self.library.status_message =
-                                        format!("✔ Saved Master Mix recording ({dur_s:.1}s) to {}", out_path.display());
-                                }
-                                Err(e) => {
-                                    self.library.status_message = format!("⚠ Failed to save WAV recording: {e}");
-                                }
-                            }
-                        }
-                    }
-
-                    let controller_tip = match &self.mx2_dev_node {
-                        Some(node) => format!("Traktor MX2 connected ({node}). Click for controller settings"),
-                        None => "No controller connected. Click for controller settings".to_string(),
-                    };
-                    if lamp(ui, "MX2", self.mx2_dev_node.is_some()).on_hover_text(controller_tip).clicked() {
-                        self.preferences.is_open = true;
-                        self.preferences.current_tab = PrefsTab::Controllers;
-                    }
-                    if roomy
-                        && lamp(ui, "48 kHz", true)
-                            .on_hover_text("Audio out: PipeWire, 48 kHz. Click for audio settings")
-                            .clicked()
-                    {
-                        self.preferences.is_open = true;
-                        self.preferences.current_tab = PrefsTab::AudioSetup;
+                        self.fx2_on = !self.fx2_on;
                     }
                 });
             });
