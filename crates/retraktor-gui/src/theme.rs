@@ -306,27 +306,98 @@ impl Palette {
     }
 }
 
-fn store() -> &'static RwLock<Palette> {
-    static P: OnceLock<RwLock<Palette>> = OnceLock::new();
+/// Theme plus the "Look" settings that travel with it.
+struct ThemeState {
+    current: Palette,
+    /// Palette being faded out, and when the fade began.
+    from: Option<(Palette, std::time::Instant)>,
+    animations: bool,
+    scale: f32,
+}
+
+const THEME_FADE_SECS: f32 = 0.28;
+
+fn store() -> &'static RwLock<ThemeState> {
+    static P: OnceLock<RwLock<ThemeState>> = OnceLock::new();
     P.get_or_init(|| RwLock::new(load()))
 }
 
+fn lerp_colour(a: Color32, b: Color32, t: f32) -> Color32 {
+    let l = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    Color32::from_rgb(l(a.r(), b.r()), l(a.g(), b.g()), l(a.b(), b.b()))
+}
+
+/// Blend between two colours; `t` 0 = `a`, 1 = `b`.
+pub fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
+    lerp_colour(a, b, t.clamp(0.0, 1.0))
+}
+
+/// The palette to draw with right now (mid-crossfade while a theme change settles).
 pub fn palette() -> Palette {
-    store().read().map(|p| p.clone()).unwrap_or(Palette::NIGHT)
+    let Ok(st) = store().read() else { return Palette::NIGHT };
+    if let Some((from, start)) = &st.from {
+        let t = start.elapsed().as_secs_f32() / THEME_FADE_SECS;
+        if t < 1.0 && st.animations {
+            let eased = 1.0 - (1.0 - t).powi(3);
+            let (mut out, mut a, mut b) = (st.current.clone(), from.clone(), st.current.clone());
+            for ((_, o), ((_, x), (_, y))) in out.tokens_mut().into_iter().zip(a.tokens_mut().into_iter().zip(b.tokens_mut())) {
+                *o = lerp_colour(*x, *y, eased);
+            }
+            return out;
+        }
+    }
+    st.current.clone()
+}
+
+/// The chosen palette, ignoring any crossfade in progress.
+pub fn target_palette() -> Palette {
+    store().read().map(|s| s.current.clone()).unwrap_or(Palette::NIGHT)
 }
 
 pub fn set_palette(p: Palette) {
-    if let Ok(mut cur) = store().write() {
-        *cur = p;
+    let shown = palette();
+    if let Ok(mut st) = store().write() {
+        st.from = Some((shown, std::time::Instant::now()));
+        st.current = p;
     }
+}
+
+/// Whether motion is enabled (Preferences > Look).
+pub fn animations() -> bool {
+    store().read().map(|s| s.animations).unwrap_or(true)
+}
+
+/// Eased 0..=1 that follows `on`; call every frame with the same `id`. Snaps when animations are off.
+pub fn fade(ctx: &egui::Context, id: impl std::hash::Hash, on: bool) -> f32 {
+    if !animations() {
+        return if on { 1.0 } else { 0.0 };
+    }
+    let t = ctx.animate_bool_with_time(egui::Id::new(("fade", id)), on, 0.16);
+    1.0 - (1.0 - t).powi(3)
+}
+
+/// 0..=1 pulse that peaks on each beat and decays; steady 1.0 when animations are off.
+pub fn beat_pulse(position_sec: f64, bpm: f64) -> f32 {
+    if !animations() || bpm <= 0.0 {
+        return 1.0;
+    }
+    let phase = (position_sec.max(0.0) * bpm / 60.0).fract() as f32;
+    0.25 + 0.75 * (1.0 - phase).powi(3)
 }
 
 fn theme_path() -> std::path::PathBuf {
     std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config/retraktor/theme.txt")
 }
 
-fn load() -> Palette {
-    std::fs::read_to_string(theme_path()).map(|t| Palette::from_text(&Palette::NIGHT, &t)).unwrap_or(Palette::NIGHT)
+fn load() -> ThemeState {
+    let text = std::fs::read_to_string(theme_path()).unwrap_or_default();
+    let setting = |key: &str| text.lines().find_map(|l| l.trim().strip_prefix(key).map(|v| v.trim().to_string()));
+    ThemeState {
+        current: Palette::from_text(&Palette::NIGHT, &text),
+        from: None,
+        animations: setting("animations=").as_deref() != Some("off"),
+        scale: setting("scale=").and_then(|v| v.parse::<f32>().ok()).filter(|v| (0.8..=1.6).contains(v)).unwrap_or(1.0),
+    }
 }
 
 pub fn save() -> std::io::Result<()> {
@@ -334,7 +405,9 @@ pub fn save() -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(path, palette().to_text())
+    let (animations, scale) = store().read().map(|s| (s.animations, s.scale)).unwrap_or((true, 1.0));
+    let extra = format!("animations={}\nscale={scale:.2}\n", if animations { "on" } else { "off" });
+    std::fs::write(path, target_palette().to_text() + &extra)
 }
 
 /// Pushes the palette into egui's own widget colours so stock buttons, inputs and tables follow the theme.
@@ -366,6 +439,11 @@ pub fn apply_visuals(ctx: &egui::Context) {
     v.widgets.noninteractive.weak_bg_fill = p.BG_PANEL;
     v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, p.BORDER_ACCENT);
     ctx.set_visuals(v);
+    let (animations, scale) = store().read().map(|s| (s.animations, s.scale)).unwrap_or((true, 1.0));
+    ctx.style_mut(|style| style.animation_time = if animations { 0.12 } else { 0.0 });
+    if (ctx.zoom_factor() - scale).abs() > 0.001 {
+        ctx.set_zoom_factor(scale);
+    }
 }
 
 /// Black or white, whichever reads better on `fill`.
@@ -388,8 +466,10 @@ pub fn contrast(a: Color32, b: Color32) -> f32 {
 
 /// Preferences > Look: preset cards plus every token, applied live and saved.
 pub fn editor(ui: &mut egui::Ui) {
-    let mut p = palette();
+    let mut p = target_palette();
     let mut changed = false;
+    let (mut animations, mut scale) = store().read().map(|s| (s.animations, s.scale)).unwrap_or((true, 1.0));
+    let mut settings_changed = false;
     ui.label(egui::RichText::new("Theme").size(15.0).strong());
     ui.add_space(6.0);
     ui.horizontal_wrapped(|ui| {
@@ -459,8 +539,41 @@ pub fn editor(ui: &mut egui::Ui) {
         }
         ui.label(egui::RichText::new("Saved automatically to ~/.config/retraktor/theme.txt").size(11.5).color(p.TEXT_MUTED));
     });
+    ui.add_space(18.0);
+    ui.label(egui::RichText::new("Motion & size").size(15.0).strong());
+    ui.add_space(6.0);
+    settings_changed |= ui
+        .checkbox(&mut animations, "Animations")
+        .on_hover_text("Fades, the beat lamp and the theme crossfade. Turn off if the app feels slow.")
+        .changed();
+    ui.horizontal(|ui| {
+        ui.label("Text and control size");
+        // Applied when the drag ends, so the slider doesn't move under the pointer.
+        let pending = egui::Id::new("pending_scale");
+        let mut shown = ui.ctx().data(|d| d.get_temp::<f32>(pending)).unwrap_or(scale);
+        let r = ui.add(egui::Slider::new(&mut shown, 0.8..=1.6).step_by(0.05).custom_formatter(|v, _| format!("{:.0}%", v * 100.0)));
+        if r.dragged() {
+            ui.ctx().data_mut(|d| d.insert_temp(pending, shown));
+        } else if r.drag_stopped() || r.changed() {
+            ui.ctx().data_mut(|d| d.remove::<f32>(pending));
+            scale = shown;
+            settings_changed = true;
+        }
+        if ui.button("Reset").clicked() {
+            scale = 1.0;
+            settings_changed = true;
+        }
+    });
     if changed {
         set_palette(p);
+    }
+    if settings_changed {
+        if let Ok(mut st) = store().write() {
+            st.animations = animations;
+            st.scale = scale;
+        }
+    }
+    if changed || settings_changed {
         if let Err(e) = save() {
             eprintln!("retraktor: could not save theme: {e}");
         }

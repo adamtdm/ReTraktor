@@ -2188,7 +2188,9 @@ pub fn deck_drop_target(ui: &Ui, rect: egui::Rect) -> Option<usize> {
     if !egui::DragAndDrop::has_payload_of_type::<DragTracks>(ui.ctx()) || !ui.rect_contains_pointer(rect) {
         return None;
     }
-    ui.painter().rect_stroke(rect.shrink(1.0), 4.0, Stroke::new(2.0_f32, TraktorTheme::DECK_A()));
+    // The drop outline breathes while a track hovers over the deck.
+    let pulse = if crate::theme::animations() { 0.55 + 0.45 * (ui.input(|i| i.time) * 6.0).sin().abs() as f32 } else { 1.0 };
+    ui.painter().rect_stroke(rect.shrink(1.0), 4.0, Stroke::new(2.0_f32, TraktorTheme::ACCENT().gamma_multiply(pulse)));
     if ui.input(|i| i.pointer.any_released()) {
         return egui::DragAndDrop::take_payload::<DragTracks>(ui.ctx()).and_then(|p| p.0.first().copied());
     }

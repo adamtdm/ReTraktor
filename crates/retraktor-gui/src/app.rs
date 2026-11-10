@@ -333,10 +333,14 @@ impl eframe::App for ReTraktorApp {
                 ui.spacing_mut().item_spacing = Vec2::new(4.0, 4.0);
 
                 // If Preferences is open, render as a full-page workspace view with maximum screen real estate
+                let prefs_t = crate::theme::fade(ctx, "prefs_page", self.preferences.is_open);
+                let work_t = crate::theme::fade(ctx, "workspace", !self.preferences.is_open);
                 if self.preferences.is_open {
+                    ui.set_opacity(prefs_t);
                     self.preferences.show_full_page(ui, ctx);
                     return;
                 }
+                ui.set_opacity(work_t);
 
                 // 1. Top FX Rack, Master Clock, Layout Switcher, Pattern Toggle & Mix Recorder
                 self.show_top_bar(ui);
@@ -346,7 +350,15 @@ impl eframe::App for ReTraktorApp {
                     self.show_pattern_player_bar(ui);
                 }
 
-                // 2. Active Workspace Layout
+                // 2. Active Workspace Layout (each fades in when chosen)
+                let mut layout_t = 1.0;
+                for lay in [TraktorLayout::Parallel, TraktorLayout::FourDeck, TraktorLayout::Timeline, TraktorLayout::Browser] {
+                    let t = crate::theme::fade(ctx, ("layout", lay.label()), self.layout == lay);
+                    if self.layout == lay {
+                        layout_t = t;
+                    }
+                }
+                ui.set_opacity(work_t * layout_t);
                 match self.layout {
                     TraktorLayout::Parallel => {
                         self.show_parallel_layout(ui);
@@ -563,7 +575,9 @@ impl ReTraktorApp {
             "relocate" if first => self.library.start_relocate(self.preferences.music_folders.clone()),
             _ => {}
         }
-        if (n - warm) % 90 == 80 {
+        // SHOT_AT picks the frame within a step (default 80 = settled; small = mid-transition).
+        let at: usize = std::env::var("SHOT_AT").ok().and_then(|v| v.parse().ok()).unwrap_or(80);
+        if (n - warm) % 90 == at.min(88) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
         }
         let shots: Vec<_> = ctx.input(|i| {
@@ -1770,12 +1784,20 @@ impl ReTraktorApp {
         let four_deck = self.layout == TraktorLayout::FourDeck || self.preferences.four_deck_mode;
         let wave_h = mix_wave_height(ui) * if four_deck { 0.7 } else { 1.0 };
 
-        panel(TraktorTheme::BG_PANEL()).show(ui, |ui| {
-            let decks = if four_deck { 4 } else { 2 };
-            for deck_idx in 1..=decks {
-                self.show_parallel_waveform_row(ui, deck_idx, TraktorTheme::deck_color(deck_idx), wave_h, false);
-            }
-        });
+        // Waveforms only for loaded decks; an empty deck's own panel already says how to load it.
+        let decks = if four_deck { 4 } else { 2 };
+        let loaded: Vec<usize> = match self.audio.shared.lock() {
+            Ok(s) => (1..=decks).filter(|d| s.loaded_tracks[d - 1].is_some()).collect(),
+            Err(_) => Vec::new(),
+        };
+        if !loaded.is_empty() {
+            panel(TraktorTheme::BG_PANEL()).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                for deck_idx in loaded {
+                    self.show_parallel_waveform_row(ui, deck_idx, TraktorTheme::deck_color(deck_idx), wave_h, false);
+                }
+            });
+        }
 
         ui.horizontal_top(|ui| {
             let mixer_w = 320.0_f32;
@@ -2049,6 +2071,9 @@ impl ReTraktorApp {
     ) {
         let d = deck_idx - 1;
         let deck_letter = DECK_LETTERS[d.min(3)];
+        let is_loaded = self.audio.shared.lock().is_ok_and(|s| s.loaded_tracks[d].is_some());
+        let loaded_t = crate::theme::fade(ui.ctx(), ("deck_loaded", d), is_loaded);
+        let pads_t = crate::theme::fade(ui.ctx(), ("deck_pads", d), self.deck_expanded[d]);
         let Some(deck) = self.deck_view(d) else {
             self.show_empty_deck(ui, deck_idx, accent_color, min_height);
             return;
@@ -2062,6 +2087,7 @@ impl ReTraktorApp {
 
         panel(TraktorTheme::BG_PANEL()).show(ui, |ui| {
             ui.set_min_height((min_height - 12.0).max(0.0));
+            ui.multiply_opacity(loaded_t);
 
             // 1. Which deck, which track.
             ui.horizontal(|ui| {
@@ -2075,6 +2101,7 @@ impl ReTraktorApp {
                 let advance = ui.fonts(|f| f.glyph_width(&crate::theme::dot_font(100.0), '0')) / 100.0;
                 let size = ((ui.available_width() - 3.0 * 14.0) / (20.0 * advance)).floor().clamp(18.0, 30.0);
                 let pitch_pct = self.deck_pitch_fader[d];
+                beat_lamp(ui, ink, deck.is_playing, deck.elapsed_sec, bpm);
                 readout(ui, "BPM", &format!("{:.2}", bpm * (1.0 + pitch_pct as f64 / 100.0)), size, ink);
                 readout(ui, "PITCH", &format!("{pitch_pct:+.1}%"), size, ink);
                 // A compatible key says so in words, not just in brightness.
@@ -2240,6 +2267,7 @@ impl ReTraktorApp {
             if !self.deck_expanded[d] {
                 return;
             }
+            ui.multiply_opacity(pads_t);
             let gap = ui.spacing().item_spacing.x;
             ui.horizontal(|ui| {
                 let w = (ui.available_width() - 3.0 * gap) / 4.0;
@@ -2618,10 +2646,15 @@ fn icon_pill(ui: &mut Ui, icon: Icon, label: &str, fill: Color32, fg: Color32, m
 
 /// The one text button: 24 px tall, filled with `on_fill` while engaged (its text flips to stay readable).
 fn pill(ui: &mut Ui, label: &str, engaged: bool, on_fill: Color32, min_width: f32) -> egui::Response {
-    let fg = if engaged { on(on_fill) } else { TraktorTheme::TEXT_SECONDARY() };
+    // The fill eases in and out; the text flips halfway so it is readable throughout.
+    // Keyed to this button's own position, so same-named buttons never share an animation.
+    let t = crate::theme::fade(ui.ctx(), ui.next_auto_id(), engaged);
+    let idle = TraktorTheme::CONTROL();
+    let fill = crate::theme::mix(idle, on_fill, t);
+    let fg = if t > 0.5 { on(on_fill) } else { TraktorTheme::TEXT_SECONDARY() };
     let mut button = egui::Button::new(RichText::new(label).size(11.5).color(fg)).min_size(Vec2::new(min_width, HIT));
-    if engaged {
-        button = button.fill(on_fill);
+    if t > 0.0 && on_fill != Color32::TRANSPARENT {
+        button = button.fill(fill);
     }
     let resp = ui.add(button);
     ring(ui, resp)
@@ -2657,6 +2690,19 @@ fn display(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui, Color32)) {
         .rounding(3.0)
         .inner_margin(egui::Margin::symmetric(8.0, 3.0))
         .show(ui, |ui| ui.horizontal(|ui| add_contents(ui, on(bg))));
+}
+
+/// Beat lamp: flashes on every beat while the deck plays; a hollow ring when stopped,
+/// so the state reads without colour or motion.
+fn beat_lamp(ui: &mut Ui, ink: Color32, playing: bool, position_sec: f64, bpm: f64) {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(10.0, 28.0), Sense::hover());
+    let centre = rect.center();
+    if playing {
+        ui.painter().circle_filled(centre, 4.0, ink.gamma_multiply(crate::theme::beat_pulse(position_sec, bpm)));
+    } else {
+        ui.painter().circle_stroke(centre, 3.5, Stroke::new(1.2_f32, ink.gamma_multiply(0.6)));
+    }
+    resp.on_hover_text(if playing { "Playing — flashes on the beat" } else { "Stopped" });
 }
 
 /// A number glanced at mid-mix: small caps label over the value in the dot-matrix face.
