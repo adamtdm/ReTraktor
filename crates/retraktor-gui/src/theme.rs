@@ -368,6 +368,100 @@ pub fn apply_visuals(ctx: &egui::Context) {
     ctx.set_visuals(v);
 }
 
+/// WCAG contrast ratio between two colours (1.0..=21.0).
+pub fn contrast(a: Color32, b: Color32) -> f32 {
+    let lum = |c: Color32| {
+        let ch = |v: u8| {
+            let v = v as f32 / 255.0;
+            if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+        };
+        0.2126 * ch(c.r()) + 0.7152 * ch(c.g()) + 0.0722 * ch(c.b())
+    };
+    let (x, y) = (lum(a), lum(b));
+    (x.max(y) + 0.05) / (x.min(y) + 0.05)
+}
+
+/// Preferences > Look: preset cards plus every token, applied live and saved.
+pub fn editor(ui: &mut egui::Ui) {
+    let mut p = palette();
+    let mut changed = false;
+    ui.label(egui::RichText::new("Theme").size(15.0).strong());
+    ui.add_space(6.0);
+    ui.horizontal_wrapped(|ui| {
+        for (name, preset) in Palette::PRESETS {
+            let (rect, r) = ui.allocate_exact_size(egui::vec2(168.0, 104.0), egui::Sense::click());
+            let painter = ui.painter();
+            let active = p == preset;
+            painter.rect_filled(rect, 8.0, preset.BG_WINDOW);
+            let panel = egui::Rect::from_min_size(rect.min + egui::vec2(10.0, 10.0), egui::vec2(148.0, 54.0));
+            painter.rect_filled(panel, 5.0, preset.BG_PANEL);
+            painter.text(panel.min + egui::vec2(10.0, 8.0), egui::Align2::LEFT_TOP, "128.00", dot_font(20.0), preset.TEXT_PRIMARY);
+            painter.circle_filled(panel.right_top() + egui::vec2(-16.0, 16.0), 6.0, preset.ACCENT);
+            for (i, c) in [preset.DECK_A, preset.DECK_B, preset.WAVEFORM_LOW, preset.WAVEFORM_MID].into_iter().enumerate() {
+                painter.rect_filled(egui::Rect::from_min_size(panel.left_bottom() + egui::vec2(10.0 + i as f32 * 20.0, -14.0), egui::vec2(14.0, 6.0)), 1.0, c);
+            }
+            painter.text(rect.left_bottom() + egui::vec2(12.0, -12.0), egui::Align2::LEFT_BOTTOM, name, egui::FontId::proportional(14.0), preset.TEXT_PRIMARY);
+            let ring = if active { egui::Stroke::new(2.5_f32, p.ACCENT) } else if r.hovered() { egui::Stroke::new(1.5_f32, p.TEXT_SECONDARY) } else { egui::Stroke::new(1.0_f32, p.BORDER_ACCENT) };
+            painter.rect_stroke(rect, 8.0, ring);
+            if r.on_hover_text(format!("Use the {name} theme")).clicked() {
+                p = preset.clone();
+                changed = true;
+            }
+        }
+    });
+    let ratio = contrast(p.TEXT_PRIMARY, p.BG_WINDOW).min(contrast(p.TEXT_SECONDARY, p.BG_PANEL));
+    ui.add_space(6.0);
+    ui.label(
+        egui::RichText::new(if ratio >= 4.5 { format!("Text contrast {ratio:.1}:1 — readable") } else { format!("Text contrast {ratio:.1}:1 — too low; aim for 4.5:1 or more") })
+            .size(12.0)
+            .color(if ratio >= 4.5 { p.TEXT_SECONDARY } else { p.METER_RED }),
+    );
+    ui.add_space(10.0);
+    const GROUPS: [(&str, &[&str]); 7] = [
+        ("Surfaces", &["BG_", "BORDER_", "CONTROL", "ROW_SELECTED"]),
+        ("Text", &["TEXT_"]),
+        ("Accent & transport", &["ACCENT", "PLAY_", "CUE_", "SYNC_", "FLUX_", "LOOP_", "KEYLOCK_"]),
+        ("Decks", &["DECK_"]),
+        ("Meters", &["METER_"]),
+        ("Waveform", &["WAVEFORM_"]),
+        ("Hotcues", &["HOTCUE_"]),
+    ];
+    let mut tokens = p.tokens_mut();
+    for (group, prefixes) in GROUPS {
+        egui::CollapsingHeader::new(egui::RichText::new(group).size(13.5)).id_salt(("theme_group", group)).show(ui, |ui| {
+            egui::Grid::new(("theme_grid", group)).num_columns(4).spacing([18.0, 8.0]).show(ui, |ui| {
+                let mut col = 0;
+                for (name, colour) in tokens.iter_mut().filter(|(n, _)| prefixes.iter().any(|pre| n.starts_with(pre))) {
+                    if egui::color_picker::color_edit_button_srgba(ui, colour, egui::color_picker::Alpha::Opaque).changed() {
+                        changed = true;
+                    }
+                    let mut label = name.replace('_', " ").to_lowercase();
+                    label.replace_range(0..1, &label[0..1].to_uppercase());
+                    ui.label(label);
+                    col += 1;
+                    if col % 2 == 0 {
+                        ui.end_row();
+                    }
+                }
+            });
+        });
+    }
+    drop(tokens);
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        if ui.button("Copy theme as text").on_hover_text("Paste it somewhere to keep or share").clicked() {
+            ui.ctx().copy_text(p.to_text());
+        }
+        ui.label(egui::RichText::new("Saved automatically to ~/.config/retraktor/theme.txt").size(11.5).color(p.TEXT_MUTED));
+    });
+    if changed {
+        set_palette(p);
+        if let Err(e) = save() {
+            eprintln!("retraktor: could not save theme: {e}");
+        }
+    }
+}
+
 /// Font family for the dot-matrix display face (BPM, time, key).
 pub fn dot_font(size: f32) -> egui::FontId {
     egui::FontId::new(size, egui::FontFamily::Name("dot".into()))
@@ -473,5 +567,9 @@ mod tests {
         let back = Palette::from_text(&Palette::NIGHT, &(p.to_text() + "BOGUS=#zzzzzz\nACCENT=#12\n"));
         assert_eq!(back, p);
         assert!(Palette::NIGHT.is_dark() && !Palette::FIELD.is_dark());
+        for (name, p) in Palette::PRESETS {
+            assert!(contrast(p.TEXT_PRIMARY, p.BG_WINDOW) >= 7.0, "{name} body text");
+            assert!(contrast(p.TEXT_SECONDARY, p.BG_PANEL) >= 4.5, "{name} secondary text");
+        }
     }
 }

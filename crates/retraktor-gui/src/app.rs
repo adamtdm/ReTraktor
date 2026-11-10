@@ -3411,7 +3411,7 @@ impl ReTraktorApp {
                         ui,
                         four_deck_mode,
                         locked_decks,
-                        self.preferences.library_columns,
+                        &mut self.preferences.library_columns,
                         &mut self.preferences.music_folders,
                     );
                     self.drain_pending_loads();

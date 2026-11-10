@@ -328,6 +328,34 @@ fn find_collections(roots: &[PathBuf], max_depth: usize, max_dirs: usize) -> Vec
     found
 }
 
+/// Tick-box list of optional library columns (title and artist are always shown).
+fn column_menu(ui: &mut Ui, c: &mut LibraryColumnsConfig) {
+    ui.label(RichText::new("Show columns").size(11.0).color(TraktorTheme::TEXT_MUTED()));
+    for (on, name) in [
+        (&mut c.bpm, "BPM"),
+        (&mut c.key, "Key"),
+        (&mut c.energy, "Energy"),
+        (&mut c.duration, "Time"),
+        (&mut c.genre, "Genre"),
+        (&mut c.album, "Album"),
+        (&mut c.rating, "Rating"),
+        (&mut c.remixer, "Remixer"),
+        (&mut c.label, "Label"),
+        (&mut c.year, "Year"),
+        (&mut c.comment, "Comment"),
+        (&mut c.bitrate, "Bitrate"),
+        (&mut c.format, "Format"),
+        (&mut c.track_number, "Track number"),
+        (&mut c.stems, "Stems"),
+    ] {
+        ui.checkbox(on, name);
+    }
+    ui.separator();
+    if ui.button("Default columns").clicked() {
+        *c = LibraryColumnsConfig::default();
+    }
+}
+
 fn plural(n: usize) -> String {
     if n == 1 { "1 track".to_string() } else { format!("{n} tracks") }
 }
@@ -1472,7 +1500,7 @@ impl LibraryManager {
         ui: &mut Ui,
         four_deck_mode: bool,
         locked: [bool; 4],
-        columns: LibraryColumnsConfig,
+        columns: &mut LibraryColumnsConfig,
         music_folders: &mut Vec<PathBuf>,
     ) {
         self.apply_picks(music_folders);
@@ -1502,7 +1530,7 @@ impl LibraryManager {
             } else if self.tracks.is_empty() {
                 self.show_empty_state(ui, music_folders);
             } else {
-                self.show_toolbar(ui, music_folders);
+                self.show_toolbar(ui, music_folders, columns);
                 if self.selected_nav == NavItem::Missing {
                     self.show_missing_banner(ui, music_folders);
                 }
@@ -1546,7 +1574,7 @@ impl LibraryManager {
         ui.add_space(4.0);
     }
 
-    fn show_toolbar(&mut self, ui: &mut Ui, music_folders: &[PathBuf]) {
+    fn show_toolbar(&mut self, ui: &mut Ui, music_folders: &[PathBuf], columns: &mut LibraryColumnsConfig) {
         ui.horizontal(|ui| {
             let r = ui.add(egui::TextEdit::singleline(&mut self.search_query).hint_text("Search title, artist, genre, key, BPM…").desired_width(260.0));
             if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F)) {
@@ -1582,10 +1610,7 @@ impl LibraryManager {
                         Err(e) => format!("rekordbox export failed: {e}"),
                     };
                 }
-                if ui.small_button("Columns").clicked() {
-                    self.open_prefs_requested = true;
-                    self.open_prefs_browser_columns = true;
-                }
+                ui.menu_button("Columns", |ui| column_menu(ui, columns));
                 if ui.small_button("Folders").clicked() {
                     self.open_prefs_requested = true;
                     self.open_prefs_file_management = true;
@@ -1730,7 +1755,11 @@ impl LibraryManager {
             SortColumn::Key if !t.musical_key.is_empty() => {
                 // Colour keys around the wheel so compatible neighbours look alike.
                 let hue = KeyWheel::parse_open_key(&t.musical_key).map_or(0.0, |(n, _)| (n as f32 - 1.0) / 12.0);
-                txt(t.musical_key.clone()).monospace().color(Color32::from(egui::ecolor::Hsva::new(hue, 0.55, 0.95, 1.0)))
+                {
+                    // Light themes need darker, more saturated key colours to stay readable.
+                    let (sat, val) = if crate::theme::palette().is_dark() { (0.55, 0.95) } else { (0.9, 0.5) };
+                    txt(t.musical_key.clone()).monospace().color(Color32::from(egui::ecolor::Hsva::new(hue, sat, val, 1.0)))
+                }
             }
             SortColumn::TrackNum if t.track_number > 0 => txt(t.track_number.to_string()).monospace().color(dim),
             SortColumn::Energy if t.energy > 0 => txt(t.energy.to_string()).monospace(),
@@ -1752,8 +1781,8 @@ impl LibraryManager {
         }
     }
 
-    fn show_table(&mut self, ui: &mut Ui, columns: LibraryColumnsConfig, locked: [bool; 4], deck_count: usize, four_deck: bool) {
-        let cols = self.visible_columns(&columns);
+    fn show_table(&mut self, ui: &mut Ui, columns: &mut LibraryColumnsConfig, locked: [bool; 4], deck_count: usize, four_deck: bool) {
+        let cols = self.visible_columns(columns);
         let in_playlist = matches!(self.selected_nav, NavItem::Playlist(_));
         let playlist_names: Vec<String> = self.playlists.iter().map(|p| p.name.clone()).collect();
         let mut actions: Vec<Action> = Vec::new();
@@ -1816,6 +1845,7 @@ impl LibraryManager {
                         if r.clicked() {
                             actions.push(Action::Sort(c));
                         }
+                        r.on_hover_text("Click to sort · right-click to choose columns").context_menu(|ui| column_menu(ui, columns));
                     });
                 }
             })

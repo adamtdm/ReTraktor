@@ -17,6 +17,7 @@ pub enum PrefsTab {
     FileManagement,
     AnalyzeOptions,
     Controllers,
+    Look,
     About,
 }
 
@@ -522,17 +523,19 @@ impl PreferencesDialog {
             PrefsTab::FileManagement => ("COLLECTION & HARDWARE", "File Management & Folders"),
             PrefsTab::AnalyzeOptions => ("COLLECTION & HARDWARE", "Analyze & Musical Key"),
             PrefsTab::Controllers => ("COLLECTION & HARDWARE", "Controller Manager & Remapper"),
+            PrefsTab::Look => ("LOOK", "Theme & colours"),
             PrefsTab::About => ("COLLECTION & HARDWARE", "About & Diagnostics"),
         }
     }
 
     /// Settings pages grouped into the six top-level tabs.
-    pub const GROUPS: [(&'static str, &'static [PrefsTab]); 6] = [
+    pub const GROUPS: [(&'static str, &'static [PrefsTab]); 7] = [
         ("Audio", &[PrefsTab::AudioSetup, PrefsTab::OutputRouting, PrefsTab::InputRouting, PrefsTab::ExternalSync]),
         ("Decks & Mixer", &[PrefsTab::Decks, PrefsTab::TrackDecks, PrefsTab::Mixer, PrefsTab::Effects]),
         ("Library", &[PrefsTab::FileManagement, PrefsTab::BrowserColumns, PrefsTab::AnalyzeOptions]),
         ("Stems & Recording", &[PrefsTab::StemsAndAi, PrefsTab::Recording]),
         ("Controllers", &[PrefsTab::Controllers]),
+        ("Look", &[PrefsTab::Look]),
         ("About", &[PrefsTab::About]),
     ];
 
@@ -580,6 +583,7 @@ impl PreferencesDialog {
             PrefsTab::FileManagement => self.show_file_management(ui),
             PrefsTab::AnalyzeOptions => self.show_analyze_prefs(ui),
             PrefsTab::Controllers => self.show_controller_prefs(ui),
+            PrefsTab::Look => crate::theme::editor(ui),
             PrefsTab::About => self.show_about(ui),
         }
     }
