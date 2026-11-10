@@ -1482,6 +1482,40 @@ impl ReTraktorApp {
                 if i.key_pressed(Key::CloseBracket) {
                     self.crossfader_pos = (self.crossfader_pos + 0.08).clamp(0.0, 1.0);
                 }
+
+                // Timeline actions: Cycle Curve (U), Cycle Bar Length (B), Audition (A)
+                if i.key_pressed(Key::U) {
+                    let next = (self.timeline_preset_idx + 1) % 3;
+                    self.timeline_preset_idx = next;
+                    match next {
+                        0 => {
+                            self.deck_stem_muted[0] = [false; 4];
+                            self.deck_stem_muted[1] = [false; 4];
+                        }
+                        1 => {
+                            self.deck_stem_muted[0][1] = true;
+                            self.deck_stem_muted[1][1] = false;
+                        }
+                        _ => {
+                            self.deck_stem_muted[0] = [true, true, true, false];
+                            self.deck_stem_muted[1] = [false, false, false, true];
+                        }
+                    }
+                }
+                if i.key_pressed(Key::B) {
+                    self.timeline_transition_bars = match self.timeline_transition_bars {
+                        8 => 16,
+                        16 => 32,
+                        _ => 8,
+                    };
+                }
+                if i.key_pressed(Key::A) {
+                    self.sync_deck(2);
+                    if let Ok(mut state) = self.audio.shared.lock() {
+                        state.is_playing[0] = true;
+                        state.is_playing[1] = true;
+                    }
+                }
             });
         }
     }
@@ -1836,42 +1870,30 @@ impl ReTraktorApp {
     /// Timeline layout: decks A and B as stacked waveforms with transition presets.
     fn show_timeline_studio_layout(&mut self, ui: &mut Ui) {
         panel(TraktorTheme::BG_PANEL()).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(caps("TRANSITION"));
-                for bars in [8u32, 16, 32] {
-                    if pill(ui, &format!("{bars}"), self.timeline_transition_bars == bars, TraktorTheme::ROW_SELECTED(), 32.0)
-                        .on_hover_text(format!("Transition over {bars} bars"))
-                        .clicked()
-                    {
-                        self.timeline_transition_bars = bars;
-                    }
-                }
-                ui.label(caps("BARS"));
-                ui.separator();
+            row(ui, 50.0, |ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+
                 ui.label(caps("CURVE"));
                 for (idx, name, tip) in [
-                    (0usize, "CROSSFADE", "Smooth crossfade: every stem plays on both decks"),
-                    (1usize, "BASS SWAP", "Deck A drops its bass as deck B brings its bass in"),
-                    (2usize, "VOCAL BRIDGE", "Deck A's vocals over deck B's instrumental"),
+                    (0usize, "CROSSFADE", "Smooth crossfade: every stem plays on both decks (U)"),
+                    (1usize, "BASS SWAP", "Deck A drops its bass as deck B brings its bass in (U)"),
+                    (2usize, "VOCAL BRIDGE", "Deck A's vocals over deck B's instrumental (U)"),
                 ] {
                     if pill(ui, name, self.timeline_preset_idx == idx, TraktorTheme::ROW_SELECTED(), 0.0)
                         .on_hover_text(tip)
                         .clicked()
                     {
                         self.timeline_preset_idx = idx;
-                        // Apply stem automation preset to Decks A & B
                         match idx {
                             0 => {
                                 self.deck_stem_muted[0] = [false; 4];
                                 self.deck_stem_muted[1] = [false; 4];
                             }
                             1 => {
-                                // Outgoing Deck A drops Bass; Incoming Deck B brings Bass
                                 self.deck_stem_muted[0][1] = true;
                                 self.deck_stem_muted[1][1] = false;
                             }
                             _ => {
-                                // Outgoing Deck A isolates Vocals over Incoming Deck B Instrumental
                                 self.deck_stem_muted[0] = [true, true, true, false];
                                 self.deck_stem_muted[1] = [false, false, false, true];
                             }
@@ -1879,10 +1901,109 @@ impl ReTraktorApp {
                     }
                 }
 
+                ui.separator();
+
+                // Live animated crossfader cursor position (smoothed when animations are enabled)
+                let anim = crate::theme::animations();
+                let cursor_xfader = if anim {
+                    ui.ctx().animate_value_with_time(egui::Id::new("timeline_cursor_xfader"), self.crossfader_pos, 0.08)
+                } else {
+                    self.crossfader_pos
+                };
+
+                // Curve wipe animation when preset changes
+                let prev_preset_id = egui::Id::new("timeline_prev_preset");
+                let wipe_start_id = egui::Id::new("timeline_wipe_start");
+                let prev_preset = ui.data(|d| d.get_temp::<usize>(prev_preset_id));
+                let cur_time = ui.input(|i| i.time);
+                if let Some(prev) = prev_preset {
+                    if prev != self.timeline_preset_idx {
+                        ui.data_mut(|d| {
+                            d.insert_temp(prev_preset_id, self.timeline_preset_idx);
+                            d.insert_temp(wipe_start_id, cur_time);
+                        });
+                    }
+                } else {
+                    ui.data_mut(|d| d.insert_temp(prev_preset_id, self.timeline_preset_idx));
+                }
+                let wipe_start = ui.data(|d| d.get_temp::<f64>(wipe_start_id)).unwrap_or(0.0);
+                let wipe_elapsed = (cur_time - wipe_start) as f32;
+                let wipe_duration = 0.28;
+                let wipe_progress = if anim && wipe_elapsed < wipe_duration {
+                    ui.ctx().request_repaint();
+                    (wipe_elapsed / wipe_duration).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+
+                // Compact dot-matrix transition display
+                let disp_w = (ui.available_width() - 260.0).clamp(240.0, 360.0);
+                let mut disp_resp = dot::dot_transition_display(
+                    ui,
+                    self.timeline_preset_idx,
+                    self.timeline_transition_bars,
+                    cursor_xfader,
+                    wipe_progress,
+                    Vec2::new(disp_w, 42.0),
+                );
+                disp_resp = disp_resp.on_hover_text("Transition curve: Deck A falls, Deck B rises. Drag to move crossfader, click to cycle curve (U)");
+                if disp_resp.clicked() {
+                    let next = (self.timeline_preset_idx + 1) % 3;
+                    self.timeline_preset_idx = next;
+                    match next {
+                        0 => {
+                            self.deck_stem_muted[0] = [false; 4];
+                            self.deck_stem_muted[1] = [false; 4];
+                        }
+                        1 => {
+                            self.deck_stem_muted[0][1] = true;
+                            self.deck_stem_muted[1][1] = false;
+                        }
+                        _ => {
+                            self.deck_stem_muted[0] = [true, true, true, false];
+                            self.deck_stem_muted[1] = [false, false, false, true];
+                        }
+                    }
+                }
+                if disp_resp.dragged() {
+                    let delta = disp_resp.drag_delta().x / (disp_w - 44.0).max(20.0);
+                    self.crossfader_pos = (self.crossfader_pos + delta).clamp(0.0, 1.0);
+                }
+
+                ui.separator();
+
+                // Bar length choice (8/16/32) shown as lit segments
+                ui.scope(|ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    for bars in [8u32, 16, 32] {
+                        let is_selected = self.timeline_transition_bars == bars;
+                        let (rect, mut resp) = ui.allocate_exact_size(Vec2::new(28.0, HIT), Sense::click());
+                        let fill = if is_selected { TraktorTheme::ROW_SELECTED() } else { TraktorTheme::CONTROL() };
+                        let border = if is_selected { TraktorTheme::BORDER_ACCENT() } else { TraktorTheme::BORDER_COLOR() };
+                        ui.painter().rect(rect, 3.0, fill, Stroke::new(1.0_f32, border));
+                        let lamp_col = if is_selected { TraktorTheme::ACCENT() } else { dot::unlit_on_panel() };
+                        ui.painter().circle_filled(egui::pos2(rect.center().x, rect.top() + 4.5), 1.6, lamp_col);
+                        let fg = if is_selected { TraktorTheme::TEXT_PRIMARY() } else { TraktorTheme::TEXT_MUTED() };
+                        ui.painter().text(
+                            egui::pos2(rect.center().x, rect.bottom() - 3.5),
+                            egui::Align2::CENTER_BOTTOM,
+                            &format!("{bars}"),
+                            egui::FontId::monospace(10.0),
+                            fg,
+                        );
+                        resp = resp.on_hover_text(format!("Transition over {bars} bars (B)"));
+                        if resp.clicked() {
+                            self.timeline_transition_bars = bars;
+                        }
+                        ring(ui, resp);
+                    }
+                });
+                ui.label(caps("BARS"));
+
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let (fill, fg) = (TraktorTheme::CONTROL(), TraktorTheme::TEXT_PRIMARY());
                     if icon_pill(ui, Icon::Play, "AUDITION", fill, fg, Vec2::new(0.0, HIT))
-                        .on_hover_text("Sync deck B to deck A and play both")
+                        .on_hover_text("Sync deck B to deck A and play both (A)")
                         .clicked()
                     {
                         self.sync_deck(2);
@@ -1961,16 +2082,60 @@ impl ReTraktorApp {
         };
 
         if header {
-            row(ui, 40.0, |ui| {
+            let phase = self.audio.shared.lock().ok().and_then(|state| {
+                let other = if d == 0 { 1 } else { 0 };
+                let beats = |i: usize| {
+                    let t = state.loaded_tracks[i].as_ref().filter(|_| state.is_playing[i])?;
+                    Some((state.playhead_sec[i] - t.grid_offset_sec) * t.bpm.max(20.0) / 60.0)
+                };
+                Some(beat_phase_diff(beats(other)?, beats(d)?))
+            });
+            let in_key = deck_idx != 1
+                && self.audio.shared.lock().is_ok_and(|s| {
+                    s.loaded_tracks[0].as_ref().is_some_and(|a| KeyWheel::are_harmonically_compatible(&a.key, &deck.key))
+                });
+            let is_loaded = self.audio.shared.lock().is_ok_and(|s| s.loaded_tracks[d].is_some());
+            let loaded_t = crate::theme::fade(ui.ctx(), ("deck_loaded", d), is_loaded);
+            let looping = crate::theme::fade(ui.ctx(), ("deck_loop", d), self.deck_loop_active[d]);
+
+            row(ui, 48.0, |ui| {
                 deck_badge(ui, deck_letter, accent_color);
                 self.stem_buttons(ui, d);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    display(ui, |ui, ink| {
-                        ui.spacing_mut().item_spacing.x = 14.0;
-                        readout(ui, "BPM", &format!("{:.2}", deck.bpm * (1.0 + self.deck_pitch_fader[d] as f64 / 100.0)), 20.0, ink);
-                        readout(ui, "KEY", &deck.key, 20.0, ink);
-                        readout(ui, "REMAIN", &deck.remaining(), 20.0, ink);
+                    let display_w = 340.0;
+                    let panel_rect = display(ui, |ui, ink| {
+                        ui.set_width(display_w);
+                        ui.vertical(|ui| {
+                            // Beat strip: the bar counter sweeps with the music, the phase meter shows drift from the other deck.
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 10.0;
+                                let bar_w = ((display_w - 10.0) * 0.60).max(60.0);
+                                let (bar, _) = ui.allocate_exact_size(Vec2::new(bar_w, 11.0), Sense::hover());
+                                dot::bar_counter(ui.painter(), bar, (deck.elapsed_sec - deck.grid_offset_sec) * deck.bpm / 60.0, deck.is_playing, accent_color, ink);
+                                let meter_w = (display_w - bar_w - 10.0).max(40.0);
+                                let (meter, resp) = ui.allocate_exact_size(Vec2::new(meter_w, 11.0), Sense::hover());
+                                dot::phase_meter(ui.painter(), meter, phase, accent_color, ink);
+                                resp.on_hover_text("Beat phase against the other deck: centre means the beats are locked");
+                            });
+                            // Readout numbers in dot font: BPM, KEY, REMAIN with fixed columns so A and B headers align
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 8.0;
+                                let size = 18.0;
+                                let pitch_pct = self.deck_pitch_fader[d];
+                                let bpm_txt = format!("{:.2}", deck.bpm * (1.0 + pitch_pct as f64 / 100.0));
+                                ui.allocate_ui_with_layout(Vec2::new(95.0, 24.0), Layout::left_to_right(Align::Center), |ui| {
+                                    readout(ui, "BPM", &bpm_txt, size, ink);
+                                });
+                                ui.allocate_ui_with_layout(Vec2::new(85.0, 24.0), Layout::left_to_right(Align::Center), |ui| {
+                                    readout(ui, if in_key { "IN KEY" } else { "KEY" }, &deck.key, size, ink);
+                                });
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    readout(ui, "REMAIN", &deck.remaining(), size, ink);
+                                });
+                            });
+                        });
                     });
+                    dot::paint_dot_wipe(ui.painter(), panel_rect, (1.0 - loaded_t).max(looping), accent_color);
                     ui.with_layout(Layout::left_to_right(Align::Center), |ui| title_label(ui, &deck.title, &deck.artist));
                 });
             });
@@ -2844,5 +3009,22 @@ mod tests {
                 assert!(contrast(p.TEXT_SECONDARY, bg) >= 4.5, "{name}: secondary text on {bg:?}");
             }
         }
+    }
+
+    #[test]
+    fn timeline_preset_and_bar_cycling() {
+        let cycle_curve = |idx: usize| (idx + 1) % 3;
+        assert_eq!(cycle_curve(0), 1);
+        assert_eq!(cycle_curve(1), 2);
+        assert_eq!(cycle_curve(2), 0);
+
+        let cycle_bars = |bars: u32| match bars {
+            8 => 16,
+            16 => 32,
+            _ => 8,
+        };
+        assert_eq!(cycle_bars(8), 16);
+        assert_eq!(cycle_bars(16), 32);
+        assert_eq!(cycle_bars(32), 8);
     }
 }

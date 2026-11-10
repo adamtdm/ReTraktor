@@ -1505,7 +1505,13 @@ pub fn render_shortcuts_hud(ctx: &egui::Context, is_open: &mut bool) {
                     key_row(ui, "F2", "4-Deck Full Mix", c);
                     key_row(ui, "F3", "Browser (Full Library)", c);
                     key_row(ui, "F4", "Timeline Studio", c);
-                    ui.add_space(8.0);
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("TIMELINE STUDIO").color(TraktorTheme::DECK_A()).strong());
+                    ui.add_space(4.0);
+                    key_row(ui, "U", "Cycle Transition Curve", c);
+                    key_row(ui, "B", "Cycle Bar Length (8/16/32)", c);
+                    key_row(ui, "A", "Audition Transition", c);
+                    ui.add_space(6.0);
                     key_row(ui, "Cmd / Ctrl + ,", "Preferences & Setup", c);
                     key_row(ui, "?", "Toggle Shortcuts HUD", c);
                     key_row(ui, "Esc", "Dismiss HUD / Modals", c);
