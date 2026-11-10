@@ -92,6 +92,8 @@ pub struct ReTraktorApp {
     pub master_volume: f32,
     pub master_tempo: f64,
     pub crossfader_pos: f32,
+    pub xfader_cheer_sm: dot::CrossfadeCheerStateMachine,
+    pub active_cheer: Option<dot::ActiveCheer>,
 
     // FX Racks UI State
     pub fx1_dry_wet: f32,
@@ -209,6 +211,8 @@ impl Default for ReTraktorApp {
             master_volume: 0.8,
             master_tempo: 128.00,
             crossfader_pos: 0.5,
+            xfader_cheer_sm: dot::CrossfadeCheerStateMachine::new(),
+            active_cheer: None,
             fx1_dry_wet: 0.3,
             fx1_param: [0.5, 0.5, 0.5],
             fx1_on: false,
@@ -2499,9 +2503,11 @@ impl ReTraktorApp {
         let mut bands = [[0.0f32; 3]; 4];
         let mut stems = [[0.0f32; 4]; 4];
         let (mut peaks, mut main) = ([0.0f32; 4], (0.0, 0.0));
+        let mut both_playing = false;
         if let Ok(state) = self.audio.shared.lock() {
             peaks = state.channel_peaks;
             main = (state.master_peak_l, state.master_peak_r);
+            both_playing = state.is_playing[0] && state.is_playing[1];
             for d in 0..4 {
                 if let (Some(t), true) = (&state.loaded_tracks[d], state.is_playing[d]) {
                     let at = (state.playhead_sec[d].max(0.0) * PEAKS_PER_SEC as f64) as usize;
@@ -2510,6 +2516,30 @@ impl ReTraktorApp {
                 }
             }
         }
+
+        // Crossfade cheers state machine
+        let now_sec = ui.input(|i| i.time);
+        if crate::theme::animations() {
+            if let Some(cheer_idx) = self.xfader_cheer_sm.update(self.crossfader_pos, both_playing, now_sec) {
+                let deck = self.xfader_cheer_sm.target_deck;
+                self.active_cheer = Some(dot::ActiveCheer {
+                    deck,
+                    cheer_index: cheer_idx,
+                    start_sec: now_sec,
+                });
+            }
+        } else {
+            self.active_cheer = None;
+        }
+
+        if let Some(cheer) = self.active_cheer {
+            if !crate::theme::animations() || now_sec - cheer.start_sec >= 1.5 {
+                self.active_cheer = None;
+            } else {
+                ui.ctx().request_repaint();
+            }
+        }
+
         let screen_h = ui.ctx().screen_rect().height();
         let h = (132.0 + (screen_h - 640.0) * 0.25).clamp(132.0, 220.0);
         const FADER_W: f32 = 44.0;
@@ -2540,6 +2570,17 @@ impl ReTraktorApp {
 
     fn mixer_display(&mut self, ui: &mut Ui, d: usize, mirrored: bool, bands: [f32; 3], stems: [f32; 4], size: Vec2) {
         let accent = TraktorTheme::deck_color(d + 1);
+        let now_sec = ui.input(|i| i.time);
+        if let Some(cheer) = self.active_cheer {
+            if cheer.deck == d && crate::theme::animations() {
+                let elapsed = (now_sec - cheer.start_sec) as f32;
+                if elapsed < 1.5 {
+                    dot::cheer_display(ui, cheer.cheer_index, elapsed, accent, size);
+                    return;
+                }
+            }
+        }
+
         if self.deck_stem_view[d] {
             let progress = self.library.stem_job_progress.filter(|(id, _)| self.deck_track_ids[d] == Some(*id)).map(|(_, p)| p);
             dot::stem_display(ui, d, &mut self.deck_stem_muted[d], &mut self.deck_stem_fx_send[d], stems, progress, mirrored, accent, size)
@@ -2865,5 +2906,53 @@ mod tests {
                 assert!(contrast(p.TEXT_SECONDARY, bg) >= 4.5, "{name}: secondary text on {bg:?}");
             }
         }
+    }
+
+    #[test]
+    fn crossfade_cheer_state_machine_transitions() {
+        let mut sm = dot::CrossfadeCheerStateMachine::new();
+
+        // 1. Initial state at Deck A side (< 0.1): no cheer yet
+        assert_eq!(sm.update(0.05, true, 0.0), None);
+
+        // 2. Crossfader moves through middle with both playing
+        assert_eq!(sm.update(0.5, true, 1.0), None);
+
+        // 3. Reaches Deck B side (> 0.9) at t=2.0
+        assert_eq!(sm.update(0.95, true, 2.0), None);
+
+        // 4. Still resting at t=3.5 (< 2.0s resting)
+        assert_eq!(sm.update(0.95, true, 3.5), None);
+
+        // 5. Rests for 2.0s at t=4.0 -> cheer triggers on Deck B!
+        let cheer1 = sm.update(0.95, true, 4.0);
+        assert!(cheer1.is_some());
+        assert_eq!(sm.target_deck, 1); // Deck B
+
+        // 6. Continues resting: does not re-trigger
+        assert_eq!(sm.update(0.95, true, 4.5), None);
+
+        // 7. Transition back from Right to Left, but paused halfway: no cheer!
+        assert_eq!(sm.update(0.5, false, 5.0), None); // paused!
+        assert_eq!(sm.update(0.05, true, 6.0), None); // reached Left
+        assert_eq!(sm.update(0.05, true, 8.5), None); // rested 2.5s, but transit was invalid -> None!
+
+        // 8. Now a valid transit from Left to Right:
+        assert_eq!(sm.update(0.05, true, 9.0), None);
+        assert_eq!(sm.update(0.5, true, 9.5), None);
+        assert_eq!(sm.update(0.95, true, 10.0), None);
+        let cheer2 = sm.update(0.95, true, 12.0);
+        assert!(cheer2.is_some());
+        assert_eq!(sm.target_deck, 1);
+        // Consecutive cheers must not repeat the same index
+        assert_ne!(cheer1, cheer2);
+
+        // 9. Valid transit from Right to Left: triggers cheer on Deck A!
+        assert_eq!(sm.update(0.5, true, 13.0), None);
+        assert_eq!(sm.update(0.05, true, 14.0), None);
+        let cheer3 = sm.update(0.05, true, 16.0);
+        assert!(cheer3.is_some());
+        assert_eq!(sm.target_deck, 0); // Deck A
+        assert_ne!(cheer2, cheer3);
     }
 }
