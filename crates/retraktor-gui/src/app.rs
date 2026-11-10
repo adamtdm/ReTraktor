@@ -3,11 +3,11 @@ use crate::library_ui::LibraryManager;
 use crate::preferences::{PreferencesDialog, PrefsTab};
 use crate::theme::TraktorTheme;
 use crate::widgets::{
-    crossfader, cue_pad, deck_transport_bar, render_shortcuts_hud, rotary_knob_sized,
-    scrolling_stem_waveforms, scrolling_waveform, stripe_overview, vertical_fader, vu_meter,
+    crossfader, deck_transport_bar, icon_button, render_shortcuts_hud, rotary_knob_sized,
+    scrolling_stem_waveforms, scrolling_waveform, stripe_overview, vertical_fader, vu_meter, Icon,
     TransportAction,
 };
-use eframe::egui::{self, Align, Color32, Key, Layout, RichText, Stroke, Ui, Vec2};
+use eframe::egui::{self, Align, Color32, Key, Layout, RichText, Sense, Stroke, Ui, Vec2};
 use retraktor_core::{PropValue, PropertyBus, SurfaceEvent};
 use retraktor_dsp::MixerFxKind;
 use retraktor_hid::{
@@ -308,11 +308,11 @@ impl eframe::App for ReTraktorApp {
         self.poll_mx2_hardware();
         self.sync_audio_state();
 
-        // Authentic Traktor Dark Theme Canvas
         crate::theme::apply_visuals(ctx);
 
+        // One 4 px gutter everywhere: window edge to panel, and panel to panel.
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(TraktorTheme::BG_WINDOW()))
+            .frame(egui::Frame::none().fill(TraktorTheme::BG_WINDOW()).inner_margin(4.0))
             .show(ctx, |ui| {
                 ui.spacing_mut().item_spacing = Vec2::new(4.0, 4.0);
 
@@ -497,7 +497,7 @@ impl ReTraktorApp {
     }
 
     /// Dev-only: walks SHOT_STEPS (90 frames each after SHOT_WARM frames) saving a PNG per step, then exits.
-    /// Steps: Mix FourDeck Browser Timeline prefs prefs:<Tab> nav:Missing|Suggestions|Files loadA expandA relocate wait.
+    /// Steps: Mix FourDeck Browser Timeline prefs prefs:<Tab> nav:Missing|Suggestions|Files loadA loadB expandA stemsA pattern relocate wait.
     fn screenshot_step(&mut self, ctx: &egui::Context) {
         let Some((dir, steps)) = self.shot.clone() else { return };
         let warm: usize = std::env::var("SHOT_WARM").ok().and_then(|v| v.parse().ok()).unwrap_or(300);
@@ -533,12 +533,16 @@ impl ReTraktorApp {
                     _ => NavItem::Collection,
                 };
             }
-            "loadA" if first => {
-                if let Some(id) = self.library.tracks.iter().find(|t| !t.missing && t.file_path.as_ref().is_some_and(|p| p.is_file())).map(|t| t.id) {
-                    self.library.load_to_deck(1, id, [false; 4]);
+            "loadA" | "loadB" if first => {
+                let deck = if step == "loadA" { 1 } else { 2 };
+                let mut playable = self.library.tracks.iter().filter(|t| !t.missing && t.file_path.as_ref().is_some_and(|p| p.is_file()));
+                if let Some(id) = playable.nth(deck - 1).map(|t| t.id) {
+                    self.library.load_to_deck(deck, id, [false; 4]);
                     self.drain_pending_loads();
                 }
             }
+            "stemsA" => self.deck_stem_view[0] = true,
+            "pattern" => self.show_pattern_player = true,
             "relocate" if first => self.library.start_relocate(self.preferences.music_folders.clone()),
             _ => {}
         }
@@ -1381,892 +1385,376 @@ impl ReTraktorApp {
         }
     }
 
-    /// Top Header Bar with Brand, Master Clock, FX 1 & 2, Layout Switcher, and Master Limiter
+    /// Top bar, left to right: layout tabs, master tempo, FX units, pattern player;
+    /// right-aligned: status lamps, recorder, main level, help and settings.
     fn show_top_bar(&mut self, ui: &mut Ui) {
-        egui::Frame::none()
-            .fill(TraktorTheme::BG_PANEL())
-            .stroke(Stroke::new(1.0_f32, TraktorTheme::BORDER_COLOR()))
-            .inner_margin(egui::Margin::symmetric(8.0, 4.0))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    // 1. Brand Logo
-                    ui.label(
-                        RichText::new("ReTraktor")
-                            .color(Color32::WHITE)
-                            .font(egui::FontId::proportional(15.0))
-                            .strong(),
-                    );
-
+        panel(TraktorTheme::BG_PANEL()).show(ui, |ui| {
+            row(ui, 40.0, |ui| {
+                // The wordmark is the first thing to go when the window is narrow.
+                if ui.available_width() >= 1180.0 {
+                    ui.label(RichText::new("ReTraktor").size(14.0).color(TraktorTheme::TEXT_HIGHLIGHT()));
                     ui.separator();
+                }
 
-                    // 2. Master Clock
-                    ui.label(
-                        RichText::new("MASTER")
-                            .color(TraktorTheme::TEXT_SECONDARY())
-                            .font(egui::FontId::proportional(9.5)),
-                    );
-                    ui.label(
-                        RichText::new(format!("{:.2}", self.master_tempo))
-                            .color(Color32::WHITE)
-                            .font(egui::FontId::monospace(13.5))
-                            .strong(),
-                    );
+                for (lay, key) in [
+                    (TraktorLayout::Parallel, "F1"),
+                    (TraktorLayout::FourDeck, "F2"),
+                    (TraktorLayout::Browser, "F3"),
+                    (TraktorLayout::Timeline, "F4"),
+                ] {
+                    if pill(ui, lay.label(), self.layout == lay, TraktorTheme::ROW_SELECTED(), 54.0)
+                        .on_hover_text(format!("{} layout ({key})", lay.label()))
+                        .clicked()
+                    {
+                        self.layout = lay;
+                        self.preferences.four_deck_mode = lay == TraktorLayout::FourDeck;
+                    }
+                }
+                ui.separator();
+
+                display(ui, |ui, ink| {
+                    readout(ui, "MASTER BPM", &format!("{:.2}", self.master_tempo), 20.0, ink);
+                });
+                if pill(ui, "−", false, Color32::TRANSPARENT, HIT).on_hover_text("Master tempo down 0.5 BPM").clicked() {
+                    self.master_tempo = (self.master_tempo - 0.5).max(40.0);
+                }
+                if pill(ui, "+", false, Color32::TRANSPARENT, HIT).on_hover_text("Master tempo up 0.5 BPM").clicked() {
+                    self.master_tempo = (self.master_tempo + 0.5).min(240.0);
+                }
+                if pill(ui, "ROUND", false, Color32::TRANSPARENT, 0.0)
+                    .on_hover_text("Round the master tempo to a whole BPM")
+                    .clicked()
+                {
+                    self.master_tempo = self.master_tempo.round().clamp(60.0, 200.0);
+                }
+                ui.separator();
+
+                fx_unit(ui, 1, &mut self.fx1_on, &mut self.fx1_dry_wet, &mut self.fx1_param[0], "REV", "reverb amount");
+                ui.separator();
+                fx_unit(ui, 2, &mut self.fx2_on, &mut self.fx2_dry_wet, &mut self.fx2_param[0], "DLY", "delay amount");
+                ui.separator();
+
+                // Lit in the signal colour while the pattern is sounding, even if its strip is hidden.
+                let pattern_fill = if self.pattern_enabled { TraktorTheme::ACCENT() } else { TraktorTheme::ROW_SELECTED() };
+                if pill(ui, "PATTERN", self.show_pattern_player || self.pattern_enabled, pattern_fill, 0.0)
+                    .on_hover_text("Show or hide the 16-step pattern player (drum machine)")
+                    .clicked()
+                {
+                    self.show_pattern_player = !self.show_pattern_player;
+                }
+
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui
-                        .add(egui::Button::new("TAP").min_size(Vec2::new(30.0, 18.0)))
+                        .add(egui::Button::new(RichText::new("⚙").size(15.0)).min_size(Vec2::new(28.0, HIT)))
+                        .on_hover_text("Preferences (Ctrl+,)")
                         .clicked()
                     {
-                        self.master_tempo = (self.master_tempo.round()).clamp(60.0, 200.0);
+                        self.preferences.is_open = !self.preferences.is_open;
                     }
                     if ui
-                        .add(egui::Button::new("-").min_size(Vec2::new(18.0, 18.0)))
+                        .add(egui::Button::new(RichText::new("?").size(14.0)).min_size(Vec2::new(28.0, HIT)))
+                        .on_hover_text("Keyboard shortcuts (?)")
                         .clicked()
                     {
-                        self.master_tempo = (self.master_tempo - 0.5).max(40.0);
+                        self.show_shortcuts_hud = !self.show_shortcuts_hud;
                     }
-                    if ui
-                        .add(egui::Button::new("+").min_size(Vec2::new(18.0, 18.0)))
+
+                    rotary_knob_sized(ui, &mut self.master_volume, 0.0, 1.0, 0.8, "MAIN", TraktorTheme::TEXT_PRIMARY(), 28.0)
+                        .on_hover_text(format!("Main output level. {KNOB_TIP}"));
+
+                    let (peak_l, peak_r, is_rec, rec_sec) = if let Ok(state) = self.audio.shared.lock() {
+                        let secs = state.recorded_samples.len() as f64 / (48_000.0 * 2.0);
+                        (state.master_peak_l, state.master_peak_r, state.is_recording, secs)
+                    } else {
+                        (0.0, 0.0, false, 0.0)
+                    };
+                    vu_meter(ui, peak_l, peak_r, 30.0);
+
+                    // Recording shows as a filled button with a running clock, not by colour alone.
+                    let rec_label = if is_rec {
+                        format!("REC {:02}:{:02}", (rec_sec / 60.0).floor() as u32, (rec_sec % 60.0).floor() as u32)
+                    } else {
+                        "REC".to_string()
+                    };
+                    let (rec_fill, rec_fg) = if is_rec {
+                        (TraktorTheme::ACCENT(), on(TraktorTheme::ACCENT()))
+                    } else {
+                        (TraktorTheme::CONTROL(), TraktorTheme::TEXT_SECONDARY())
+                    };
+                    if icon_pill(ui, Icon::Dot, &rec_label, rec_fill, rec_fg, Vec2::new(0.0, HIT))
+                        .on_hover_text(if is_rec {
+                            "Stop and save the recording to ~/Music/ReTraktor_Master_Mix.wav"
+                        } else {
+                            "Record the main mix (16-bit 48 kHz WAV in ~/Music)"
+                        })
                         .clicked()
                     {
-                        self.master_tempo = (self.master_tempo + 0.5).min(240.0);
-                    }
-
-                    ui.separator();
-
-                    // 3. Layout Switcher Pills (Parallel | Extended | Essential | 4-Deck | Timeline | Browser)
-                    ui.label(
-                        RichText::new("LAYOUT")
-                            .color(TraktorTheme::TEXT_SECONDARY())
-                            .font(egui::FontId::proportional(10.0)),
-                    );
-                    let layouts = [
-                        TraktorLayout::Parallel,
-                        TraktorLayout::FourDeck,
-                        TraktorLayout::Browser,
-                        TraktorLayout::Timeline,
-                    ];
-                    for lay in layouts {
-                        let active = self.layout == lay;
-                        let btn = ui.add(
-                            egui::Button::new(
-                                RichText::new(lay.label())
-                                    .color(if active {
-                                        Color32::WHITE
-                                    } else {
-                                        TraktorTheme::TEXT_SECONDARY()
-                                    })
-                                    .font(egui::FontId::proportional(10.5))
-                                    .strong(),
-                            )
-                            .fill(if active {
-                                TraktorTheme::ROW_SELECTED()
+                        let mut samples_to_save: Option<Vec<i16>> = None;
+                        if let Ok(mut state) = self.audio.shared.lock() {
+                            if state.is_recording {
+                                state.is_recording = false;
+                                samples_to_save = Some(std::mem::take(&mut state.recorded_samples));
                             } else {
-                                Color32::from_rgb(48, 51, 57)
-                            })
-                            .stroke(Stroke::new(0.5_f32, TraktorTheme::BORDER_COLOR()))
-                            .min_size(Vec2::new(54.0, 20.0)),
-                        );
-                        if btn.clicked() {
-                            self.layout = lay;
-                            self.preferences.four_deck_mode = lay == TraktorLayout::FourDeck;
-                        }
-                    }
-
-                    ui.separator();
-
-                    // 3b. Traktor Pro 4 Pattern Player Toggle
-                    let pat_btn = ui.add(
-                        egui::Button::new(
-                            RichText::new(if self.pattern_enabled {
-                                "PATTERN"
-                            } else {
-                                "PATTERN"
-                            })
-                            .color(if self.show_pattern_player || self.pattern_enabled {
-                                Color32::BLACK
-                            } else {
-                                TraktorTheme::TEXT_SECONDARY()
-                            })
-                            .font(egui::FontId::monospace(9.5))
-                            .strong(),
-                        )
-                        .fill(if self.show_pattern_player || self.pattern_enabled {
-                            TraktorTheme::DECK_B()
-                        } else {
-                            Color32::from_rgb(48, 51, 57)
-                        })
-                        .min_size(Vec2::new(66.0, 20.0)),
-                    );
-                    if pat_btn
-                        .on_hover_text("Toggle Traktor Pro 4 16-Step Pattern Player (Drum Machine)")
-                        .clicked()
-                    {
-                        self.show_pattern_player = !self.show_pattern_player;
-                    }
-
-                    ui.separator();
-
-                    // 4. FX 1 & FX 2 Compact Racks
-                    let fx1_btn = ui.add(
-                        egui::Button::new(
-                            RichText::new("FX 1")
-                                .color(if self.fx1_on {
-                                    Color32::BLACK
-                                } else {
-                                    TraktorTheme::DECK_A()
-                                })
-                                .font(egui::FontId::monospace(9.5))
-                                .strong(),
-                        )
-                        .fill(if self.fx1_on {
-                            TraktorTheme::DECK_A()
-                        } else {
-                            Color32::from_rgb(28, 30, 36)
-                        })
-                        .min_size(Vec2::new(32.0, 20.0)),
-                    );
-                    if fx1_btn.clicked() {
-                        self.fx1_on = !self.fx1_on;
-                    }
-                    rotary_knob_sized(
-                        ui,
-                        &mut self.fx1_dry_wet,
-                        0.0,
-                        1.0,
-                        0.3,
-                        "D/W",
-                        TraktorTheme::DECK_A(),
-                        28.0,
-                    );
-                    rotary_knob_sized(
-                        ui,
-                        &mut self.fx1_param[0],
-                        0.0,
-                        1.0,
-                        0.5,
-                        "REV",
-                        TraktorTheme::DECK_A(),
-                        28.0,
-                    );
-
-                    ui.separator();
-
-                    let fx2_btn = ui.add(
-                        egui::Button::new(
-                            RichText::new("FX 2")
-                                .color(if self.fx2_on {
-                                    Color32::BLACK
-                                } else {
-                                    TraktorTheme::DECK_B()
-                                })
-                                .font(egui::FontId::monospace(9.5))
-                                .strong(),
-                        )
-                        .fill(if self.fx2_on {
-                            TraktorTheme::DECK_B()
-                        } else {
-                            Color32::from_rgb(28, 30, 36)
-                        })
-                        .min_size(Vec2::new(32.0, 20.0)),
-                    );
-                    if fx2_btn.clicked() {
-                        self.fx2_on = !self.fx2_on;
-                    }
-                    rotary_knob_sized(
-                        ui,
-                        &mut self.fx2_dry_wet,
-                        0.0,
-                        1.0,
-                        0.3,
-                        "D/W",
-                        TraktorTheme::DECK_B(),
-                        28.0,
-                    );
-                    rotary_knob_sized(
-                        ui,
-                        &mut self.fx2_param[0],
-                        0.0,
-                        1.0,
-                        0.5,
-                        "DLY",
-                        TraktorTheme::DECK_B(),
-                        28.0,
-                    );
-
-                    // 5. Right-aligned Master Output, Mix Recorder, Meter & Preferences Gear
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new("⚙").font(egui::FontId::proportional(15.0)),
-                                )
-                                .min_size(Vec2::new(26.0, 22.0)),
-                            )
-                            .on_hover_text("Preferences: Audio, Stems & Traktor MX2 Settings (Ctrl+,)")
-                            .clicked()
-                        {
-                            self.preferences.is_open = !self.preferences.is_open;
-                        }
-
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new("?").font(egui::FontId::proportional(14.0)).strong(),
-                                )
-                                .min_size(Vec2::new(24.0, 22.0)),
-                            )
-                            .on_hover_text("Live Performance Keyboard Shortcuts Cheat-Sheet (?)")
-                            .clicked()
-                        {
-                            self.show_shortcuts_hud = !self.show_shortcuts_hud;
-                        }
-
-                        rotary_knob_sized(
-                            ui,
-                            &mut self.master_volume,
-                            0.0,
-                            1.0,
-                            0.8,
-                            "MAIN",
-                            Color32::WHITE,
-                            28.0,
-                        );
-
-                        let (peak_l, peak_r, is_rec, rec_sec) =
-                            if let Ok(state) = self.audio.shared.lock() {
-                                let secs =
-                                    state.recorded_samples.len() as f64 / (48_000.0 * 2.0);
-                                (
-                                    state.master_peak_l,
-                                    state.master_peak_r,
-                                    state.is_recording,
-                                    secs,
-                                )
-                            } else {
-                                (0.0, 0.0, false, 0.0)
-                            };
-                        vu_meter(ui, peak_l, peak_r, 30.0);
-
-                        // Master Mix Recorder Button (`● REC`)
-                        let rec_m = (rec_sec / 60.0).floor() as u32;
-                        let rec_s = (rec_sec % 60.0).floor() as u32;
-                        let rec_label = if is_rec {
-                            format!("REC {rec_m:02}:{rec_s:02}")
-                        } else {
-                            "REC".to_string()
-                        };
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new(rec_label)
-                                        .color(if is_rec {
-                                            Color32::WHITE
-                                        } else {
-                                            Color32::from_rgb(220, 95, 90)
-                                        })
-                                        .font(egui::FontId::monospace(9.5))
-                                        .strong(),
-                                )
-                                .fill(if is_rec {
-                                    Color32::from_rgb(175, 42, 42)
-                                } else {
-                                    Color32::from_rgb(48, 51, 57)
-                                }),
-                            )
-                            .on_hover_text(
-                                "Record live Master Mix to ~/Music/ReTraktor_Master_Mix.wav (16-bit 48kHz Stereo WAV)",
-                            )
-                            .clicked()
-                        {
-                            let mut samples_to_save: Option<Vec<i16>> = None;
-                            if let Ok(mut state) = self.audio.shared.lock() {
-                                if state.is_recording {
-                                    state.is_recording = false;
-                                    samples_to_save =
-                                        Some(std::mem::take(&mut state.recorded_samples));
-                                } else {
-                                    state.recorded_samples = Vec::with_capacity(48_000 * 2 * 1800);
-                                    state.is_recording = true;
-                                }
+                                state.recorded_samples = Vec::with_capacity(48_000 * 2 * 1800);
+                                state.is_recording = true;
                             }
-                            if let Some(samples) = samples_to_save {
-                                let home = env::var("HOME")
-                                    .map(PathBuf::from)
-                                    .unwrap_or_else(|_| PathBuf::from("."));
-                                let music_dir = home.join("Music");
-                                let out_dir = if music_dir.is_dir() { music_dir } else { home };
-                                let out_path = out_dir.join("ReTraktor_Master_Mix.wav");
-                                match AudioSystem::write_stereo_wav_file(&out_path, &samples, 48_000)
-                                {
-                                    Ok(dur_s) => {
-                                        self.library.status_message = format!(
-                                            "✔ Saved Master Mix recording ({dur_s:.1}s) to {}",
-                                            out_path.display()
-                                        );
-                                    }
-                                    Err(e) => {
-                                        self.library.status_message =
-                                            format!("⚠ Failed to save WAV recording: {e}");
-                                    }
+                        }
+                        if let Some(samples) = samples_to_save {
+                            let home = env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("."));
+                            let music_dir = home.join("Music");
+                            let out_dir = if music_dir.is_dir() { music_dir } else { home };
+                            let out_path = out_dir.join("ReTraktor_Master_Mix.wav");
+                            match AudioSystem::write_stereo_wav_file(&out_path, &samples, 48_000) {
+                                Ok(dur_s) => {
+                                    self.library.status_message =
+                                        format!("✔ Saved Master Mix recording ({dur_s:.1}s) to {}", out_path.display());
+                                }
+                                Err(e) => {
+                                    self.library.status_message = format!("⚠ Failed to save WAV recording: {e}");
                                 }
                             }
                         }
+                    }
 
-                        let (mx2_label, mx2_color) = if let Some(ref node) = self.mx2_dev_node {
-                            (
-                                format!("MX2 ({node})"),
-                                TraktorTheme::PLAY_ACTIVE(),
-                            )
-                        } else {
-                            (
-                                "No controller".to_string(),
-                                TraktorTheme::TEXT_MUTED(),
-                            )
-                        };
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new(mx2_label)
-                                        .color(mx2_color)
-                                        .font(egui::FontId::monospace(9.5))
-                                        .strong(),
-                                )
-                                .frame(false),
-                            )
-                            .on_hover_text(
-                                "Click to open Traktor MX2 [17CC:2420] & Controller Settings in Preferences",
-                            )
-                            .clicked()
-                        {
-                            self.preferences.is_open = true;
-                            self.preferences.current_tab = PrefsTab::Controllers;
-                        }
-
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new("PipeWire 48 kHz")
-                                        .color(TraktorTheme::PLAY_ACTIVE())
-                                        .font(egui::FontId::monospace(9.5)),
-                                )
-                                .frame(false),
-                            )
-                            .on_hover_text("Click to open Audio & UAC2 Routing Settings in Preferences")
-                            .clicked()
-                        {
-                            self.preferences.is_open = true;
-                            self.preferences.current_tab = PrefsTab::AudioSetup;
-                        }
-                    });
+                    let controller_tip = match &self.mx2_dev_node {
+                        Some(node) => format!("Traktor MX2 connected ({node}). Click for controller settings"),
+                        None => "No controller connected. Click for controller settings".to_string(),
+                    };
+                    if lamp(ui, "MX2", self.mx2_dev_node.is_some()).on_hover_text(controller_tip).clicked() {
+                        self.preferences.is_open = true;
+                        self.preferences.current_tab = PrefsTab::Controllers;
+                    }
+                    if lamp(ui, "48 kHz", true)
+                        .on_hover_text("Audio out: PipeWire, 48 kHz. Click for audio settings")
+                        .clicked()
+                    {
+                        self.preferences.is_open = true;
+                        self.preferences.current_tab = PrefsTab::AudioSetup;
+                    }
                 });
             });
+        });
     }
 
-    /// Traktor Pro 4 16-Step Pattern Player (Master-Clock-Synced Drum Machine)
+    /// 16-step pattern player (drum machine locked to the master tempo).
     fn show_pattern_player_bar(&mut self, ui: &mut Ui) {
-        let cur_step = if let Ok(state) = self.audio.shared.lock() {
-            state.pattern_current_step
-        } else {
-            0
-        };
+        let cur_step = self.audio.shared.lock().map(|s| s.pattern_current_step).unwrap_or(0);
 
-        egui::Frame::none()
-            .fill(Color32::from_rgb(20, 22, 29))
-            .stroke(Stroke::new(1.0_f32, Color32::from_rgb(255, 195, 0)))
-            .inner_margin(egui::Margin::symmetric(8.0, 4.0))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    let on_btn = ui.add(
-                        egui::Button::new(
-                            RichText::new(if self.pattern_enabled {
-                                "⏸ PATTERN ON"
-                            } else {
-                                "PATTERN"
-                            })
-                            .color(if self.pattern_enabled {
-                                Color32::BLACK
-                            } else {
-                                Color32::from_rgb(255, 195, 0)
-                            })
-                            .font(egui::FontId::monospace(10.0))
-                            .strong(),
-                        )
-                        .fill(if self.pattern_enabled {
-                            Color32::from_rgb(255, 195, 0)
-                        } else {
-                            Color32::from_rgb(35, 36, 44)
-                        }),
-                    );
-                    if on_btn.clicked() {
-                        self.pattern_enabled = !self.pattern_enabled;
+        panel(TraktorTheme::BG_PANEL()).show(ui, |ui| {
+            row(ui, 33.0, |ui| {
+                let running = self.pattern_enabled;
+                let (fill, fg) = if running {
+                    (TraktorTheme::ACCENT(), on(TraktorTheme::ACCENT()))
+                } else {
+                    (TraktorTheme::CONTROL(), TraktorTheme::TEXT_SECONDARY())
+                };
+                let icon = if running { Icon::Pause } else { Icon::Play };
+                if icon_pill(ui, icon, "PATTERN", fill, fg, Vec2::new(0.0, HIT))
+                    .on_hover_text(if running { "Stop the pattern" } else { "Start the pattern (follows the master tempo)" })
+                    .clicked()
+                {
+                    self.pattern_enabled = !running;
+                }
+                ui.separator();
+
+                for (v, (label, name)) in
+                    [("KICK", "808 kick"), ("CLAP", "909 clap"), ("HAT", "909 hat"), ("PERC", "rave percussion")].into_iter().enumerate()
+                {
+                    if pill(ui, label, self.pattern_selected_voice == v, TraktorTheme::ROW_SELECTED(), 44.0)
+                        .on_hover_text(format!("Edit the {name} steps"))
+                        .clicked()
+                    {
+                        self.pattern_selected_voice = v;
                     }
+                }
+                ui.separator();
 
-                    ui.separator();
-
-                    // 4 Percussion Kit Voices
-                    let voices = [
-                        (0usize, "808 KICK", TraktorTheme::DECK_A()),
-                        (1usize, "909 CLAP", TraktorTheme::DECK_B()),
-                        (2usize, "909 HAT", Color32::from_rgb(205, 175, 75)),
-                        (3usize, "RAVE PERC", Color32::from_rgb(155, 115, 205)),
-                    ];
-                    for (v_idx, v_lbl, v_col) in voices {
-                        let sel = self.pattern_selected_voice == v_idx;
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new(v_lbl)
-                                        .color(if sel { Color32::BLACK } else { v_col })
-                                        .font(egui::FontId::monospace(9.5))
-                                        .strong(),
-                                )
-                                .fill(if sel {
-                                    v_col
-                                } else {
-                                    Color32::from_rgb(28, 30, 38)
-                                }),
-                            )
-                            .clicked()
-                        {
-                            self.pattern_selected_voice = v_idx;
-                        }
-                    }
-
-                    ui.separator();
-
-                    // 16-Step Sequencer Buttons for Selected Voice
-                    let v = self.pattern_selected_voice.min(3);
-                    let voice_col = [
-                        Color32::from_rgb(0, 215, 255),
-                        Color32::from_rgb(255, 145, 0),
-                        Color32::from_rgb(255, 215, 0),
-                        Color32::from_rgb(195, 95, 255),
-                    ][v];
-
+                // Steps share whatever is left after the fixed controls to their right.
+                let v = self.pattern_selected_voice.min(3);
+                let step_w = ((ui.available_width() - 250.0) / 16.0).clamp(HIT, 40.0);
+                ui.scope(|ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
                     for step in 0..16 {
-                        let active = self.pattern_steps[v][step];
-                        let is_playhead = self.pattern_enabled && cur_step == step;
-                        let fill = if active {
-                            voice_col
-                        } else if step % 4 == 0 {
-                            Color32::from_rgb(40, 44, 54)
-                        } else {
-                            Color32::from_rgb(26, 28, 35)
-                        };
-                        let border = if is_playhead {
-                            Stroke::new(1.8_f32, Color32::WHITE)
-                        } else {
-                            Stroke::new(0.6_f32, TraktorTheme::BORDER_COLOR())
-                        };
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new(format!("{}", step + 1))
-                                        .color(if active {
-                                            Color32::BLACK
-                                        } else {
-                                            TraktorTheme::TEXT_SECONDARY()
-                                        })
-                                        .font(egui::FontId::monospace(9.0))
-                                        .strong(),
-                                )
-                                .fill(fill)
-                                .stroke(border)
-                                .min_size(Vec2::new(21.0, 20.0)),
-                            )
-                            .clicked()
-                        {
+                        if step > 0 && step % 4 == 0 {
+                            ui.add_space(4.0); // one gap per beat
+                        }
+                        let resp = pill(ui, &format!("{}", step + 1), self.pattern_steps[v][step], TraktorTheme::ACCENT(), step_w)
+                            .on_hover_text(format!("Step {}", step + 1));
+                        if running && cur_step == step {
+                            ui.painter().rect_stroke(resp.rect, 2.0, Stroke::new(2.0_f32, TraktorTheme::TEXT_HIGHLIGHT()));
+                        }
+                        if resp.clicked() {
                             self.pattern_steps[v][step] = !self.pattern_steps[v][step];
                         }
                     }
-
-                    ui.separator();
-
-                    if ui.small_button("4x4").on_hover_text("Load 4x4 Techno Pattern").clicked() {
-                        self.pattern_steps[v] = [false; 16];
-                        for s in (0..16).step_by(4) {
-                            self.pattern_steps[v][s] = true;
-                        }
-                    }
-                    if ui.small_button("Roll").on_hover_text("Load 16th Snare/Hat Build Roll").clicked() {
-                        self.pattern_steps[v] = [true; 16];
-                    }
-                    if ui.small_button("Clr").on_hover_text("Clear Selected Voice Steps").clicked() {
-                        self.pattern_steps[v] = [false; 16];
-                    }
-
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.add(
-                            egui::Slider::new(&mut self.pattern_volume, 0.0..=1.0)
-                                .text("LVL")
-                                .show_value(false),
-                        );
-                    });
                 });
-            });
-    }
+                ui.separator();
 
-    /// LAYOUT 6: DJ.STUDIO-STYLE TIMELINE TRANSITION EDITOR (`F6`)
-    fn show_timeline_studio_layout(&mut self, ui: &mut Ui) {
-        egui::Frame::none()
-            .fill(TraktorTheme::BG_PANEL())
-            .stroke(Stroke::new(1.0_f32, TraktorTheme::DECK_A()))
-            .inner_margin(egui::Margin::symmetric(10.0, 6.0))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("TIMELINE TRANSITION & STEM AUTOMATION")
-                            .color(TraktorTheme::DECK_A())
-                            .font(egui::FontId::monospace(11.5))
-                            .strong(),
-                    );
-                    ui.separator();
-                    ui.label("Transition Window:");
-                    for bars in [8u32, 16, 32] {
-                        if ui
-                            .selectable_label(
-                                self.timeline_transition_bars == bars,
-                                format!("{bars} Bars"),
-                            )
-                            .clicked()
-                        {
-                            self.timeline_transition_bars = bars;
-                        }
+                if pill(ui, "4X4", false, Color32::TRANSPARENT, 0.0).on_hover_text("Fill with a four-on-the-floor pattern").clicked() {
+                    self.pattern_steps[v] = [false; 16];
+                    for s in (0..16).step_by(4) {
+                        self.pattern_steps[v][s] = true;
                     }
-                    ui.separator();
-                    ui.label("Automation Curve:");
-                    for (idx, name) in [
-                        (0usize, "Smooth Crossfade"),
-                        (1usize, "Instant Bass-Swap"),
-                        (2usize, "Vocal Stem Bridge"),
-                    ] {
-                        if ui
-                            .selectable_label(self.timeline_preset_idx == idx, name)
-                            .clicked()
-                        {
-                            self.timeline_preset_idx = idx;
-                            // Apply stem automation preset to Decks A & B
-                            match idx {
-                                0 => {
-                                    self.deck_stem_muted[0] = [false; 4];
-                                    self.deck_stem_muted[1] = [false; 4];
-                                }
-                                1 => {
-                                    // Outgoing Deck A drops Bass; Incoming Deck B brings Bass
-                                    self.deck_stem_muted[0][1] = true;
-                                    self.deck_stem_muted[1][1] = false;
-                                }
-                                _ => {
-                                    // Outgoing Deck A isolates Vocals over Incoming Deck B Instrumental
-                                    self.deck_stem_muted[0] = [true, true, true, false];
-                                    self.deck_stem_muted[1] = [false, false, false, true];
-                                }
-                            }
-                        }
-                    }
-
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new("Audition transition")
-                                        .color(Color32::BLACK)
-                                        .strong(),
-                                )
-                                .fill(TraktorTheme::PLAY_ACTIVE()),
-                            )
-                            .clicked()
-                        {
-                            self.sync_deck(2);
-                            if let Ok(mut state) = self.audio.shared.lock() {
-                                state.is_playing[0] = true;
-                                state.is_playing[1] = true;
-                            }
-                        }
-                    });
-                });
-
-                ui.add_space(4.0);
-
-                // Render Deck A & Deck B Parallel Stem Timelines + Crossfade Envelope Canvas
-                self.show_parallel_waveform_row(ui, 1, TraktorTheme::DECK_A(), 72.0);
-                ui.add_space(3.0);
-                self.show_parallel_waveform_row(ui, 2, TraktorTheme::DECK_B(), 72.0);
-            });
-    }
-
-    /// LAYOUT 1: PARALLEL WAVEFORMS LAYOUT
-    /// Stacked full-width waveforms for Deck A and Deck B right on top of each other so beatgrids
-    /// align pixel-for-pixel vertically, followed by Deck A controls | Center Mixer | Deck B controls.
-    fn show_parallel_layout(&mut self, ui: &mut Ui) {
-        let four_deck = self.layout == TraktorLayout::FourDeck || self.preferences.four_deck_mode;
-        let wave_h = if four_deck { 50.0 } else { 72.0 };
-
-        // A. Full-Width Stacked Parallel Waveforms Panel
-        egui::Frame::none()
-            .fill(TraktorTheme::BG_PANEL())
-            .stroke(Stroke::new(1.0_f32, TraktorTheme::BORDER_COLOR()))
-            .inner_margin(egui::Margin::symmetric(6.0, 4.0))
-            .show(ui, |ui| {
-                self.show_parallel_waveform_row(ui, 1, TraktorTheme::DECK_A(), wave_h);
-                ui.add_space(2.0);
-                self.show_parallel_waveform_row(ui, 2, TraktorTheme::DECK_B(), wave_h);
-                if four_deck {
-                    ui.add_space(2.0);
-                    self.show_parallel_waveform_row(ui, 3, TraktorTheme::DECK_C(), wave_h);
-                    ui.add_space(2.0);
-                    self.show_parallel_waveform_row(ui, 4, TraktorTheme::DECK_D(), wave_h);
                 }
+                if pill(ui, "ROLL", false, Color32::TRANSPARENT, 0.0).on_hover_text("Fill every step (16th-note roll)").clicked() {
+                    self.pattern_steps[v] = [true; 16];
+                }
+                if pill(ui, "CLEAR", false, Color32::TRANSPARENT, 0.0).on_hover_text("Clear this voice's steps").clicked() {
+                    self.pattern_steps[v] = [false; 16];
+                }
+
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    rotary_knob_sized(ui, &mut self.pattern_volume, 0.0, 1.0, 0.75, "LVL", TraktorTheme::TEXT_PRIMARY(), 28.0)
+                        .on_hover_text(format!("Pattern level. {KNOB_TIP}"));
+                });
             });
-
-        // B. Deck Controls + Center Mixer Row (strictly top-aligned via horizontal_top!)
-        ui.horizontal_top(|ui| {
-            let avail_w = ui.available_width();
-            let mixer_w = 340.0_f32;
-            let deck_w = ((avail_w - mixer_w - 8.0) / 2.0).max(260.0);
-
-            ui.allocate_ui_with_layout(
-                Vec2::new(deck_w, 192.0),
-                Layout::top_down(Align::Min),
-                |ui| {
-                    ui.set_width(deck_w);
-                    self.show_single_deck(ui, 1, TraktorTheme::DECK_A(), false, 0.0);
-                },
-            );
-
-            ui.allocate_ui_with_layout(
-                Vec2::new(mixer_w, 192.0),
-                Layout::top_down(Align::Min),
-                |ui| {
-                    ui.set_width(mixer_w);
-                    self.show_mixer_section(ui, true);
-                },
-            );
-
-            ui.allocate_ui_with_layout(
-                Vec2::new(deck_w, 192.0),
-                Layout::top_down(Align::Min),
-                |ui| {
-                    ui.set_width(deck_w);
-                    self.show_single_deck(ui, 2, TraktorTheme::DECK_B(), false, 0.0);
-                },
-            );
         });
     }
 
-    fn show_parallel_waveform_row(
-        &mut self,
-        ui: &mut Ui,
-        deck_idx: usize,
-        accent_color: Color32,
-        height: f32,
-    ) {
-        let rect = ui.scope(|ui| self.show_parallel_waveform_row_inner(ui, deck_idx, accent_color, height)).response.rect;
+    /// Timeline layout: decks A and B as stacked waveforms with transition presets.
+    fn show_timeline_studio_layout(&mut self, ui: &mut Ui) {
+        panel(TraktorTheme::BG_PANEL()).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(caps("TRANSITION"));
+                for bars in [8u32, 16, 32] {
+                    if pill(ui, &format!("{bars}"), self.timeline_transition_bars == bars, TraktorTheme::ROW_SELECTED(), 32.0)
+                        .on_hover_text(format!("Transition over {bars} bars"))
+                        .clicked()
+                    {
+                        self.timeline_transition_bars = bars;
+                    }
+                }
+                ui.label(caps("BARS"));
+                ui.separator();
+                ui.label(caps("CURVE"));
+                for (idx, name, tip) in [
+                    (0usize, "CROSSFADE", "Smooth crossfade: every stem plays on both decks"),
+                    (1usize, "BASS SWAP", "Deck A drops its bass as deck B brings its bass in"),
+                    (2usize, "VOCAL BRIDGE", "Deck A's vocals over deck B's instrumental"),
+                ] {
+                    if pill(ui, name, self.timeline_preset_idx == idx, TraktorTheme::ROW_SELECTED(), 0.0)
+                        .on_hover_text(tip)
+                        .clicked()
+                    {
+                        self.timeline_preset_idx = idx;
+                        // Apply stem automation preset to Decks A & B
+                        match idx {
+                            0 => {
+                                self.deck_stem_muted[0] = [false; 4];
+                                self.deck_stem_muted[1] = [false; 4];
+                            }
+                            1 => {
+                                // Outgoing Deck A drops Bass; Incoming Deck B brings Bass
+                                self.deck_stem_muted[0][1] = true;
+                                self.deck_stem_muted[1][1] = false;
+                            }
+                            _ => {
+                                // Outgoing Deck A isolates Vocals over Incoming Deck B Instrumental
+                                self.deck_stem_muted[0] = [true, true, true, false];
+                                self.deck_stem_muted[1] = [false, false, false, true];
+                            }
+                        }
+                    }
+                }
+
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let (fill, fg) = (TraktorTheme::CONTROL(), TraktorTheme::TEXT_PRIMARY());
+                    if icon_pill(ui, Icon::Play, "AUDITION", fill, fg, Vec2::new(0.0, HIT))
+                        .on_hover_text("Sync deck B to deck A and play both")
+                        .clicked()
+                    {
+                        self.sync_deck(2);
+                        if let Ok(mut state) = self.audio.shared.lock() {
+                            state.is_playing[0] = true;
+                            state.is_playing[1] = true;
+                        }
+                    }
+                });
+            });
+
+            let wave_h = mix_wave_height(ui) * 1.25;
+            self.show_parallel_waveform_row(ui, 1, TraktorTheme::DECK_A(), wave_h, true);
+            self.show_parallel_waveform_row(ui, 2, TraktorTheme::DECK_B(), wave_h, true);
+        });
+    }
+
+    /// Mix layout: full-width waveforms stacked so the beatgrids line up, then deck A | mixer | deck B.
+    fn show_parallel_layout(&mut self, ui: &mut Ui) {
+        let four_deck = self.layout == TraktorLayout::FourDeck || self.preferences.four_deck_mode;
+        let wave_h = mix_wave_height(ui) * if four_deck { 0.7 } else { 1.0 };
+
+        panel(TraktorTheme::BG_PANEL()).show(ui, |ui| {
+            let decks = if four_deck { 4 } else { 2 };
+            for deck_idx in 1..=decks {
+                self.show_parallel_waveform_row(ui, deck_idx, TraktorTheme::deck_color(deck_idx), wave_h, false);
+            }
+        });
+
+        ui.horizontal_top(|ui| {
+            let mixer_w = 320.0_f32;
+            let deck_w = ((ui.available_width() - mixer_w - 8.0) / 2.0).max(260.0);
+            // Deck panels stretch to the mixer's height (from the previous frame) so the row has one bottom edge.
+            let height_id = egui::Id::new("mix_row_height");
+            let row_h = ui.data(|d| d.get_temp::<f32>(height_id)).unwrap_or(0.0);
+
+            ui.allocate_ui_with_layout(Vec2::new(deck_w, row_h), Layout::top_down(Align::Min), |ui| {
+                ui.set_width(deck_w);
+                self.show_single_deck(ui, 1, TraktorTheme::DECK_A(), false, 0.0, row_h);
+            });
+            let mixer = ui.allocate_ui_with_layout(Vec2::new(mixer_w, 0.0), Layout::top_down(Align::Min), |ui| {
+                ui.set_width(mixer_w);
+                self.show_mixer_section(ui, true);
+            });
+            ui.data_mut(|d| d.insert_temp(height_id, mixer.response.rect.height()));
+            ui.allocate_ui_with_layout(Vec2::new(deck_w, row_h), Layout::top_down(Align::Min), |ui| {
+                ui.set_width(deck_w);
+                self.show_single_deck(ui, 2, TraktorTheme::DECK_B(), false, 0.0, row_h);
+            });
+        });
+    }
+
+    /// One full-width scrolling waveform. `header` adds the track line and readouts for layouts
+    /// with no deck panel underneath (Timeline).
+    fn show_parallel_waveform_row(&mut self, ui: &mut Ui, deck_idx: usize, accent_color: Color32, height: f32, header: bool) {
+        let rect = ui.scope(|ui| self.show_parallel_waveform_row_inner(ui, deck_idx, accent_color, height, header)).response.rect;
         self.deck_drop(ui, rect, deck_idx);
     }
 
-    fn show_parallel_waveform_row_inner(
-        &mut self,
-        ui: &mut Ui,
-        deck_idx: usize,
-        accent_color: Color32,
-        height: f32,
-    ) {
-        if !self.deck_loaded(deck_idx - 1) {
-            self.show_empty_deck(ui, deck_idx, accent_color, (height * 0.5).max(28.0));
-            return;
-        }
+    fn show_parallel_waveform_row_inner(&mut self, ui: &mut Ui, deck_idx: usize, accent_color: Color32, height: f32, header: bool) {
         let d = deck_idx - 1;
-        let deck_letter = ["A", "B", "C", "D"][d.min(3)];
-
-        let (title, artist, bpm, key, duration_sec, elapsed_sec, peaks, stem_peaks) = {
-            if let Ok(state) = self.audio.shared.lock() {
-                let el = state.playhead_sec[d];
-                if let Some(ref t) = state.loaded_tracks[d] {
-                    (
-                        t.title.clone(),
-                        t.artist.clone(),
-                        t.bpm,
-                        t.key.clone(),
-                        t.duration_sec,
-                        el,
-                        t.waveform_peaks.clone(),
-                        t.stem_peaks.clone(),
-                    )
-                } else {
-                    (
-                        format!("Deck {deck_letter} Empty"),
-                        String::new(),
-                        0.0,
-                        String::new(),
-                        120.0,
-                        0.0,
-                        Vec::new(),
-                        Vec::new(),
-                    )
-                }
-            } else {
-                (
-                    format!("Deck {deck_letter}"),
-                    String::new(),
-                    128.0,
-                    "4m".to_string(),
-                    120.0,
-                    0.0,
-                    Vec::new(),
-                    Vec::new(),
-                )
-            }
+        let deck_letter = DECK_LETTERS[d.min(3)];
+        let Some(deck) = self.deck_view(d) else {
+            row(ui, (height * 0.5).max(HIT), |ui| {
+                empty_deck_hint(ui, deck_letter, accent_color, "Drop a track here, or double-click one in the library");
+            });
+            return;
         };
 
-        // Compact info bar + Quick Stems / Acapella / Instrumental controls right above the parallel waveform
-        ui.horizontal(|ui| {
-            egui::Frame::none()
-                .fill(Color32::from_rgb(52, 55, 62))
-                .stroke(Stroke::new(0.8_f32, accent_color))
-                .rounding(2.0)
-                .inner_margin(egui::Margin::symmetric(6.0, 1.0))
-                .show(ui, |ui| {
-                    ui.label(
-                        RichText::new(format!("DECK {deck_letter}"))
-                            .color(accent_color)
-                            .font(egui::FontId::monospace(10.0))
-                            .strong(),
-                    );
+        if header {
+            row(ui, 40.0, |ui| {
+                deck_badge(ui, deck_letter, accent_color);
+                self.stem_buttons(ui, d);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    display(ui, |ui, ink| {
+                        ui.spacing_mut().item_spacing.x = 14.0;
+                        readout(ui, "BPM", &format!("{:.2}", deck.bpm * (1.0 + self.deck_pitch_fader[d] as f64 / 100.0)), 20.0, ink);
+                        readout(ui, "KEY", &deck.key, 20.0, ink);
+                        readout(ui, "REMAIN", &deck.remaining(), 20.0, ink);
+                    });
+                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| title_label(ui, &deck.title, &deck.artist));
                 });
-            ui.label(
-                RichText::new(&title)
-                    .color(TraktorTheme::TEXT_PRIMARY())
-                    .font(egui::FontId::proportional(12.0))
-                    .strong(),
-            );
-            ui.label(
-                RichText::new(format!("— {artist}"))
-                    .color(TraktorTheme::TEXT_SECONDARY())
-                    .font(egui::FontId::proportional(11.0)),
-            );
-
-            ui.separator();
-
-            // 4-Lane Stem Waveform Toggle (`STEMS`)
-            let stem_view_on = self.deck_stem_view[d];
-            if ui
-                .add(
-                    egui::Button::new(
-                        RichText::new("STEMS")
-                            .color(if stem_view_on {
-                                Color32::WHITE
-                            } else {
-                                TraktorTheme::TEXT_SECONDARY()
-                            })
-                            .font(egui::FontId::monospace(9.0))
-                            .strong(),
-                    )
-                    .fill(if stem_view_on {
-                        TraktorTheme::ROW_SELECTED()
-                    } else {
-                        Color32::from_rgb(48, 51, 57)
-                    }),
-                )
-                .on_hover_text("Toggle Traktor Pro 4 4-Lane Stem Waveform View (Drums / Bass / Other / Vocals)")
-                .clicked()
-            {
-                self.deck_stem_view[d] = !self.deck_stem_view[d];
-            }
-
-            // 1-Click Acapella & Instrumental Isolator Buttons
-            let is_acapella = self.deck_stem_muted[d] == [true, true, true, false];
-            if ui
-                .add(
-                    egui::Button::new(
-                        RichText::new("ACAPELLA")
-                            .color(if is_acapella {
-                                Color32::WHITE
-                            } else {
-                                TraktorTheme::TEXT_SECONDARY()
-                            })
-                            .font(egui::FontId::monospace(9.0))
-                            .strong(),
-                    )
-                    .fill(if is_acapella {
-                        TraktorTheme::ROW_SELECTED()
-                    } else {
-                        Color32::from_rgb(48, 51, 57)
-                    }),
-                )
-                .on_hover_text("Isolate Vocals Stem (Mute Drums, Bass & Other)")
-                .clicked()
-            {
-                if is_acapella {
-                    self.deck_stem_muted[d] = [false; 4];
-                } else {
-                    self.deck_stem_muted[d] = [true, true, true, false];
-                }
-            }
-
-            let is_inst = self.deck_stem_muted[d] == [false, false, false, true];
-            if ui
-                .add(
-                    egui::Button::new(
-                        RichText::new("INST")
-                            .color(if is_inst {
-                                Color32::WHITE
-                            } else {
-                                TraktorTheme::TEXT_SECONDARY()
-                            })
-                            .font(egui::FontId::monospace(9.0))
-                            .strong(),
-                    )
-                    .fill(if is_inst {
-                        TraktorTheme::ROW_SELECTED()
-                    } else {
-                        Color32::from_rgb(48, 51, 57)
-                    }),
-                )
-                .on_hover_text("Isolate Instrumental (Mute Vocals Stem)")
-                .clicked()
-            {
-                if is_inst {
-                    self.deck_stem_muted[d] = [false; 4];
-                } else {
-                    self.deck_stem_muted[d] = [false, false, false, true];
-                }
-            }
-
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let rem_sec = (duration_sec - elapsed_sec).max(0.0);
-                let rem_m = (rem_sec / 60.0).floor() as u32;
-                let rem_s = (rem_sec % 60.0).floor() as u32;
-                ui.label(
-                    RichText::new(format!("-{rem_m:02}:{rem_s:02}"))
-                        .color(TraktorTheme::TEXT_PRIMARY())
-                        .font(egui::FontId::monospace(12.0))
-                        .strong(),
-                );
-                ui.label(
-                    RichText::new(format!("KEY {key}"))
-                        .color(TraktorTheme::TEXT_SECONDARY())
-                        .font(egui::FontId::monospace(10.5)),
-                );
-                let eff_bpm = bpm * (1.0 + self.deck_pitch_fader[d] as f64 / 100.0);
-                ui.label(
-                    RichText::new(format!("{eff_bpm:.2} BPM"))
-                        .color(TraktorTheme::TEXT_PRIMARY())
-                        .font(egui::FontId::monospace(11.5))
-                        .strong(),
-                );
             });
-        });
+        }
 
         let cues = self.deck_hotcues[d].clone();
-        let loop_len = self.deck_loop_size_beats[d] as f64 * (60.0 / bpm.max(30.0));
-        let use_stem_waves = self.deck_stem_view[d];
-        let wave_resp = if use_stem_waves {
+        let loop_len = self.deck_loop_size_beats[d] as f64 * (60.0 / deck.bpm.max(30.0));
+        let wave_resp = if self.deck_stem_view[d] {
             scrolling_stem_waveforms(
                 ui,
-                elapsed_sec,
-                bpm,
+                deck.elapsed_sec,
+                deck.bpm,
                 &cues,
-                &stem_peaks,
+                &deck.stem_peaks,
                 &self.deck_stem_volumes[d],
                 &mut self.deck_stem_muted[d],
                 self.deck_loop_active[d],
@@ -2278,10 +1766,10 @@ impl ReTraktorApp {
         } else {
             scrolling_waveform(
                 ui,
-                elapsed_sec,
-                bpm,
+                deck.elapsed_sec,
+                deck.bpm,
                 &cues,
-                &peaks,
+                &deck.peaks,
                 self.deck_loop_active[d],
                 self.deck_loop_start_sec[d],
                 loop_len,
@@ -2289,73 +1777,64 @@ impl ReTraktorApp {
                 height,
             )
         };
+        self.scrub_by_drag(d, &wave_resp, deck.duration_sec);
+    }
+
+    /// Dragging a scrolling waveform moves the playhead.
+    fn scrub_by_drag(&mut self, d: usize, wave_resp: &egui::Response, duration_sec: f64) {
         if wave_resp.dragged() {
-            let delta_x = -wave_resp.drag_delta().x;
-            let dt = delta_x as f64 * (1.0 / 85.0);
+            let dt = -wave_resp.drag_delta().x as f64 / 85.0;
             if let Ok(mut state) = self.audio.shared.lock() {
                 state.playhead_sec[d] = (state.playhead_sec[d] + dt).clamp(0.0, duration_sec);
             }
         }
     }
 
-    /// LAYOUT 2 & 3: EXTENDED / ESSENTIAL SIDE-BY-SIDE LAYOUT
+    /// 4-Deck layout: decks A + C | four-channel mixer | decks B + D, each deck with its own waveform.
     fn show_four_deck_layout(&mut self, ui: &mut Ui) {
         ui.horizontal_top(|ui| {
-            let avail_w = ui.available_width();
             let mixer_w = 348.0_f32;
-            let deck_w = ((avail_w - mixer_w - 8.0) / 2.0).max(260.0);
+            let deck_w = ((ui.available_width() - mixer_w - 8.0) / 2.0).max(260.0);
+            // Shorter waveforms on short windows keep the browser on screen.
+            let wave_h = (36.0 + (ui.ctx().screen_rect().height() - 640.0) * 0.1).clamp(36.0, 80.0);
 
-            // Left Stack: Deck A + Deck C
-            ui.allocate_ui_with_layout(
-                Vec2::new(deck_w, 340.0),
-                Layout::top_down(Align::Min),
-                |ui| {
-                    ui.set_width(deck_w);
-                    self.show_single_deck(ui, 1, TraktorTheme::DECK_A(), true, 46.0);
-                    ui.add_space(3.0);
-                    self.show_single_deck(ui, 3, TraktorTheme::DECK_C(), true, 46.0);
-                },
-            );
-
-            // Center: 4-Channel Mixer
-            ui.allocate_ui_with_layout(
-                Vec2::new(mixer_w, 340.0),
-                Layout::top_down(Align::Min),
-                |ui| {
-                    ui.set_width(mixer_w);
-                    self.show_mixer_section(ui, false);
-                },
-            );
-
-            // Right Stack: Deck B + Deck D
-            ui.allocate_ui_with_layout(
-                Vec2::new(deck_w, 340.0),
-                Layout::top_down(Align::Min),
-                |ui| {
-                    ui.set_width(deck_w);
-                    self.show_single_deck(ui, 2, TraktorTheme::DECK_B(), true, 46.0);
-                    ui.add_space(3.0);
-                    self.show_single_deck(ui, 4, TraktorTheme::DECK_D(), true, 46.0);
-                },
-            );
+            ui.allocate_ui_with_layout(Vec2::new(deck_w, 340.0), Layout::top_down(Align::Min), |ui| {
+                ui.set_width(deck_w);
+                self.show_single_deck(ui, 1, TraktorTheme::DECK_A(), true, wave_h, 0.0);
+                self.show_single_deck(ui, 3, TraktorTheme::DECK_C(), true, wave_h, 0.0);
+            });
+            ui.allocate_ui_with_layout(Vec2::new(mixer_w, 340.0), Layout::top_down(Align::Min), |ui| {
+                ui.set_width(mixer_w);
+                self.show_mixer_section(ui, false);
+            });
+            ui.allocate_ui_with_layout(Vec2::new(deck_w, 340.0), Layout::top_down(Align::Min), |ui| {
+                ui.set_width(deck_w);
+                self.show_single_deck(ui, 2, TraktorTheme::DECK_B(), true, wave_h, 0.0);
+                self.show_single_deck(ui, 4, TraktorTheme::DECK_D(), true, wave_h, 0.0);
+            });
         });
     }
 
-    /// LAYOUT 5: BROWSER / PREPARATION MINI-DECKS BAR
+    /// Browser layout: decks A and B as one-line strips either side of the crossfader.
     fn show_mini_decks_bar(&mut self, ui: &mut Ui) {
-        egui::Frame::none()
-            .fill(TraktorTheme::BG_PANEL())
-            .stroke(Stroke::new(1.0_f32, TraktorTheme::BORDER_COLOR()))
-            .inner_margin(egui::Margin::symmetric(8.0, 4.0))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    self.show_mini_deck_strip(ui, 1, TraktorTheme::DECK_A());
-                    ui.separator();
-                    crossfader(ui, &mut self.crossfader_pos, 120.0);
-                    ui.separator();
-                    self.show_mini_deck_strip(ui, 2, TraktorTheme::DECK_B());
-                });
+        panel(TraktorTheme::BG_PANEL()).show(ui, |ui| {
+            row(ui, 40.0, |ui| {
+                let xfader_w = 140.0;
+                // Two equal halves: what is left after the crossfader, two separators and four gaps.
+                let side = ((ui.available_width() - xfader_w - 2.0 * 6.0 - 4.0 * ui.spacing().item_spacing.x) / 2.0).max(200.0);
+                for deck_idx in [1, 2] {
+                    if deck_idx == 2 {
+                        ui.separator();
+                        crossfader(ui, &mut self.crossfader_pos, xfader_w).on_hover_text(XFADER_TIP);
+                        ui.separator();
+                    }
+                    ui.allocate_ui_with_layout(Vec2::new(side, 40.0), Layout::left_to_right(Align::Center), |ui| {
+                        ui.set_width(side);
+                        self.show_mini_deck_strip(ui, deck_idx, TraktorTheme::deck_color(deck_idx));
+                    });
+                }
             });
+        });
     }
 
     fn show_mini_deck_strip(&mut self, ui: &mut Ui, deck_idx: usize, accent: Color32) {
@@ -2374,38 +1853,37 @@ impl ReTraktorApp {
 
     fn show_mini_deck_strip_inner(&mut self, ui: &mut Ui, deck_idx: usize, accent: Color32) {
         let d = deck_idx - 1;
-        let letter = ["A", "B", "C", "D"][d.min(3)];
-        let (title, bpm, is_playing) = if let Ok(state) = self.audio.shared.lock() {
-            let t_name = state.loaded_tracks[d]
-                .as_ref()
-                .map(|t| t.title.clone())
-                .unwrap_or_else(|| "Empty".to_string());
-            let b = state.loaded_tracks[d]
-                .as_ref()
-                .map(|t| t.bpm)
-                .unwrap_or(128.0);
-            (t_name, b, state.is_playing[d])
-        } else {
-            ("Empty".to_string(), 0.0, false)
+        let letter = DECK_LETTERS[d.min(3)];
+        let Some(deck) = self.deck_view(d) else {
+            empty_deck_hint(ui, letter, accent, "Empty. Drop a track here");
+            return;
         };
 
-        if !self.deck_loaded(d) {
-            ui.label(RichText::new(format!("Deck {letter}")).strong().color(accent));
-            ui.label(RichText::new("empty").color(TraktorTheme::TEXT_MUTED()));
-            return;
-        }
-        let (icon, fill, fg) = if is_playing {
-            (crate::widgets::Icon::Pause, TraktorTheme::PLAY_ACTIVE(), Color32::BLACK)
+        deck_badge(ui, letter, accent);
+        // Play state reads from the icon as well as the fill.
+        let (icon, fill, fg) = if deck.is_playing {
+            (Icon::Pause, TraktorTheme::PLAY_ACTIVE(), on(TraktorTheme::PLAY_ACTIVE()))
         } else {
-            (crate::widgets::Icon::Play, accent.gamma_multiply(0.4), Color32::WHITE)
+            (Icon::Play, TraktorTheme::PLAY_INACTIVE(), TraktorTheme::TEXT_PRIMARY())
         };
-        if crate::widgets::icon_button(ui, icon, &format!("Deck {letter}"), fill, fg, Vec2::new(0.0, 20.0)).clicked() {
+        let shortcut = ["(Space)", "(Shift+Space)", "", ""][d.min(3)];
+        if icon_pill(ui, icon, "", fill, fg, Vec2::new(34.0, HIT))
+            .on_hover_text(format!("{} deck {letter} {shortcut}", if deck.is_playing { "Pause" } else { "Play" }))
+            .clicked()
+        {
             self.toggle_play(deck_idx);
         }
-        ui.label(RichText::new(title).color(Color32::WHITE).strong());
-        ui.label(RichText::new(format!("{bpm:.2} BPM")).color(accent).monospace());
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            display(ui, |ui, ink| {
+                ui.spacing_mut().item_spacing.x = 14.0;
+                readout(ui, "BPM", &format!("{:.2}", deck.bpm * (1.0 + self.deck_pitch_fader[d] as f64 / 100.0)), 20.0, ink);
+                readout(ui, "REMAIN", &deck.remaining(), 20.0, ink);
+            });
+            ui.with_layout(Layout::left_to_right(Align::Center), |ui| title_label(ui, &deck.title, &deck.artist));
+        });
     }
 
+    /// `min_height` stretches the panel to line up with its neighbours (0 = as tall as its content).
     fn show_single_deck(
         &mut self,
         ui: &mut Ui,
@@ -2413,35 +1891,64 @@ impl ReTraktorApp {
         accent_color: Color32,
         include_scrolling_waveform: bool,
         waveform_height: f32,
+        min_height: f32,
     ) {
-        let rect = ui.scope(|ui| self.show_single_deck_inner(ui, deck_idx, accent_color, include_scrolling_waveform, waveform_height)).response.rect;
+        let rect = ui
+            .scope(|ui| self.show_single_deck_inner(ui, deck_idx, accent_color, include_scrolling_waveform, waveform_height, min_height))
+            .response
+            .rect;
         self.deck_drop(ui, rect, deck_idx);
     }
 
-    fn deck_loaded(&self, d: usize) -> bool {
-        self.audio.shared.lock().map(|s| s.loaded_tracks[d].is_some()).unwrap_or(false)
+    /// Snapshot of what a deck needs to draw itself; `None` while the deck is empty.
+    fn deck_view(&self, d: usize) -> Option<DeckView> {
+        let state = self.audio.shared.lock().ok()?;
+        let t = state.loaded_tracks[d].as_ref()?;
+        Some(DeckView {
+            title: t.title.clone(),
+            artist: t.artist.clone(),
+            bpm: t.bpm,
+            key: t.key.clone(),
+            duration_sec: t.duration_sec,
+            elapsed_sec: state.playhead_sec[d],
+            is_playing: state.is_playing[d],
+            peaks: t.waveform_peaks.clone(),
+            stem_peaks: t.stem_peaks.clone(),
+        })
+    }
+
+    /// STEMS view toggle, plus the one-click isolators while the view is on.
+    fn stem_buttons(&mut self, ui: &mut Ui, d: usize) {
+        let view_on = self.deck_stem_view[d];
+        if pill(ui, "STEMS", view_on, TraktorTheme::ROW_SELECTED(), 0.0)
+            .on_hover_text("Show the track as four stem lanes: drums, bass, other, vocals")
+            .clicked()
+        {
+            self.deck_stem_view[d] = !view_on;
+        }
+        if !view_on {
+            return;
+        }
+        for (label, mutes, tip) in [
+            ("ACAPELLA", [true, true, true, false], "Vocals only: mute drums, bass and other"),
+            ("INST", [false, false, false, true], "Instrumental: mute the vocals"),
+        ] {
+            let active = self.deck_stem_muted[d] == mutes;
+            if pill(ui, label, active, TraktorTheme::ACCENT(), 0.0).on_hover_text(tip).clicked() {
+                self.deck_stem_muted[d] = if active { [false; 4] } else { mutes };
+            }
+        }
     }
 
     /// An unloaded deck says how to load it, and shows nothing else.
     fn show_empty_deck(&self, ui: &mut Ui, deck_idx: usize, accent: Color32, min_height: f32) {
-        let letter = ["A", "B", "C", "D"][(deck_idx - 1).min(3)];
-        egui::Frame::none()
-            .fill(TraktorTheme::BG_PANEL())
-            .stroke(Stroke::new(1.0_f32, TraktorTheme::BORDER_COLOR()))
-            .inner_margin(egui::Margin::symmetric(10.0, 8.0))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.add_space(((min_height - 18.0) / 2.0).max(0.0));
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("Deck {letter}")).size(13.0).strong().color(accent));
-                    ui.label(
-                        RichText::new("Drop a track here, or double-click one in the library")
-                            .size(12.0)
-                            .color(TraktorTheme::TEXT_SECONDARY()),
-                    );
-                });
-                ui.add_space(((min_height - 18.0) / 2.0).max(0.0));
+        panel(TraktorTheme::BG_PANEL()).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.set_min_height((min_height - 12.0).max(HIT));
+            ui.horizontal(|ui| {
+                empty_deck_hint(ui, DECK_LETTERS[(deck_idx - 1).min(3)], accent, "Drop a track here, or double-click one in the library");
             });
+        });
     }
 
     fn show_single_deck_inner(
@@ -2451,427 +1958,155 @@ impl ReTraktorApp {
         accent_color: Color32,
         include_scrolling_waveform: bool,
         waveform_height: f32,
+        min_height: f32,
     ) {
-        if !self.deck_loaded(deck_idx - 1) {
-            self.show_empty_deck(ui, deck_idx, accent_color, 40.0);
-            return;
-        }
         let d = deck_idx - 1;
-        let deck_letter = match deck_idx {
-            1 => "A",
-            2 => "B",
-            3 => "C",
-            4 => "D",
-            _ => "A",
+        let deck_letter = DECK_LETTERS[d.min(3)];
+        let Some(deck) = self.deck_view(d) else {
+            self.show_empty_deck(ui, deck_idx, accent_color, min_height);
+            return;
         };
+        let bpm = deck.bpm;
+        // Keys are compared against deck A, the reference deck.
+        let in_key = deck_idx != 1
+            && self.audio.shared.lock().is_ok_and(|s| {
+                s.loaded_tracks[0].as_ref().is_some_and(|a| KeyWheel::are_harmonically_compatible(&a.key, &deck.key))
+            });
 
-        let (title, artist, bpm, key, duration_sec, elapsed_sec, _is_playing, peaks, stem_peaks) = {
-            if let Ok(state) = self.audio.shared.lock() {
-                let is_p = state.is_playing[d];
-                let el = state.playhead_sec[d];
-                if let Some(ref t) = state.loaded_tracks[d] {
-                    (
-                        t.title.clone(),
-                        t.artist.clone(),
-                        t.bpm,
-                        t.key.clone(),
-                        t.duration_sec,
-                        el,
-                        is_p,
-                        t.waveform_peaks.clone(),
-                        t.stem_peaks.clone(),
-                    )
-                } else {
-                    (
-                        format!("Deck {deck_letter} Empty"),
-                        "No Track Loaded".to_string(),
-                        0.0,
-                        String::new(),
-                        120.0,
-                        0.0,
-                        false,
-                        Vec::new(),
-                        Vec::new(),
-                    )
-                }
-            } else {
-                (
-                    format!("Deck {deck_letter}"),
-                    String::new(),
-                    128.0,
-                    "4m".to_string(),
-                    120.0,
-                    0.0,
-                    false,
-                    Vec::new(),
-                    Vec::new(),
-                )
-            }
-        };
+        panel(TraktorTheme::BG_PANEL()).show(ui, |ui| {
+            ui.set_min_height((min_height - 12.0).max(0.0));
 
-        let is_playing = if let Ok(state) = self.audio.shared.lock() {
-            state.is_playing[d]
-        } else {
-            false
-        };
+            // 1. Which deck, which track.
+            ui.horizontal(|ui| {
+                deck_badge(ui, deck_letter, accent_color);
+                title_label(ui, &deck.title, &deck.artist);
+            });
 
-        let is_harmonic = if deck_idx != 1 {
-            if let Ok(state) = self.audio.shared.lock() {
-                if let Some(track_a) = &state.loaded_tracks[0] {
-                    KeyWheel::are_harmonically_compatible(&track_a.key, &key)
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
-        } else {
-            true
-        };
-
-        egui::Frame::none()
-            .fill(TraktorTheme::BG_PANEL())
-            .stroke(Stroke::new(1.0_f32, TraktorTheme::BORDER_COLOR()))
-            .inner_margin(egui::Margin::symmetric(8.0, 5.0))
-            .show(ui, |ui| {
-                // 1. Authentic Traktor Pro 4 Deck Header Strip:
-                //    Left: Dark album-art record square + Title / Artist
-                //    Right: Remaining Time + BPM + Pitch% + Key + Large Deck Letter (A / B)
-                ui.horizontal(|ui| {
-                    // Mini Album Art / Vinyl Record Icon on Left
-                    let (art_rect, _) =
-                        ui.allocate_exact_size(Vec2::new(28.0, 28.0), egui::Sense::hover());
-                    ui.painter()
-                        .rect_filled(art_rect, 2.0, Color32::from_rgb(24, 26, 30));
-                    ui.painter().rect_stroke(
-                        art_rect,
-                        2.0,
-                        Stroke::new(0.8_f32, TraktorTheme::BORDER_COLOR()),
-                    );
-                    ui.painter()
-                        .circle_stroke(art_rect.center(), 9.0, Stroke::new(1.2_f32, accent_color));
-                    ui.painter()
-                        .circle_filled(art_rect.center(), 2.5, accent_color);
-
-                    ui.vertical(|ui| {
-                        ui.spacing_mut().item_spacing = Vec2::new(0.0, 1.0);
-                        ui.label(
-                            RichText::new(&title)
-                                .color(TraktorTheme::TEXT_PRIMARY())
-                                .font(egui::FontId::proportional(12.5))
-                                .strong(),
-                        );
-                        ui.label(
-                            RichText::new(&artist)
-                                .color(TraktorTheme::TEXT_SECONDARY())
-                                .font(egui::FontId::proportional(10.5)),
-                        );
-                    });
-
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        // Large Traktor Deck Letter (A / B) on the far right
-                        ui.label(
-                            RichText::new(deck_letter)
-                                .color(accent_color)
-                                .font(egui::FontId::proportional(20.0))
-                                .strong(),
-                        );
-
-                        ui.add_space(4.0);
-
-                        let rem_sec = (duration_sec - elapsed_sec).max(0.0);
-                        let rem_m = (rem_sec / 60.0).floor() as u32;
-                        let rem_s = (rem_sec % 60.0).floor() as u32;
-                        ui.label(
-                            RichText::new(format!("-{rem_m:02}:{rem_s:02}"))
-                                .color(TraktorTheme::TEXT_PRIMARY())
-                                .font(egui::FontId::monospace(12.5))
-                                .strong(),
-                        );
-
-                        let key_col = if is_harmonic {
-                            TraktorTheme::PLAY_ACTIVE()
-                        } else {
-                            TraktorTheme::TEXT_SECONDARY()
-                        };
-                        ui.label(
-                            RichText::new(&key)
-                                .color(key_col)
-                                .font(egui::FontId::monospace(10.5))
-                                .strong(),
-                        );
-
-                        let pitch_pct = self.deck_pitch_fader[d];
-                        let effective_bpm = bpm * (1.0 + pitch_pct as f64 / 100.0);
-                        ui.label(
-                            RichText::new(format!("{effective_bpm:.2} ({pitch_pct:+.1}%)"))
-                                .color(TraktorTheme::TEXT_SECONDARY())
-                                .font(egui::FontId::monospace(10.5)),
-                        );
-                    });
+            // 2. Display: the numbers read at arm's length, as large as the deck's width allows.
+            display(ui, |ui, ink| {
+                ui.spacing_mut().item_spacing.x = 14.0;
+                let advance = ui.fonts(|f| f.glyph_width(&crate::theme::dot_font(100.0), '0')) / 100.0;
+                let size = ((ui.available_width() - 3.0 * 14.0) / (20.0 * advance)).floor().clamp(18.0, 30.0);
+                let pitch_pct = self.deck_pitch_fader[d];
+                readout(ui, "BPM", &format!("{:.2}", bpm * (1.0 + pitch_pct as f64 / 100.0)), size, ink);
+                readout(ui, "PITCH", &format!("{pitch_pct:+.1}%"), size, ink);
+                // A compatible key says so in words, not just in brightness.
+                readout(ui, if in_key { "IN KEY" } else { "KEY" }, &deck.key, size, ink);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    readout(ui, "REMAIN", &deck.remaining(), size, ink);
                 });
+            });
 
-                // 1b. Traktor Sub-Header Bar: [SYNC] [MASTER] | [STEMS] [DRUMS] [BASS] [OTHER] [VOCALS] | [CUE|STEM|PAT|ROLL]
+            // 3. Sync, tempo master, stems; "MORE" discloses the performance pads.
+            ui.horizontal(|ui| {
+                if pill(ui, "SYNC", self.deck_sync_enabled[d], TraktorTheme::ACCENT(), 0.0)
+                    .on_hover_text("Match tempo and beat phase to the other deck")
+                    .clicked()
+                {
+                    self.sync_deck(deck_idx);
+                }
+                if pill(ui, "MASTER", (self.master_tempo - bpm).abs() < 0.05, TraktorTheme::ROW_SELECTED(), 0.0)
+                    .on_hover_text("Use this track's tempo as the master tempo")
+                    .clicked()
+                {
+                    self.master_tempo = bpm;
+                }
+                self.stem_buttons(ui, d);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let expanded = self.deck_expanded[d];
+                    if pill(ui, "MORE", expanded, TraktorTheme::ROW_SELECTED(), 0.0)
+                        .on_hover_text("Hotcue pads, pad modes, cue-play, flux and every loop size")
+                        .clicked()
+                    {
+                        self.deck_expanded[d] = !expanded;
+                    }
+                });
+            });
+
+            // 4. Scrolling waveform (4-Deck; Mix draws them full width above).
+            let cues = self.deck_hotcues[d].clone();
+            let loop_len_sec = self.deck_loop_size_beats[d] as f64 * (60.0 / bpm.max(30.0));
+            if include_scrolling_waveform && waveform_height > 10.0 {
+                let wave_resp = if self.deck_stem_view[d] {
+                    scrolling_stem_waveforms(
+                        ui,
+                        deck.elapsed_sec,
+                        bpm,
+                        &cues,
+                        &deck.stem_peaks,
+                        &self.deck_stem_volumes[d],
+                        &mut self.deck_stem_muted[d],
+                        self.deck_loop_active[d],
+                        self.deck_loop_start_sec[d],
+                        loop_len_sec,
+                        None,
+                        waveform_height,
+                    )
+                } else {
+                    scrolling_waveform(
+                        ui,
+                        deck.elapsed_sec,
+                        bpm,
+                        &cues,
+                        &deck.peaks,
+                        self.deck_loop_active[d],
+                        self.deck_loop_start_sec[d],
+                        loop_len_sec,
+                        None,
+                        waveform_height,
+                    )
+                };
+                self.scrub_by_drag(d, &wave_resp, deck.duration_sec);
+            }
+
+            // 5. Stem mutes, while the stems view is on.
+            if self.deck_stem_view[d] {
                 ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing = Vec2::new(3.0, 0.0);
-
-                    let is_synced = self.deck_sync_enabled[d];
-                    let sync_bg = if is_synced {
-                        accent_color
-                    } else {
-                        Color32::from_rgb(52, 55, 62)
-                    };
-                    let sync_fg = if is_synced {
-                        Color32::WHITE
-                    } else {
-                        TraktorTheme::TEXT_PRIMARY()
-                    };
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                RichText::new("SYNC")
-                                    .color(sync_fg)
-                                    .font(egui::FontId::monospace(8.5))
-                                    .strong(),
-                            )
-                            .fill(sync_bg)
-                            .min_size(Vec2::new(36.0, 16.0)),
-                        )
-                        .clicked()
-                    {
-                        self.sync_deck(deck_idx);
-                    }
-
-                    let is_master = (self.master_tempo - bpm).abs() < 0.05;
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                RichText::new("MASTER")
-                                    .color(if is_master {
-                                        accent_color
-                                    } else {
-                                        TraktorTheme::TEXT_SECONDARY()
-                                    })
-                                    .font(egui::FontId::monospace(8.5))
-                                    .strong(),
-                            )
-                            .fill(Color32::from_rgb(46, 49, 55))
-                            .min_size(Vec2::new(44.0, 16.0)),
-                        )
-                        .clicked()
-                    {
-                        self.master_tempo = bpm;
-                    }
-
-                    let stem_view_on = self.deck_stem_view[d];
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                RichText::new("STEMS")
-                                    .color(if stem_view_on {
-                                        Color32::WHITE
-                                    } else {
-                                        TraktorTheme::TEXT_SECONDARY()
-                                    })
-                                    .font(egui::FontId::monospace(8.5))
-                                    .strong(),
-                            )
-                            .fill(if stem_view_on {
-                                TraktorTheme::ROW_SELECTED()
-                            } else {
-                                Color32::from_rgb(46, 49, 55)
-                            })
-                            .min_size(Vec2::new(40.0, 16.0)),
-                        )
-                        .on_hover_text("Toggle Traktor Pro 4 4-Stem Lane View (Drums / Bass / Other / Vocals)")
-                        .clicked()
-                    {
-                        self.deck_stem_view[d] = !self.deck_stem_view[d];
-                    }
-
-                    ui.separator();
-
-                    // Subtle matte Stem Mute Pills
-                    let stem_defs = [
-                        (0usize, "DRUM", Color32::from_rgb(84, 164, 214)),
-                        (1usize, "BASS", Color32::from_rgb(208, 92, 62)),
-                        (2usize, "OTHER", Color32::from_rgb(96, 172, 132)),
-                        (3usize, "VOCAL", Color32::from_rgb(214, 148, 56)),
-                    ];
-                    // Stem mutes only show while the deck's STEMS view is on.
-                    for (s_idx, s_lbl, s_col) in stem_defs.into_iter().filter(|_| stem_view_on) {
-                        let muted = self.deck_stem_muted[d][s_idx];
-                        let resp = ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new(s_lbl)
-                                        .color(if muted {
-                                            TraktorTheme::TEXT_MUTED()
-                                        } else {
-                                            Color32::WHITE
-                                        })
-                                        .font(egui::FontId::monospace(8.0))
-                                        .strong(),
-                                )
-                                .fill(if muted {
-                                    Color32::from_rgb(35, 37, 42)
-                                } else {
-                                    s_col.gamma_multiply(0.55)
-                                })
-                                .stroke(Stroke::new(
-                                    0.6_f32,
-                                    if muted {
-                                        TraktorTheme::BORDER_COLOR()
-                                    } else {
-                                        s_col
-                                    },
-                                ))
-                                .min_size(Vec2::new(36.0, 16.0)),
-                            )
-                            .on_hover_text("Left-click: Mute/Unmute Stem | Right-click: Send Stem to FX");
+                    let w = (ui.available_width() - 3.0 * ui.spacing().item_spacing.x) / 4.0;
+                    for (s, name) in ["DRUMS", "BASS", "OTHER", "VOCALS"].into_iter().enumerate() {
+                        let label = if self.deck_stem_fx_send[d][s] { format!("{name} · FX") } else { name.to_string() };
+                        let resp = pill(ui, &label, !self.deck_stem_muted[d][s], accent_color, w)
+                            .on_hover_text("Click to mute or unmute this stem. Right-click to send it to the FX");
                         if resp.clicked() {
-                            self.deck_stem_muted[d][s_idx] = !self.deck_stem_muted[d][s_idx];
+                            self.deck_stem_muted[d][s] = !self.deck_stem_muted[d][s];
                         }
                         if resp.secondary_clicked() {
-                            self.deck_stem_fx_send[d][s_idx] = !self.deck_stem_fx_send[d][s_idx];
+                            self.deck_stem_fx_send[d][s] = !self.deck_stem_fx_send[d][s];
                         }
                     }
-
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let expanded = self.deck_expanded[d];
-                        if ui
-                            .add(egui::Button::new(RichText::new(if expanded { "Less" } else { "More" }).size(11.0).color(TraktorTheme::TEXT_SECONDARY())).frame(false))
-                            .on_hover_text(if expanded { "Hide hotcue pads and extra transport" } else { "Show hotcue pads, pad modes, cue-play, flux and loop sizes" })
-                            .clicked()
-                        {
-                            self.deck_expanded[d] = !expanded;
-                        }
-                        if !expanded {
-                            return;
-                        }
-                        for mode in [
-                            DeckPadMode::FluxLoop,
-                            DeckPadMode::Pattern,
-                            DeckPadMode::Stems,
-                            DeckPadMode::Hotcues,
-                        ] {
-                            let active = self.deck_pad_mode[d] == mode;
-                            let short_lbl = match mode {
-                                DeckPadMode::Hotcues => "CUE",
-                                DeckPadMode::Stems => "STEM",
-                                DeckPadMode::Pattern => "PAT",
-                                DeckPadMode::FluxLoop => "ROLL",
-                            };
-                            if ui
-                                .add(
-                                    egui::Button::new(
-                                        RichText::new(short_lbl)
-                                            .color(if active {
-                                                Color32::WHITE
-                                            } else {
-                                                TraktorTheme::TEXT_SECONDARY()
-                                            })
-                                            .font(egui::FontId::monospace(8.0))
-                                            .strong(),
-                                    )
-                                    .fill(if active {
-                                        TraktorTheme::ROW_SELECTED()
-                                    } else {
-                                        Color32::from_rgb(44, 47, 52)
-                                    })
-                                    .min_size(Vec2::new(26.0, 16.0)),
-                                )
-                                .on_hover_text(format!("MX2 Performance Pad Mode: {}", mode.label()))
-                                .clicked()
-                            {
-                                self.deck_pad_mode[d] = mode;
-                                if mode == DeckPadMode::Pattern {
-                                    self.show_pattern_player = true;
-                                }
-                            }
-                        }
-                    });
                 });
+            }
 
-                // 2. Optional Scrolling Frequency / 4-Stem Waveform (in Extended / 4-Deck views)
-                let cues = self.deck_hotcues[d].clone();
-                let loop_len_sec = self.deck_loop_size_beats[d] as f64 * (60.0 / bpm.max(30.0));
-                if include_scrolling_waveform && waveform_height > 10.0 {
-                    ui.add_space(2.0);
-                    let use_stem_waves = self.deck_stem_view[d];
-                    let wave_resp = if use_stem_waves {
-                        scrolling_stem_waveforms(
-                            ui,
-                            elapsed_sec,
-                            bpm,
-                            &cues,
-                            &stem_peaks,
-                            &self.deck_stem_volumes[d],
-                            &mut self.deck_stem_muted[d],
-                            self.deck_loop_active[d],
-                            self.deck_loop_start_sec[d],
-                            loop_len_sec,
-                            None,
-                            waveform_height,
-                        )
-                    } else {
-                        scrolling_waveform(
-                            ui,
-                            elapsed_sec,
-                            bpm,
-                            &cues,
-                            &peaks,
-                            self.deck_loop_active[d],
-                            self.deck_loop_start_sec[d],
-                            loop_len_sec,
-                            None,
-                            waveform_height,
-                        )
-                    };
-                    if wave_resp.dragged() {
-                        let delta_x = -wave_resp.drag_delta().x;
-                        let dt = delta_x as f64 * (1.0 / 85.0);
-                        if let Ok(mut state) = self.audio.shared.lock() {
-                            state.playhead_sec[d] =
-                                (state.playhead_sec[d] + dt).clamp(0.0, duration_sec);
-                        }
-                    }
+            // 6. Whole-track overview with scrubber.
+            let mut scrub_pos = deck.elapsed_sec;
+            let stripe_resp = stripe_overview(
+                ui,
+                &mut scrub_pos,
+                deck.duration_sec,
+                &deck.peaks,
+                &cues,
+                self.deck_loop_active[d],
+                self.deck_loop_start_sec[d],
+                loop_len_sec,
+                accent_color,
+            );
+            if stripe_resp.changed() {
+                if let Ok(mut state) = self.audio.shared.lock() {
+                    state.playhead_sec[d] = scrub_pos;
                 }
+            }
 
-                ui.add_space(2.0);
-
-                // 3. Full-Track Stripe Overview Minimap with Scrubber
-                let mut scrub_pos = elapsed_sec;
-                let stripe_resp = stripe_overview(
+            // 7. Transport and loop; the pitch fader shares the row when there is room for it.
+            let mut pitch_inline = false;
+            row(ui, HIT, |ui| {
+                if let Some(action) = deck_transport_bar(
                     ui,
-                    &mut scrub_pos,
-                    duration_sec,
-                    &peaks,
-                    &cues,
+                    deck.is_playing,
+                    self.deck_flux_active[d],
                     self.deck_loop_active[d],
-                    self.deck_loop_start_sec[d],
-                    loop_len_sec,
-                    accent_color,
-                );
-                if stripe_resp.changed() {
-                    if let Ok(mut state) = self.audio.shared.lock() {
-                        state.playhead_sec[d] = scrub_pos;
-                    }
-                }
-
-                ui.add_space(3.0);
-
-                // 4. Authentic Traktor Pro 4 Transport & Loop Selector Row:
-                //    Left: [▶] [CUE] [CUP] [FLX]   |   Right: [<] [1] [2] [4] [8] [16] [>] + Pitch Slider
-                ui.horizontal(|ui| {
-                    if let Some(action) = deck_transport_bar(
-                        ui,
-                        is_playing,
-                        self.deck_flux_active[d],
-                        self.deck_loop_active[d],
-                        self.deck_loop_size_beats[d],
-                        !self.deck_expanded[d],
-                    ) {
+                    self.deck_loop_size_beats[d],
+                    !self.deck_expanded[d],
+                ) {
                     match action {
                         TransportAction::TogglePlay => self.toggle_play(deck_idx),
                         TransportAction::Cue => self.jump_to_cue(deck_idx, 1),
@@ -2902,460 +2137,521 @@ impl ReTraktorApp {
                         }
                     }
                 }
-
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new("0%")
-                                        .color(TraktorTheme::TEXT_SECONDARY())
-                                        .font(egui::FontId::monospace(9.0))
-                                        .strong(),
-                                )
-                                .fill(Color32::from_rgb(48, 51, 57))
-                                .stroke(Stroke::new(0.5_f32, TraktorTheme::BORDER_COLOR()))
-                                .min_size(Vec2::new(28.0, 22.0)),
-                            )
-                            .on_hover_text("Reset pitch to 0.0%")
-                            .clicked()
-                        {
-                            self.deck_pitch_fader[d] = 0.0;
-                        }
-                        ui.add(
-                            egui::Slider::new(&mut self.deck_pitch_fader[d], -8.0..=8.0)
-                                .suffix("%")
-                                .show_value(false),
-                        );
-                    });
-                });
-
-                ui.add_space(2.0);
-
-                // 5. Hotcue / performance pads, shown when the deck is expanded.
-                if self.deck_expanded[d] { ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing = Vec2::new(3.0, 0.0);
-                    let cue_w = ((ui.available_width() - 21.0) / 8.0).max(16.0);
-                    for i in 1..=8 {
-                        let pad_active = match self.deck_pad_mode[d] {
-                            DeckPadMode::Hotcues => {
-                                self.deck_hotcues[d].iter().any(|(c, _)| *c == i as u8)
-                            }
-                            DeckPadMode::Stems => {
-                                if i <= 4 {
-                                    !self.deck_stem_muted[d][i - 1]
-                                } else {
-                                    self.deck_stem_fx_send[d][i - 5]
-                                }
-                            }
-                            DeckPadMode::Pattern => {
-                                let v = self.pattern_selected_voice.min(3);
-                                let step_offset = if deck_idx == 2 { 8 } else { 0 };
-                                self.pattern_steps[v][(step_offset + i - 1).min(15)]
-                            }
-                            DeckPadMode::FluxLoop => self.deck_loop_active[d],
-                        };
-                        let pad_resp = cue_pad(ui, i, pad_active, false, cue_w);
-                        if pad_resp.clicked() {
-                            self.trigger_performance_pad(deck_idx, i as u8);
-                        }
-                        if pad_resp.secondary_clicked() && self.deck_pad_mode[d] == DeckPadMode::Hotcues {
-                            self.deck_hotcues[d].retain(|(c, _)| *c != i as u8);
-                        }
-                    }
-                }); }
-            });
-    }
-
-    /// Center Mixer Section — Strictly top-aligned with side-by-side EQ/Stems + Fader/VU columns per strip
-    /// so all 4 channels line up horizontally with zero staircase/staggering!
-    fn show_mixer_section(&mut self, ui: &mut Ui, two_channel_only: bool) {
-        egui::Frame::none()
-            .fill(TraktorTheme::BG_PANEL_ALT())
-            .stroke(Stroke::new(1.0_f32, TraktorTheme::BORDER_COLOR()))
-            .inner_margin(egui::Margin::symmetric(6.0, 5.0))
-            .show(ui, |ui| {
-                ui.vertical(|ui| {
-                    // Algoriddim djay Pro-style Neural Mix™ EQ ⇄ STEMS Mode Toggle Bar
-                    ui.horizontal(|ui| {
-                        // Two-segment switch: what the three knobs per channel control.
-                        let neural = self.preferences.neural_mix_eq_mode;
-                        ui.label(RichText::new("Knobs").size(11.0).color(TraktorTheme::TEXT_SECONDARY()));
-                        for (label, on, tip) in [
-                            ("EQ", !neural, "High / mid / low equaliser"),
-                            ("Stems", neural, "Vocals / instruments / drums + bass"),
-                        ] {
-                            let b = egui::Button::new(RichText::new(label).size(11.0).color(if on { Color32::WHITE } else { TraktorTheme::TEXT_SECONDARY() }))
-                                .fill(if on { TraktorTheme::ROW_SELECTED() } else { Color32::from_rgb(42, 45, 50) })
-                                .min_size(Vec2::new(52.0, 18.0));
-                            if ui.add(b).on_hover_text(tip).clicked() && !on {
-                                self.preferences.neural_mix_eq_mode = !neural;
-                            }
-                        }
-                    });
-
-                    ui.add_space(2.0);
-
-                    if two_channel_only {
-                        ui.columns(2, |cols| {
-                            self.show_channel_strip(&mut cols[0], 0);
-                            self.show_channel_strip(&mut cols[1], 1);
-                        });
-                    } else {
-                        // 4 Channel Strips side-by-side in locked equal columns: Ch 1 (A), Ch 3 (C), Ch 4 (D), Ch 2 (B)
-                        ui.columns(4, |cols| {
-                            self.show_channel_strip(&mut cols[0], 0);
-                            self.show_channel_strip(&mut cols[1], 2);
-                            self.show_channel_strip(&mut cols[2], 3);
-                            self.show_channel_strip(&mut cols[3], 1);
-                        });
-                    }
-
-                    ui.add_space(2.0);
-                    ui.separator();
-
-                    // Master Crossfader Row
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new("A")
-                                .color(TraktorTheme::DECK_A())
-                                .font(egui::FontId::monospace(10.5))
-                                .strong(),
-                        );
-                        let xf_w = (ui.available_width() - 48.0).max(90.0);
-                        crossfader(ui, &mut self.crossfader_pos, xf_w);
-                        ui.label(
-                            RichText::new("B")
-                                .color(TraktorTheme::DECK_B())
-                                .font(egui::FontId::monospace(10.5))
-                                .strong(),
-                        );
-                    });
-                });
-            });
-    }
-
-    /// Authentic Traktor Channel Strip:
-    /// Left sub-column = HI, MID, LOW (or VOC, INST, D+B in Neural Stem mode), FLTR rotary knobs
-    /// Right sub-column = GAIN knob, CUE button, Vertical Volume Fader + Stereo VU Meter
-    fn show_channel_strip(&mut self, ui: &mut Ui, ch: usize) {
-        let ch_num = ch + 1;
-        let ch_letter = ["A", "B", "C", "D"][ch.min(3)];
-        let accent = TraktorTheme::deck_color(ch_num);
-        let neural_mode = self.preferences.neural_mix_eq_mode;
-
-        ui.vertical_centered(|ui| {
-            ui.spacing_mut().item_spacing = Vec2::new(2.0, 2.0);
-
-            // Channel Header + Cue button
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(format!("CH{ch_num} ({ch_letter})"))
-                        .color(TraktorTheme::TEXT_PRIMARY())
-                        .font(egui::FontId::monospace(9.5))
-                        .strong(),
-                );
-                let cue_active = self.channel_cue[ch];
-                if ui
-                    .add(
-                        egui::Button::new(
-                            RichText::new("CUE")
-                                .color(if cue_active {
-                                    Color32::BLACK
-                                } else {
-                                    TraktorTheme::TEXT_SECONDARY()
-                                })
-                                .font(egui::FontId::monospace(8.0))
-                                .strong(),
-                        )
-                        .fill(if cue_active {
-                            TraktorTheme::CUE_ACTIVE()
-                        } else {
-                            Color32::from_rgb(46, 49, 55)
-                        })
-                        .min_size(Vec2::new(24.0, 15.0)),
-                    )
-                    .on_hover_text("Headphone Cue Listen")
-                    .clicked()
-                {
-                    self.channel_cue[ch] = !self.channel_cue[ch];
+                pitch_inline = ui.available_width() >= 120.0;
+                if pitch_inline {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| pitch_fader(ui, &mut self.deck_pitch_fader[d]));
                 }
             });
-
-            // Side-by-side EQ/Stems/Filter column & Fader/Meter column
-            ui.horizontal_top(|ui| {
-                ui.spacing_mut().item_spacing = Vec2::new(2.0, 1.0);
-
-                // Sub-column 1: HI/VOC, MID/INST, LOW/D+B, FLTR
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing = Vec2::new(1.0, 1.0);
-                    if neural_mode {
-                        let voc_col = if self.deck_stem_muted[ch][3] {
-                            TraktorTheme::METER_RED()
-                        } else {
-                            Color32::from_rgb(190, 85, 255)
-                        };
-                        if rotary_knob_sized(
-                            ui,
-                            &mut self.deck_stem_volumes[ch][3],
-                            0.0,
-                            1.0,
-                            1.0,
-                            "VOC",
-                            voc_col,
-                            28.0,
-                        )
-                        .secondary_clicked()
-                        {
-                            self.deck_stem_muted[ch][3] = !self.deck_stem_muted[ch][3];
-                        }
-
-                        let inst_col = if self.deck_stem_muted[ch][2] {
-                            TraktorTheme::METER_RED()
-                        } else {
-                            Color32::from_rgb(255, 195, 0)
-                        };
-                        if rotary_knob_sized(
-                            ui,
-                            &mut self.deck_stem_volumes[ch][2],
-                            0.0,
-                            1.0,
-                            1.0,
-                            "INST",
-                            inst_col,
-                            28.0,
-                        )
-                        .secondary_clicked()
-                        {
-                            self.deck_stem_muted[ch][2] = !self.deck_stem_muted[ch][2];
-                        }
-
-                        let mut db_vol =
-                            (self.deck_stem_volumes[ch][0] + self.deck_stem_volumes[ch][1]) * 0.5;
-                        let db_muted =
-                            self.deck_stem_muted[ch][0] && self.deck_stem_muted[ch][1];
-                        let db_col = if db_muted {
-                            TraktorTheme::METER_RED()
-                        } else {
-                            Color32::from_rgb(0, 210, 255)
-                        };
-                        let db_resp = rotary_knob_sized(
-                            ui,
-                            &mut db_vol,
-                            0.0,
-                            1.0,
-                            1.0,
-                            "D+B",
-                            db_col,
-                            28.0,
-                        );
-                        if db_resp.changed() {
-                            self.deck_stem_volumes[ch][0] = db_vol;
-                            self.deck_stem_volumes[ch][1] = db_vol;
-                        }
-                        if db_resp.secondary_clicked() {
-                            let next_mute = !db_muted;
-                            self.deck_stem_muted[ch][0] = next_mute;
-                            self.deck_stem_muted[ch][1] = next_mute;
-                        }
-                    } else {
-                        let hi_col = if self.eq_kill_hi[ch] {
-                            TraktorTheme::METER_RED()
-                        } else {
-                            accent
-                        };
-                        if rotary_knob_sized(
-                            ui,
-                            &mut self.channel_eq_hi[ch],
-                            0.0,
-                            1.0,
-                            0.5,
-                            "HI",
-                            hi_col,
-                            28.0,
-                        )
-                        .secondary_clicked()
-                        {
-                            self.eq_kill_hi[ch] = !self.eq_kill_hi[ch];
-                        }
-
-                        let mid_col = if self.eq_kill_mid[ch] {
-                            TraktorTheme::METER_RED()
-                        } else {
-                            accent
-                        };
-                        if rotary_knob_sized(
-                            ui,
-                            &mut self.channel_eq_mid[ch],
-                            0.0,
-                            1.0,
-                            0.5,
-                            "MID",
-                            mid_col,
-                            28.0,
-                        )
-                        .secondary_clicked()
-                        {
-                            self.eq_kill_mid[ch] = !self.eq_kill_mid[ch];
-                        }
-
-                        let low_col = if self.eq_kill_low[ch] {
-                            TraktorTheme::METER_RED()
-                        } else {
-                            accent
-                        };
-                        if rotary_knob_sized(
-                            ui,
-                            &mut self.channel_eq_low[ch],
-                            0.0,
-                            1.0,
-                            0.5,
-                            "LOW",
-                            low_col,
-                            28.0,
-                        )
-                        .secondary_clicked()
-                        {
-                            self.eq_kill_low[ch] = !self.eq_kill_low[ch];
-                        }
-                    }
-
-                    let fltr_col = if self.channel_filter_on[ch] {
-                        TraktorTheme::PLAY_ACTIVE()
-                    } else {
-                        TraktorTheme::TEXT_MUTED()
-                    };
-                    let fltr_resp = rotary_knob_sized(
-                        ui,
-                        &mut self.channel_filter[ch],
-                        0.0,
-                        1.0,
-                        0.5,
-                        "FLTR",
-                        fltr_col,
-                        28.0,
-                    );
-                    if fltr_resp.changed() {
-                        self.channel_filter_on[ch] = (self.channel_filter[ch] - 0.5).abs() > 0.02;
-                    }
+            if !pitch_inline {
+                ui.horizontal(|ui| {
+                    ui.label(caps("PITCH"));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| pitch_fader(ui, &mut self.deck_pitch_fader[d]));
                 });
+            }
 
-                // Sub-column 2: GAIN + Volume Fader + VU Meter
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing = Vec2::new(2.0, 2.0);
-                    rotary_knob_sized(
-                        ui,
-                        &mut self.channel_gain[ch],
-                        0.0,
-                        1.0,
-                        0.5,
-                        "GAIN",
-                        accent,
-                        28.0,
-                    );
-
-                    ui.horizontal_top(|ui| {
-                        ui.spacing_mut().item_spacing = Vec2::new(2.0, 0.0);
-                        vertical_fader(ui, &mut self.channel_volume[ch], 0.0, 1.0, accent, 94.0);
-                        let peak = if let Ok(state) = self.audio.shared.lock() {
-                            state.channel_peaks[ch]
-                        } else {
-                            0.0
-                        };
-                        vu_meter(ui, peak, peak * 0.94, 94.0);
-                    });
-                });
-            });
-
-            // Crossfader Assign Buttons [A | T | B]
+            // 8. Pad mode and the eight performance pads, behind "MORE".
+            if !self.deck_expanded[d] {
+                return;
+            }
+            let gap = ui.spacing().item_spacing.x;
             ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing = Vec2::new(2.0, 0.0);
-                let assign = &mut self.channel_xfader_assign[ch];
-                for (label, val) in [("A", 0usize), ("T", 1usize), ("B", 2usize)] {
-                    let is_sel = *assign == val;
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                RichText::new(label)
-                                    .color(if is_sel {
-                                        Color32::BLACK
-                                    } else {
-                                        TraktorTheme::TEXT_MUTED()
-                                    })
-                                    .font(egui::FontId::monospace(8.5))
-                                    .strong(),
-                            )
-                            .fill(if is_sel {
-                                accent
-                            } else {
-                                Color32::from_rgb(24, 26, 32)
-                            })
-                            .min_size(Vec2::new(18.0, 14.0)),
-                        )
+                let w = (ui.available_width() - 3.0 * gap) / 4.0;
+                for mode in [DeckPadMode::Hotcues, DeckPadMode::Stems, DeckPadMode::Pattern, DeckPadMode::FluxLoop] {
+                    if pill(ui, mode.label(), self.deck_pad_mode[d] == mode, TraktorTheme::ROW_SELECTED(), w)
+                        .on_hover_text(match mode {
+                            DeckPadMode::Hotcues => "Pads jump to hotcues 1-8",
+                            DeckPadMode::Stems => "Pads 1-4 mute stems, pads 5-8 send them to the FX",
+                            DeckPadMode::Pattern => "Pads toggle pattern player steps",
+                            DeckPadMode::FluxLoop => "Pads hold a loop roll of 1 to 32 beats",
+                        })
                         .clicked()
                     {
-                        *assign = val;
+                        self.deck_pad_mode[d] = mode;
+                        if mode == DeckPadMode::Pattern {
+                            self.show_pattern_player = true;
+                        }
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                let w = (ui.available_width() - 7.0 * gap) / 8.0;
+                let mode = self.deck_pad_mode[d];
+                for i in 1..=8usize {
+                    let (lit, fill, tip) = match mode {
+                        DeckPadMode::Hotcues => (
+                            self.deck_hotcues[d].iter().any(|(c, _)| *c == i as u8),
+                            TraktorTheme::hotcue_color(i),
+                            "Jump to this hotcue, or set it here if empty. Right-click to clear",
+                        ),
+                        DeckPadMode::Stems if i <= 4 => (!self.deck_stem_muted[d][i - 1], TraktorTheme::ACCENT(), "Mute or unmute a stem"),
+                        DeckPadMode::Stems => (self.deck_stem_fx_send[d][i - 5], TraktorTheme::ACCENT(), "Send a stem to the FX"),
+                        DeckPadMode::Pattern => {
+                            let v = self.pattern_selected_voice.min(3);
+                            let step_offset = if deck_idx == 2 { 8 } else { 0 };
+                            (self.pattern_steps[v][(step_offset + i - 1).min(15)], TraktorTheme::ACCENT(), "Toggle a pattern step")
+                        }
+                        DeckPadMode::FluxLoop => (self.deck_loop_active[d], TraktorTheme::ACCENT(), "Loop roll"),
+                    };
+                    let pad = pill(ui, &i.to_string(), lit, fill, w).on_hover_text(tip);
+                    if pad.clicked() {
+                        self.trigger_performance_pad(deck_idx, i as u8);
+                    }
+                    if pad.secondary_clicked() && mode == DeckPadMode::Hotcues {
+                        self.deck_hotcues[d].retain(|(c, _)| *c != i as u8);
                     }
                 }
             });
         });
     }
 
+    /// Centre mixer: knob-mode switch, channel strips, crossfader.
+    fn show_mixer_section(&mut self, ui: &mut Ui, two_channel_only: bool) {
+        panel(TraktorTheme::BG_PANEL_ALT()).show(ui, |ui| {
+            // What the three knobs per channel control.
+            ui.horizontal(|ui| {
+                let neural = self.preferences.neural_mix_eq_mode;
+                ui.label(caps("KNOBS"));
+                for (label, selected, tip) in [
+                    ("EQ", !neural, "Knobs are a high / mid / low equaliser"),
+                    ("STEMS", neural, "Knobs are vocals / instruments / drums + bass levels"),
+                ] {
+                    if pill(ui, label, selected, TraktorTheme::ROW_SELECTED(), 52.0).on_hover_text(tip).clicked() && !selected {
+                        self.preferences.neural_mix_eq_mode = !neural;
+                    }
+                }
+            });
+
+            if two_channel_only {
+                ui.columns(2, |cols| {
+                    self.show_channel_strip(&mut cols[0], 0, true);
+                    self.show_channel_strip(&mut cols[1], 1, true);
+                });
+            } else {
+                // Same order as the decks either side: A, C | D, B.
+                ui.columns(4, |cols| {
+                    self.show_channel_strip(&mut cols[0], 0, false);
+                    self.show_channel_strip(&mut cols[1], 2, false);
+                    self.show_channel_strip(&mut cols[2], 3, false);
+                    self.show_channel_strip(&mut cols[3], 1, false);
+                });
+            }
+
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label(caps("A"));
+                let w = (ui.available_width() - 20.0).max(90.0);
+                crossfader(ui, &mut self.crossfader_pos, w).on_hover_text(XFADER_TIP);
+                ui.label(caps("B"));
+            });
+        });
+    }
+
+    /// One channel: header (deck, headphone cue), EQ or stem knobs, gain, filter, fader with meter and
+    /// crossfader side. `compact` (two-channel Mix) spreads the knobs over two columns to stay short.
+    fn show_channel_strip(&mut self, ui: &mut Ui, ch: usize, compact: bool) {
+        let accent = TraktorTheme::deck_color(ch + 1);
+        let knob_h = 33.0; // rotary_knob_sized(28) is 28 + 5 tall
+        let fader_h = 3.0 * knob_h + 2.0 * 2.0;
+
+        ui.horizontal(|ui| {
+            deck_badge(ui, DECK_LETTERS[ch.min(3)], accent);
+            if pill(ui, "CUE", self.channel_cue[ch], TraktorTheme::CUE_ACTIVE(), 36.0)
+                .on_hover_text("Headphone cue: hear this channel in the headphones")
+                .clicked()
+            {
+                self.channel_cue[ch] = !self.channel_cue[ch];
+            }
+            if compact {
+                ui.add_space((ui.available_width() - XFADER_ASSIGN_W).max(0.0));
+                self.xfader_assign(ui, ch);
+            }
+        });
+
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing = Vec2::new(8.0, 2.0);
+            // Centre the knob and fader block in the strip.
+            let block_w = if compact { 28.0 + 8.0 + 28.0 + 8.0 + 38.0 } else { 28.0 + 8.0 + 38.0 };
+            ui.add_space(((ui.available_width() - block_w) / 2.0).max(0.0));
+
+            ui.vertical(|ui| {
+                self.band_knobs(ui, ch, accent);
+                if !compact {
+                    self.filter_knob(ui, ch);
+                }
+            });
+            if compact {
+                ui.vertical(|ui| {
+                    self.gain_knob(ui, ch, accent);
+                    ui.add_space(knob_h + 2.0);
+                    self.filter_knob(ui, ch);
+                });
+            }
+            ui.vertical(|ui| {
+                if !compact {
+                    self.gain_knob(ui, ch, accent);
+                }
+                ui.horizontal_top(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    vertical_fader(ui, &mut self.channel_volume[ch], 0.0, 1.0, accent, fader_h)
+                        .on_hover_text("Channel volume. Drag to adjust; double-click to reset");
+                    let peak = self.audio.shared.lock().map(|s| s.channel_peaks[ch]).unwrap_or(0.0);
+                    vu_meter(ui, peak, peak * 0.94, fader_h);
+                });
+            });
+        });
+
+        if !compact {
+            ui.horizontal(|ui| {
+                ui.add_space(((ui.available_width() - XFADER_ASSIGN_W) / 2.0).max(0.0));
+                self.xfader_assign(ui, ch);
+            });
+        }
+    }
+
+    /// The three knobs that are either the EQ or, in stems mode, stem levels. Right-click cuts or mutes;
+    /// the label then says so, so the state does not rest on the arc colour alone.
+    fn band_knobs(&mut self, ui: &mut Ui, ch: usize, accent: Color32) {
+        let off = TraktorTheme::METER_RED();
+        if self.preferences.neural_mix_eq_mode {
+            for (s, label, name) in [(3usize, "VOC", "Vocals level"), (2usize, "INST", "Instruments level")] {
+                let muted = self.deck_stem_muted[ch][s];
+                let (label, col) = if muted { ("MUTE", off) } else { (label, accent) };
+                if rotary_knob_sized(ui, &mut self.deck_stem_volumes[ch][s], 0.0, 1.0, 1.0, label, col, 28.0)
+                    .on_hover_text(format!("{name}. {KNOB_TIP} Right-click to mute"))
+                    .secondary_clicked()
+                {
+                    self.deck_stem_muted[ch][s] = !muted;
+                }
+            }
+            let mut level = (self.deck_stem_volumes[ch][0] + self.deck_stem_volumes[ch][1]) * 0.5;
+            let muted = self.deck_stem_muted[ch][0] && self.deck_stem_muted[ch][1];
+            let (label, col) = if muted { ("MUTE", off) } else { ("D+B", accent) };
+            let resp = rotary_knob_sized(ui, &mut level, 0.0, 1.0, 1.0, label, col, 28.0)
+                .on_hover_text(format!("Drums and bass level. {KNOB_TIP} Right-click to mute"));
+            if resp.changed() {
+                self.deck_stem_volumes[ch][0] = level;
+                self.deck_stem_volumes[ch][1] = level;
+            }
+            if resp.secondary_clicked() {
+                self.deck_stem_muted[ch][0] = !muted;
+                self.deck_stem_muted[ch][1] = !muted;
+            }
+        } else {
+            for (label, name, value, cut) in [
+                ("HI", "High EQ", &mut self.channel_eq_hi[ch], &mut self.eq_kill_hi[ch]),
+                ("MID", "Mid EQ", &mut self.channel_eq_mid[ch], &mut self.eq_kill_mid[ch]),
+                ("LOW", "Low EQ", &mut self.channel_eq_low[ch], &mut self.eq_kill_low[ch]),
+            ] {
+                let (label, col) = if *cut { ("CUT", off) } else { (label, accent) };
+                if rotary_knob_sized(ui, value, 0.0, 1.0, 0.5, label, col, 28.0)
+                    .on_hover_text(format!("{name}. {KNOB_TIP} Right-click to cut"))
+                    .secondary_clicked()
+                {
+                    *cut = !*cut;
+                }
+            }
+        }
+    }
+
+    fn gain_knob(&mut self, ui: &mut Ui, ch: usize, accent: Color32) {
+        rotary_knob_sized(ui, &mut self.channel_gain[ch], 0.0, 1.0, 0.5, "GAIN", accent, 28.0)
+            .on_hover_text(format!("Input gain. {KNOB_TIP}"));
+    }
+
+    /// The filter engages as soon as its knob leaves the centre.
+    fn filter_knob(&mut self, ui: &mut Ui, ch: usize) {
+        let col = if self.channel_filter_on[ch] { TraktorTheme::ACCENT() } else { TraktorTheme::TEXT_MUTED() };
+        if rotary_knob_sized(ui, &mut self.channel_filter[ch], 0.0, 1.0, 0.5, "FLTR", col, 28.0)
+            .on_hover_text(format!("Filter: left of centre cuts highs, right cuts lows. {KNOB_TIP}"))
+            .changed()
+        {
+            self.channel_filter_on[ch] = (self.channel_filter[ch] - 0.5).abs() > 0.02;
+        }
+    }
+
+    /// Which side of the crossfader this channel sits on.
+    fn xfader_assign(&mut self, ui: &mut Ui, ch: usize) {
+        ui.scope(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            for (label, val, tip) in [
+                ("A", 0usize, "Crossfader side A (left)"),
+                ("T", 1usize, "Thru: bypass the crossfader"),
+                ("B", 2usize, "Crossfader side B (right)"),
+            ] {
+                if pill(ui, label, self.channel_xfader_assign[ch] == val, TraktorTheme::ROW_SELECTED(), HIT)
+                    .on_hover_text(tip)
+                    .clicked()
+                {
+                    self.channel_xfader_assign[ch] = val;
+                }
+            }
+        });
+    }
+
     fn show_browser_panel(&mut self, ui: &mut Ui) {
         let avail_h = ui.available_height().max(160.0);
-        egui::Frame::none()
-            .fill(TraktorTheme::BG_PANEL())
-            .stroke(Stroke::new(1.0_f32, TraktorTheme::BORDER_COLOR()))
-            .inner_margin(egui::Margin::symmetric(8.0, 6.0))
-            .show(ui, |ui| {
-                ui.set_min_height(avail_h - 12.0);
-                ui.horizontal_top(|ui| {
-                    // Left Navigation Tree
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(178.0, avail_h - 16.0),
-                        Layout::top_down(Align::Min),
-                        |ui| {
-                            ui.set_width(178.0);
-                            self.library.show_nav_tree(ui);
-                        },
-                    );
+        panel(TraktorTheme::BG_PANEL()).show(ui, |ui| {
+            ui.set_min_height(avail_h - 12.0);
+            ui.horizontal_top(|ui| {
+                // Left Navigation Tree
+                ui.allocate_ui_with_layout(Vec2::new(178.0, avail_h - 16.0), Layout::top_down(Align::Min), |ui| {
+                    ui.set_width(178.0);
+                    self.library.show_nav_tree(ui);
+                });
 
-                    ui.separator();
+                ui.separator();
 
-                    let four_deck_mode =
-                        self.layout == TraktorLayout::FourDeck || self.preferences.four_deck_mode;
-                    let locked_decks = self.locked_decks();
-                    self.library.show_browser_content(
-                        ui,
-                        four_deck_mode,
-                        locked_decks,
-                        self.preferences.library_columns,
-                        &mut self.preferences.music_folders,
-                    );
-                    self.drain_pending_loads();
+                let four_deck_mode = self.layout == TraktorLayout::FourDeck || self.preferences.four_deck_mode;
+                let locked_decks = self.locked_decks();
+                self.library.show_browser_content(
+                    ui,
+                    four_deck_mode,
+                    locked_decks,
+                    self.preferences.library_columns,
+                    &mut self.preferences.music_folders,
+                );
+                self.drain_pending_loads();
 
-                    // If a track was loaded and has stems ready, automatically enable deck stems view
-                    if let Some((d, stems_ready)) = self.library.last_loaded_deck.take() {
-                        if stems_ready {
-                            self.deck_stem_view[d] = true;
-                        }
+                // If a track was loaded and has stems ready, automatically enable deck stems view
+                if let Some((d, stems_ready)) = self.library.last_loaded_deck.take() {
+                    if stems_ready {
+                        self.deck_stem_view[d] = true;
                     }
+                }
 
-                    // If stems were generated for a track, enable stems view if it is currently playing/loaded on any deck
-                    if let Some(stemmed_id) = self.library.last_stemmed_track_id.take() {
-                        if let Some(track) = self.library.tracks.iter().find(|t| t.id == stemmed_id) {
-                            if let Ok(mut state) = self.audio.shared.lock() {
-                                for d in 0..4 {
-                                    if let Some(ref mut loaded) = state.loaded_tracks[d] {
-                                        if loaded.title == track.title && loaded.artist == track.artist {
-                                            loaded.stems_ready = true;
-                                            self.deck_stem_view[d] = true;
-                                        }
+                // If stems were generated for a track, enable stems view if it is currently playing/loaded on any deck
+                if let Some(stemmed_id) = self.library.last_stemmed_track_id.take() {
+                    if let Some(track) = self.library.tracks.iter().find(|t| t.id == stemmed_id) {
+                        if let Ok(mut state) = self.audio.shared.lock() {
+                            for d in 0..4 {
+                                if let Some(ref mut loaded) = state.loaded_tracks[d] {
+                                    if loaded.title == track.title && loaded.artist == track.artist {
+                                        loaded.stems_ready = true;
+                                        self.deck_stem_view[d] = true;
                                     }
                                 }
                             }
                         }
                     }
-                });
+                }
             });
+        });
+    }
+}
+
+/// What a loaded deck needs to draw one frame.
+struct DeckView {
+    title: String,
+    artist: String,
+    bpm: f64,
+    key: String,
+    duration_sec: f64,
+    elapsed_sec: f64,
+    is_playing: bool,
+    peaks: Vec<[f32; 3]>,
+    stem_peaks: Vec<[f32; 4]>,
+}
+
+impl DeckView {
+    fn remaining(&self) -> String {
+        let rem = (self.duration_sec - self.elapsed_sec).max(0.0);
+        format!("-{:02}:{:02}", (rem / 60.0).floor() as u32, (rem % 60.0).floor() as u32)
+    }
+}
+
+// ---- The performance screen's small design system: one panel, one button, one readout. ----
+
+const DECK_LETTERS: [&str; 4] = ["A", "B", "C", "D"];
+/// Smallest side of anything clickable.
+const HIT: f32 = 24.0;
+/// Three 24 px crossfader-side buttons and their two 2 px gaps.
+const XFADER_ASSIGN_W: f32 = 3.0 * HIT + 2.0 * 2.0;
+const KNOB_TIP: &str = "Drag up or down; double-click to reset.";
+const XFADER_TIP: &str = "Crossfader. Drag to blend A and B; double-click to centre";
+
+/// WCAG relative luminance.
+fn luminance(c: Color32) -> f32 {
+    let linear = |v: u8| {
+        let v = v as f32 / 255.0;
+        if v <= 0.04045 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * linear(c.r()) + 0.7152 * linear(c.g()) + 0.0722 * linear(c.b())
+}
+
+/// Text colour for any fill: black or white, whichever contrasts more (never below 4.5:1).
+fn on(fill: Color32) -> Color32 {
+    // Above this luminance black wins; at it both give 4.58:1.
+    if luminance(fill) > 0.179 {
+        Color32::BLACK
+    } else {
+        Color32::WHITE
+    }
+}
+
+/// Every surface on the screen: same padding, border and corner.
+fn panel(fill: Color32) -> egui::Frame {
+    egui::Frame::none()
+        .fill(fill)
+        .stroke(Stroke::new(1.0_f32, TraktorTheme::BORDER_COLOR()))
+        .rounding(4.0)
+        .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+}
+
+/// A horizontal row of known height, so everything in it shares one centre line.
+fn row<R>(ui: &mut Ui, height: f32, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
+    ui.allocate_ui_with_layout(Vec2::new(ui.available_width(), height), Layout::left_to_right(Align::Center), |ui| {
+        ui.set_min_height(height);
+        add_contents(ui)
+    })
+    .inner
+}
+
+/// Small caps label for a group of controls.
+fn caps(text: &str) -> RichText {
+    RichText::new(text).size(10.0).color(TraktorTheme::TEXT_SECONDARY())
+}
+
+/// Hover and keyboard-focus outline, the same on every button.
+fn ring(ui: &Ui, resp: egui::Response) -> egui::Response {
+    if resp.hovered() || resp.has_focus() {
+        ui.painter().rect_stroke(resp.rect, 2.0, Stroke::new(1.0_f32, TraktorTheme::TEXT_SECONDARY()));
+    }
+    resp
+}
+
+/// `icon_button` with the shared hover ring.
+fn icon_pill(ui: &mut Ui, icon: Icon, label: &str, fill: Color32, fg: Color32, min_size: Vec2) -> egui::Response {
+    let resp = icon_button(ui, icon, label, fill, fg, min_size);
+    ring(ui, resp)
+}
+
+/// The one text button: 24 px tall, filled with `on_fill` while engaged (its text flips to stay readable).
+fn pill(ui: &mut Ui, label: &str, engaged: bool, on_fill: Color32, min_width: f32) -> egui::Response {
+    let fg = if engaged { on(on_fill) } else { TraktorTheme::TEXT_SECONDARY() };
+    let mut button = egui::Button::new(RichText::new(label).size(11.5).color(fg)).min_size(Vec2::new(min_width, HIT));
+    if engaged {
+        button = button.fill(on_fill);
+    }
+    let resp = ui.add(button);
+    ring(ui, resp)
+}
+
+/// Deck identity: its letter on its colour, so colour alone never names a deck.
+fn deck_badge(ui: &mut Ui, letter: &str, color: Color32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(HIT), Sense::hover());
+    ui.painter().rect_filled(rect, 3.0, color);
+    ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, letter, egui::FontId::proportional(14.0), on(color));
+}
+
+/// "Title  Artist" on one line, cut with an ellipsis rather than pushing the layout wider.
+fn title_label(ui: &mut Ui, title: &str, artist: &str) {
+    let mut job = egui::text::LayoutJob::default();
+    job.append(title, 0.0, egui::TextFormat::simple(egui::FontId::proportional(13.0), TraktorTheme::TEXT_PRIMARY()));
+    job.append(artist, 10.0, egui::TextFormat::simple(egui::FontId::proportional(12.0), TraktorTheme::TEXT_SECONDARY()));
+    ui.add(egui::Label::new(job).truncate().selectable(false)).on_hover_text(format!("{title}\n{artist}"));
+}
+
+/// Badge plus a one-line hint for a deck with nothing loaded.
+fn empty_deck_hint(ui: &mut Ui, letter: &str, accent: Color32, hint: &str) {
+    deck_badge(ui, letter, accent);
+    ui.add(egui::Label::new(RichText::new(hint).size(12.0).color(TraktorTheme::TEXT_SECONDARY())).truncate().selectable(false));
+}
+
+/// Dark inset holding dot-matrix readouts, like the display window on a piece of hardware.
+/// `add_contents` gets the ink colour that reads on it.
+fn display(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui, Color32)) {
+    let bg = TraktorTheme::WAVEFORM_BG();
+    egui::Frame::none()
+        .fill(bg)
+        .rounding(3.0)
+        .inner_margin(egui::Margin::symmetric(8.0, 3.0))
+        .show(ui, |ui| ui.horizontal(|ui| add_contents(ui, on(bg))));
+}
+
+/// A number glanced at mid-mix: small caps label over the value in the dot-matrix face.
+fn readout(ui: &mut Ui, label: &str, value: &str, size: f32, ink: Color32) {
+    let label_galley = ui.painter().layout_no_wrap(label.to_owned(), egui::FontId::proportional(10.0), ink.gamma_multiply(0.65));
+    let value_galley = ui.painter().layout_no_wrap(value.to_owned(), crate::theme::dot_font(size), ink);
+    let size = Vec2::new(label_galley.size().x.max(value_galley.size().x), label_galley.size().y + value_galley.size().y);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::hover());
+    let value_pos = egui::pos2(rect.left(), rect.bottom() - value_galley.size().y);
+    ui.painter().galley(rect.left_top(), label_galley, ink);
+    ui.painter().galley(value_pos, value_galley, ink);
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, format!("{label} {value}")));
+}
+
+/// Status lamp with a label; clicking opens the matching settings. Filled = OK, hollow = not,
+/// so the state never rests on colour alone.
+fn lamp(ui: &mut Ui, label: &str, ok: bool) -> egui::Response {
+    let galley = ui.painter().layout_no_wrap(label.to_owned(), egui::FontId::proportional(11.5), TraktorTheme::TEXT_SECONDARY());
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(galley.size().x + 22.0, HIT), Sense::click());
+    let centre = egui::pos2(rect.left() + 8.0, rect.center().y);
+    if ok {
+        ui.painter().circle_filled(centre, 3.5, TraktorTheme::TEXT_PRIMARY());
+    } else {
+        ui.painter().circle_stroke(centre, 3.0, Stroke::new(1.2_f32, TraktorTheme::TEXT_SECONDARY()));
+    }
+    ui.painter().galley(egui::pos2(rect.left() + 17.0, rect.center().y - galley.size().y / 2.0), galley, TraktorTheme::TEXT_SECONDARY());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+    ring(ui, resp)
+}
+
+/// One FX unit in the top bar: on/off, dry/wet and one amount knob. The arcs light up with the unit.
+fn fx_unit(ui: &mut Ui, n: u8, enabled: &mut bool, dry_wet: &mut f32, amount: &mut f32, amount_label: &str, amount_name: &str) {
+    if pill(ui, &format!("FX {n}"), *enabled, TraktorTheme::ACCENT(), 40.0)
+        .on_hover_text(format!("FX unit {n} on / off"))
+        .clicked()
+    {
+        *enabled = !*enabled;
+    }
+    let arc = if *enabled { TraktorTheme::ACCENT() } else { TraktorTheme::TEXT_MUTED() };
+    rotary_knob_sized(ui, dry_wet, 0.0, 1.0, 0.3, "D/W", arc, 28.0).on_hover_text(format!("FX {n} dry / wet mix. {KNOB_TIP}"));
+    rotary_knob_sized(ui, amount, 0.0, 1.0, 0.5, amount_label, arc, 28.0).on_hover_text(format!("FX {n} {amount_name}. {KNOB_TIP}"));
+}
+
+/// Pitch fader and its reset. Call inside a right-to-left layout: the fader takes the width that is left.
+fn pitch_fader(ui: &mut Ui, pitch: &mut f32) {
+    if pill(ui, "0%", false, Color32::TRANSPARENT, 32.0).on_hover_text("Reset pitch to 0%").clicked() {
+        *pitch = 0.0;
+    }
+    ui.spacing_mut().interact_size.y = HIT;
+    ui.spacing_mut().slider_width = (ui.available_width() - ui.spacing().item_spacing.x).clamp(48.0, 220.0);
+    ui.add(egui::Slider::new(pitch, -8.0..=8.0).show_value(false)).on_hover_text("Pitch fader: tempo ±8%");
+}
+
+/// Height of the full-width waveforms: 64 px at the minimum window, growing with the window.
+fn mix_wave_height(ui: &Ui) -> f32 {
+    (64.0 + (ui.ctx().screen_rect().height() - 640.0) * 0.14).clamp(64.0, 124.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::theme::Palette;
+
+    fn contrast(a: Color32, b: Color32) -> f32 {
+        let (x, y) = (luminance(a), luminance(b));
+        (x.max(y) + 0.05) / (x.min(y) + 0.05)
+    }
+
+    #[test]
+    fn button_text_is_readable_in_every_preset() {
+        for (name, p) in Palette::PRESETS {
+            // Every fill a pill, badge or display can take.
+            for fill in [
+                p.ACCENT, p.ROW_SELECTED, p.CUE_ACTIVE, p.PLAY_ACTIVE, p.WAVEFORM_BG, p.DECK_A, p.DECK_B, p.DECK_C, p.DECK_D,
+                p.HOTCUE_CUE, p.HOTCUE_LOAD, p.HOTCUE_LOOP, p.HOTCUE_FADEIN, p.HOTCUE_FADEOUT, p.HOTCUE_GENERIC,
+            ] {
+                assert!(contrast(on(fill), fill) >= 4.5, "{name}: text on {fill:?}");
+            }
+            // Idle buttons and labels.
+            for bg in [p.CONTROL, p.CONTROL_HOVER, p.BG_PANEL, p.BG_PANEL_ALT] {
+                assert!(contrast(p.TEXT_SECONDARY, bg) >= 4.5, "{name}: secondary text on {bg:?}");
+            }
+        }
     }
 }
