@@ -2745,7 +2745,7 @@ fn pitch_fader(ui: &mut Ui, pitch: &mut f32) {
     }
     ui.spacing_mut().interact_size.y = HIT;
     ui.spacing_mut().slider_width = (ui.available_width() - ui.spacing().item_spacing.x).clamp(48.0, 220.0);
-    ui.add(egui::Slider::new(pitch, -8.0..=8.0).clamp_to_range(false).show_value(false)).on_hover_text("Pitch fader: tempo ±8%");
+    ui.add(egui::Slider::new(pitch, -8.0..=8.0).clamping(egui::SliderClamping::Never).show_value(false)).on_hover_text("Pitch fader: tempo ±8%");
 }
 
 /// Height of the full-width waveforms: 64 px at the minimum window, growing with the window.
