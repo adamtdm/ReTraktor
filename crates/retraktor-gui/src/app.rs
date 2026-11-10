@@ -687,11 +687,15 @@ impl ReTraktorApp {
                 match LoadedTrackAudio::from_file(path, &track.title, &track.artist, track.bpm, &track.musical_key) {
                     Ok(mut loaded) => {
                         // Unanalysed track: analyse the PCM we just decoded and report back to the library.
+                        if let Some(grid) = track.cues.iter().find(|c| c.cue_type == retraktor_core::CueType::Grid) {
+                            loaded.grid_offset_sec = grid.start_ms / 1000.0;
+                        }
                         if track.bpm <= 0.0 || track.musical_key.is_empty() {
                             let mono = crate::library_ui::stereo_to_mono(&loaded.pcm_stereo);
                             let a = retraktor_library::analyze_mono(&mono, loaded.sample_rate);
                             if track.bpm <= 0.0 {
                                 loaded.bpm = a.bpm;
+                                loaded.grid_offset_sec = a.beatgrid_offset_sec;
                             }
                             if track.musical_key.is_empty() {
                                 loaded.key = a.key_open.clone();
@@ -730,6 +734,8 @@ impl ReTraktorApp {
             state.pattern_pitch = self.pattern_pitch;
             state.pattern_decay = self.pattern_decay;
 
+            let grids: [Option<(f64, f64)>; 4] =
+                std::array::from_fn(|i| state.loaded_tracks[i].as_ref().map(|t| (t.bpm.max(20.0), t.grid_offset_sec)));
             for d in 0..4 {
                 state.channel_gain[d] = self.channel_gain[d];
                 state.engine.strips[d].volume = self.channel_volume[d];
@@ -747,28 +753,25 @@ impl ReTraktorApp {
                 state.engine.strips[d].xfader_left = self.channel_xfader_assign[d] == 0;
                 state.engine.strips[d].xfader_right = self.channel_xfader_assign[d] == 2;
 
-                let pitch_pct = self.deck_pitch_fader[d] as f64 / 100.0;
-                let mut ratio = 1.0 + pitch_pct;
-
-                // Continuous Beat Phase Sync Lock:
-                if self.deck_sync_enabled[d] && state.is_playing[d] {
-                    let other_deck = if d == 0 { 1 } else { 0 };
-                    if state.is_playing[other_deck] {
-                        let target_bpm = self.master_tempo.max(20.0);
-                        let beat_sec = 60.0 / target_bpm;
-                        let master_phase = state.playhead_sec[other_deck].rem_euclid(beat_sec);
-                        let cur_phase = state.playhead_sec[d].rem_euclid(beat_sec);
-                        let mut diff = master_phase - cur_phase;
-                        if diff > 0.5 * beat_sec {
-                            diff -= beat_sec;
-                        } else if diff < -0.5 * beat_sec {
-                            diff += beat_sec;
+                let mut nudge = 0.0;
+                // Sync holds the tempo to the other deck (or the master tempo) and eases the beats together.
+                if self.deck_sync_enabled[d] {
+                    if let Some((bpm, offset)) = grids[d] {
+                        let other = if d == 0 { 1 } else { 0 };
+                        let target = grids[other]
+                            .map(|(b, _)| b * (1.0 + self.deck_pitch_fader[other] as f64 / 100.0))
+                            .unwrap_or(self.master_tempo);
+                        self.deck_pitch_fader[d] = ((sync_ratio(bpm, target) - 1.0) * 100.0) as f32;
+                        if let (Some((other_bpm, other_offset)), true, true) = (grids[other], state.is_playing[d], state.is_playing[other]) {
+                            let behind = beat_phase_diff(
+                                (state.playhead_sec[other] - other_offset) * other_bpm / 60.0,
+                                (state.playhead_sec[d] - offset) * bpm / 60.0,
+                            );
+                            nudge = (behind * 0.2).clamp(-0.03, 0.03);
                         }
-                        // Gentle proportional correction nudge to keep beatgrids locked (< 2% nudge)
-                        let nudge = (diff / beat_sec * 0.05).clamp(-0.02, 0.02);
-                        ratio += nudge;
                     }
                 }
+                let ratio = 1.0 + self.deck_pitch_fader[d] as f64 / 100.0 + nudge;
                 state.pitch_ratio[d] = ratio;
 
                 let bpm = state.loaded_tracks[d]
@@ -1423,51 +1426,16 @@ impl ReTraktorApp {
             return;
         }
 
+        // Tempo follows in sync_audio_state; here the deck jumps straight onto the other deck's beat.
         if let Ok(mut state) = self.audio.shared.lock() {
-            let other_deck = if d == 0 { 1 } else { 0 };
-            let (target_bpm, target_phase_sec) = if state.is_playing[other_deck] {
-                let other_orig_bpm = state.loaded_tracks[other_deck]
-                    .as_ref()
-                    .map(|t| t.bpm)
-                    .unwrap_or(self.master_tempo);
-                let other_effective_bpm = other_orig_bpm * (1.0 + self.deck_pitch_fader[other_deck] as f64 / 100.0);
-                (other_effective_bpm, Some(state.playhead_sec[other_deck]))
-            } else {
-                (self.master_tempo, None)
-            };
-
-            // 1. Match the Tempo (BPM)
-            if let Some(track) = &state.loaded_tracks[d] {
-                let orig_bpm = track.bpm.max(20.0);
-                let pct = ((target_bpm - orig_bpm) / orig_bpm) * 100.0;
-                self.deck_pitch_fader[d] = pct.clamp(-8.0, 8.0) as f32;
-
-                // 2. Put it on the beat (Beat Phase Alignment)
-                let beat_sec = 60.0 / target_bpm.max(20.0);
-                let cur_pos = state.playhead_sec[d];
-
-                let delta = if let Some(master_pos) = target_phase_sec {
-                    // Align to master deck's beat phase
-                    let master_phase = master_pos.rem_euclid(beat_sec);
-                    let cur_phase = cur_pos.rem_euclid(beat_sec);
-                    let mut diff = master_phase - cur_phase;
-                    if diff > 0.5 * beat_sec {
-                        diff -= beat_sec;
-                    } else if diff < -0.5 * beat_sec {
-                        diff += beat_sec;
-                    }
-                    diff
-                } else {
-                    // Snap to the nearest beat on this track's own grid
-                    let cur_phase = cur_pos.rem_euclid(beat_sec);
-                    if cur_phase > 0.5 * beat_sec {
-                        beat_sec - cur_phase
-                    } else {
-                        -cur_phase
-                    }
-                };
-
-                state.playhead_sec[d] = (cur_pos + delta).max(0.0);
+            let other = if d == 0 { 1 } else { 0 };
+            let grid = |i: usize| state.loaded_tracks[i].as_ref().map(|t| (t.bpm.max(20.0), t.grid_offset_sec));
+            if let (Some((bpm, offset)), Some((other_bpm, other_offset)), true) = (grid(d), grid(other), state.is_playing[other]) {
+                let behind = beat_phase_diff(
+                    (state.playhead_sec[other] - other_offset) * other_bpm / 60.0,
+                    (state.playhead_sec[d] - offset) * bpm / 60.0,
+                );
+                state.playhead_sec[d] = (state.playhead_sec[d] + behind * 60.0 / bpm).max(0.0);
             }
         }
     }
@@ -1862,6 +1830,7 @@ impl ReTraktorApp {
                 ui,
                 deck.elapsed_sec,
                 deck.bpm,
+                deck.grid_offset_sec,
                 &cues,
                 &deck.stem_peaks,
                 &self.deck_stem_volumes[d],
@@ -1877,6 +1846,7 @@ impl ReTraktorApp {
                 ui,
                 deck.elapsed_sec,
                 deck.bpm,
+                deck.grid_offset_sec,
                 &cues,
                 &deck.peaks,
                 self.deck_loop_active[d],
@@ -2017,6 +1987,7 @@ impl ReTraktorApp {
             title: t.title.clone(),
             artist: t.artist.clone(),
             bpm: t.bpm,
+            grid_offset_sec: t.grid_offset_sec,
             key: t.key.clone(),
             duration_sec: t.duration_sec,
             elapsed_sec: state.playhead_sec[d],
@@ -2101,7 +2072,7 @@ impl ReTraktorApp {
                 let advance = ui.fonts(|f| f.glyph_width(&crate::theme::dot_font(100.0), '0')) / 100.0;
                 let size = ((ui.available_width() - 3.0 * 14.0) / (20.0 * advance)).floor().clamp(18.0, 30.0);
                 let pitch_pct = self.deck_pitch_fader[d];
-                beat_lamp(ui, ink, deck.is_playing, deck.elapsed_sec, bpm);
+                beat_lamp(ui, ink, deck.is_playing, deck.elapsed_sec - deck.grid_offset_sec, bpm);
                 readout(ui, "BPM", &format!("{:.2}", bpm * (1.0 + pitch_pct as f64 / 100.0)), size, ink);
                 readout(ui, "PITCH", &format!("{pitch_pct:+.1}%"), size, ink);
                 // A compatible key says so in words, not just in brightness.
@@ -2146,6 +2117,7 @@ impl ReTraktorApp {
                         ui,
                         deck.elapsed_sec,
                         bpm,
+                        deck.grid_offset_sec,
                         &cues,
                         &deck.stem_peaks,
                         &self.deck_stem_volumes[d],
@@ -2161,6 +2133,7 @@ impl ReTraktorApp {
                         ui,
                         deck.elapsed_sec,
                         bpm,
+                        deck.grid_offset_sec,
                         &cues,
                         &deck.peaks,
                         self.deck_loop_active[d],
@@ -2554,11 +2527,30 @@ impl ReTraktorApp {
     }
 }
 
+/// Playback ratio that brings `bpm` to `target`, folding the target by octaves so 70 follows 140 at half time.
+fn sync_ratio(bpm: f64, target: f64) -> f64 {
+    let mut ratio = target.max(20.0) / bpm.max(20.0);
+    while ratio > std::f64::consts::SQRT_2 {
+        ratio /= 2.0;
+    }
+    while ratio < std::f64::consts::FRAC_1_SQRT_2 {
+        ratio *= 2.0;
+    }
+    ratio
+}
+
+/// How far (in beats, -0.5..=0.5) a deck at `beats` must move forward to land on the master's beat.
+fn beat_phase_diff(master_beats: f64, beats: f64) -> f64 {
+    let diff = (master_beats - beats).rem_euclid(1.0);
+    if diff > 0.5 { diff - 1.0 } else { diff }
+}
+
 /// What a loaded deck needs to draw one frame.
 struct DeckView {
     title: String,
     artist: String,
     bpm: f64,
+    grid_offset_sec: f64,
     key: String,
     duration_sec: f64,
     elapsed_sec: f64,
@@ -2753,7 +2745,7 @@ fn pitch_fader(ui: &mut Ui, pitch: &mut f32) {
     }
     ui.spacing_mut().interact_size.y = HIT;
     ui.spacing_mut().slider_width = (ui.available_width() - ui.spacing().item_spacing.x).clamp(48.0, 220.0);
-    ui.add(egui::Slider::new(pitch, -8.0..=8.0).show_value(false)).on_hover_text("Pitch fader: tempo ±8%");
+    ui.add(egui::Slider::new(pitch, -8.0..=8.0).clamp_to_range(false).show_value(false)).on_hover_text("Pitch fader: tempo ±8%");
 }
 
 /// Height of the full-width waveforms: 64 px at the minimum window, growing with the window.
@@ -2765,6 +2757,16 @@ fn mix_wave_height(ui: &Ui) -> f32 {
 mod tests {
     use super::*;
     use crate::theme::Palette;
+
+    #[test]
+    fn sync_matches_tempo_and_phase() {
+        assert!((sync_ratio(91.0, 68.5) - 68.5 / 91.0).abs() < 1e-9);
+        assert!((sync_ratio(68.5, 137.0) - 1.0).abs() < 1e-9); // half time, not +100%
+        assert!((sync_ratio(140.0, 128.0) * 140.0 - 128.0).abs() < 1e-9);
+        assert!((beat_phase_diff(10.25, 3.0) - 0.25).abs() < 1e-9);
+        assert!((beat_phase_diff(10.0, 3.9) - 0.1).abs() < 1e-9);
+        assert!((beat_phase_diff(10.0, 3.2) + 0.2).abs() < 1e-9);
+    }
 
     fn contrast(a: Color32, b: Color32) -> f32 {
         let (x, y) = (luminance(a), luminance(b));

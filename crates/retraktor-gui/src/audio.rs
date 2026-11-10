@@ -23,6 +23,8 @@ pub struct LoadedTrackAudio {
     pub title: String,
     pub artist: String,
     pub bpm: f64,
+    /// Time of the first beat; every beat is `grid_offset_sec + n * 60 / bpm`.
+    pub grid_offset_sec: f64,
     pub key: String,
     pub duration_sec: f64,
     pub pcm_stereo: Vec<f32>, // Interleaved [L, R, L, R, ...]
@@ -251,6 +253,7 @@ impl LoadedTrackAudio {
             title,
             artist,
             bpm: fallback_bpm,
+            grid_offset_sec: 0.0,
             key: fallback_key.to_string(),
             duration_sec,
             pcm_stereo,

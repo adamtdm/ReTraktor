@@ -325,6 +325,7 @@ pub fn scrolling_waveform(
     ui: &mut Ui,
     elapsed_sec: f64,
     bpm: f64,
+    grid_offset_sec: f64,
     cues: &[(u8, f64)],
     waveform_peaks: &[[f32; 3]],
     loop_active: bool,
@@ -443,11 +444,11 @@ pub fn scrolling_waveform(
     let visible_sec_half = (width / 2.0 / pixels_per_sec) as f64;
     let min_sec = (elapsed_sec - visible_sec_half).max(0.0);
     let max_sec = elapsed_sec + visible_sec_half;
-    let start_beat = (min_sec / beat_len_sec).floor() as i64;
-    let end_beat = (max_sec / beat_len_sec).ceil() as i64;
+    let start_beat = ((min_sec - grid_offset_sec) / beat_len_sec).floor() as i64;
+    let end_beat = ((max_sec - grid_offset_sec) / beat_len_sec).ceil() as i64;
 
     for b in start_beat..=end_beat {
-        let beat_time = b as f64 * beat_len_sec;
+        let beat_time = grid_offset_sec + b as f64 * beat_len_sec;
         let x = center_x + ((beat_time - elapsed_sec) as f32) * pixels_per_sec;
         if x < rect.left() || x > rect.right() {
             continue;
@@ -507,6 +508,7 @@ pub fn scrolling_stem_waveforms(
     ui: &mut Ui,
     elapsed_sec: f64,
     bpm: f64,
+    grid_offset_sec: f64,
     cues: &[(u8, f64)],
     stem_peaks: &[[f32; 4]],
     stem_volumes: &[f32; 4],
@@ -647,11 +649,11 @@ pub fn scrolling_stem_waveforms(
     let visible_sec_half = (wave_rect.width() / 2.0 / pixels_per_sec) as f64;
     let min_sec = (elapsed_sec - visible_sec_half).max(0.0);
     let max_sec = elapsed_sec + visible_sec_half;
-    let start_beat = (min_sec / beat_len_sec).floor() as i64;
-    let end_beat = (max_sec / beat_len_sec).ceil() as i64;
+    let start_beat = ((min_sec - grid_offset_sec) / beat_len_sec).floor() as i64;
+    let end_beat = ((max_sec - grid_offset_sec) / beat_len_sec).ceil() as i64;
 
     for b in start_beat..=end_beat {
-        let beat_time = b as f64 * beat_len_sec;
+        let beat_time = grid_offset_sec + b as f64 * beat_len_sec;
         let x = center_x + ((beat_time - elapsed_sec) as f32) * pixels_per_sec;
         if x < wave_rect.left() || x > wave_rect.right() {
             continue;
