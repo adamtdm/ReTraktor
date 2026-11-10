@@ -159,6 +159,8 @@ pub struct ReTraktorApp {
     // Exit Collection Save Prompt State
     pub exit_confirmed: bool,
     startup_scan_done: bool,
+    /// Dev screenshot mode (RETRAKTOR_SHOT_DIR): output dir and steps.
+    shot: Option<(String, Vec<String>)>,
 }
 
 impl Default for ReTraktorApp {
@@ -265,6 +267,10 @@ impl Default for ReTraktorApp {
             custom_mappings: std::collections::HashMap::new(),
             exit_confirmed: false,
             startup_scan_done: false,
+            shot: std::env::var("RETRAKTOR_SHOT_DIR").ok().map(|d| {
+                let steps = std::env::var("SHOT_STEPS").unwrap_or_else(|_| "Mix,FourDeck,Browser,prefs".into());
+                (d, steps.split(',').map(str::to_string).collect())
+            }),
         }
     }
 }
@@ -273,6 +279,9 @@ impl eframe::App for ReTraktorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Request 60 FPS continuous repaint for smooth scrolling waveforms and VU meters
         ctx.request_repaint();
+        if self.shot.is_some() {
+            self.screenshot_step(ctx);
+        }
 
         // Flush the autosaved collection and preferences on close.
         if ctx.input(|i| i.viewport().close_requested()) && !self.exit_confirmed {
@@ -484,6 +493,74 @@ impl ReTraktorApp {
         if fmt == 1 || fmt == 2 {
             let m3u_path = LibraryManager::default_m3u8_path();
             let _ = self.library.save_collection_m3u8(&m3u_path);
+        }
+    }
+
+    /// Dev-only: walks SHOT_STEPS (90 frames each after SHOT_WARM frames) saving a PNG per step, then exits.
+    /// Steps: Mix FourDeck Browser Timeline prefs prefs:<Tab> nav:Missing|Suggestions|Files loadA expandA relocate wait.
+    fn screenshot_step(&mut self, ctx: &egui::Context) {
+        let Some((dir, steps)) = self.shot.clone() else { return };
+        let warm: usize = std::env::var("SHOT_WARM").ok().and_then(|v| v.parse().ok()).unwrap_or(300);
+        let n = ctx.cumulative_pass_nr() as usize;
+        if n < warm {
+            return;
+        }
+        let idx = (n - warm) / 90;
+        let Some(step) = steps.get(idx) else { std::process::exit(0) };
+        let first = (n - warm) % 90 == 0;
+        use crate::library_ui::NavItem;
+        match step.as_str() {
+            "Mix" => self.layout = TraktorLayout::Parallel,
+            "FourDeck" => self.layout = TraktorLayout::FourDeck,
+            "Browser" => self.layout = TraktorLayout::Browser,
+            "Timeline" => self.layout = TraktorLayout::Timeline,
+            "prefs" => self.preferences.is_open = true,
+            "noprefs" => self.preferences.is_open = false,
+            "expandA" => self.deck_expanded[0] = true,
+            s if s.starts_with("prefs:") => {
+                self.preferences.is_open = true;
+                if let Some((_, tabs)) = PreferencesDialog::GROUPS.iter().find(|(name, _)| name.replace(' ', "") == s[6..]) {
+                    self.preferences.current_tab = tabs[0];
+                }
+            }
+            s if s.starts_with("nav:") => {
+                self.preferences.is_open = false;
+                self.layout = TraktorLayout::Browser;
+                self.library.selected_nav = match &s[4..] {
+                    "Missing" => NavItem::Missing,
+                    "Suggestions" => NavItem::Suggestions,
+                    "Files" => NavItem::Explorer,
+                    _ => NavItem::Collection,
+                };
+            }
+            "loadA" if first => {
+                if let Some(id) = self.library.tracks.iter().find(|t| !t.missing && t.file_path.as_ref().is_some_and(|p| p.is_file())).map(|t| t.id) {
+                    self.library.load_to_deck(1, id, [false; 4]);
+                    self.drain_pending_loads();
+                }
+            }
+            "relocate" if first => self.library.start_relocate(self.preferences.music_folders.clone()),
+            _ => {}
+        }
+        if (n - warm) % 90 == 80 {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
+        }
+        let shots: Vec<_> = ctx.input(|i| {
+            i.raw.events.iter().filter_map(|e| if let egui::Event::Screenshot { image, .. } = e { Some(image.clone()) } else { None }).collect()
+        });
+        for img in shots {
+            let name = format!("{dir}/{idx:02}-{}.png", step.replace(':', "-"));
+            let write = || -> Result<(), Box<dyn std::error::Error>> {
+                let mut enc = png::Encoder::new(std::fs::File::create(&name)?, img.size[0] as u32, img.size[1] as u32);
+                enc.set_color(png::ColorType::Rgba);
+                enc.set_depth(png::BitDepth::Eight);
+                let bytes: Vec<u8> = img.pixels.iter().flat_map(|c| c.to_srgba_unmultiplied()).collect();
+                enc.write_header()?.write_image_data(&bytes)?;
+                Ok(())
+            };
+            if let Err(e) = write() {
+                eprintln!("screenshot {name}: {e}");
+            }
         }
     }
 

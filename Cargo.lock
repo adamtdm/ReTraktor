@@ -3003,6 +3003,7 @@ dependencies = [
  "eframe",
  "egui_extras",
  "lofty",
+ "png",
  "retraktor-audio",
  "retraktor-core",
  "retraktor-dsp",

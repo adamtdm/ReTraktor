@@ -21,11 +21,18 @@ mod widgets;
 
 use app::ReTraktorApp;
 
+/// Screenshot mode can test other window sizes via SHOT_SIZE=WxH.
+fn shot_window_size() -> Option<Vec2> {
+    std::env::var("RETRAKTOR_SHOT_DIR").ok()?;
+    let (w, h) = std::env::var("SHOT_SIZE").ok()?.split_once('x').map(|(w, h)| (w.parse().ok(), h.parse().ok()))?;
+    Some(Vec2::new(w?, h?))
+}
+
 fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("ReTraktor")
-            .with_inner_size(Vec2::new(1280.0, 820.0))
+            .with_inner_size(shot_window_size().unwrap_or(Vec2::new(1280.0, 820.0)))
             .with_min_inner_size(Vec2::new(1024.0, 640.0))
             .with_active(true),
         ..Default::default()
