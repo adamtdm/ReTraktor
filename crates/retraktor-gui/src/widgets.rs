@@ -50,15 +50,15 @@ pub fn rotary_knob_sized(
         painter.circle_stroke(
             center,
             radius + 1.2,
-            Stroke::new(1.2_f32, Color32::from_rgb(24, 25, 28)),
+            Stroke::new(1.2_f32, TraktorTheme::BORDER_COLOR()),
         );
 
         // Matte charcoal knob cap (matching Traktor Pro 4 knobs)
-        painter.circle_filled(center, radius, Color32::from_rgb(52, 55, 60));
+        painter.circle_filled(center, radius, TraktorTheme::CONTROL());
         painter.circle_stroke(
             center,
             radius,
-            Stroke::new(1.0_f32, Color32::from_rgb(72, 76, 82)),
+            Stroke::new(1.0_f32, TraktorTheme::BORDER_ACCENT()),
         );
 
         // Angular calculations (-135° to +135°)
@@ -94,7 +94,7 @@ pub fn rotary_knob_sized(
             center + Vec2::new(current_angle.cos(), current_angle.sin()) * (radius - 1.2);
         painter.line_segment(
             [ptr_inner, ptr_outer],
-            Stroke::new(1.5_f32, Color32::from_rgb(215, 220, 226)),
+            Stroke::new(1.5_f32, TraktorTheme::TEXT_PRIMARY()),
         );
 
         // Knob label underneath
@@ -152,11 +152,11 @@ pub fn vertical_fader(
             };
             painter.line_segment(
                 [Pos2::new(track_x - tick_w - 2.0, y), Pos2::new(track_x - 2.5, y)],
-                Stroke::new(0.8_f32, Color32::from_rgb(76, 80, 88)),
+                Stroke::new(0.8_f32, TraktorTheme::BORDER_ACCENT()),
             );
             painter.line_segment(
                 [Pos2::new(track_x + 2.5, y), Pos2::new(track_x + tick_w + 2.0, y)],
-                Stroke::new(0.8_f32, Color32::from_rgb(76, 80, 88)),
+                Stroke::new(0.8_f32, TraktorTheme::BORDER_ACCENT()),
             );
         }
 
@@ -165,7 +165,7 @@ pub fn vertical_fader(
             Pos2::new(track_x - 1.5, track_top),
             Pos2::new(track_x + 1.5, track_bot),
         );
-        painter.rect_filled(slot_rect, 0.5, Color32::from_rgb(22, 23, 26));
+        painter.rect_filled(slot_rect, 0.5, TraktorTheme::BG_INPUT());
 
         let norm_val = (*value - min) / (max - min).max(1e-5);
         let cap_y = track_bot - norm_val * track_h;
@@ -175,18 +175,18 @@ pub fn vertical_fader(
         let cap_h = 9.0;
         let cap_rect = Rect::from_center_size(Pos2::new(track_x, cap_y), Vec2::new(cap_w, cap_h));
 
-        painter.rect_filled(cap_rect, 1.5, Color32::from_rgb(66, 70, 76));
+        painter.rect_filled(cap_rect, 1.5, TraktorTheme::CONTROL_HOVER());
         painter.rect_stroke(
             cap_rect,
             1.5,
-            Stroke::new(0.8_f32, Color32::from_rgb(24, 25, 28)),
+            Stroke::new(0.8_f32, TraktorTheme::BORDER_COLOR()),
         );
         painter.line_segment(
             [
                 Pos2::new(cap_rect.left() + 2.0, cap_y),
                 Pos2::new(cap_rect.right() - 2.0, cap_y),
             ],
-            Stroke::new(1.5_f32, Color32::from_rgb(210, 215, 222)),
+            Stroke::new(1.5_f32, TraktorTheme::TEXT_PRIMARY()),
         );
     }
 
@@ -221,7 +221,7 @@ pub fn crossfader(ui: &mut Ui, value: &mut f32, width: f32) -> Response {
             Pos2::new(slot_left, slot_y - 1.5),
             Pos2::new(slot_right, slot_y + 1.5),
         );
-        painter.rect_filled(slot_rect, 1.0, Color32::from_rgb(22, 23, 26));
+        painter.rect_filled(slot_rect, 1.0, TraktorTheme::BG_INPUT());
 
         // Center marker
         painter.line_segment(
@@ -236,18 +236,18 @@ pub fn crossfader(ui: &mut Ui, value: &mut f32, width: f32) -> Response {
         let cap_x = slot_left + *value * slot_w;
         let cap_rect = Rect::from_center_size(Pos2::new(cap_x, slot_y), Vec2::new(12.0, 15.0));
 
-        painter.rect_filled(cap_rect, 1.5, Color32::from_rgb(66, 70, 76));
+        painter.rect_filled(cap_rect, 1.5, TraktorTheme::CONTROL_HOVER());
         painter.rect_stroke(
             cap_rect,
             1.5,
-            Stroke::new(0.8_f32, Color32::from_rgb(24, 25, 28)),
+            Stroke::new(0.8_f32, TraktorTheme::BORDER_COLOR()),
         );
         painter.line_segment(
             [
                 Pos2::new(cap_x, cap_rect.top() + 2.0),
                 Pos2::new(cap_x, cap_rect.bottom() - 2.0),
             ],
-            Stroke::new(1.5_f32, Color32::from_rgb(220, 224, 230)),
+            Stroke::new(1.5_f32, TraktorTheme::TEXT_PRIMARY()),
         );
     }
 
@@ -285,7 +285,7 @@ pub fn vu_meter(ui: &mut Ui, level_l: f32, level_r: f32, height: f32) {
                     TraktorTheme::METER_GREEN()
                 }
             } else {
-                Color32::from_rgb(35, 37, 41)
+                TraktorTheme::METER_GREEN().gamma_multiply(0.15)
             };
             painter.rect_filled(seg_rect, 0.0, color);
         }
@@ -295,30 +295,26 @@ pub fn vu_meter(ui: &mut Ui, level_l: f32, level_r: f32, height: f32) {
     draw_channel(rect.left() + 1.0 + seg_w + 1.0, level_r);
 }
 
-/// Maps 3-band `[low, mid, high]` amplitudes into Traktor Pro 4's signature "Spectrum" colors:
-/// - Outer silhouette: Periwinkle / Indigo / Sky-Blue highs & Teal-Sage mids
-/// - Inner body: Warm Olive-Gold / Amber mids & Coral-Orange bass transients
+/// Maps 3-band `[low, mid, high]` amplitudes into the active theme's `WAVEFORM_*` spectrum colors:
+/// - Outer silhouette: `WAVEFORM_HIGH` blended with `WAVEFORM_MID`
+/// - Inner body: `WAVEFORM_MID` blended with `WAVEFORM_LOW`
+/// - Core transients: `WAVEFORM_LOW`
 fn spectrum_colors(low: f32, mid: f32, high: f32) -> (Color32, Color32, Color32) {
-    // Outer band (Highs + Mids): blends between Periwinkle-Violet (118, 112, 212) and Sky-Teal (82, 168, 206)
+    let mix = |a: Color32, b: Color32, t: f32| -> Color32 {
+        Color32::from(egui::Rgba::from(a) * (1.0 - t) + egui::Rgba::from(b) * t)
+    };
+    let low_c = TraktorTheme::WAVEFORM_LOW();
+    let mid_c = TraktorTheme::WAVEFORM_MID();
+    let high_c = TraktorTheme::WAVEFORM_HIGH();
+
     let h_ratio = (high / (high + mid + 0.05)).clamp(0.0, 1.0);
-    let outer_r = (96.0 + 36.0 * (1.0 - h_ratio)) as u8;
-    let outer_g = (118.0 + 54.0 * h_ratio) as u8;
-    let outer_b = (208.0 + 18.0 * h_ratio) as u8;
-    let outer_col = Color32::from_rgba_unmultiplied(outer_r, outer_g, outer_b, 195);
+    let outer_col = mix(mid_c, high_c, 0.5 + 0.5 * h_ratio).gamma_multiply(195.0 / 255.0);
 
-    // Middle band (Mids + Harmonics): blends between Sage-Green (88, 178, 118) and Warm Gold (206, 174, 58)
     let m_ratio = (mid / (low + mid + 0.05)).clamp(0.0, 1.0);
-    let mid_r = (94.0 + 112.0 * (1.0 - m_ratio)) as u8;
-    let mid_g = (176.0 - 10.0 * (1.0 - m_ratio)) as u8;
-    let mid_b = (122.0 - 62.0 * (1.0 - m_ratio)) as u8;
-    let mid_col = Color32::from_rgba_unmultiplied(mid_r, mid_g, mid_b, 220);
+    let mid_col = mix(low_c, mid_c, 0.5 + 0.5 * m_ratio).gamma_multiply(220.0 / 255.0);
 
-    // Core band (Bass / Kick Transients): Warm Coral-Orange (218, 98, 52) to Warm Amber (226, 142, 54)
     let l_boost = low.clamp(0.0, 1.0);
-    let core_r = (205.0 + 22.0 * l_boost) as u8;
-    let core_g = (88.0 + 48.0 * (1.0 - l_boost)) as u8;
-    let core_b = 52;
-    let core_col = Color32::from_rgba_unmultiplied(core_r, core_g, core_b, 240);
+    let core_col = mix(mid_c, low_c, 0.65 + 0.35 * l_boost).gamma_multiply(240.0 / 255.0);
 
     (outer_col, mid_col, core_col)
 }
@@ -356,7 +352,7 @@ pub fn scrolling_waveform(
     // Subtle horizontal zero-crossing baseline
     painter.line_segment(
         [Pos2::new(rect.left(), center_y), Pos2::new(rect.right(), center_y)],
-        Stroke::new(0.5_f32, Color32::from_rgb(44, 47, 52)),
+        Stroke::new(0.5_f32, TraktorTheme::WAVEFORM_GRID().gamma_multiply(0.35)),
     );
 
     // 1. Active Loop Overlay
@@ -372,7 +368,7 @@ pub fn scrolling_waveform(
             painter.rect_filled(
                 loop_rect,
                 0.0,
-                Color32::from_rgba_unmultiplied(114, 182, 102, 28),
+                TraktorTheme::LOOP_ACTIVE().gamma_multiply(0.11),
             );
             painter.rect_stroke(loop_rect, 0.0, Stroke::new(1.0_f32, TraktorTheme::LOOP_ACTIVE()));
         }
@@ -459,9 +455,9 @@ pub fn scrolling_waveform(
 
         let is_bar_start = b % 4 == 0;
         let stroke = if is_bar_start {
-            Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(230, 234, 240, 110))
+            Stroke::new(1.0_f32, TraktorTheme::WAVEFORM_GRID().gamma_multiply(0.5))
         } else {
-            Stroke::new(0.6_f32, Color32::from_rgba_unmultiplied(200, 205, 212, 42))
+            Stroke::new(0.6_f32, TraktorTheme::WAVEFORM_GRID().gamma_multiply(0.2))
         };
         painter.line_segment([Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())], stroke);
     }
@@ -491,7 +487,7 @@ pub fn scrolling_waveform(
     if let Some((badge_txt, _badge_col)) = deck_badge {
         let badge_rect =
             Rect::from_min_size(Pos2::new(rect.left() + 5.0, rect.top() + 5.0), Vec2::new(18.0, 16.0));
-        painter.rect_filled(badge_rect, 2.0, Color32::from_rgba_unmultiplied(45, 48, 54, 210));
+        painter.rect_filled(badge_rect, 2.0, TraktorTheme::BG_PANEL().gamma_multiply(0.85));
         painter.text(
             badge_rect.center(),
             egui::Align2::CENTER_CENTER,
@@ -547,7 +543,7 @@ pub fn scrolling_stem_waveforms(
 
     let painter = ui.painter();
     painter.rect_filled(wave_rect, 1.0, TraktorTheme::WAVEFORM_BG());
-    painter.rect_filled(header_rect, 1.0, Color32::from_rgb(48, 51, 56));
+    painter.rect_filled(header_rect, 1.0, TraktorTheme::BG_SECTION());
     painter.rect_stroke(rect, 1.0, Stroke::new(1.0_f32, TraktorTheme::BORDER_COLOR()));
 
     let center_x = wave_rect.center().x;
@@ -583,7 +579,7 @@ pub fn scrolling_stem_waveforms(
             painter.rect_filled(
                 loop_rect,
                 0.0,
-                Color32::from_rgba_unmultiplied(114, 182, 102, 24),
+                TraktorTheme::LOOP_ACTIVE().gamma_multiply(0.1),
             );
             painter.rect_stroke(loop_rect, 0.0, Stroke::new(1.0_f32, TraktorTheme::LOOP_ACTIVE()));
         }
@@ -631,7 +627,7 @@ pub fn scrolling_stem_waveforms(
             if stem_muted[lane] {
                 painter.line_segment(
                     [Pos2::new(col_x, lane_cy - h_outer), Pos2::new(col_x, lane_cy + h_outer)],
-                    Stroke::new(col_w, Color32::from_rgb(56, 59, 65)),
+                    Stroke::new(col_w, TraktorTheme::WAVEFORM_GRID().gamma_multiply(0.4)),
                 );
             } else {
                 painter.line_segment(
@@ -662,9 +658,9 @@ pub fn scrolling_stem_waveforms(
         }
         let is_bar_start = b % 4 == 0;
         let stroke = if is_bar_start {
-            Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(230, 234, 240, 100))
+            Stroke::new(1.0_f32, TraktorTheme::WAVEFORM_GRID().gamma_multiply(0.45))
         } else {
-            Stroke::new(0.5_f32, Color32::from_rgba_unmultiplied(200, 205, 212, 38))
+            Stroke::new(0.5_f32, TraktorTheme::WAVEFORM_GRID().gamma_multiply(0.18))
         };
         painter.line_segment(
             [Pos2::new(x, wave_rect.top()), Pos2::new(x, wave_rect.bottom())],
@@ -707,7 +703,7 @@ pub fn scrolling_stem_waveforms(
         if lane > 0 {
             painter.line_segment(
                 [Pos2::new(rect.left(), top_y), Pos2::new(rect.right(), top_y)],
-                Stroke::new(0.8_f32, Color32::from_rgb(30, 32, 36)),
+                Stroke::new(0.8_f32, TraktorTheme::BORDER_COLOR()),
             );
         }
 
@@ -733,23 +729,12 @@ pub fn scrolling_stem_waveforms(
         painter.circle_stroke(
             ring1_c,
             ring_r,
-            Stroke::new(
-                1.1_f32,
-                if muted {
-                    Color32::from_rgb(80, 84, 92)
-                } else {
-                    Color32::from_rgb(205, 210, 218)
-                },
-            ),
+            Stroke::new(1.1_f32, text_col),
         );
         painter.circle_filled(
             Pos2::new(ring1_c.x + ring_r + 3.0, lane_cy + 1.5),
             1.6,
-            if muted {
-                Color32::from_rgb(75, 78, 84)
-            } else {
-                Color32::from_rgb(220, 224, 230)
-            },
+            text_col,
         );
 
         painter.circle_stroke(
@@ -792,7 +777,7 @@ pub fn stripe_overview(
 
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
-        painter.rect_filled(rect, 1.0, Color32::from_rgb(28, 30, 33));
+        painter.rect_filled(rect, 1.0, TraktorTheme::WAVEFORM_BG());
         painter.rect_stroke(rect, 1.0, Stroke::new(1.0_f32, TraktorTheme::BORDER_COLOR()));
 
         let norm_pos = (*elapsed_sec / total).clamp(0.0, 1.0) as f32;
@@ -833,7 +818,7 @@ pub fn stripe_overview(
             let mx = rect.left() + ((m as f64 * 60.0 / total) as f32) * rect.width();
             painter.line_segment(
                 [Pos2::new(mx, rect.top()), Pos2::new(mx, rect.top() + 4.0)],
-                Stroke::new(1.0_f32, Color32::from_rgb(160, 165, 175)),
+                Stroke::new(1.0_f32, TraktorTheme::WAVEFORM_GRID()),
             );
         }
 
@@ -859,7 +844,7 @@ pub fn stripe_overview(
             painter.rect_filled(
                 loop_rect,
                 1.0,
-                Color32::from_rgba_unmultiplied(114, 182, 102, 35),
+                TraktorTheme::LOOP_ACTIVE().gamma_multiply(0.14),
             );
             painter.rect_stroke(loop_rect, 1.0, Stroke::new(1.0_f32, TraktorTheme::LOOP_ACTIVE()));
         }
@@ -873,7 +858,7 @@ pub fn stripe_overview(
         painter.rect_filled(
             win_rect,
             1.0,
-            Color32::from_rgba_unmultiplied(230, 235, 242, 32),
+            TraktorTheme::WAVEFORM_GRID().gamma_multiply(0.15),
         );
         painter.line_segment(
             [Pos2::new(scrub_x, rect.top()), Pos2::new(scrub_x, rect.bottom())],
@@ -894,9 +879,9 @@ pub fn cue_pad(ui: &mut Ui, index: usize, has_cue: bool, active: bool, width: f3
         let bg = if active {
             TraktorTheme::DECK_A()
         } else if has_cue {
-            Color32::from_rgb(64, 68, 74)
+            TraktorTheme::CONTROL_HOVER()
         } else {
-            Color32::from_rgb(52, 55, 60)
+            TraktorTheme::HOTCUE_EMPTY()
         };
 
         painter.rect_filled(rect, 1.0, bg);
@@ -913,7 +898,7 @@ pub fn cue_pad(ui: &mut Ui, index: usize, has_cue: bool, active: bool, width: f3
         }
 
         let text_color = if active {
-            Color32::BLACK
+            TraktorTheme::BG_INPUT()
         } else if has_cue {
             TraktorTheme::TEXT_PRIMARY()
         } else {
@@ -1003,6 +988,11 @@ pub fn deck_transport_bar(
     compact: bool,
 ) -> Option<TransportAction> {
     let mut action = None;
+    let active_fg = if crate::theme::palette().is_dark() {
+        TraktorTheme::BG_WINDOW()
+    } else {
+        TraktorTheme::TEXT_HIGHLIGHT()
+    };
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing = Vec2::new(3.0, 0.0);
 
@@ -1012,7 +1002,7 @@ pub fn deck_transport_bar(
             TraktorTheme::PLAY_INACTIVE()
         };
         let play_text_color = if is_playing {
-            Color32::BLACK
+            active_fg
         } else {
             TraktorTheme::TEXT_PRIMARY()
         };
@@ -1064,7 +1054,7 @@ pub fn deck_transport_bar(
                 egui::Button::new(
                     RichText::new("FLX")
                         .color(if flux_active {
-                            Color32::BLACK
+                            active_fg
                         } else {
                             TraktorTheme::TEXT_SECONDARY()
                         })
@@ -1087,7 +1077,7 @@ pub fn deck_transport_bar(
 
         ui.separator();
 
-        let chevron_fill = Color32::from_rgb(48, 51, 57);
+        let chevron_fill = TraktorTheme::CONTROL();
         if icon_button(ui, Icon::Prev, "", chevron_fill, TraktorTheme::TEXT_SECONDARY(), Vec2::new(18.0, 22.0))
             .on_hover_text("Halve loop length")
             .clicked()
@@ -1103,12 +1093,12 @@ pub fn deck_transport_bar(
             let fill = if is_active_loop {
                 TraktorTheme::LOOP_ACTIVE()
             } else if is_selected_size {
-                Color32::from_rgb(64, 68, 76)
+                TraktorTheme::CONTROL_HOVER()
             } else {
-                Color32::from_rgb(46, 49, 55)
+                TraktorTheme::CONTROL()
             };
             let fg = if is_active_loop {
-                Color32::BLACK
+                active_fg
             } else if is_selected_size {
                 TraktorTheme::LOOP_ACTIVE()
             } else {
@@ -1156,7 +1146,7 @@ pub fn render_shortcuts_hud(ctx: &egui::Context, is_open: &mut bool) {
         .default_width(680.0)
         .frame(
             egui::Frame::window(&ctx.style())
-                .fill(Color32::from_rgb(26, 28, 32))
+                .fill(TraktorTheme::BG_PANEL())
                 .stroke(Stroke::new(1.0_f32, TraktorTheme::BORDER_ACCENT()))
                 .rounding(6.0)
                 .inner_margin(16.0),
@@ -1219,7 +1209,7 @@ pub fn render_shortcuts_hud(ctx: &egui::Context, is_open: &mut bool) {
                         ui.horizontal(|ui| {
                             ui.label(
                                 RichText::new(format!("[ {key} ]"))
-                                    .color(Color32::from_rgb(180, 200, 240))
+                                    .color(TraktorTheme::ACCENT())
                                     .font(egui::FontId::monospace(11.0))
                                     .strong(),
                             );
@@ -1242,7 +1232,7 @@ pub fn render_shortcuts_hud(ctx: &egui::Context, is_open: &mut bool) {
                         ui.horizontal(|ui| {
                             ui.label(
                                 RichText::new(format!("[ {key} ]"))
-                                    .color(Color32::from_rgb(240, 200, 140))
+                                    .color(TraktorTheme::ACCENT())
                                     .font(egui::FontId::monospace(11.0))
                                     .strong(),
                             );

@@ -475,7 +475,7 @@ impl PreferencesDialog {
                         ui.spacing_mut().item_spacing.y = 2.0;
                         ui.label(
                             RichText::new(label)
-                                .color(Color32::WHITE)
+                                .color(TraktorTheme::TEXT_PRIMARY())
                                 .font(egui::FontId::proportional(13.0))
                                 .strong(),
                         );
@@ -556,7 +556,7 @@ impl PreferencesDialog {
                     continue;
                 }
                 let selected = tabs.contains(&self.current_tab);
-                let button = egui::Button::new(RichText::new(label).size(13.0).color(if selected { Color32::WHITE } else { TraktorTheme::TEXT_PRIMARY() }))
+                let button = egui::Button::new(RichText::new(label).size(13.0).color(if selected { on_selected_text() } else { TraktorTheme::TEXT_PRIMARY() }))
                     .fill(if selected { TraktorTheme::ROW_SELECTED() } else { TraktorTheme::BG_PANEL() })
                     .rounding(4.0)
                     .min_size(Vec2::new(110.0, 30.0));
@@ -602,7 +602,7 @@ impl PreferencesDialog {
                     ui.horizontal(|ui| {
                         ui.label(
                             RichText::new("Preferences")
-                                .color(Color32::WHITE)
+                                .color(TraktorTheme::TEXT_PRIMARY())
                                 .size(20.0)
                                 .strong(),
                         );
@@ -614,7 +614,7 @@ impl PreferencesDialog {
                                 .add(
                                     egui::Button::new(
                                         RichText::new("Close (Esc)")
-                                            .color(Color32::WHITE)
+                                            .color(on_selected_text())
                                             .font(egui::FontId::proportional(12.0))
                                             .strong(),
                                     )
@@ -1079,14 +1079,14 @@ impl PreferencesDialog {
                 }
                 crate::demucs::DemucsInstallState::Installing { step, percent } => {
                     ui.add(egui::ProgressBar::new(*percent).desired_width(140.0).show_percentage());
-                    ui.label(RichText::new(step).color(Color32::from_rgb(255, 185, 45)));
+                    ui.label(RichText::new(step).color(TraktorTheme::METER_YELLOW()));
                 }
                 crate::demucs::DemucsInstallState::NotInstalled => {
                     if ui
                         .add(
                             egui::Button::new(
                                 RichText::new("Install Demucs AI (~1.2 GB)")
-                                    .color(Color32::WHITE)
+                                    .color(on_selected_text())
                                     .strong(),
                             )
                             .fill(TraktorTheme::ROW_SELECTED())
@@ -1101,7 +1101,7 @@ impl PreferencesDialog {
                     if ui.button("Retry install").clicked() {
                         self.trigger_demucs_install = true;
                     }
-                    ui.label(RichText::new(error_summary(error)).color(Color32::from_rgb(240, 110, 100)));
+                    ui.label(RichText::new(error_summary(error)).color(TraktorTheme::METER_RED()));
                 }
             },
         );
@@ -1903,7 +1903,7 @@ impl PreferencesDialog {
                 "Watched audio directory included in library scans.",
                 |ui| {
                     if ui
-                        .button(RichText::new("Remove").color(Color32::from_rgb(240, 80, 80)))
+                        .button(RichText::new("Remove").color(TraktorTheme::METER_RED()))
                         .clicked()
                     {
                         to_remove = Some(idx);
@@ -1955,7 +1955,7 @@ impl PreferencesDialog {
                     .add(
                         egui::Button::new(
                             RichText::new("Rescan All Music Folders")
-                                .color(Color32::WHITE)
+                                .color(on_selected_text())
                                 .strong(),
                         )
                         .fill(TraktorTheme::ROW_SELECTED())
@@ -2012,6 +2012,15 @@ impl PreferencesDialog {
                 ui.label(RichText::new("Linux x86_64 / aarch64").monospace());
             },
         );
+    }
+}
+
+/// High-contrast light text on `ROW_SELECTED` across dark and light presets.
+fn on_selected_text() -> Color32 {
+    if crate::theme::palette().is_dark() {
+        TraktorTheme::TEXT_HIGHLIGHT()
+    } else {
+        TraktorTheme::BG_INPUT()
     }
 }
 
