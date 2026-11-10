@@ -503,9 +503,9 @@ impl CrossfadeCheerStateMachine {
     }
 
     pub fn update(&mut self, crossfader: f32, both_playing: bool, now_sec: f64) -> Option<usize> {
-        let current_side = if crossfader < 0.1 {
+        let current_side = if crossfader < 0.15 {
             Some(XfaderSide::Left)
-        } else if crossfader > 0.9 {
+        } else if crossfader > 0.85 {
             Some(XfaderSide::Right)
         } else {
             None
@@ -1348,8 +1348,9 @@ pub fn stem_display(
         let (last_muted, mut anim_start) = prev_state.unwrap_or((muted, -100.0));
         if muted != last_muted {
             anim_start = now;
-            ui.ctx().data_mut(|d| d.insert_temp(stem_id, (muted, now)));
         }
+        // Stored every frame: a first toggle has nothing to compare against otherwise.
+        ui.ctx().data_mut(|d| d.insert_temp(stem_id, (muted, anim_start)));
         let elapsed = (now - anim_start) as f32;
         let is_animating = anim && elapsed >= 0.0 && elapsed < 0.6;
         if is_animating {
@@ -1407,18 +1408,22 @@ pub fn stem_display(
             let step_x = if cols > 1 { (block_rect.width() - dot_radius * 2.0).max(1.0) / (cols - 1) as f32 } else { 0.0 };
             let step_y = if rows > 1 { (block_rect.height() - dot_radius * 2.0).max(1.0) / (rows - 1) as f32 } else { 0.0 };
             let top_dot_y = block_rect.top() + dot_radius;
-            let icon_cy = top_dot_y + 2.0 * step_y;
             let sprite = STEM_SPRITES[s];
+            // The icon rides the stem: one row from the top when on, resting on the floor when muted.
+            let sprite_h = sprite.dimensions(0).1 as f32;
+            let floor_row = rows as f32 - 1.0 - sprite_h;
+            let icon_top = (floor_row + (1.0 - floor_row) * open_t).round();
+            let icon_cy = top_dot_y + (icon_top + (sprite_h - 1.0) * 0.5) * step_y;
 
             let (bounce_dots, mode, col) = if is_animating {
                 let b = bounce_dot_offset(elapsed, 0.6, 5);
                 let pop = ((1.0 - (elapsed / 0.25).min(1.0)) * 6.0).round() as i32;
                 let m = if muted { SpriteMode::Hollow } else { SpriteMode::Filled };
-                let c = if muted { accent_vis.gamma_multiply(0.45) } else { accent_vis };
+                let c = if muted { accent_vis.gamma_multiply(0.45) } else { ink };
                 (b - pop, m, c)
             } else {
                 let m = if muted { SpriteMode::Hollow } else { SpriteMode::Filled };
-                let c = if muted { accent_vis.gamma_multiply(0.38) } else { accent_vis };
+                let c = if muted { accent_vis.gamma_multiply(0.38) } else { ink };
                 (0, m, c)
             };
 

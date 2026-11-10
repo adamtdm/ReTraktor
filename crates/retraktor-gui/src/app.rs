@@ -580,6 +580,7 @@ impl ReTraktorApp {
             }
             "playA" | "playB" if first => self.toggle_play(if step == "playA" { 1 } else { 2 }),
             "stemsA" => self.deck_stem_view[0] = true,
+            "stemsB" => self.deck_stem_view[1] = true,
             "pattern" => self.show_pattern_player = true,
             "help" => self.show_shortcuts_hud = true,
             // Held mid-animation so a still can show it.
@@ -587,6 +588,7 @@ impl ReTraktorApp {
                 let cheer_index = s[6..].parse().unwrap_or(0);
                 self.active_cheer = Some(dot::ActiveCheer { deck: 1, cheer_index, start_sec: ctx.input(|i| i.time) - 0.7 });
             }
+            s if s.starts_with("xf:") => self.crossfader_pos = s[3..].parse().unwrap_or(0.5),
             "muteA" if first => self.deck_stem_muted[0][0] ^= true,
             "relocate" if first => self.library.start_relocate(self.preferences.music_folders.clone()),
             _ => {}
@@ -2678,7 +2680,8 @@ impl ReTraktorApp {
         if let Ok(state) = self.audio.shared.lock() {
             peaks = state.channel_peaks;
             main = (state.master_peak_l, state.master_peak_r);
-            both_playing = state.is_playing[0] && state.is_playing[1];
+            // Either deck: the outgoing one is often stopped or muted to stems by the time the fader lands.
+            both_playing = state.is_playing[0] || state.is_playing[1];
             for d in 0..4 {
                 if let (Some(t), true) = (&state.loaded_tracks[d], state.is_playing[d]) {
                     let at = (state.playhead_sec[d].max(0.0) * PEAKS_PER_SEC as f64) as usize;
