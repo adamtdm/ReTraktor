@@ -306,6 +306,47 @@ impl Palette {
     }
 }
 
+/// Waveform rendering style (Preferences > Look).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum WaveformStyle {
+    #[default]
+    Classic,
+    Dots,
+    Bars,
+    Line,
+}
+
+impl WaveformStyle {
+    pub const ALL: [Self; 4] = [Self::Classic, Self::Dots, Self::Bars, Self::Line];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Classic => "classic",
+            Self::Dots => "dots",
+            Self::Bars => "bars",
+            Self::Line => "line",
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Classic => "Classic",
+            Self::Dots => "Dots",
+            Self::Bars => "Bars",
+            Self::Line => "Line",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "dots" => Self::Dots,
+            "bars" => Self::Bars,
+            "line" => Self::Line,
+            _ => Self::Classic,
+        }
+    }
+}
+
 /// Theme plus the "Look" settings that travel with it.
 struct ThemeState {
     current: Palette,
@@ -313,6 +354,7 @@ struct ThemeState {
     from: Option<(Palette, std::time::Instant)>,
     animations: bool,
     scale: f32,
+    waveform_style: WaveformStyle,
 }
 
 const THEME_FADE_SECS: f32 = 0.28;
@@ -367,6 +409,17 @@ pub fn animations() -> bool {
     store().read().map(|s| s.animations).unwrap_or(true)
 }
 
+/// Selected waveform style (Preferences > Look).
+pub fn waveform_style() -> WaveformStyle {
+    store().read().map(|s| s.waveform_style).unwrap_or_default()
+}
+
+pub fn set_waveform_style(style: WaveformStyle) {
+    if let Ok(mut st) = store().write() {
+        st.waveform_style = style;
+    }
+}
+
 /// Eased 0..=1 that follows `on`; call every frame with the same `id`. Snaps when animations are off.
 pub fn fade(ctx: &egui::Context, id: impl std::hash::Hash, on: bool) -> f32 {
     if !animations() {
@@ -389,15 +442,35 @@ fn theme_path() -> std::path::PathBuf {
     std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config/retraktor/theme.txt")
 }
 
+impl ThemeState {
+    fn from_text(base: &Palette, text: &str) -> Self {
+        let setting = |key: &str| text.lines().find_map(|l| l.trim().strip_prefix(key).map(|v| v.trim().to_string()));
+        Self {
+            current: Palette::from_text(base, text),
+            from: None,
+            animations: setting("animations=").as_deref() != Some("off"),
+            scale: setting("scale=").and_then(|v| v.parse::<f32>().ok()).filter(|v| (0.8..=1.6).contains(v)).unwrap_or(1.0),
+            waveform_style: setting("waveform_style=")
+                .or_else(|| setting("waveform="))
+                .map(|v| WaveformStyle::from_str(&v))
+                .unwrap_or_default(),
+        }
+    }
+
+    fn to_text(&self) -> String {
+        format!(
+            "{}animations={}\nscale={:.2}\nwaveform_style={}\n",
+            self.current.to_text(),
+            if self.animations { "on" } else { "off" },
+            self.scale,
+            self.waveform_style.as_str(),
+        )
+    }
+}
+
 fn load() -> ThemeState {
     let text = std::fs::read_to_string(theme_path()).unwrap_or_default();
-    let setting = |key: &str| text.lines().find_map(|l| l.trim().strip_prefix(key).map(|v| v.trim().to_string()));
-    ThemeState {
-        current: Palette::from_text(&Palette::NIGHT, &text),
-        from: None,
-        animations: setting("animations=").as_deref() != Some("off"),
-        scale: setting("scale=").and_then(|v| v.parse::<f32>().ok()).filter(|v| (0.8..=1.6).contains(v)).unwrap_or(1.0),
-    }
+    ThemeState::from_text(&Palette::NIGHT, &text)
 }
 
 pub fn save() -> std::io::Result<()> {
@@ -405,9 +478,8 @@ pub fn save() -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let (animations, scale) = store().read().map(|s| (s.animations, s.scale)).unwrap_or((true, 1.0));
-    let extra = format!("animations={}\nscale={scale:.2}\n", if animations { "on" } else { "off" });
-    std::fs::write(path, target_palette().to_text() + &extra)
+    let text = store().read().map(|s| s.to_text()).unwrap_or_else(|_| Palette::NIGHT.to_text());
+    std::fs::write(path, text)
 }
 
 /// Pushes the palette into egui's own widget colours so stock buttons, inputs and tables follow the theme.
@@ -468,13 +540,16 @@ pub fn contrast(a: Color32, b: Color32) -> f32 {
 pub fn editor(ui: &mut egui::Ui) {
     let mut p = target_palette();
     let mut changed = false;
-    let (mut animations, mut scale) = store().read().map(|s| (s.animations, s.scale)).unwrap_or((true, 1.0));
+    let (mut animations, mut scale, mut waveform_style) = store()
+        .read()
+        .map(|s| (s.animations, s.scale, s.waveform_style))
+        .unwrap_or((true, 1.0, WaveformStyle::Classic));
     let mut settings_changed = false;
     ui.label(egui::RichText::new("Theme").size(15.0).strong());
     ui.add_space(6.0);
     ui.horizontal_wrapped(|ui| {
         for (name, preset) in Palette::PRESETS {
-            let (rect, r) = ui.allocate_exact_size(egui::vec2(168.0, 104.0), egui::Sense::click());
+            let (rect, r) = ui.allocate_exact_size(egui::vec2(168.0, 104.0), egui::Sense::click().union(egui::Sense::focusable_noninteractive()));
             let painter = ui.painter();
             let active = p == preset;
             painter.rect_filled(rect, 8.0, preset.BG_WINDOW);
@@ -486,9 +561,18 @@ pub fn editor(ui: &mut egui::Ui) {
                 painter.rect_filled(egui::Rect::from_min_size(panel.left_bottom() + egui::vec2(10.0 + i as f32 * 20.0, -14.0), egui::vec2(14.0, 6.0)), 1.0, c);
             }
             painter.text(rect.left_bottom() + egui::vec2(12.0, -12.0), egui::Align2::LEFT_BOTTOM, name, egui::FontId::proportional(14.0), preset.TEXT_PRIMARY);
-            let ring = if active { egui::Stroke::new(2.5_f32, p.ACCENT) } else if r.hovered() { egui::Stroke::new(1.5_f32, p.TEXT_SECONDARY) } else { egui::Stroke::new(1.0_f32, p.BORDER_ACCENT) };
+            let ring = if active {
+                egui::Stroke::new(2.5_f32, p.ACCENT)
+            } else if r.has_focus() {
+                egui::Stroke::new(2.0_f32, p.TEXT_HIGHLIGHT)
+            } else if r.hovered() {
+                egui::Stroke::new(1.5_f32, p.TEXT_SECONDARY)
+            } else {
+                egui::Stroke::new(1.0_f32, p.BORDER_ACCENT)
+            };
             painter.rect_stroke(rect, 8.0, ring);
-            if r.on_hover_text(format!("Use the {name} theme")).clicked() {
+            let key_activate = r.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Space));
+            if r.on_hover_text(format!("Use the {name} theme")).clicked() || key_activate {
                 p = preset.clone();
                 changed = true;
             }
@@ -501,7 +585,81 @@ pub fn editor(ui: &mut egui::Ui) {
             .size(12.0)
             .color(if ratio >= 4.5 { p.TEXT_SECONDARY } else { p.METER_RED }),
     );
-    ui.add_space(10.0);
+    ui.add_space(14.0);
+    ui.label(egui::RichText::new("Waveform style").size(15.0).strong());
+    ui.add_space(6.0);
+    ui.horizontal_wrapped(|ui| {
+        for style in WaveformStyle::ALL {
+            let (rect, r) = ui.allocate_exact_size(
+                egui::vec2(148.0, 76.0),
+                egui::Sense::click().union(egui::Sense::focusable_noninteractive()),
+            );
+            let painter = ui.painter();
+            let active = waveform_style == style;
+            painter.rect_filled(rect, 8.0, p.BG_PANEL);
+            let wave_rect = egui::Rect::from_min_size(rect.min + egui::vec2(8.0, 8.0), egui::vec2(132.0, 40.0));
+            crate::widgets::paint_waveform_style_preview(painter, wave_rect, style);
+            painter.text(
+                rect.left_bottom() + egui::vec2(10.0, -7.0),
+                egui::Align2::LEFT_BOTTOM,
+                style.label(),
+                egui::FontId::proportional(13.0),
+                if active { p.TEXT_HIGHLIGHT } else { p.TEXT_PRIMARY },
+            );
+            let ring = if active {
+                egui::Stroke::new(2.5_f32, p.ACCENT)
+            } else if r.has_focus() {
+                egui::Stroke::new(2.0_f32, p.TEXT_HIGHLIGHT)
+            } else if r.hovered() {
+                egui::Stroke::new(1.5_f32, p.TEXT_SECONDARY)
+            } else {
+                egui::Stroke::new(1.0_f32, p.BORDER_ACCENT)
+            };
+            painter.rect_stroke(rect, 8.0, ring);
+            let key_activate = r.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Space));
+            if r.has_focus() {
+                if ui.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
+                    let idx = WaveformStyle::ALL.iter().position(|&s| s == waveform_style).unwrap_or(0);
+                    waveform_style = WaveformStyle::ALL[(idx + 1) % WaveformStyle::ALL.len()];
+                    settings_changed = true;
+                } else if ui.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
+                    let idx = WaveformStyle::ALL.iter().position(|&s| s == waveform_style).unwrap_or(0);
+                    waveform_style = WaveformStyle::ALL[(idx + WaveformStyle::ALL.len() - 1) % WaveformStyle::ALL.len()];
+                    settings_changed = true;
+                }
+            }
+            if r.on_hover_text(format!("Use the {} waveform style", style.label())).clicked() || key_activate {
+                waveform_style = style;
+                settings_changed = true;
+            }
+        }
+    });
+    ui.add_space(14.0);
+    ui.label(egui::RichText::new("Motion & size").size(15.0).strong());
+    ui.add_space(6.0);
+    settings_changed |= ui
+        .checkbox(&mut animations, "Animations")
+        .on_hover_text("Fades, the beat lamp and the theme crossfade. Turn off if the app feels slow.")
+        .changed();
+    ui.horizontal(|ui| {
+        ui.label("Text and control size");
+        // Applied when the drag ends, so the slider doesn't move under the pointer.
+        let pending = egui::Id::new("pending_scale");
+        let mut shown = ui.ctx().data(|d| d.get_temp::<f32>(pending)).unwrap_or(scale);
+        let r = ui.add(egui::Slider::new(&mut shown, 0.8..=1.6).step_by(0.05).custom_formatter(|v, _| format!("{:.0}%", v * 100.0)));
+        if r.dragged() {
+            ui.ctx().data_mut(|d| d.insert_temp(pending, shown));
+        } else if r.drag_stopped() || r.changed() {
+            ui.ctx().data_mut(|d| d.remove::<f32>(pending));
+            scale = shown;
+            settings_changed = true;
+        }
+        if ui.button("Reset").clicked() {
+            scale = 1.0;
+            settings_changed = true;
+        }
+    });
+    ui.add_space(14.0);
     const GROUPS: [(&str, &[&str]); 7] = [
         ("Surfaces", &["BG_", "BORDER_", "CONTROL", "ROW_SELECTED"]),
         ("Text", &["TEXT_"]),
@@ -539,31 +697,6 @@ pub fn editor(ui: &mut egui::Ui) {
         }
         ui.label(egui::RichText::new("Saved automatically to ~/.config/retraktor/theme.txt").size(11.5).color(p.TEXT_MUTED));
     });
-    ui.add_space(18.0);
-    ui.label(egui::RichText::new("Motion & size").size(15.0).strong());
-    ui.add_space(6.0);
-    settings_changed |= ui
-        .checkbox(&mut animations, "Animations")
-        .on_hover_text("Fades, the beat lamp and the theme crossfade. Turn off if the app feels slow.")
-        .changed();
-    ui.horizontal(|ui| {
-        ui.label("Text and control size");
-        // Applied when the drag ends, so the slider doesn't move under the pointer.
-        let pending = egui::Id::new("pending_scale");
-        let mut shown = ui.ctx().data(|d| d.get_temp::<f32>(pending)).unwrap_or(scale);
-        let r = ui.add(egui::Slider::new(&mut shown, 0.8..=1.6).step_by(0.05).custom_formatter(|v, _| format!("{:.0}%", v * 100.0)));
-        if r.dragged() {
-            ui.ctx().data_mut(|d| d.insert_temp(pending, shown));
-        } else if r.drag_stopped() || r.changed() {
-            ui.ctx().data_mut(|d| d.remove::<f32>(pending));
-            scale = shown;
-            settings_changed = true;
-        }
-        if ui.button("Reset").clicked() {
-            scale = 1.0;
-            settings_changed = true;
-        }
-    });
     if changed {
         set_palette(p);
     }
@@ -571,6 +704,7 @@ pub fn editor(ui: &mut egui::Ui) {
         if let Ok(mut st) = store().write() {
             st.animations = animations;
             st.scale = scale;
+            st.waveform_style = waveform_style;
         }
     }
     if changed || settings_changed {
@@ -689,5 +823,28 @@ mod tests {
             assert!(contrast(p.TEXT_PRIMARY, p.BG_WINDOW) >= 7.0, "{name} body text");
             assert!(contrast(p.TEXT_SECONDARY, p.BG_PANEL) >= 4.5, "{name} secondary text");
         }
+    }
+
+    #[test]
+    fn waveform_style_settings_roundtrip_and_unknown_fallback() {
+        for style in WaveformStyle::ALL {
+            let st = ThemeState {
+                current: Palette::CHARCOAL,
+                from: None,
+                animations: false,
+                scale: 1.25,
+                waveform_style: style,
+            };
+            let text = st.to_text();
+            let parsed = ThemeState::from_text(&Palette::NIGHT, &text);
+            assert_eq!(parsed.current, Palette::CHARCOAL);
+            assert!(!parsed.animations);
+            assert!((parsed.scale - 1.25).abs() < 1e-4);
+            assert_eq!(parsed.waveform_style, style);
+        }
+        let fallback = ThemeState::from_text(&Palette::NIGHT, "waveform_style=unknown_style\n");
+        assert_eq!(fallback.waveform_style, WaveformStyle::Classic);
+        let missing = ThemeState::from_text(&Palette::NIGHT, "animations=on\n");
+        assert_eq!(missing.waveform_style, WaveformStyle::Classic);
     }
 }
