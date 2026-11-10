@@ -685,31 +685,38 @@ impl PreferencesDialog {
     pub fn show(&mut self, _ctx: &egui::Context) {}
 
     fn show_audio_setup(&mut self, ui: &mut Ui) {
-        Self::list_section_header(ui, "HARDWARE INTERFACE & BUFFER LATENCY");
+        Self::list_section_header(ui, "Sound card");
 
+        let device_label = match self.audio_device_name.as_str() {
+            "PipeWire pro-audio / ALSA Default" => "System default (PipeWire / ALSA)",
+            "Traktor Kontrol / MX2 USB Audio (hw:MX2,0)" => "Traktor MX2 USB audio",
+            "USB Audio Class 2.0 Interface (hw:UAC2,0)" => "USB audio interface",
+            other => other,
+        }
+        .to_string();
         Self::list_row(
             ui,
-            "Audio Device",
-            "Select the hardware soundcard or PipeWire/ALSA pro-audio interface.",
+            "Audio device",
+            "Which sound card or audio output ReTraktor plays through.",
             |ui| {
                 egui::ComboBox::from_id_salt("audio_device_combo")
-                    .selected_text(&self.audio_device_name)
-                    .width(340.0)
+                    .selected_text(device_label)
+                    .width(240.0)
                     .show_ui(ui, |ui| {
                         ui.selectable_value(
                             &mut self.audio_device_name,
                             "PipeWire pro-audio / ALSA Default".to_string(),
-                            "PipeWire pro-audio / ALSA Default",
+                            "System default (PipeWire / ALSA)",
                         );
                         ui.selectable_value(
                             &mut self.audio_device_name,
                             "Traktor Kontrol / MX2 USB Audio (hw:MX2,0)".to_string(),
-                            "Traktor Kontrol / MX2 USB Audio (hw:MX2,0)",
+                            "Traktor MX2 USB audio",
                         );
                         ui.selectable_value(
                             &mut self.audio_device_name,
                             "USB Audio Class 2.0 Interface (hw:UAC2,0)".to_string(),
-                            "USB Audio Class 2.0 Interface (hw:UAC2,0)",
+                            "USB audio interface",
                         );
                     });
             },
@@ -717,17 +724,17 @@ impl PreferencesDialog {
 
         Self::list_row(
             ui,
-            "Sample Rate",
-            "Operating sample rate of the real-time DSP and hardware DAC.",
+            "Sample rate",
+            "Audio rate in Hz; 48000 Hz matches most DJ controllers.",
             |ui| {
                 egui::ComboBox::from_id_salt("sr_combo")
                     .selected_text(format!("{} Hz", self.sample_rate))
-                    .width(240.0)
+                    .width(220.0)
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.sample_rate, 44100, "44100 Hz (CD Standard)");
-                        ui.selectable_value(&mut self.sample_rate, 48000, "48000 Hz (Pro Audio Default)");
+                        ui.selectable_value(&mut self.sample_rate, 44100, "44100 Hz (CD)");
+                        ui.selectable_value(&mut self.sample_rate, 48000, "48000 Hz (standard)");
                         ui.selectable_value(&mut self.sample_rate, 88200, "88200 Hz");
-                        ui.selectable_value(&mut self.sample_rate, 96000, "96000 Hz (Studio Master)");
+                        ui.selectable_value(&mut self.sample_rate, 96000, "96000 Hz (high)");
                     });
             },
         );
@@ -735,28 +742,28 @@ impl PreferencesDialog {
         let latency_ms = (self.buffer_size as f64 / self.sample_rate as f64) * 1000.0;
         Self::list_row(
             ui,
-            "Buffer Size (Latency)",
-            "Smaller buffers reduce scratch/cue latency; larger buffers increase stability.",
+            "Buffer size",
+            "Smaller values feel more responsive when scratching; larger values prevent crackles.",
             |ui| {
                 egui::ComboBox::from_id_salt("buf_combo")
-                    .selected_text(format!("{} frames ({:.1} ms)", self.buffer_size, latency_ms))
-                    .width(240.0)
+                    .selected_text(format!("{} samples ({:.1} ms)", self.buffer_size, latency_ms))
+                    .width(220.0)
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.buffer_size, 64, "64 frames (1.3 ms — Ultra Low)");
-                        ui.selectable_value(&mut self.buffer_size, 128, "128 frames (2.7 ms — Performance)");
-                        ui.selectable_value(&mut self.buffer_size, 256, "256 frames (5.3 ms — Safe)");
-                        ui.selectable_value(&mut self.buffer_size, 512, "512 frames (10.7 ms — High)");
+                        ui.selectable_value(&mut self.buffer_size, 64, "64 samples (1.3 ms, fast)");
+                        ui.selectable_value(&mut self.buffer_size, 128, "128 samples (2.7 ms, balanced)");
+                        ui.selectable_value(&mut self.buffer_size, 256, "256 samples (5.3 ms, safe)");
+                        ui.selectable_value(&mut self.buffer_size, 512, "512 samples (10.7 ms, relaxed)");
                     });
             },
         );
 
         Self::list_row(
             ui,
-            "Real-Time Audio Scheduler Status",
-            "Lock-free SPSC command ring buffer with non-blocking audio callback.",
+            "Audio status",
+            "Live round-trip latency and audio dropouts.",
             |ui| {
                 ui.label(
-                    RichText::new(format!("ACTIVE • {:.2} ms Roundtrip • 0 XRuns", latency_ms))
+                    RichText::new(format!("Running · {:.1} ms latency · 0 dropouts", latency_ms))
                         .color(TraktorTheme::PLAY_ACTIVE())
                         .font(egui::FontId::monospace(11.5))
                         .strong(),
@@ -766,20 +773,20 @@ impl PreferencesDialog {
     }
 
     fn show_output_routing(&mut self, ui: &mut Ui) {
-        Self::list_section_header(ui, "OUTPUT ROUTING — MASTER, MONITOR & BOOTH");
+        Self::list_section_header(ui, "Outputs");
 
         Self::list_row(
             ui,
-            "Mixing Mode",
-            "Route all 4 decks through the internal software mixer or separately to an external hardware mixer.",
+            "Mixing mode",
+            "Mix inside ReTraktor or send each deck to an external hardware mixer.",
             |ui| {
                 let modes = [
-                    "Internal (Software Mixer)",
-                    "External (Hardware Mixer Channels)",
+                    "Internal mixer",
+                    "External mixer",
                 ];
                 egui::ComboBox::from_id_salt("mixing_mode_combo")
                     .selected_text(modes[self.mixing_mode.min(1)])
-                    .width(260.0)
+                    .width(220.0)
                     .show_ui(ui, |ui| {
                         ui.selectable_value(&mut self.mixing_mode, 0, modes[0]);
                         ui.selectable_value(&mut self.mixing_mode, 1, modes[1]);
@@ -789,8 +796,8 @@ impl PreferencesDialog {
 
         Self::list_row(
             ui,
-            "Output Master (Main PA Speakers)",
-            "Primary stereo bus output channels.",
+            "Main output",
+            "Stereo channels sent to your main speakers.",
             |ui| {
                 ui.add(egui::TextEdit::singleline(&mut self.master_out_r).desired_width(170.0));
                 ui.label("R:");
@@ -801,8 +808,8 @@ impl PreferencesDialog {
 
         Self::list_row(
             ui,
-            "Output Monitor (Headphone Cue)",
-            "Stereo headphone cue bus for pre-listening.",
+            "Headphones",
+            "Stereo channels used for headphone cueing.",
             |ui| {
                 ui.add(egui::TextEdit::singleline(&mut self.monitor_out_r).desired_width(170.0));
                 ui.label("R:");
@@ -813,8 +820,8 @@ impl PreferencesDialog {
 
         Self::list_row(
             ui,
-            "Output Booth (DJ Booth Monitor)",
-            "Secondary stereo output with independent booth level control.",
+            "Booth output",
+            "Second stereo output for booth speakers with its own volume.",
             |ui| {
                 ui.add(egui::TextEdit::singleline(&mut self.booth_out_r).desired_width(170.0));
                 ui.label("R:");
@@ -825,21 +832,21 @@ impl PreferencesDialog {
 
         Self::list_row(
             ui,
-            "Split Cue Mode",
-            "Sums Cue Monitor into the left headphone ear and Master Output into the right ear.",
+            "Split cue",
+            "Put the cued deck in the left headphone ear and the main mix in the right.",
             |ui| {
-                ui.checkbox(&mut self.split_cue, "Enabled");
+                ui.checkbox(&mut self.split_cue, "").on_hover_text("Split cue");
             },
         );
     }
 
     fn show_input_routing(&mut self, ui: &mut Ui) {
-        Self::list_section_header(ui, "INPUT ROUTING — LIVE INPUTS, DVS & AUX");
+        Self::list_section_header(ui, "Inputs");
 
         Self::list_row(
             ui,
-            "Input Deck A (Live / DVS Timecode)",
-            "Hardware stereo input pair assigned to Deck A.",
+            "Deck A input",
+            "Stereo input channels for a turntable or CDJ on Deck A.",
             |ui| {
                 ui.add(egui::TextEdit::singleline(&mut self.deck_a_in_r).desired_width(170.0));
                 ui.label("R:");
@@ -850,8 +857,8 @@ impl PreferencesDialog {
 
         Self::list_row(
             ui,
-            "Input Deck B (Live / DVS Timecode)",
-            "Hardware stereo input pair assigned to Deck B.",
+            "Deck B input",
+            "Stereo input channels for a turntable or CDJ on Deck B.",
             |ui| {
                 ui.add(egui::TextEdit::singleline(&mut self.deck_b_in_r).desired_width(170.0));
                 ui.label("R:");
@@ -862,8 +869,8 @@ impl PreferencesDialog {
 
         Self::list_row(
             ui,
-            "Input Aux / Microphone",
-            "Auxiliary line or microphone input routed to the master bus.",
+            "Aux or microphone",
+            "Extra stereo or mic input sent straight to the main mix.",
             |ui| {
                 ui.add(egui::TextEdit::singleline(&mut self.aux_in_r).desired_width(170.0));
                 ui.label("R:");
@@ -874,11 +881,11 @@ impl PreferencesDialog {
 
         Self::list_row(
             ui,
-            "DVS Timecode Engine",
-            "2.5 kHz MK2 timecode vinyl & CD carrier tracking calibration.",
+            "Timecode vinyl",
+            "Control playback speed and position with timecode records or CDs.",
             |ui| {
                 ui.label(
-                    RichText::new("READY (0.0 dB Lead-In)")
+                    RichText::new("Ready")
                         .color(TraktorTheme::DECK_A())
                         .font(egui::FontId::monospace(11.0))
                         .strong(),
@@ -888,17 +895,17 @@ impl PreferencesDialog {
     }
 
     fn show_external_sync(&mut self, ui: &mut Ui) {
-        Self::list_section_header(ui, "EXTERNAL SYNC, MIDI CLOCK & ABLETON LINK");
+        Self::list_section_header(ui, "Sync");
 
         Self::list_row(
             ui,
-            "Master Clock Mode",
-            "Choose whether Master Tempo follows the active playing deck or remains manually fixed.",
+            "Tempo leader",
+            "Follow the playing deck automatically or hold a fixed master tempo.",
             |ui| {
-                let modes = ["Auto Master (Follows Active Deck)", "Manual Master (Fixed Tempo)"];
+                let modes = ["Follow playing deck", "Manual tempo"];
                 egui::ComboBox::from_id_salt("clock_mode_combo")
                     .selected_text(modes[self.clock_mode.min(1)])
-                    .width(250.0)
+                    .width(220.0)
                     .show_ui(ui, |ui| {
                         ui.selectable_value(&mut self.clock_mode, 0, modes[0]);
                         ui.selectable_value(&mut self.clock_mode, 1, modes[1]);
@@ -908,17 +915,17 @@ impl PreferencesDialog {
 
         Self::list_row(
             ui,
-            "Send MIDI Clock Output",
-            "Transmit 24 PPQN MIDI Clock messages to external hardware drum machines and synths.",
+            "Send MIDI clock",
+            "Keep external drum machines and synths in time over MIDI.",
             |ui| {
-                ui.checkbox(&mut self.send_midi_clock, "Enabled");
+                ui.checkbox(&mut self.send_midi_clock, "").on_hover_text("Send MIDI clock");
             },
         );
 
         Self::list_row(
             ui,
-            "MIDI Clock Offset",
-            "Compensate for external hardware MIDI buffer latency (-50 ms to +50 ms).",
+            "MIDI clock offset",
+            "Nudge the MIDI clock early or late to line up external gear.",
             |ui| {
                 ui.add(egui::Slider::new(&mut self.midi_clock_offset_ms, -50.0..=50.0).suffix(" ms"));
             },
@@ -926,32 +933,32 @@ impl PreferencesDialog {
 
         Self::list_row(
             ui,
-            "Ableton Link Integration",
-            "Synchronize beatgrid phase and tempo with peer applications over local LAN/Wi-Fi.",
+            "Ableton Link",
+            "Share tempo and beat phase with other music apps on your network.",
             |ui| {
-                ui.checkbox(&mut self.ableton_link_enabled, "Enable Link");
+                ui.checkbox(&mut self.ableton_link_enabled, "").on_hover_text("Ableton Link");
             },
         );
     }
 
     fn show_mixer_prefs(&mut self, ui: &mut Ui) {
-        Self::list_section_header(ui, "MIXER EQ MODELS, FILTERS & MASTER LIMITER");
+        Self::list_section_header(ui, "Mixer");
 
         let models = [
-            "Z ISO (Full Kill 3-Band — Traktor Pro 4 Default)",
-            "Classic (Standard Warm Curves)",
-            "P600 (Club Standard Steep Roll-off)",
-            "Nuo (Fat Analog Lows)",
-            "Xone:92 (4-Band Dual-Mid Audiophile)",
+            "Z ISO (full kill)",
+            "Classic",
+            "P600 (club)",
+            "Nuo (warm lows)",
+            "Xone:92 (4-band)",
         ];
         Self::list_row(
             ui,
-            "Channel EQ Model",
-            "Select the frequency crossover and kill behavior of the channel strip EQs.",
+            "EQ style",
+            "How the high, mid, and low knobs shape and cut each frequency band.",
             |ui| {
                 egui::ComboBox::from_id_salt("eq_model_combo")
                     .selected_text(models[self.eq_model_idx.min(models.len() - 1)])
-                    .width(300.0)
+                    .width(220.0)
                     .show_ui(ui, |ui| {
                         for (i, m) in models.iter().enumerate() {
                             ui.selectable_value(&mut self.eq_model_idx, i, *m);
@@ -961,18 +968,18 @@ impl PreferencesDialog {
         );
 
         let filters = [
-            "Ladder (Moog-style 4-Pole 24dB/oct resonant)",
-            "State Variable (Clean 12dB/oct dual-slope)",
-            "Pro-53 (Classic Analog Synth Filter)",
+            "Ladder (warm, resonant)",
+            "Clean",
+            "Synth (Pro-53)",
         ];
         Self::list_row(
             ui,
-            "Channel Filter Model",
-            "Select the analog filter topology for the bipolar channel filter knob.",
+            "Filter style",
+            "Character of the channel filter knob.",
             |ui| {
                 egui::ComboBox::from_id_salt("filter_model_combo")
                     .selected_text(filters[self.filter_model_idx.min(filters.len() - 1)])
-                    .width(300.0)
+                    .width(220.0)
                     .show_ui(ui, |ui| {
                         for (i, f) in filters.iter().enumerate() {
                             ui.selectable_value(&mut self.filter_model_idx, i, *f);
@@ -983,26 +990,26 @@ impl PreferencesDialog {
 
         Self::list_row(
             ui,
-            "Filter Resonance (Q)",
-            "Adjust peak emphasis at the filter cutoff frequency.",
+            "Filter resonance",
+            "How sharp the filter sounds around its cutoff point.",
             |ui| {
                 ui.add(egui::Slider::new(&mut self.filter_resonance, 0.0..=1.0).show_value(true));
             },
         );
 
         let curves = [
-            "Smooth (Constant-Power blend — House/Trance)",
-            "Steep (Linear Blend — Techno/Club)",
-            "Scratch Cut (Sharp 5% cut-in lag — Turntablism)",
+            "Smooth blend",
+            "Steep blend",
+            "Sharp cut (scratch)",
         ];
         Self::list_row(
             ui,
-            "Crossfader Curve",
-            "Adjust transition slope from smooth constant-power blend to instant scratch cut.",
+            "Crossfader curve",
+            "Blend smoothly across the middle or cut in sharply at the edges for scratching.",
             |ui| {
                 egui::ComboBox::from_id_salt("xf_curve_combo")
                     .selected_text(curves[self.xfader_curve_idx.min(curves.len() - 1)])
-                    .width(300.0)
+                    .width(220.0)
                     .show_ui(ui, |ui| {
                         for (i, c) in curves.iter().enumerate() {
                             ui.selectable_value(&mut self.xfader_curve_idx, i, *c);
@@ -1013,36 +1020,36 @@ impl PreferencesDialog {
 
         Self::list_row(
             ui,
-            "Per-Track Autogain",
-            "Automatically normalize perceived track loudness based on analyzed ReplayGain/LUFS.",
+            "Auto gain",
+            "Match volume across quiet and loud tracks automatically.",
             |ui| {
-                ui.checkbox(&mut self.autogain, "Enabled");
+                ui.checkbox(&mut self.autogain, "").on_hover_text("Auto gain");
             },
         );
 
         Self::list_row(
             ui,
-            "Master Bus Brickwall Limiter",
-            "Prevent digital clipping on the master output bus.",
+            "Master limiter",
+            "Keep loud peaks on the main output from clipping.",
             |ui| {
-                ui.checkbox(&mut self.limiter_enabled, "Enabled");
+                ui.checkbox(&mut self.limiter_enabled, "").on_hover_text("Master limiter");
             },
         );
 
         if self.limiter_enabled {
             let headrooms = [
-                "0.0 dB (Max Volume)",
-                "-3.0 dB (Traktor Pro 4 Standard)",
-                "-6.0 dB (Club PA Protection)",
+                "None (0 dB)",
+                "-3 dB (recommended)",
+                "-6 dB (extra headroom)",
             ];
             Self::list_row(
                 ui,
-                "Limiter Headroom Ceiling",
-                "Attenuate pre-limiter master bus headroom to preserve transient punch.",
+                "Headroom",
+                "Leave breathing room before the limiter kicks in.",
                 |ui| {
                     egui::ComboBox::from_id_salt("limiter_headroom_combo")
                         .selected_text(headrooms[self.limiter_headroom.min(2)])
-                        .width(240.0)
+                        .width(220.0)
                         .show_ui(ui, |ui| {
                             for (i, h) in headrooms.iter().enumerate() {
                                 ui.selectable_value(&mut self.limiter_headroom, i, *h);
@@ -1054,25 +1061,25 @@ impl PreferencesDialog {
 
         Self::list_row(
             ui,
-            "Neural Mix EQ ⇄ Stems Mode",
-            "Map channel HI / MID / LOW EQ knobs directly to Vocals, Instruments, and Drums+Bass stems.",
+            "EQ controls stems",
+            "Use the high, mid, and low EQ knobs to adjust vocals, instruments, and drums.",
             |ui| {
-                ui.checkbox(&mut self.neural_mix_eq_mode, "Enabled");
+                ui.checkbox(&mut self.neural_mix_eq_mode, "").on_hover_text("EQ controls stems");
             },
         );
     }
 
     fn show_stems_prefs(&mut self, ui: &mut Ui) {
-        Self::list_section_header(ui, "STEMS CREATION & META DEMUCS AI ENGINE");
+        Self::list_section_header(ui, "Stems");
 
         Self::list_row(
             ui,
-            "Meta Demucs AI Neural Separation Engine",
-            "Isolates tracks into 4 studio-grade stems (Drums, Bass, Other, Vocals) in the background.",
+            "Stem separation (Demucs)",
+            "Splits tracks into drums, bass, instruments, and vocals in the background.",
             |ui| match &self.demucs_install_state {
                 crate::demucs::DemucsInstallState::Ready { version, .. } => {
                     ui.label(
-                        RichText::new(format!("✔ {version} Ready"))
+                        RichText::new(format!("{version} ready"))
                             .color(TraktorTheme::PLAY_ACTIVE())
                             .strong(),
                     );
@@ -1085,12 +1092,12 @@ impl PreferencesDialog {
                     if ui
                         .add(
                             egui::Button::new(
-                                RichText::new("Install Demucs AI (~1.2 GB)")
+                                RichText::new("Install Demucs (~1.2 GB)")
                                     .color(on_selected_text())
                                     .strong(),
                             )
                             .fill(TraktorTheme::ROW_SELECTED())
-                            .min_size(Vec2::new(210.0, 26.0)),
+                            .min_size(Vec2::new(200.0, 26.0)),
                         )
                         .clicked()
                     {
@@ -1121,18 +1128,18 @@ impl PreferencesDialog {
         }
 
         let stem_modes = [
-            "Hybrid (Neural Demucs AI + Real-Time DSP Fallback)",
-            "Real-Time DSP Isolation Only (Zero Dependencies)",
-            "Offline Pre-Computed 4-Stem Cache (.stem.m4a / FLAC)",
+            "Automatic (Demucs + live fallback)",
+            "Live frequency split only",
+            "Saved stem files only",
         ];
         Self::list_row(
             ui,
-            "Stem Separation Mode",
-            "Choose between hybrid AI separation, zero-latency DSP crossover, or offline stem files.",
+            "Separation mode",
+            "Use Demucs when available, live frequency splitting, or saved stem files.",
             |ui| {
                 egui::ComboBox::from_id_salt("stem_engine_mode_combo")
                     .selected_text(stem_modes[self.stems_engine_mode.min(2)])
-                    .width(320.0)
+                    .width(240.0)
                     .show_ui(ui, |ui| {
                         for (i, m) in stem_modes.iter().enumerate() {
                             ui.selectable_value(&mut self.stems_engine_mode, i, *m);
@@ -1143,39 +1150,39 @@ impl PreferencesDialog {
 
         Self::list_row(
             ui,
-            "Neural Mix EQ ⇄ Stems Knob Swap",
-            "Swap channel HI/MID/LOW EQ knobs to control Vocals, Instruments, and Drums+Bass levels.",
+            "EQ controls stems",
+            "Use the high, mid, and low EQ knobs to adjust vocals, instruments, and drums.",
             |ui| {
-                ui.checkbox(&mut self.neural_mix_eq_mode, "Enabled");
+                ui.checkbox(&mut self.neural_mix_eq_mode, "").on_hover_text("EQ controls stems");
             },
         );
     }
 
     fn show_deck_prefs(&mut self, ui: &mut Ui) {
-        Self::list_section_header(ui, "DECKS LAYOUT & WAVEFORM DISPLAY");
+        Self::list_section_header(ui, "Waveforms");
 
         Self::list_row(
             ui,
-            "4-Deck Workspace Mode (Decks A, B, C, D)",
-            "Display four independent deck strips and stacked parallel waveforms.",
+            "Four decks",
+            "Show Decks C and D alongside Decks A and B.",
             |ui| {
-                ui.checkbox(&mut self.four_deck_mode, "Enabled");
+                ui.checkbox(&mut self.four_deck_mode, "").on_hover_text("Four decks");
             },
         );
 
         let palettes = [
-            "Spectrum (3-Band Frequency Color)",
-            "Ultraviolet (Neon Purple Mids & Ice Blue Highs)",
-            "High Contrast RGB (Red Bass, Green Mids, Blue Highs)",
+            "Spectrum",
+            "Ultraviolet",
+            "High contrast",
         ];
         Self::list_row(
             ui,
-            "Waveform Color Palette",
-            "Select the frequency-band color mapping used on scrolling and overview waveforms.",
+            "Waveform colours",
+            "Colour scheme used to draw bass, mids, and highs on waveforms.",
             |ui| {
                 egui::ComboBox::from_id_salt("wf_palette_combo")
                     .selected_text(palettes[self.waveform_color_mode.min(2)])
-                    .width(300.0)
+                    .width(220.0)
                     .show_ui(ui, |ui| {
                         for (i, p) in palettes.iter().enumerate() {
                             ui.selectable_value(&mut self.waveform_color_mode, i, *p);
@@ -1186,59 +1193,59 @@ impl PreferencesDialog {
 
         Self::list_row(
             ui,
-            "Minute Markers on Stripe Overview",
-            "Render vertical 60-second time division ticks across the full-track overview bar.",
+            "Minute markers",
+            "Draw a tick every minute along the full-track overview bar.",
             |ui| {
-                ui.checkbox(&mut self.show_minute_markers, "Enabled");
+                ui.checkbox(&mut self.show_minute_markers, "").on_hover_text("Minute markers");
             },
         );
 
         Self::list_row(
             ui,
-            "Beatgrid Transient Ticks",
-            "Display beatgrid bar and beat lines on scrolling waveforms for visual phase alignment.",
+            "Beat markers",
+            "Draw beat and bar lines on the scrolling waveform.",
             |ui| {
-                ui.checkbox(&mut self.show_beatgrid_ticks, "Enabled");
+                ui.checkbox(&mut self.show_beatgrid_ticks, "").on_hover_text("Beat markers");
             },
         );
 
         Self::list_row(
             ui,
-            "Fit Full Track in Stripe Overview",
-            "Scale the mini overview waveform to always span 100% of the track duration.",
+            "Fit full track in overview",
+            "Always fit the entire song into the small overview stripe.",
             |ui| {
-                ui.checkbox(&mut self.stripe_fit_full, "Enabled");
+                ui.checkbox(&mut self.stripe_fit_full, "").on_hover_text("Fit full track in overview");
             },
         );
     }
 
     fn show_track_decks_prefs(&mut self, ui: &mut Ui) {
-        Self::list_section_header(ui, "TRACK DECKS, SAFETY & VINYL SCRATCH PHYSICS");
+        Self::list_section_header(ui, "Decks");
 
         Self::list_row(
             ui,
-            "Lock Playing Decks",
-            "Prevent loading a new track into a deck that is currently playing live audio.",
+            "Lock playing decks",
+            "Stop a new track from loading onto a deck that is currently playing.",
             |ui| {
-                ui.checkbox(&mut self.lock_playing_decks, "Enabled");
+                ui.checkbox(&mut self.lock_playing_decks, "").on_hover_text("Lock playing decks");
             },
         );
 
         let ranges = [
-            "±8% (Club / House)",
-            "±16% (Wide Range)",
-            "±32% (Extreme)",
-            "±50% (Breakbeat)",
-            "±100% (Ultra Pitch)",
+            "±8%",
+            "±16%",
+            "±32%",
+            "±50%",
+            "±100%",
         ];
         Self::list_row(
             ui,
-            "Tempo Pitch Fader Range",
-            "Maximum tempo bend percentage for deck pitch faders.",
+            "Tempo fader range",
+            "How far the tempo slider can speed up or slow down a track.",
             |ui| {
                 egui::ComboBox::from_id_salt("pitch_range_combo")
                     .selected_text(ranges[self.pitch_range_idx.min(4)])
-                    .width(220.0)
+                    .width(180.0)
                     .show_ui(ui, |ui| {
                         for (i, r) in ranges.iter().enumerate() {
                             ui.selectable_value(&mut self.pitch_range_idx, i, *r);
@@ -1247,15 +1254,15 @@ impl PreferencesDialog {
             },
         );
 
-        let modes = ["HiQ (Phase Vocoder — Scratch Preserving)", "ECO (Low CPU Usage)"];
+        let modes = ["High quality", "Eco (lower CPU)"];
         Self::list_row(
             ui,
-            "Keylock Time-Stretch Quality",
-            "Master tempo pitch-lock algorithm quality when changing BPM.",
+            "Key lock quality",
+            "Sound quality vs CPU use when keeping musical key fixed across tempo changes.",
             |ui| {
                 egui::ComboBox::from_id_salt("keylock_mode_combo")
                     .selected_text(modes[self.keylock_quality.min(1)])
-                    .width(260.0)
+                    .width(200.0)
                     .show_ui(ui, |ui| {
                         for (i, m) in modes.iter().enumerate() {
                             ui.selectable_value(&mut self.keylock_quality, i, *m);
@@ -1264,15 +1271,15 @@ impl PreferencesDialog {
             },
         );
 
-        let positions = ["Centered (50% Center)", "Left-Weighted (30% Ahead)"];
+        let positions = ["Centre", "Left of centre"];
         Self::list_row(
             ui,
-            "Playhead Marker Position",
-            "Horizontal position of the red playhead cursor inside the scrolling waveform viewport.",
+            "Playhead position",
+            "Where the playhead sits on the scrolling waveform.",
             |ui| {
                 egui::ComboBox::from_id_salt("play_marker_combo")
                     .selected_text(positions[self.play_marker_pos.min(1)])
-                    .width(220.0)
+                    .width(200.0)
                     .show_ui(ui, |ui| {
                         for (i, p) in positions.iter().enumerate() {
                             ui.selectable_value(&mut self.play_marker_pos, i, *p);
@@ -1283,17 +1290,17 @@ impl PreferencesDialog {
 
         Self::list_row(
             ui,
-            "Auto-Cue on Track Load",
-            "Automatically position playhead at the first beatgrid cue point when loading a track.",
+            "Jump to cue on load",
+            "Park newly loaded tracks at their first cue point.",
             |ui| {
-                ui.checkbox(&mut self.auto_cue_on_load, "Enabled");
+                ui.checkbox(&mut self.auto_cue_on_load, "").on_hover_text("Jump to cue on load");
             },
         );
 
         Self::list_row(
             ui,
-            "Jogwheel Scratch Sensitivity",
-            "Multiplier for capacitive platter vinyl scratch velocity.",
+            "Jog wheel sensitivity",
+            "How far the track moves when you spin the jog wheel.",
             |ui| {
                 ui.add(egui::Slider::new(&mut self.jog_scratch_sensitivity, 0.2..=3.0).show_value(true));
             },
@@ -1301,26 +1308,26 @@ impl PreferencesDialog {
 
         Self::list_row(
             ui,
-            "Turntable Mode (Vinyl Scratch)",
-            "Top platter touch engages alpha-beta vinyl scratch; outer rim performs pitch bend nudge.",
+            "Vinyl mode",
+            "Touch the top of the platter to scratch, or use the outer rim to nudge tempo.",
             |ui| {
-                ui.checkbox(&mut self.jog_mode_turntable, "Enabled");
+                ui.checkbox(&mut self.jog_mode_turntable, "").on_hover_text("Vinyl mode");
             },
         );
     }
 
     fn show_effects_prefs(&mut self, ui: &mut Ui) {
-        Self::list_section_header(ui, "EFFECTS ROUTING & MIXER FX ASSIGNMENTS");
+        Self::list_section_header(ui, "Effects");
 
-        let unit_counts = ["2 FX Units (Standard Decks A & B)", "4 FX Units (Decks A, B, C, D)"];
+        let unit_counts = ["2 units", "4 units"];
         Self::list_row(
             ui,
-            "Active Master FX Units",
-            "Number of assignable multi-effect units in the top rack.",
+            "FX units",
+            "How many effect units appear at the top of the screen.",
             |ui| {
                 egui::ComboBox::from_id_salt("fx_units_count_combo")
                     .selected_text(unit_counts[self.fx_units_count.min(1)])
-                    .width(250.0)
+                    .width(200.0)
                     .show_ui(ui, |ui| {
                         ui.selectable_value(&mut self.fx_units_count, 0, unit_counts[0]);
                         ui.selectable_value(&mut self.fx_units_count, 1, unit_counts[1]);
@@ -1329,17 +1336,17 @@ impl PreferencesDialog {
         );
 
         let panel_modes = [
-            "Group Mode (3 Chained Effects per Unit)",
-            "Single Mode (1 Deep Effect with Parameter Knobs)",
+            "Group (3 effects)",
+            "Single (detailed)",
         ];
         Self::list_row(
             ui,
-            "FX Panel Display Mode",
-            "Choose between 3 simultaneous macro effects or single-effect deep parameter control.",
+            "FX unit mode",
+            "Chain three simple effects together or control one effect in detail.",
             |ui| {
                 egui::ComboBox::from_id_salt("fx_panel_mode_combo")
                     .selected_text(panel_modes[self.fx_panel_mode.min(1)])
-                    .width(280.0)
+                    .width(200.0)
                     .show_ui(ui, |ui| {
                         ui.selectable_value(&mut self.fx_panel_mode, 0, panel_modes[0]);
                         ui.selectable_value(&mut self.fx_panel_mode, 1, panel_modes[1]);
@@ -1347,29 +1354,29 @@ impl PreferencesDialog {
             },
         );
 
-        Self::list_section_header(ui, "ONE-KNOB MIXER FX SLOT ASSIGNMENTS");
+        Self::list_section_header(ui, "Channel FX");
         let fx_options = [
-            "Filter (92 Dual Resonant)",
-            "Reverb (T3 Space Reverb)",
-            "Dual Delay (Ping-Pong Stereo)",
-            "White Noise Sweep",
-            "Time Gater (Rhythmic Chop)",
-            "Barber Pole (Infinite Phaser)",
-            "Flanger Flux",
-            "Dotted 8th Delay",
-            "Bit Crush (Digital Lo-Fi)",
+            "Filter",
+            "Reverb",
+            "Dual delay",
+            "Noise sweep",
+            "Time gater",
+            "Barber pole phaser",
+            "Flanger",
+            "Dotted eighth delay",
+            "Bit crush",
         ];
 
         for idx in 0..4 {
             let mut slot_val = self.mixer_fx_slots[idx].min(fx_options.len() - 1);
             Self::list_row(
                 ui,
-                &format!("Mixer FX Slot {}", idx + 1),
-                "Effect assigned to channel strip Mixer FX selector button.",
+                &format!("Slot {}", idx + 1),
+                "One-knob effect available on each mixer channel.",
                 |ui| {
                     egui::ComboBox::from_id_salt(format!("mfx_slot_{idx}"))
                         .selected_text(fx_options[slot_val])
-                        .width(240.0)
+                        .width(200.0)
                         .show_ui(ui, |ui| {
                             for (opt_idx, name) in fx_options.iter().enumerate() {
                                 ui.selectable_value(&mut slot_val, opt_idx, *name);
@@ -1382,13 +1389,13 @@ impl PreferencesDialog {
     }
 
     fn show_recording_prefs(&mut self, ui: &mut Ui) {
-        Self::list_section_header(ui, "MASTER MIX RECORDER & LIVE BROADCAST");
+        Self::list_section_header(ui, "Recording");
 
         let path_str = self.recording_dir.to_string_lossy().to_string();
         Self::list_row(
             ui,
-            "Mix Recording Directory",
-            "Destination folder where recorded live WAV mixes are saved.",
+            "Recordings folder",
+            "Where recorded mixes are saved as WAV files.",
             |ui| {
                 // Long paths shorten to ~ and truncate instead of running over the label.
                 let home = std::env::var("HOME").unwrap_or_default();
@@ -1398,17 +1405,17 @@ impl PreferencesDialog {
         );
 
         let formats = [
-            "WAV 16-bit / 48 kHz (Lossless CD Quality)",
-            "WAV 24-bit / 48 kHz (Studio Master)",
+            "16-bit WAV (CD quality)",
+            "24-bit WAV (studio)",
         ];
         Self::list_row(
             ui,
-            "Recording Audio Format",
-            "Uncompressed PCM bit-depth for master mix recordings.",
+            "Recording quality",
+            "Bit depth for recorded WAV files.",
             |ui| {
                 egui::ComboBox::from_id_salt("rec_format_combo")
                     .selected_text(formats[self.recording_format.min(1)])
-                    .width(260.0)
+                    .width(220.0)
                     .show_ui(ui, |ui| {
                         for (i, f) in formats.iter().enumerate() {
                             ui.selectable_value(&mut self.recording_format, i, *f);
@@ -1417,12 +1424,12 @@ impl PreferencesDialog {
             },
         );
 
-        Self::list_section_header(ui, "ICECAST / SHOUTCAST STREAMING SERVER");
+        Self::list_section_header(ui, "Live stream");
 
         Self::list_row(
             ui,
-            "Broadcast Server Host",
-            "Hostname or IP address of your Icecast2 / Shoutcast server.",
+            "Stream server",
+            "Address of your Icecast or Shoutcast server.",
             |ui| {
                 ui.add(egui::TextEdit::singleline(&mut self.broadcast_host).desired_width(200.0));
             },
@@ -1430,8 +1437,8 @@ impl PreferencesDialog {
 
         Self::list_row(
             ui,
-            "Broadcast Server Port",
-            "TCP port for Icecast stream (default: 8000).",
+            "Port",
+            "Server port (usually 8000).",
             |ui| {
                 let mut port_str = self.broadcast_port.to_string();
                 if ui
@@ -1447,8 +1454,8 @@ impl PreferencesDialog {
 
         Self::list_row(
             ui,
-            "Stream Mount Point",
-            "Icecast mount path (e.g. /retraktor.mp3 or /live.ogg).",
+            "Mount path",
+            "Stream path on the server, such as /retraktor.mp3.",
             |ui| {
                 ui.add(egui::TextEdit::singleline(&mut self.broadcast_mount).desired_width(200.0));
             },
@@ -1456,8 +1463,8 @@ impl PreferencesDialog {
 
         Self::list_row(
             ui,
-            "Stream Source Password",
-            "Authentication password for the broadcast source client.",
+            "Password",
+            "Source password for your streaming server.",
             |ui| {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.broadcast_password)
@@ -1469,170 +1476,168 @@ impl PreferencesDialog {
     }
 
     fn show_browser_columns_prefs(&mut self, ui: &mut Ui) {
-        Self::list_section_header(ui, "LIBRARY METADATA COLUMNS & VIEW PRESETS");
+        Self::list_section_header(ui, "Columns");
 
         Self::list_row(
             ui,
-            "Quick Column Presets",
-            "Apply a preset column layout to the Track Collection browser table.",
+            "Column preset",
+            "Pick a starting set of columns for the track list.",
             |ui| {
-                if ui.button("Minimal Club View").clicked() {
+                if ui.button("Minimal").clicked() {
                     self.library_columns.set_all(false);
                     self.library_columns.bpm = true;
                     self.library_columns.key = true;
                     self.library_columns.stems = true;
                     self.library_columns.duration = true;
                 }
-                if ui.button("Show All Metadata Fields").clicked() {
+                if ui.button("All").clicked() {
                     self.library_columns.set_all(true);
                 }
-                if ui.button("Standard DJ View (Default)").clicked() {
+                if ui.button("Default").clicked() {
                     self.library_columns = LibraryColumnsConfig::default();
                 }
             },
         );
 
-        Self::list_section_header(ui, "VISIBLE METADATA FIELDS IN LIBRARY TABLE");
-
         Self::list_row(
             ui,
             "Album",
-            "Album or EP title (ID3 TALB / Vorbis ALBUM / NML ALBUM/@TITLE).",
+            "",
             |ui| {
-                ui.checkbox(&mut self.library_columns.album, "Show Column");
+                ui.checkbox(&mut self.library_columns.album, "").on_hover_text("Album");
             },
         );
         Self::list_row(
             ui,
-            "BPM (Tempo)",
-            "Detected or tag-stored beats per minute (ID3 TBPM / NML TEMPO/@BPM).",
+            "BPM",
+            "Tempo in beats per minute.",
             |ui| {
-                ui.checkbox(&mut self.library_columns.bpm, "Show Column");
+                ui.checkbox(&mut self.library_columns.bpm, "").on_hover_text("BPM");
             },
         );
         Self::list_row(
             ui,
-            "Musical Key",
-            "Harmonic key in Open Key, Camelot, or Musical notation (ID3 TKEY / NML MUSICAL_KEY).",
+            "Key",
+            "Musical key for harmonic mixing.",
             |ui| {
-                ui.checkbox(&mut self.library_columns.key, "Show Column");
+                ui.checkbox(&mut self.library_columns.key, "").on_hover_text("Key");
             },
         );
         Self::list_row(
             ui,
-            "Stems Status",
-            "4-Stem separation availability and 1-click AI Demucs separation trigger.",
+            "Stems",
+            "Shows whether stems are ready and lets you split a track.",
             |ui| {
-                ui.checkbox(&mut self.library_columns.stems, "Show Column");
+                ui.checkbox(&mut self.library_columns.stems, "").on_hover_text("Stems");
             },
         );
         Self::list_row(
             ui,
-            "Time (Duration)",
-            "Track playback length in MM:SS (NML INFO/@PLAYTIME).",
+            "Duration",
+            "Track length in minutes and seconds.",
             |ui| {
-                ui.checkbox(&mut self.library_columns.duration, "Show Column");
+                ui.checkbox(&mut self.library_columns.duration, "").on_hover_text("Duration");
             },
         );
         Self::list_row(
             ui,
             "Genre",
-            "Musical genre tag (ID3 TCON / Vorbis GENRE / NML INFO/@GENRE).",
+            "",
             |ui| {
-                ui.checkbox(&mut self.library_columns.genre, "Show Column");
+                ui.checkbox(&mut self.library_columns.genre, "").on_hover_text("Genre");
             },
         );
         Self::list_row(
             ui,
             "Rating",
-            "Track star rating 1–5 stars (ID3 POPM / NML INFO/@RANKING).",
+            "Star rating from 1 to 5.",
             |ui| {
-                ui.checkbox(&mut self.library_columns.rating, "Show Column");
+                ui.checkbox(&mut self.library_columns.rating, "").on_hover_text("Rating");
             },
         );
         Self::list_row(
             ui,
             "Comment",
-            "DJ notes, energy cues, and tag comments (ID3 COMM / Vorbis COMMENT / NML INFO/@COMMENT).",
+            "Your notes on the track.",
             |ui| {
-                ui.checkbox(&mut self.library_columns.comment, "Show Column");
+                ui.checkbox(&mut self.library_columns.comment, "").on_hover_text("Comment");
             },
         );
         Self::list_row(
             ui,
             "Remixer",
-            "Remix artist or producer credit (ID3 TPE4 / Vorbis REMIXER).",
+            "",
             |ui| {
-                ui.checkbox(&mut self.library_columns.remixer, "Show Column");
+                ui.checkbox(&mut self.library_columns.remixer, "").on_hover_text("Remixer");
             },
         );
         Self::list_row(
             ui,
-            "Label (Publisher)",
-            "Record label or imprint (ID3 TPUB / Vorbis LABEL / NML INFO/@PRODUCER).",
+            "Label",
+            "Record label.",
             |ui| {
-                ui.checkbox(&mut self.library_columns.label, "Show Column");
+                ui.checkbox(&mut self.library_columns.label, "").on_hover_text("Label");
             },
         );
         Self::list_row(
             ui,
-            "Year (Release Date)",
-            "Release year or date (ID3 TDRC / TYER / Vorbis DATE / NML INFO/@RELEASE_DATE).",
+            "Year",
+            "",
             |ui| {
-                ui.checkbox(&mut self.library_columns.year, "Show Column");
+                ui.checkbox(&mut self.library_columns.year, "").on_hover_text("Year");
             },
         );
         Self::list_row(
             ui,
-            "Bitrate (kbps)",
-            "Audio stream bitrate in kbps (e.g. 320 kbps, 1411 kbps — NML INFO/@BITRATE).",
+            "Bitrate",
+            "Audio quality in kbps.",
             |ui| {
-                ui.checkbox(&mut self.library_columns.bitrate, "Show Column");
+                ui.checkbox(&mut self.library_columns.bitrate, "").on_hover_text("Bitrate");
             },
         );
         Self::list_row(
             ui,
-            "Format (Codec)",
-            "Container and audio codec type (FLAC, MP3, WAV, AIFF, M4A, OGG).",
+            "Format",
+            "File type such as FLAC, MP3, or WAV.",
             |ui| {
-                ui.checkbox(&mut self.library_columns.format, "Show Column");
+                ui.checkbox(&mut self.library_columns.format, "").on_hover_text("Format");
             },
         );
         Self::list_row(
             ui,
-            "Track #",
-            "Album track number (ID3 TRCK / Vorbis TRACKNUMBER / NML ALBUM/@TRACK).",
+            "Track number",
+            "",
             |ui| {
-                ui.checkbox(&mut self.library_columns.track_number, "Show Column");
+                ui.checkbox(&mut self.library_columns.track_number, "").on_hover_text("Track number");
             },
         );
         Self::list_row(
             ui,
             "Energy",
-            "Perceived intensity 1–10 from track analysis (stored as NML INFO/@ENERGY).",
+            "Estimated dancefloor intensity from 1 to 10.",
             |ui| {
-                ui.checkbox(&mut self.library_columns.energy, "Show Column");
+                ui.checkbox(&mut self.library_columns.energy, "").on_hover_text("Energy");
             },
         );
     }
 
     fn show_analyze_prefs(&mut self, ui: &mut Ui) {
-        Self::list_section_header(ui, "TRACK ANALYZE OPTIONS & MUSICAL KEY NOTATION");
+        Self::list_section_header(ui, "Analysis");
 
         let ranges = [
-            "70 - 140 BPM (Standard House / Techno / Pop)",
-            "60 - 120 BPM (Downtempo / Hip-Hop / Reggae)",
-            "90 - 180 BPM (Drum & Bass / Jungle)",
-            "110 - 220 BPM (Hardcore / Speed Garage)",
+            "70–140 BPM (house, techno, pop)",
+            "60–120 BPM (hip-hop, downtempo)",
+            "90–180 BPM (drum & bass, jungle)",
+            "110–220 BPM (hardcore, fast)",
         ];
         Self::list_row(
             ui,
-            "BPM Detection Range",
-            "Constrain automatic tempo detection to avoid half/double-time octave errors.",
+            "BPM range",
+            "Expected tempo range so half-time and double-time tracks read accurately.",
             |ui| {
                 egui::ComboBox::from_id_salt("bpm_range_combo")
                     .selected_text(ranges[self.bpm_detection_range.min(3)])
-                    .width(290.0)
+                    .width(240.0)
                     .show_ui(ui, |ui| {
                         for (i, r) in ranges.iter().enumerate() {
                             ui.selectable_value(&mut self.bpm_detection_range, i, *r);
@@ -1642,18 +1647,18 @@ impl PreferencesDialog {
         );
 
         let keys = [
-            "Open Key (Traktor Standard: 1d..12d / 1m..12m)",
-            "Camelot Notation (8A / 8B Wheel)",
-            "Traditional Musical Key (Am, C, F#m)",
+            "Open Key (1d / 1m)",
+            "Camelot (8A / 8B)",
+            "Musical (Am, C)",
         ];
         Self::list_row(
             ui,
-            "Musical Key Display Notation",
-            "Choose how harmonic keys are formatted across Decks, Browser, and Match Radar.",
+            "Key format",
+            "How musical keys are written in the library and on the decks.",
             |ui| {
                 egui::ComboBox::from_id_salt("key_notation_combo")
                     .selected_text(keys[self.key_notation_idx.min(2)])
-                    .width(290.0)
+                    .width(220.0)
                     .show_ui(ui, |ui| {
                         for (i, k) in keys.iter().enumerate() {
                             ui.selectable_value(&mut self.key_notation_idx, i, *k);
@@ -1664,10 +1669,10 @@ impl PreferencesDialog {
 
         Self::list_row(
             ui,
-            "Auto-Analyze Imported Tracks",
-            "Automatically compute BPM, beatgrid transients, and musical key when adding files.",
+            "Analyse on import",
+            "Find BPM, beatgrid, and key automatically when you add files.",
             |ui| {
-                ui.checkbox(&mut self.analyze_new_tracks, "Enabled");
+                ui.checkbox(&mut self.analyze_new_tracks, "").on_hover_text("Analyse on import");
             },
         );
     }
@@ -1698,10 +1703,10 @@ impl PreferencesDialog {
             (
                 TraktorTheme::BG_PANEL(),
                 TraktorTheme::PLAY_ACTIVE(),
-                format!("● Traktor MX2 Connected ({})", self.mx2_connected_node.as_deref().unwrap_or("")),
+                format!("Connected: Traktor MX2 ({})", self.mx2_connected_node.as_deref().unwrap_or("")),
                 format!(
-                    "{} | {} Packets Received | NHL2 Reports 0x01/0x02/0x03 Active",
-                    self.mx2_access_status.as_deref().unwrap_or("Read/Write Active"),
+                    "{} · {} packets received",
+                    self.mx2_access_status.as_deref().unwrap_or("Read/write ready"),
                     self.mx2_packets_count
                 ),
             )
@@ -1709,15 +1714,15 @@ impl PreferencesDialog {
             (
                 TraktorTheme::BG_PANEL(),
                 TraktorTheme::METER_YELLOW(),
-                "⚠ Traktor Controller Detected — Permission Check Needed".to_string(),
+                "Controller detected — permission needed".to_string(),
                 status.clone(),
             )
         } else {
             (
                 TraktorTheme::BG_PANEL(),
                 TraktorTheme::BORDER_ACCENT(),
-                "○ No Traktor MX2 Controller Attached via USB".to_string(),
-                "Plug in the 15V DC power supply and connect via USB-C cable to auto-detect.".to_string(),
+                "No Traktor MX2 connected".to_string(),
+                "Plug in the 15V power adapter and connect the controller over USB-C.".to_string(),
             )
         };
 
@@ -1729,7 +1734,7 @@ impl PreferencesDialog {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(title_text).color(TraktorTheme::TEXT_PRIMARY()).strong());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("🔄 Rescan Hardware").clicked() {
+                        if ui.button("Rescan").clicked() {
                             self.trigger_rescan = true;
                         }
                     });
@@ -1740,20 +1745,20 @@ impl PreferencesDialog {
         ui.add_space(6.0);
 
         // 2. Hardware Checklist & Troubleshooting Card
-        egui::CollapsingHeader::new(RichText::new("⚙ Hardware Setup & Troubleshooting Guide").strong())
+        egui::CollapsingHeader::new(RichText::new("Setup and permissions").strong())
             .default_open(true)
             .show(ui, |ui| {
-                ui.label("• 🔌 Dedicated Power Supply: The Traktor MX2 requires the external 15V DC power adapter plugged into the back panel. USB-C bus power alone cannot power the audio DAC, platters, and RGB lighting.");
-                ui.label("• Native HID Mode vs MIDI Mode: If the unit is in MIDI mode, press and hold Left SHIFT + Right SHIFT together to switch back to Native HID mode.");
-                ui.label("• 🔒 Linux Permissions (udev): Requires /etc/udev/rules.d/60-retraktor-controllers.rules for non-root /dev/hidraw* read/write access.");
+                ui.label("Power: Plug the 15V DC adapter into the back of the MX2. USB-C alone cannot power the sound card, platters, and lights.");
+                ui.label("HID mode: If the controller is in MIDI mode, hold Left SHIFT and Right SHIFT together to switch back.");
+                ui.label("Linux permissions: Install the udev rule so ReTraktor can access the controller without root.");
                 ui.horizontal(|ui| {
-                    if ui.button("📋 Copy 1-Click udev Fix Command to Clipboard").clicked() {
+                    if ui.button("Copy udev setup command").clicked() {
                         let cmd = "sudo cp assets/99-retraktor-ni.rules /etc/udev/rules.d/60-retraktor-controllers.rules && sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=hidraw";
                         ui.output_mut(|o| o.copied_text = cmd.to_string());
                         self.udev_command_copied = true;
                     }
                     if self.udev_command_copied {
-                        ui.label(RichText::new("✔ Copied command to clipboard!").color(TraktorTheme::PLAY_ACTIVE()));
+                        ui.label(RichText::new("Copied to clipboard").color(TraktorTheme::PLAY_ACTIVE()));
                     }
                 });
             });
@@ -1762,10 +1767,10 @@ impl PreferencesDialog {
 
         // 3. Hardware Test & Verification Actions
         ui.horizontal(|ui| {
-            if ui.add(egui::Button::new(RichText::new("✨ Test Controller LEDs (Light Show)").strong())).clicked() {
+            if ui.add(egui::Button::new(RichText::new("Test lights").strong())).clicked() {
                 self.trigger_led_test = true;
             }
-            if ui.add(egui::Button::new(RichText::new("▶ Run 114-Control Automated Verification").strong())).clicked() {
+            if ui.add(egui::Button::new(RichText::new("Run self-test").strong())).clicked() {
                 self.trigger_self_test = true;
             }
         });
@@ -1777,9 +1782,9 @@ impl PreferencesDialog {
                 .stroke(Stroke::new(1.0_f32, TraktorTheme::PLAY_ACTIVE()))
                 .inner_margin(egui::Margin::symmetric(8.0, 4.0))
                 .show(ui, |ui| {
-                    ui.label(RichText::new("✔ Automated Hardware Protocol Verification Passed!").color(TraktorTheme::PLAY_ACTIVE()).strong());
+                    ui.label(RichText::new("Self-test passed").color(TraktorTheme::PLAY_ACTIVE()).strong());
                     ui.label(format!(
-                        "Tested: {} Buttons ({}), {} Encoders ({}), {} Pots/Faders ({}), {} Jogwheels ({}), {} LEDs ({})",
+                        "Buttons: {} ({}), encoders: {} ({}), knobs and faders: {} ({}), jog wheels: {} ({}), lights: {} ({})",
                         report.buttons_tested, report.buttons_passed,
                         report.encoders_tested, report.encoders_passed,
                         report.pots_faders_tested, report.pots_faders_passed,
@@ -1792,31 +1797,31 @@ impl PreferencesDialog {
         ui.add_space(6.0);
 
         // 4. Live HID Packet & Control Inspector
-        egui::CollapsingHeader::new(RichText::new("📡 Live HID Input & Control Monitor").strong())
+        egui::CollapsingHeader::new(RichText::new("Live input monitor").strong())
             .default_open(true)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     let r_id = self.mx2_last_report_id.map(|id| format!("0x{:02X}", id)).unwrap_or_else(|| "None".to_string());
-                    ui.label(RichText::new(format!("Last Report: {}", r_id)).monospace().color(TraktorTheme::DECK_A()));
-                    ui.label(RichText::new(format!("Total Packets: {}", self.mx2_packets_count)).monospace());
+                    ui.label(RichText::new(format!("Last report: {}", r_id)).monospace().color(TraktorTheme::DECK_A()));
+                    ui.label(RichText::new(format!("Packets: {}", self.mx2_packets_count)).monospace());
                 });
                 if let Some(ref hex) = self.mx2_last_hex {
-                    ui.label(RichText::new(format!("Raw Hex: {}", hex)).monospace().color(Color32::LIGHT_GRAY).font(egui::FontId::monospace(9.0)));
+                    ui.label(RichText::new(format!("Raw data: {}", hex)).monospace().color(Color32::LIGHT_GRAY).font(egui::FontId::monospace(9.0)));
                 }
                 if !self.mx2_recent_events.is_empty() {
-                    ui.label(RichText::new("Recent Control Events:").strong());
+                    ui.label(RichText::new("Recent events:").strong());
                     for ev in self.mx2_recent_events.iter().rev().take(4) {
-                        ui.label(RichText::new(format!("  • {}", ev)).monospace().color(TraktorTheme::PLAY_ACTIVE()).font(egui::FontId::monospace(9.5)));
+                        ui.label(RichText::new(format!("  {}", ev)).monospace().color(TraktorTheme::PLAY_ACTIVE()).font(egui::FontId::monospace(9.5)));
                     }
                 } else {
-                    ui.label(RichText::new("Touch any button, fader, knob, or jogwheel on the hardware to see live events here.").italics());
+                    ui.label(RichText::new("Move any button, knob, fader, or jog wheel on the controller to see input here.").italics());
                 }
             });
 
         ui.add_space(6.0);
 
         // 5. Detected Hardware Devices Table
-        ui.label(RichText::new("Discovered USB, HIDRAW & ALSA Devices:").strong());
+        ui.label(RichText::new("Connected audio and USB devices").strong());
         egui::ScrollArea::vertical()
             .id_salt("prefs_discovered_hw_scroll")
             .max_height(110.0)
@@ -1826,10 +1831,10 @@ impl PreferencesDialog {
                     .spacing(Vec2::new(10.0, 3.0))
                     .show(ui, |ui| {
                         ui.label(RichText::new("Type").color(TraktorTheme::TEXT_SECONDARY()).strong());
-                        ui.label(RichText::new("Device Node / Path").color(TraktorTheme::TEXT_SECONDARY()).strong());
-                        ui.label(RichText::new("Device Model").color(TraktorTheme::TEXT_SECONDARY()).strong());
-                        ui.label(RichText::new("VID:PID").color(TraktorTheme::TEXT_SECONDARY()).strong());
-                        ui.label(RichText::new("Access / Action").color(TraktorTheme::TEXT_SECONDARY()).strong());
+                        ui.label(RichText::new("Path").color(TraktorTheme::TEXT_SECONDARY()).strong());
+                        ui.label(RichText::new("Device").color(TraktorTheme::TEXT_SECONDARY()).strong());
+                        ui.label(RichText::new("ID").color(TraktorTheme::TEXT_SECONDARY()).strong());
+                        ui.label(RichText::new("Status").color(TraktorTheme::TEXT_SECONDARY()).strong());
                         ui.end_row();
 
                         for item in &self.discovered_hardware {
@@ -1848,16 +1853,16 @@ impl PreferencesDialog {
                                     retraktor_hid::DeviceAccessLevel::ReadWriteOk => {
                                         let is_cur = self.mx2_connected_node.as_ref() == Some(&item.identifier);
                                         if is_cur {
-                                            ui.label(RichText::new("✔ Active").color(TraktorTheme::PLAY_ACTIVE()).strong());
+                                            ui.label(RichText::new("Connected").color(TraktorTheme::PLAY_ACTIVE()).strong());
                                         } else if ui.button("Connect").clicked() {
                                             self.trigger_connect_node = Some(item.identifier.clone());
                                         }
                                     }
                                     retraktor_hid::DeviceAccessLevel::ReadOnlyOk => {
-                                        ui.label(RichText::new("Read-Only").color(TraktorTheme::METER_YELLOW()));
+                                        ui.label(RichText::new("Read-only").color(TraktorTheme::METER_YELLOW()));
                                     }
                                     retraktor_hid::DeviceAccessLevel::PermissionDenied => {
-                                        ui.label(RichText::new("Permission Denied").color(TraktorTheme::METER_RED()));
+                                        ui.label(RichText::new("Permission denied").color(TraktorTheme::METER_RED()));
                                     }
                                     _ => {
                                         ui.label("-");
@@ -1872,21 +1877,18 @@ impl PreferencesDialog {
             });
 
         ui.add_space(6.0);
-
-
-        ui.add_space(6.0);
         ui.horizontal(|ui| {
-            ui.label("MX2 Bottom-Shell LED Brightness:");
+            ui.label("Under-glow brightness");
             ui.add(egui::Slider::new(&mut self.mx2_bottom_led_brightness, 0.1..=1.0));
         });
     }
 
     fn show_file_management(&mut self, ui: &mut Ui) {
-        Self::list_section_header(ui, "COLLECTION");
+        Self::list_section_header(ui, "Collection");
         Self::list_row(
             ui,
             "Autosave",
-            "Your collection and playlists save automatically to ~/.local/share/retraktor/collection.nml (Traktor NML v20).",
+            "Your collection saves automatically to ~/.local/share/retraktor/collection.nml.",
             |ui| {
                 let mut m3u = self.collection_save_format == 2;
                 if ui.checkbox(&mut m3u, "Also export collection.m3u8 on exit").changed() {
@@ -1895,7 +1897,7 @@ impl PreferencesDialog {
             },
         );
 
-        Self::list_section_header(ui, "MUSIC FOLDERS WATCHLIST");
+        Self::list_section_header(ui, "Music folders");
 
         let mut to_remove = None;
         for (idx, folder) in self.music_folders.iter().enumerate() {
@@ -1903,7 +1905,7 @@ impl PreferencesDialog {
             Self::list_row(
                 ui,
                 &folder_str,
-                "Watched audio directory included in library scans.",
+                "",
                 |ui| {
                     if ui
                         .button(RichText::new("Remove").color(TraktorTheme::METER_RED()))
@@ -1920,8 +1922,8 @@ impl PreferencesDialog {
 
         Self::list_row(
             ui,
-            "Add a music folder",
-            "ReTraktor scans it for audio files and reads their tags.",
+            "Add folder",
+            "Choose a folder of music files to include in your library.",
             |ui| {
                 if ui.button("Choose folder…").clicked() {
                     self.request_folder_pick = true;
@@ -1929,40 +1931,40 @@ impl PreferencesDialog {
             },
         );
 
-        Self::list_section_header(ui, "SCAN & IMPORT OPTIONS");
+        Self::list_section_header(ui, "Scanning");
 
         Self::list_row(
             ui,
-            "Scan Music Folders on Startup",
-            "Look for new files in your music folders each time ReTraktor opens.",
+            "Scan on startup",
+            "Check your music folders for new tracks when ReTraktor opens.",
             |ui| {
-                ui.checkbox(&mut self.scan_on_startup, "Enabled");
+                ui.checkbox(&mut self.scan_on_startup, "").on_hover_text("Scan on startup");
             },
         );
 
         Self::list_row(
             ui,
-            "Auto-Analyze New Tracks",
-            "Detect BPM, key and energy for tracks found by a folder scan (existing values are kept).",
+            "Analyse new tracks",
+            "Detect BPM, musical key, and energy for newly added tracks.",
             |ui| {
-                ui.checkbox(&mut self.analyze_new_tracks, "Enabled");
+                ui.checkbox(&mut self.analyze_new_tracks, "").on_hover_text("Analyse new tracks");
             },
         );
 
         Self::list_row(
             ui,
-            "Manual Library Rescan",
+            "Rescan now",
             &self.file_management_status.clone(),
             |ui| {
                 if ui
                     .add(
                         egui::Button::new(
-                            RichText::new("Rescan All Music Folders")
+                            RichText::new("Rescan folders")
                                 .color(on_selected_text())
                                 .strong(),
                         )
                         .fill(TraktorTheme::ROW_SELECTED())
-                        .min_size(Vec2::new(200.0, 26.0)),
+                        .min_size(Vec2::new(150.0, 26.0)),
                     )
                     .clicked()
                 {
@@ -1973,12 +1975,12 @@ impl PreferencesDialog {
     }
 
     fn show_about(&mut self, ui: &mut Ui) {
-        Self::list_section_header(ui, "ABOUT RETRAKTOR");
+        Self::list_section_header(ui, "About");
 
         Self::list_row(
             ui,
             "Version",
-            "A personal DJ workstation for Linux that reads and writes Traktor collections.",
+            "Personal DJ app for Linux, compatible with Traktor libraries.",
             |ui| {
                 ui.label(
                     RichText::new(concat!("ReTraktor ", env!("CARGO_PKG_VERSION")))
@@ -1992,7 +1994,7 @@ impl PreferencesDialog {
         Self::list_row(
             ui,
             "Audio engine",
-            "Rust audio engine with live crossover stems; optional Demucs AI stem separation.",
+            "32-bit float audio with live frequency splitting and optional Demucs stems.",
             |ui| {
                 ui.label(RichText::new("Rust · 32-bit float").monospace());
             },
@@ -2001,7 +2003,7 @@ impl PreferencesDialog {
         Self::list_row(
             ui,
             "Library formats",
-            "Traktor .nml (v19/v20) in and out, .m3u8 playlists, rekordbox XML export, tags in every common audio format.",
+            "Reads and writes Traktor NML, M3U8 playlists, rekordbox XML, and standard audio tags.",
             |ui| {
                 ui.label(RichText::new("NML · M3U8 · rekordbox XML").monospace());
             },
@@ -2010,7 +2012,7 @@ impl PreferencesDialog {
         Self::list_row(
             ui,
             "Platform",
-            "Linux on Wayland or X11, with PipeWire or ALSA audio and direct USB controller access.",
+            "Linux on Wayland or X11 with PipeWire or ALSA audio.",
             |ui| {
                 ui.label(RichText::new(format!("Linux {}", std::env::consts::ARCH)).monospace());
             },
