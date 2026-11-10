@@ -488,9 +488,9 @@ pub fn eq_display(
         if response.dragged() {
             let delta = -response.drag_delta().y / (rect.height() * 0.65).max(30.0);
             let val = match b {
-                0 => eq_low,
-                1 => eq_mid,
-                _ => eq_hi,
+                0 => &mut *eq_low,
+                1 => &mut *eq_mid,
+                _ => &mut *eq_hi,
             };
             *val = (*val + delta).clamp(0.0, 1.0);
             response.mark_changed();
@@ -898,7 +898,7 @@ pub fn bar_counter(
     for b in 0..4usize {
         let bx = rect.left() + b as f32 * (block_w + gap);
         let block_rect = Rect::from_min_max(Pos2::new(bx, rect.top()), Pos2::new(bx + block_w, rect.bottom()));
-        let cols = 3usize;
+        let cols = ((block_w / 7.0) as usize).clamp(3, 12);
         let rows = 2usize;
         paint_dot_grid(painter, block_rect, cols, rows, 1.85, unlit, |c, _r| {
             if b == beat_in_bar {
@@ -929,7 +929,7 @@ pub fn phase_meter(
     accent: Color32,
     ink: Color32,
 ) {
-    let cols = 11usize;
+    let cols = ((rect.width() / 7.0) as usize).clamp(11, 41) | 1;
     let rows = 2usize;
     let half = (cols / 2) as isize;
     let center_col = cols / 2;

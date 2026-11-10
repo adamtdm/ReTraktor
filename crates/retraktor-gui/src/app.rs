@@ -574,6 +574,7 @@ impl ReTraktorApp {
                     self.drain_pending_loads();
                 }
             }
+            "playA" | "playB" if first => self.toggle_play(if step == "playA" { 1 } else { 2 }),
             "stemsA" => self.deck_stem_view[0] = true,
             "pattern" => self.show_pattern_player = true,
             "relocate" if first => self.library.start_relocate(self.preferences.music_folders.clone()),
@@ -1569,42 +1570,7 @@ impl ReTraktorApp {
             row(ui, 56.0, |ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
 
-                // ---- Left: Deck A strip (A | GAIN | FILTER | FX + ON/OFF) ----
-                let col_a = TraktorTheme::DECK_A();
-                deck_badge(ui, "A", col_a);
-                let gain_a_txt = dot::format_eq_db(self.channel_gain[0]);
-                dot::dot_ring(ui, "GAIN", &mut self.channel_gain[0], 0.5, false, &gain_a_txt, col_a, true)
-                    .on_hover_text(format!("Deck A input gain ({gain_a_txt} dB). {KNOB_TIP}"));
-
-                let fltr_a_txt = dot::format_filter_val(self.channel_filter[0], self.channel_filter_on[0]);
-                let fltr_a_resp = dot::dot_ring(
-                    ui,
-                    "FILTER",
-                    &mut self.channel_filter[0],
-                    0.5,
-                    true,
-                    &fltr_a_txt,
-                    col_a,
-                    self.channel_filter_on[0],
-                )
-                .on_hover_text(format!("Deck A filter (F to toggle, right-click to toggle). {KNOB_TIP}"));
-                if fltr_a_resp.changed() {
-                    self.channel_filter_on[0] = (self.channel_filter[0] - 0.5).abs() > 0.02;
-                }
-                if fltr_a_resp.secondary_clicked() {
-                    self.channel_filter_on[0] = !self.channel_filter_on[0];
-                }
-
-                let fx1_txt = format!("{}", (self.fx1_dry_wet * 100.0).round() as i32);
-                dot::dot_ring(ui, "FX", &mut self.fx1_dry_wet, 0.3, false, &fx1_txt, col_a, self.fx1_on)
-                    .on_hover_text(format!("Deck A FX dry/wet mix ({fx1_txt}%). {KNOB_TIP}"));
-                if dot::dot_lamp(ui, if self.fx1_on { "ON" } else { "OFF" }, self.fx1_on, col_a)
-                    .on_hover_text("Deck A FX unit on / off (D)")
-                    .clicked()
-                {
-                    self.fx1_on = !self.fx1_on;
-                }
-
+                self.deck_strip(ui, 0);
                 ui.separator();
 
                 // ---- Centre-left: compact layout tabs ----
@@ -1660,6 +1626,9 @@ impl ReTraktorApp {
                 // ---- Right: utilities + mirrored Deck B strip (ON/OFF + FX | FILTER | GAIN | B) ----
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
+                    // Same order in a right-to-left layout mirrors the strip.
+                    self.deck_strip(ui, 1);
+                    ui.separator();
 
                     if ui
                         .add(egui::Button::new(RichText::new("⚙").size(14.0)).min_size(Vec2::new(26.0, HIT)))
@@ -1677,7 +1646,7 @@ impl ReTraktorApp {
                     }
 
                     let main_txt = format!("{}", (self.master_volume * 100.0).round() as i32);
-                    dot::dot_ring(ui, "MAIN", &mut self.master_volume, 0.8, false, &main_txt, TraktorTheme::TEXT_PRIMARY(), true)
+                    dot::dot_ring(ui, &mut self.master_volume, 0.0, 1.0, 0.8, &main_txt, "MAIN", TraktorTheme::TEXT_PRIMARY(), true)
                         .on_hover_text(format!("Main output level ({main_txt}%). {KNOB_TIP}"));
 
                     let is_rec = self.audio.shared.lock().map(|s| s.is_recording).unwrap_or(false);
@@ -1745,46 +1714,35 @@ impl ReTraktorApp {
                         }
                     }
 
-                    ui.separator();
 
-                    // Mirrored Deck B strip: in right-to-left layout, add B first (rightmost), then GAIN, FILTER, FX, ON/OFF
-                    let col_b = TraktorTheme::DECK_B();
-                    deck_badge(ui, "B", col_b);
-                    let gain_b_txt = dot::format_eq_db(self.channel_gain[1]);
-                    dot::dot_ring(ui, "GAIN", &mut self.channel_gain[1], 0.5, false, &gain_b_txt, col_b, true)
-                        .on_hover_text(format!("Deck B input gain ({gain_b_txt} dB). {KNOB_TIP}"));
-
-                    let fltr_b_txt = dot::format_filter_val(self.channel_filter[1], self.channel_filter_on[1]);
-                    let fltr_b_resp = dot::dot_ring(
-                        ui,
-                        "FILTER",
-                        &mut self.channel_filter[1],
-                        0.5,
-                        true,
-                        &fltr_b_txt,
-                        col_b,
-                        self.channel_filter_on[1],
-                    )
-                    .on_hover_text(format!("Deck B filter (Shift+F to toggle, right-click to toggle). {KNOB_TIP}"));
-                    if fltr_b_resp.changed() {
-                        self.channel_filter_on[1] = (self.channel_filter[1] - 0.5).abs() > 0.02;
-                    }
-                    if fltr_b_resp.secondary_clicked() {
-                        self.channel_filter_on[1] = !self.channel_filter_on[1];
-                    }
-
-                    let fx2_txt = format!("{}", (self.fx2_dry_wet * 100.0).round() as i32);
-                    dot::dot_ring(ui, "FX", &mut self.fx2_dry_wet, 0.3, false, &fx2_txt, col_b, self.fx2_on)
-                        .on_hover_text(format!("Deck B FX dry/wet mix ({fx2_txt}%). {KNOB_TIP}"));
-                    if dot::dot_lamp(ui, if self.fx2_on { "ON" } else { "OFF" }, self.fx2_on, col_b)
-                        .on_hover_text("Deck B FX unit on / off (Shift+D)")
-                        .clicked()
-                    {
-                        self.fx2_on = !self.fx2_on;
-                    }
                 });
             });
         });
+    }
+
+    /// One deck's top-bar strip: letter, then GAIN, FILTER and FX as dot rings with the FX on/off lamp.
+    fn deck_strip(&mut self, ui: &mut Ui, d: usize) {
+        let col = TraktorTheme::deck_color(d + 1);
+        let letter = DECK_LETTERS[d];
+        let shift = if d == 1 { "Shift+" } else { "" };
+        deck_badge(ui, letter, col);
+        let gain_txt = dot::format_db(self.channel_gain[d], 0.5);
+        dot::dot_ring(ui, &mut self.channel_gain[d], 0.0, 1.0, 0.5, &gain_txt, "GAIN", col, true)
+            .on_hover_text(format!("Deck {letter} input gain. {KNOB_TIP}"));
+        let filter_txt = dot::format_filter_val(self.channel_filter[d], self.channel_filter_on[d]);
+        let filter = dot::dot_ring(ui, &mut self.channel_filter[d], 0.0, 1.0, 0.5, &filter_txt, "FILTER", col, self.channel_filter_on[d])
+            .on_hover_text(format!("Deck {letter} filter ({shift}F or right-click turns it on or off). {KNOB_TIP}"));
+        if filter.changed() {
+            self.channel_filter_on[d] = (self.channel_filter[d] - 0.5).abs() > 0.02;
+        }
+        if filter.secondary_clicked() {
+            self.channel_filter_on[d] ^= true;
+        }
+        let (mix, fx_on) = if d == 0 { (&mut self.fx1_dry_wet, &mut self.fx1_on) } else { (&mut self.fx2_dry_wet, &mut self.fx2_on) };
+        let fx_txt = format!("{}", (*mix * 100.0).round() as i32);
+        dot::dot_ring(ui, mix, 0.0, 1.0, 0.3, &fx_txt, "FX", col, *fx_on)
+            .on_hover_text(format!("Deck {letter} effect amount. {KNOB_TIP}"));
+        dot::dot_lamp(ui, fx_on, col, &format!("Deck {letter} effect on or off ({shift}D)"));
     }
 
     /// 16-step pattern player (drum machine locked to the master tempo).
@@ -1950,7 +1908,7 @@ impl ReTraktorApp {
         }
 
         ui.horizontal_top(|ui| {
-            let mixer_w = 320.0_f32;
+            let mixer_w = (ui.available_width() * 0.38).clamp(380.0, 560.0);
             let deck_w = ((ui.available_width() - mixer_w - 8.0) / 2.0).max(260.0);
             // Deck panels stretch to the mixer's height (from the previous frame) so the row has one bottom edge.
             let height_id = egui::Id::new("mix_row_height");
@@ -2249,20 +2207,46 @@ impl ReTraktorApp {
             });
 
             // 2. Display: the numbers read at arm's length, as large as the deck's width allows.
-            display(ui, |ui, ink| {
-                ui.spacing_mut().item_spacing.x = 14.0;
-                let advance = ui.fonts(|f| f.glyph_width(&crate::theme::dot_font(100.0), '0')) / 100.0;
-                let size = ((ui.available_width() - 3.0 * 14.0) / (20.0 * advance)).floor().clamp(18.0, 30.0);
-                let pitch_pct = self.deck_pitch_fader[d];
-                beat_lamp(ui, ink, deck.is_playing, deck.elapsed_sec - deck.grid_offset_sec, bpm);
-                readout(ui, "BPM", &format!("{:.2}", bpm * (1.0 + pitch_pct as f64 / 100.0)), size, ink);
-                readout(ui, "PITCH", &format!("{pitch_pct:+.1}%"), size, ink);
-                // A compatible key says so in words, not just in brightness.
-                readout(ui, if in_key { "IN KEY" } else { "KEY" }, &deck.key, size, ink);
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    readout(ui, "REMAIN", &deck.remaining(), size, ink);
+            // The other deck's beat position, for the phase meter (only while both play).
+            let phase = self.audio.shared.lock().ok().and_then(|state| {
+                let other = if d == 0 { 1 } else { 0 };
+                let beats = |i: usize| {
+                    let t = state.loaded_tracks[i].as_ref().filter(|_| state.is_playing[i])?;
+                    Some((state.playhead_sec[i] - t.grid_offset_sec) * t.bpm.max(20.0) / 60.0)
+                };
+                Some(beat_phase_diff(beats(other)?, beats(d)?))
+            });
+            let looping = crate::theme::fade(ui.ctx(), ("deck_loop", d), self.deck_loop_active[d]);
+            let panel_rect = display(ui, |ui, ink| {
+                ui.vertical(|ui| {
+                    // Beat strip: the bar counter sweeps with the music, the phase meter shows drift from the other deck.
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 12.0;
+                        let w = ui.available_width();
+                        let (bar, _) = ui.allocate_exact_size(Vec2::new((w - 12.0) * 0.62, 12.0), Sense::hover());
+                        dot::bar_counter(ui.painter(), bar, (deck.elapsed_sec - deck.grid_offset_sec) * bpm / 60.0, deck.is_playing, accent_color, ink);
+                        let (meter, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 12.0), Sense::hover());
+                        dot::phase_meter(ui.painter(), meter, phase, accent_color, ink);
+                        resp.on_hover_text("Beat phase against the other deck: centre means the beats are locked");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 14.0;
+                        let advance = ui.fonts(|f| f.glyph_width(&crate::theme::dot_font(100.0), '0')) / 100.0;
+                        let size = ((ui.available_width() - 3.0 * 14.0) / (20.0 * advance)).floor().clamp(16.0, 30.0);
+                        let pitch_pct = self.deck_pitch_fader[d];
+                        readout(ui, "BPM", &format!("{:.2}", bpm * (1.0 + pitch_pct as f64 / 100.0)), size, ink);
+                        readout(ui, "PITCH", &format!("{pitch_pct:+.1}%"), size, ink);
+                        // A compatible key says so in words, not just in brightness.
+                        readout(ui, if in_key { "IN KEY" } else { "KEY" }, &deck.key, size, ink);
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            readout(ui, "REMAIN", &deck.remaining(), size, ink);
+                        });
+                    });
                 });
             });
+            // A sweep of dots crosses the display when a track lands or a loop engages.
+            dot::paint_dot_wipe(ui.painter(), panel_rect, loaded_t, accent_color);
+            dot::paint_dot_wipe(ui.painter(), panel_rect, looping, accent_color);
 
             // 3. Sync, tempo master, stems; "MORE" discloses the performance pads.
             ui.horizontal(|ui| {
@@ -2474,188 +2458,76 @@ impl ReTraktorApp {
         });
     }
 
-    /// Centre mixer: knob-mode switch, channel strips, crossfader.
+    /// Centre mixer, mirrored around the main meter: per-deck dot display (EQ, or stems when the deck is in
+    /// stems view), fader-on-meter columns, and the dot-ribbon crossfader underneath.
     fn show_mixer_section(&mut self, ui: &mut Ui, two_channel_only: bool) {
+        // Live levels for the displays: band and stem peaks at the playhead, silent when stopped.
+        let mut bands = [[0.0f32; 3]; 4];
+        let mut stems = [[0.0f32; 4]; 4];
+        let (mut peaks, mut main) = ([0.0f32; 4], (0.0, 0.0));
+        if let Ok(state) = self.audio.shared.lock() {
+            peaks = state.channel_peaks;
+            main = (state.master_peak_l, state.master_peak_r);
+            for d in 0..4 {
+                if let (Some(t), true) = (&state.loaded_tracks[d], state.is_playing[d]) {
+                    let at = (state.playhead_sec[d].max(0.0) * PEAKS_PER_SEC as f64) as usize;
+                    bands[d] = t.waveform_peaks.get(at).copied().unwrap_or_default();
+                    stems[d] = t.stem_peaks.get(at).copied().unwrap_or_default();
+                }
+            }
+        }
+        let screen_h = ui.ctx().screen_rect().height();
+        let h = (132.0 + (screen_h - 640.0) * 0.25).clamp(132.0, 220.0);
+        const FADER_W: f32 = 44.0;
+        const MAIN_W: f32 = 34.0;
+        // shortcut: decks C and D get a fader but no EQ display, add one when a four-channel controller is mapped
+        let faders: &[usize] = if two_channel_only { &[0, 1] } else { &[0, 2, 3, 1] };
+
         panel(TraktorTheme::BG_PANEL_ALT()).show(ui, |ui| {
-            // What the three knobs per channel control.
             ui.horizontal(|ui| {
-                let neural = self.preferences.neural_mix_eq_mode;
-                ui.label(caps("KNOBS"));
-                for (label, selected, tip) in [
-                    ("EQ", !neural, "Knobs are a high / mid / low equaliser"),
-                    ("STEMS", neural, "Knobs are vocals / instruments / drums + bass levels"),
-                ] {
-                    if pill(ui, label, selected, TraktorTheme::ROW_SELECTED(), 52.0).on_hover_text(tip).clicked() && !selected {
-                        self.preferences.neural_mix_eq_mode = !neural;
+                ui.spacing_mut().item_spacing.x = 8.0;
+                let fixed = faders.len() as f32 * (FADER_W + 8.0) + MAIN_W + 8.0;
+                let display = Vec2::new(((ui.available_width() - fixed - 8.0) / 2.0).max(96.0), h);
+                self.mixer_display(ui, 0, false, bands[0], stems[0], display);
+                for (n, &ch) in faders.iter().enumerate() {
+                    if n == faders.len() / 2 {
+                        dot::dot_meter(ui, main.0, main.1, "MAIN", h, MAIN_W).on_hover_text("Main output level");
                     }
+                    dot::fader_meter(ui, &mut self.channel_volume[ch], peaks[ch], peaks[ch] * 0.94, &mut self.channel_cue[ch], TraktorTheme::deck_color(ch + 1), h, FADER_W)
+                        .on_hover_text(format!("Deck {} volume on its level meter. The lamp below is headphone cue.", DECK_LETTERS[ch]));
                 }
+                self.mixer_display(ui, 1, true, bands[1], stems[1], display);
             });
-
-            if two_channel_only {
-                ui.columns(2, |cols| {
-                    self.show_channel_strip(&mut cols[0], 0, true);
-                    self.show_channel_strip(&mut cols[1], 1, true);
-                });
-            } else {
-                // Same order as the decks either side: A, C | D, B.
-                ui.columns(4, |cols| {
-                    self.show_channel_strip(&mut cols[0], 0, false);
-                    self.show_channel_strip(&mut cols[1], 2, false);
-                    self.show_channel_strip(&mut cols[2], 3, false);
-                    self.show_channel_strip(&mut cols[3], 1, false);
-                });
-            }
-
-            ui.separator();
-            ui.horizontal(|ui| {
-                ui.label(caps("A"));
-                let w = (ui.available_width() - 20.0).max(90.0);
-                crossfader(ui, &mut self.crossfader_pos, w).on_hover_text(XFADER_TIP);
-                ui.label(caps("B"));
-            });
+            ui.add_space(4.0);
+            let w = ui.available_width();
+            dot::dot_crossfader(ui, &mut self.crossfader_pos, peaks[0], peaks[1], w).on_hover_text(XFADER_TIP);
         });
     }
 
-    /// One channel: header (deck, headphone cue), EQ or stem knobs, gain, filter, fader with meter and
-    /// crossfader side. `compact` (two-channel Mix) spreads the knobs over two columns to stay short.
-    fn show_channel_strip(&mut self, ui: &mut Ui, ch: usize, compact: bool) {
-        let accent = TraktorTheme::deck_color(ch + 1);
-        let knob_h = 33.0; // rotary_knob_sized(28) is 28 + 5 tall
-        let fader_h = 3.0 * knob_h + 2.0 * 2.0;
-
-        ui.horizontal(|ui| {
-            deck_badge(ui, DECK_LETTERS[ch.min(3)], accent);
-            if pill(ui, "CUE", self.channel_cue[ch], TraktorTheme::CUE_ACTIVE(), 36.0)
-                .on_hover_text("Headphone cue: hear this channel in the headphones")
-                .clicked()
-            {
-                self.channel_cue[ch] = !self.channel_cue[ch];
-            }
-            if compact {
-                ui.add_space((ui.available_width() - XFADER_ASSIGN_W).max(0.0));
-                self.xfader_assign(ui, ch);
-            }
-        });
-
-        ui.horizontal_top(|ui| {
-            ui.spacing_mut().item_spacing = Vec2::new(8.0, 2.0);
-            // Centre the knob and fader block in the strip.
-            let block_w = if compact { 28.0 + 8.0 + 28.0 + 8.0 + 38.0 } else { 28.0 + 8.0 + 38.0 };
-            ui.add_space(((ui.available_width() - block_w) / 2.0).max(0.0));
-
-            ui.vertical(|ui| {
-                self.band_knobs(ui, ch, accent);
-                if !compact {
-                    self.filter_knob(ui, ch);
-                }
-            });
-            if compact {
-                ui.vertical(|ui| {
-                    self.gain_knob(ui, ch, accent);
-                    ui.add_space(knob_h + 2.0);
-                    self.filter_knob(ui, ch);
-                });
-            }
-            ui.vertical(|ui| {
-                if !compact {
-                    self.gain_knob(ui, ch, accent);
-                }
-                ui.horizontal_top(|ui| {
-                    ui.spacing_mut().item_spacing.x = 4.0;
-                    vertical_fader(ui, &mut self.channel_volume[ch], 0.0, 1.0, accent, fader_h)
-                        .on_hover_text("Channel volume. Drag to adjust; double-click to reset");
-                    let peak = self.audio.shared.lock().map(|s| s.channel_peaks[ch]).unwrap_or(0.0);
-                    vu_meter(ui, peak, peak * 0.94, fader_h);
-                });
-            });
-        });
-
-        if !compact {
-            ui.horizontal(|ui| {
-                ui.add_space(((ui.available_width() - XFADER_ASSIGN_W) / 2.0).max(0.0));
-                self.xfader_assign(ui, ch);
-            });
-        }
-    }
-
-    /// The three knobs that are either the EQ or, in stems mode, stem levels. Right-click cuts or mutes;
-    /// the label then says so, so the state does not rest on the arc colour alone.
-    fn band_knobs(&mut self, ui: &mut Ui, ch: usize, accent: Color32) {
-        let off = TraktorTheme::METER_RED();
-        if self.preferences.neural_mix_eq_mode {
-            for (s, label, name) in [(3usize, "VOC", "Vocals level"), (2usize, "INST", "Instruments level")] {
-                let muted = self.deck_stem_muted[ch][s];
-                let (label, col) = if muted { ("MUTE", off) } else { (label, accent) };
-                if rotary_knob_sized(ui, &mut self.deck_stem_volumes[ch][s], 0.0, 1.0, 1.0, label, col, 28.0)
-                    .on_hover_text(format!("{name}. {KNOB_TIP} Right-click to mute"))
-                    .secondary_clicked()
-                {
-                    self.deck_stem_muted[ch][s] = !muted;
-                }
-            }
-            let mut level = (self.deck_stem_volumes[ch][0] + self.deck_stem_volumes[ch][1]) * 0.5;
-            let muted = self.deck_stem_muted[ch][0] && self.deck_stem_muted[ch][1];
-            let (label, col) = if muted { ("MUTE", off) } else { ("D+B", accent) };
-            let resp = rotary_knob_sized(ui, &mut level, 0.0, 1.0, 1.0, label, col, 28.0)
-                .on_hover_text(format!("Drums and bass level. {KNOB_TIP} Right-click to mute"));
-            if resp.changed() {
-                self.deck_stem_volumes[ch][0] = level;
-                self.deck_stem_volumes[ch][1] = level;
-            }
-            if resp.secondary_clicked() {
-                self.deck_stem_muted[ch][0] = !muted;
-                self.deck_stem_muted[ch][1] = !muted;
-            }
+    fn mixer_display(&mut self, ui: &mut Ui, d: usize, mirrored: bool, bands: [f32; 3], stems: [f32; 4], size: Vec2) {
+        let accent = TraktorTheme::deck_color(d + 1);
+        if self.deck_stem_view[d] {
+            let progress = self.library.stem_job_progress.filter(|(id, _)| self.deck_track_ids[d] == Some(*id)).map(|(_, p)| p);
+            dot::stem_display(ui, d, &mut self.deck_stem_muted[d], &mut self.deck_stem_fx_send[d], stems, progress, mirrored, accent, size)
+                .on_hover_text("Stems: click one to turn it on or off");
         } else {
-            for (label, name, value, cut) in [
-                ("HI", "High EQ", &mut self.channel_eq_hi[ch], &mut self.eq_kill_hi[ch]),
-                ("MID", "Mid EQ", &mut self.channel_eq_mid[ch], &mut self.eq_kill_mid[ch]),
-                ("LOW", "Low EQ", &mut self.channel_eq_low[ch], &mut self.eq_kill_low[ch]),
-            ] {
-                let (label, col) = if *cut { ("CUT", off) } else { (label, accent) };
-                if rotary_knob_sized(ui, value, 0.0, 1.0, 0.5, label, col, 28.0)
-                    .on_hover_text(format!("{name}. {KNOB_TIP} Right-click to cut"))
-                    .secondary_clicked()
-                {
-                    *cut = !*cut;
-                }
-            }
+            dot::eq_display(
+                ui,
+                &mut self.channel_eq_low[d],
+                &mut self.channel_eq_mid[d],
+                &mut self.channel_eq_hi[d],
+                &mut self.eq_kill_low[d],
+                &mut self.eq_kill_mid[d],
+                &mut self.eq_kill_hi[d],
+                bands,
+                self.channel_filter[d],
+                self.channel_filter_on[d],
+                mirrored,
+                accent,
+                size,
+            )
+            .on_hover_text("Equaliser: drag a band up or down, right-click to cut it");
         }
-    }
-
-    fn gain_knob(&mut self, ui: &mut Ui, ch: usize, accent: Color32) {
-        rotary_knob_sized(ui, &mut self.channel_gain[ch], 0.0, 1.0, 0.5, "GAIN", accent, 28.0)
-            .on_hover_text(format!("Input gain. {KNOB_TIP}"));
-    }
-
-    /// The filter engages as soon as its knob leaves the centre.
-    fn filter_knob(&mut self, ui: &mut Ui, ch: usize) {
-        let col = if self.channel_filter_on[ch] { TraktorTheme::ACCENT() } else { TraktorTheme::TEXT_MUTED() };
-        if rotary_knob_sized(ui, &mut self.channel_filter[ch], 0.0, 1.0, 0.5, "FLTR", col, 28.0)
-            .on_hover_text(format!("Filter: left of centre cuts highs, right cuts lows. {KNOB_TIP}"))
-            .changed()
-        {
-            self.channel_filter_on[ch] = (self.channel_filter[ch] - 0.5).abs() > 0.02;
-        }
-    }
-
-    /// Which side of the crossfader this channel sits on.
-    fn xfader_assign(&mut self, ui: &mut Ui, ch: usize) {
-        ui.scope(|ui| {
-            ui.spacing_mut().item_spacing.x = 2.0;
-            for (label, val, tip) in [
-                ("A", 0usize, "Crossfader side A (left)"),
-                ("T", 1usize, "Thru: bypass the crossfader"),
-                ("B", 2usize, "Crossfader side B (right)"),
-            ] {
-                if pill(ui, label, self.channel_xfader_assign[ch] == val, TraktorTheme::ROW_SELECTED(), HIT)
-                    .on_hover_text(tip)
-                    .clicked()
-                {
-                    self.channel_xfader_assign[ch] = val;
-                }
-            }
-        });
     }
 
     fn show_browser_panel(&mut self, ui: &mut Ui) {
@@ -2857,26 +2729,15 @@ fn empty_deck_hint(ui: &mut Ui, letter: &str, accent: Color32, hint: &str) {
 
 /// Dark inset holding dot-matrix readouts, like the display window on a piece of hardware.
 /// `add_contents` gets the ink colour that reads on it.
-fn display(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui, Color32)) {
+fn display(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui, Color32)) -> egui::Rect {
     let bg = TraktorTheme::WAVEFORM_BG();
     egui::Frame::none()
         .fill(bg)
         .rounding(3.0)
         .inner_margin(egui::Margin::symmetric(8.0, 3.0))
-        .show(ui, |ui| ui.horizontal(|ui| add_contents(ui, on(bg))));
-}
-
-/// Beat lamp: flashes on every beat while the deck plays; a hollow ring when stopped,
-/// so the state reads without colour or motion.
-fn beat_lamp(ui: &mut Ui, ink: Color32, playing: bool, position_sec: f64, bpm: f64) {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(10.0, 28.0), Sense::hover());
-    let centre = rect.center();
-    if playing {
-        ui.painter().circle_filled(centre, 4.0, ink.gamma_multiply(crate::theme::beat_pulse(position_sec, bpm)));
-    } else {
-        ui.painter().circle_stroke(centre, 3.5, Stroke::new(1.2_f32, ink.gamma_multiply(0.6)));
-    }
-    resp.on_hover_text(if playing { "Playing — flashes on the beat" } else { "Stopped" });
+        .show(ui, |ui| ui.horizontal(|ui| add_contents(ui, on(bg))))
+        .response
+        .rect
 }
 
 /// A number glanced at mid-mix: small caps label over the value in the dot-matrix face.
