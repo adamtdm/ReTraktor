@@ -275,6 +275,22 @@ impl Default for ReTraktorApp {
     }
 }
 
+/// Maps action ids saved by older builds to the current `verb:deck[:arg]` form.
+fn legacy_action(a: &str) -> String {
+    let deck = |s: &str| if s.ends_with("_a") { 1 } else { 2 };
+    match a {
+        "play_deck_a" | "play_deck_b" => format!("play:{}", deck(a)),
+        "cue_deck_a" | "cue_deck_b" => format!("cue:{}", deck(a)),
+        "sync_deck_a" | "sync_deck_b" => format!("sync:{}", deck(a)),
+        "stem_mute_drums_a" => "stem:1:1".into(),
+        "stem_mute_bass_a" => "stem:1:2".into(),
+        "stem_mute_inst_a" => "stem:1:3".into(),
+        "stem_mute_vocals_a" => "stem:1:4".into(),
+        "filter_toggle_a" | "filter_toggle_b" => format!("filter_on:{}", deck(a)),
+        other => other.to_string(),
+    }
+}
+
 impl eframe::App for ReTraktorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Request 60 FPS continuous repaint for smooth scrolling waveforms and VU meters
@@ -400,7 +416,7 @@ impl eframe::App for ReTraktorApp {
         self.jog_scratch_sensitivity = self.preferences.jog_scratch_sensitivity;
         self.deck_turntable_mode[0] = self.preferences.jog_mode_turntable;
         self.deck_turntable_mode[1] = self.preferences.jog_mode_turntable;
-        self.custom_mappings = self.preferences.custom_control_action.clone();
+        self.custom_mappings = self.preferences.mapping.action.clone();
 
         // Demucs background installer & separation worker synchronization
         self.preferences.demucs_install_state = self.demucs.get_install_state();
@@ -517,6 +533,7 @@ impl ReTraktorApp {
             "prefs" => self.preferences.is_open = true,
             "noprefs" => self.preferences.is_open = false,
             "expandA" => self.deck_expanded[0] = true,
+            s if s.starts_with("select:") => self.preferences.mapper.selected = Some(s[7..].to_string()),
             s if s.starts_with("prefs:") => {
                 self.preferences.is_open = true;
                 if let Some((_, tabs)) = PreferencesDialog::GROUPS.iter().find(|(name, _)| name.replace(' ', "") == s[6..]) {
@@ -561,6 +578,71 @@ impl ReTraktorApp {
             if let Err(e) = write() {
                 eprintln!("screenshot {name}: {e}");
             }
+        }
+    }
+
+    /// Executes a mapped button action (`play:1`, `hotcue:2:5`, …). Unknown verbs are ignored.
+    fn run_button_action(&mut self, verb: &str, deck: usize, arg: &str) {
+        let d = deck.clamp(1, 4) - 1;
+        let n: usize = arg.parse().unwrap_or(1);
+        match verb {
+            "play" => self.toggle_play(deck),
+            "cue" => self.jump_to_cue(deck, 1),
+            "cueplay" => {
+                self.jump_to_cue(deck, 1);
+                if let Ok(mut st) = self.audio.shared.lock() {
+                    st.is_playing[d] = true;
+                }
+            }
+            "sync" => self.sync_deck(deck),
+            "flux" => self.deck_flux_active[d] = !self.deck_flux_active[d],
+            "loop" => self.toggle_loop(deck),
+            "loop_half" => self.deck_loop_size_beats[d] = (self.deck_loop_size_beats[d] / 2).max(1),
+            "loop_double" => self.deck_loop_size_beats[d] = (self.deck_loop_size_beats[d] * 2).min(32),
+            "hotcue" => self.jump_to_cue(deck, n.clamp(1, 8) as u8),
+            "stem" => self.deck_stem_muted[d][n.clamp(1, 4) - 1] ^= true,
+            "stem_view" => self.deck_stem_view[d] ^= true,
+            "pads" => {
+                self.deck_pad_mode[d] = match arg {
+                    "stems" => DeckPadMode::Stems,
+                    "pattern" => DeckPadMode::Pattern,
+                    "loop" => DeckPadMode::FluxLoop,
+                    _ => DeckPadMode::Hotcues,
+                }
+            }
+            "load" => {
+                if let Some(id) = self.library.selected_track_id {
+                    let locked = self.locked_decks();
+                    self.library.load_to_deck(deck, id, locked);
+                    self.drain_pending_loads();
+                }
+            }
+            "browse_down" => self.library.select_next_track(),
+            "browse_up" => self.library.select_prev_track(),
+            "filter_on" => self.channel_filter_on[d] ^= true,
+            "headphone" => self.channel_cue[d] ^= true,
+            "fx_on" if deck == 2 => self.fx2_on ^= true,
+            "fx_on" => self.fx1_on ^= true,
+            _ => {}
+        }
+    }
+
+    /// Applies a mapped knob/fader value (0..=1).
+    fn set_mapped_value(&mut self, target: &str, deck: usize, v: f32) {
+        let d = deck.clamp(1, 4) - 1;
+        match target {
+            "volume" => self.channel_volume[d] = v,
+            "gain" => self.channel_gain[d] = v,
+            "eq_hi" => self.channel_eq_hi[d] = v,
+            "eq_mid" => self.channel_eq_mid[d] = v,
+            "eq_low" => self.channel_eq_low[d] = v,
+            "filter" => self.channel_filter[d] = v,
+            "pitch" => self.deck_pitch_fader[d] = v * 16.0 - 8.0,
+            "xfader" => self.crossfader_pos = v,
+            "master_volume" => self.master_volume = v,
+            "fx_mix" if deck == 2 => self.fx2_dry_wet = v,
+            "fx_mix" => self.fx1_dry_wet = v,
+            _ => {}
         }
     }
 
@@ -885,28 +967,29 @@ impl ReTraktorApp {
     }
 
     pub fn apply_mx2_surface_event(&mut self, ev: SurfaceEvent) {
-        // Check for user custom mapping override first
-        let custom_action = match &ev {
-            SurfaceEvent::Button { control, pressed: true } => self.custom_mappings.get(control).cloned(),
-            SurfaceEvent::Fader { control, .. } => self.custom_mappings.get(control).cloned(),
+        let touched = match &ev {
+            SurfaceEvent::Button { control, pressed: true } => Some(control.clone()),
+            SurfaceEvent::Fader { control, .. } => Some(control.clone()),
             _ => None,
         };
-        if let Some(action) = custom_action {
-            match action.as_str() {
-                "play_deck_a" => { self.toggle_play(1); return; }
-                "play_deck_b" => { self.toggle_play(2); return; }
-                "cue_deck_a" => { self.jump_to_cue(1, 1); return; }
-                "cue_deck_b" => { self.jump_to_cue(2, 1); return; }
-                "sync_deck_a" => { self.sync_deck(1); return; }
-                "sync_deck_b" => { self.sync_deck(2); return; }
-                "stem_mute_drums_a" => { self.deck_stem_muted[0][0] = !self.deck_stem_muted[0][0]; return; }
-                "stem_mute_bass_a" => { self.deck_stem_muted[0][1] = !self.deck_stem_muted[0][1]; return; }
-                "stem_mute_inst_a" => { self.deck_stem_muted[0][2] = !self.deck_stem_muted[0][2]; return; }
-                "stem_mute_vocals_a" => { self.deck_stem_muted[0][3] = !self.deck_stem_muted[0][3]; return; }
-                "filter_toggle_a" => { self.channel_filter_on[0] = !self.channel_filter_on[0]; return; }
-                "filter_toggle_b" => { self.channel_filter_on[1] = !self.channel_filter_on[1]; return; }
-                _ => {}
+        if let Some(t) = touched {
+            self.preferences.last_surface_control = Some(t);
+        }
+        // User mapping overrides the built-in behaviour.
+        use crate::controller_map::{parse, Mapped};
+        let mapped = match &ev {
+            SurfaceEvent::Button { control, pressed } => self.custom_mappings.get(control).and_then(|a| parse(&legacy_action(a), false)).map(|m| (m, *pressed, 0.0)),
+            SurfaceEvent::Fader { control, value } => self.custom_mappings.get(control).and_then(|a| parse(a, true)).map(|m| (m, true, *value as f32)),
+            _ => None,
+        };
+        if let Some((m, pressed, v)) = mapped {
+            match m {
+                Mapped::Nothing => {}
+                Mapped::Button { .. } if !pressed => {}
+                Mapped::Button { verb, deck, arg } => self.run_button_action(&verb, deck, &arg),
+                Mapped::Value { target, deck } => self.set_mapped_value(&target, deck, v),
             }
+            return;
         }
 
         let neural_eq = self.preferences.neural_mix_eq_mode;
