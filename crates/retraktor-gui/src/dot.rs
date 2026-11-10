@@ -1774,6 +1774,149 @@ pub fn paint_dot_wipe(painter: &Painter, rect: Rect, wipe_progress: f32, accent:
     }
 }
 
+/// Pure helper: returns normalized `(deck_a_level, deck_b_level)` (`0.0..=1.0`) across a transition
+/// for progress `t` in `0.0..=1.0`.
+/// - `0`: Crossfade (linear falling / rising)
+/// - `1`: Bass Swap (deck A drops bass sharply around the midpoint, deck B brings bass in)
+/// - `2`: Vocal Bridge (deck B instrumental enters early, deck A vocal lingers through the bridge)
+pub fn transition_curve_points(preset_idx: usize, progress: f32) -> (f32, f32) {
+    let t = progress.clamp(0.0, 1.0);
+    match preset_idx {
+        0 => (1.0 - t, t),
+        1 => {
+            if t < 0.45 {
+                (1.0, 0.0)
+            } else if t > 0.55 {
+                (0.0, 1.0)
+            } else {
+                let frac = (t - 0.45) / 0.10;
+                (1.0 - frac, frac)
+            }
+        }
+        _ => {
+            let a = if t < 0.6 {
+                1.0
+            } else {
+                (1.0 - (t - 0.6) / 0.4).clamp(0.0, 1.0)
+            };
+            let b = if t < 0.4 {
+                (t / 0.4).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            (a, b)
+        }
+    }
+}
+
+/// Compact dot-matrix transition curve display showing:
+/// - Deck A falling curve in DECK_A colour
+/// - Deck B rising curve in DECK_B colour
+/// - Live crossfader cursor tracking `crossfader_pos`
+/// - Bar division ticks corresponding to `bars` (8, 16, 32)
+/// - Wipe overlay animation when `wipe_progress` is in 0.01..0.99
+pub fn dot_transition_display(
+    ui: &mut Ui,
+    preset_idx: usize,
+    bars: u32,
+    crossfader_pos: f32,
+    wipe_progress: f32,
+    size: Vec2,
+) -> Response {
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click_and_drag());
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+
+    let painter = ui.painter();
+    let bg = TraktorTheme::WAVEFORM_BG();
+    painter.rect(rect, 3.0, bg, Stroke::new(1.0_f32, TraktorTheme::BORDER_COLOR()));
+
+    let col_a = visible_on_inset(TraktorTheme::DECK_A());
+    let col_b = visible_on_inset(TraktorTheme::DECK_B());
+    let top_y = rect.top() + 4.0;
+    painter.text(Pos2::new(rect.left() + 8.0, top_y), Align2::LEFT_TOP, "A", theme::dot_font(11.0), col_a);
+    painter.text(Pos2::new(rect.right() - 8.0, top_y), Align2::RIGHT_TOP, "B", theme::dot_font(11.0), col_b);
+
+    let preset_name = match preset_idx {
+        0 => "CROSSFADE",
+        1 => "BASS SWAP",
+        _ => "VOCAL BRIDGE",
+    };
+    let center_label = format!("{preset_name}  ·  {bars} BARS");
+    painter.text(
+        Pos2::new(rect.center().x, top_y + 1.0),
+        Align2::CENTER_TOP,
+        &center_label,
+        FontId::proportional(9.0),
+        TraktorTheme::TEXT_MUTED(),
+    );
+
+    let grid_rect = Rect::from_min_max(
+        Pos2::new(rect.left() + 22.0, rect.top() + 16.0),
+        Pos2::new(rect.right() - 22.0, rect.bottom() - 4.0),
+    );
+
+    let cols = 32usize;
+    let rows = 6usize;
+    let unlit = unlit_on_inset();
+    let cursor_col = ((crossfader_pos.clamp(0.0, 1.0) * (cols - 1) as f32).round() as usize).min(cols - 1);
+    let highlight = TraktorTheme::TEXT_HIGHLIGHT();
+
+    paint_dot_grid(painter, grid_rect, cols, rows, 1.8, unlit, |c, r| {
+        let is_cursor = c == cursor_col;
+
+        let t_mid = c as f32 / (cols - 1) as f32;
+        let t_lo = (c as f32 - 0.5).max(0.0) / (cols - 1) as f32;
+        let t_hi = (c as f32 + 0.5).min((cols - 1) as f32) / (cols - 1) as f32;
+
+        let (a_lo, b_lo) = transition_curve_points(preset_idx, t_lo);
+        let (a_mid, b_mid) = transition_curve_points(preset_idx, t_mid);
+        let (a_hi, b_hi) = transition_curve_points(preset_idx, t_hi);
+
+        let min_a = ((a_lo.min(a_mid).min(a_hi) * (rows - 1) as f32).round() as usize).min(rows - 1);
+        let max_a = ((a_lo.max(a_mid).max(a_hi) * (rows - 1) as f32).round() as usize).min(rows - 1);
+        let in_a = r >= min_a && r <= max_a;
+
+        let min_b = ((b_lo.min(b_mid).min(b_hi) * (rows - 1) as f32).round() as usize).min(rows - 1);
+        let max_b = ((b_lo.max(b_mid).max(b_hi) * (rows - 1) as f32).round() as usize).min(rows - 1);
+        let in_b = r >= min_b && r <= max_b;
+
+        if is_cursor {
+            if in_a && in_b {
+                DotCell::Filled(highlight)
+            } else if in_a {
+                DotCell::Filled(col_a)
+            } else if in_b {
+                DotCell::Filled(col_b)
+            } else {
+                DotCell::Scaled(TraktorTheme::TEXT_PRIMARY(), 0.75)
+            }
+        } else if in_a && in_b {
+            DotCell::Filled(theme::mix(col_a, col_b, 0.5))
+        } else if in_a {
+            DotCell::Filled(col_a)
+        } else if in_b {
+            DotCell::Filled(col_b)
+        } else {
+            let phrase_step = match bars {
+                8 => 4,
+                16 => 2,
+                _ => 1,
+            };
+            if r == 0 && c % phrase_step == 0 {
+                DotCell::Scaled(TraktorTheme::TEXT_MUTED(), 0.5)
+            } else {
+                DotCell::Unlit
+            }
+        }
+    });
+
+    paint_dot_wipe(painter, grid_rect, wipe_progress, TraktorTheme::ACCENT());
+
+    response
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1871,5 +2014,40 @@ mod tests {
         assert!(hop1 >= 2 && hop1 <= 5, "hop1 was {hop1}");
         let hop2 = bounce_dot_offset(0.48, 0.6, 5);
         assert!(hop2 >= 0 && hop2 <= 2, "hop2 was {hop2}");
+    }
+
+    #[test]
+    fn transition_curve_points_follow_dj_presets() {
+        // Crossfade
+        let (a0, b0) = transition_curve_points(0, 0.0);
+        assert!((a0 - 1.0).abs() < 1e-5);
+        assert!(b0.abs() < 1e-5);
+
+        let (a_mid, b_mid) = transition_curve_points(0, 0.5);
+        assert!((a_mid - 0.5).abs() < 1e-5);
+        assert!((b_mid - 0.5).abs() < 1e-5);
+
+        let (a1, b1) = transition_curve_points(0, 1.0);
+        assert!(a1.abs() < 1e-5);
+        assert!((b1 - 1.0).abs() < 1e-5);
+
+        // Bass swap
+        let (a_bs_early, b_bs_early) = transition_curve_points(1, 0.3);
+        assert_eq!((a_bs_early, b_bs_early), (1.0, 0.0));
+        let (a_bs_mid, b_bs_mid) = transition_curve_points(1, 0.5);
+        assert!((a_bs_mid - 0.5).abs() < 1e-5);
+        assert!((b_bs_mid - 0.5).abs() < 1e-5);
+        let (a_bs_late, b_bs_late) = transition_curve_points(1, 0.7);
+        assert_eq!((a_bs_late, b_bs_late), (0.0, 1.0));
+
+        // Vocal bridge
+        let (a_vb_early, b_vb_early) = transition_curve_points(2, 0.2);
+        assert_eq!(a_vb_early, 1.0);
+        assert!((b_vb_early - 0.5).abs() < 1e-5);
+        let (a_vb_mid, b_vb_mid) = transition_curve_points(2, 0.5);
+        assert_eq!((a_vb_mid, b_vb_mid), (1.0, 1.0)); // Overlap plateau
+        let (a_vb_late, b_vb_late) = transition_curve_points(2, 0.8);
+        assert!((a_vb_late - 0.5).abs() < 1e-5);
+        assert_eq!(b_vb_late, 1.0);
     }
 }
