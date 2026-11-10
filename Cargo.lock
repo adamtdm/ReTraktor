@@ -2957,7 +2957,7 @@ checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 
 [[package]]
 name = "retraktor-audio"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "retraktor-core",
  "retraktor-dsp",
@@ -2965,7 +2965,7 @@ dependencies = [
 
 [[package]]
 name = "retraktor-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "crossterm",
  "retraktor-audio",
@@ -2979,25 +2979,25 @@ dependencies = [
 
 [[package]]
 name = "retraktor-core"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "retraktor-dsp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "retraktor-formats",
 ]
 
 [[package]]
 name = "retraktor-formats"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "retraktor-core",
 ]
 
 [[package]]
 name = "retraktor-gui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cpal",
  "eframe",
@@ -3016,7 +3016,7 @@ dependencies = [
 
 [[package]]
 name = "retraktor-hid"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "retraktor-core",
  "retraktor-formats",
@@ -3024,7 +3024,7 @@ dependencies = [
 
 [[package]]
 name = "retraktor-library"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "retraktor-core",
  "retraktor-formats",

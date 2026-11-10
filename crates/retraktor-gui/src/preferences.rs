@@ -1973,15 +1973,15 @@ impl PreferencesDialog {
     }
 
     fn show_about(&mut self, ui: &mut Ui) {
-        Self::list_section_header(ui, "SYSTEM & APPLICATION DIAGNOSTICS");
+        Self::list_section_header(ui, "ABOUT RETRAKTOR");
 
         Self::list_row(
             ui,
-            "Application Version",
-            "Clean-Room Linux Re-Implementation of Traktor Pro 4.",
+            "Version",
+            "A personal DJ workstation for Linux that reads and writes Traktor collections.",
             |ui| {
                 ui.label(
-                    RichText::new("ReTraktor Pro 4.5.1")
+                    RichText::new(concat!("ReTraktor ", env!("CARGO_PKG_VERSION")))
                         .color(TraktorTheme::DECK_A())
                         .font(egui::FontId::monospace(12.0))
                         .strong(),
@@ -1991,28 +1991,28 @@ impl PreferencesDialog {
 
         Self::list_row(
             ui,
-            "Audio & DSP Architecture",
-            "Zero-allocation real-time callback with 4-stem Linkwitz-Riley crossover and Demucs AI.",
+            "Audio engine",
+            "Rust audio engine with live crossover stems; optional Demucs AI stem separation.",
             |ui| {
-                ui.label(RichText::new("Pure Rust • 64-bit / 32-bit Float DSP").monospace());
+                ui.label(RichText::new("Rust · 32-bit float").monospace());
             },
         );
 
         Self::list_row(
             ui,
-            "Library & Collection Formats",
-            "Lossless round-trip support for Traktor .nml (v19/v20), .tsi, .stem.m4a, and Extended .m3u8.",
+            "Library formats",
+            "Traktor .nml (v19/v20) in and out, .m3u8 playlists, rekordbox XML export, tags in every common audio format.",
             |ui| {
-                ui.label(RichText::new("NML v20 • M3U8 • Symphonia Tags").monospace());
+                ui.label(RichText::new("NML · M3U8 · rekordbox XML").monospace());
             },
         );
 
         Self::list_row(
             ui,
-            "Target Platform",
-            "Wayland & X11 Desktop Linux with ALSA / PipeWire and hidraw NHL2 support.",
+            "Platform",
+            "Linux on Wayland or X11, with PipeWire or ALSA audio and direct USB controller access.",
             |ui| {
-                ui.label(RichText::new("Linux x86_64 / aarch64").monospace());
+                ui.label(RichText::new(format!("Linux {}", std::env::consts::ARCH)).monospace());
             },
         );
     }
