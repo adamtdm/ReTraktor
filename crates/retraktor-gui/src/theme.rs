@@ -126,7 +126,7 @@ impl Palette {
         BORDER_ACCENT: rgb(150, 148, 142),
         ROW_SELECTED: rgb(190, 62, 0),
         TEXT_PRIMARY: rgb(22, 22, 22),
-        TEXT_SECONDARY: rgb(84, 84, 82),
+        TEXT_SECONDARY: rgb(72, 72, 70),
         TEXT_MUTED: rgb(124, 122, 118),
         TEXT_HIGHLIGHT: rgb(0, 0, 0),
         DECK_A: rgb(24, 110, 210),
@@ -178,7 +178,7 @@ impl Palette {
         BORDER_ACCENT: rgb(62, 65, 71),
         ROW_SELECTED: rgb(46, 82, 128),
         TEXT_PRIMARY: rgb(232, 234, 238),
-        TEXT_SECONDARY: rgb(156, 162, 170),
+        TEXT_SECONDARY: rgb(176, 181, 188),
         TEXT_MUTED: rgb(106, 111, 120),
         TEXT_HIGHLIGHT: rgb(248, 249, 250),
         DECK_A: rgb(84, 164, 214),
@@ -217,7 +217,7 @@ impl Palette {
         HOTCUE_EMPTY: rgb(52, 55, 60),
         ACCENT: rgb(84, 164, 214),
         CONTROL: rgb(52, 55, 62),
-        CONTROL_HOVER: rgb(66, 70, 78),
+        CONTROL_HOVER: rgb(62, 66, 74),
     };
 
     pub const PRESETS: [(&'static str, Palette); 3] = [("Night", Self::NIGHT), ("Field", Self::FIELD), ("Charcoal", Self::CHARCOAL)];
