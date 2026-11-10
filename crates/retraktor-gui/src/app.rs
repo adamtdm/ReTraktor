@@ -577,6 +577,7 @@ impl ReTraktorApp {
             "playA" | "playB" if first => self.toggle_play(if step == "playA" { 1 } else { 2 }),
             "stemsA" => self.deck_stem_view[0] = true,
             "pattern" => self.show_pattern_player = true,
+            "help" => self.show_shortcuts_hud = true,
             "relocate" if first => self.library.start_relocate(self.preferences.music_folders.clone()),
             _ => {}
         }
@@ -1778,25 +1779,37 @@ impl ReTraktorApp {
                 }
                 ui.separator();
 
-                // Steps share whatever is left after the fixed controls to their right.
+                // All four voices at once as a 4 x 16 dot grid; the playing step sweeps across as a bright column.
                 let v = self.pattern_selected_voice.min(3);
-                let step_w = ((ui.available_width() - 250.0) / 16.0).clamp(HIT, 40.0);
-                ui.scope(|ui| {
-                    ui.spacing_mut().item_spacing.x = 2.0;
+                let grid_w = (ui.available_width() - 250.0).clamp(16.0 * 14.0, 16.0 * 34.0);
+                let (grid, resp) = ui.allocate_exact_size(Vec2::new(grid_w, 4.0 * 18.0), Sense::click());
+                let cell = Vec2::new(grid_w / 16.0, 18.0);
+                if let (true, Some(pos)) = (resp.clicked(), resp.interact_pointer_pos()) {
+                    let step = (((pos.x - grid.left()) / cell.x) as usize).min(15);
+                    let voice = (((pos.y - grid.top()) / cell.y) as usize).min(3);
+                    self.pattern_steps[voice][step] ^= true;
+                    self.pattern_selected_voice = voice;
+                }
+                let sweep = crate::theme::animations() && running;
+                for voice in 0..4 {
                     for step in 0..16 {
-                        if step > 0 && step % 4 == 0 {
-                            ui.add_space(4.0); // one gap per beat
-                        }
-                        let resp = pill(ui, &format!("{}", step + 1), self.pattern_steps[v][step], TraktorTheme::ACCENT(), step_w)
-                            .on_hover_text(format!("Step {}", step + 1));
-                        if running && cur_step == step {
-                            ui.painter().rect_stroke(resp.rect, 2.0, Stroke::new(2.0_f32, TraktorTheme::TEXT_HIGHLIGHT()));
-                        }
-                        if resp.clicked() {
-                            self.pattern_steps[v][step] = !self.pattern_steps[v][step];
-                        }
+                        let centre = grid.min + Vec2::new((step as f32 + 0.5) * cell.x, (voice as f32 + 0.5) * cell.y);
+                        let on_step = running && cur_step == step;
+                        // The column just played fades out behind the sweep.
+                        let trail = if sweep && (cur_step + 16 - step) % 16 == 1 { 0.35 } else { 0.0 };
+                        let lit = self.pattern_steps[voice][step];
+                        let colour = if lit {
+                            if on_step { TraktorTheme::TEXT_HIGHLIGHT() } else { TraktorTheme::ACCENT() }
+                        } else if on_step {
+                            TraktorTheme::TEXT_SECONDARY()
+                        } else {
+                            crate::theme::mix(dot::unlit_on_panel(), TraktorTheme::TEXT_SECONDARY(), trail + if voice == v { 0.25 } else { 0.0 })
+                        };
+                        let radius = if lit { 6.0 } else if step % 4 == 0 { 3.2 } else { 2.4 };
+                        ui.painter().circle_filled(centre, if on_step { radius + 1.0 } else { radius }, colour);
                     }
-                });
+                }
+                resp.on_hover_text("Rows are kick, clap, hat and percussion; click a dot to switch that step on or off");
                 ui.separator();
 
                 if pill(ui, "4X4", false, Color32::TRANSPARENT, 0.0).on_hover_text("Fill with a four-on-the-floor pattern").clicked() {
@@ -2012,7 +2025,7 @@ impl ReTraktorApp {
     /// 4-Deck layout: decks A + C | four-channel mixer | decks B + D, each deck with its own waveform.
     fn show_four_deck_layout(&mut self, ui: &mut Ui) {
         ui.horizontal_top(|ui| {
-            let mixer_w = 348.0_f32;
+            let mixer_w = (ui.available_width() * 0.36).clamp(460.0, 560.0);
             let deck_w = ((ui.available_width() - mixer_w - 8.0) / 2.0).max(260.0);
             // Shorter waveforms on short windows keep the browser on screen.
             let wave_h = (36.0 + (ui.ctx().screen_rect().height() - 640.0) * 0.1).clamp(36.0, 80.0);
