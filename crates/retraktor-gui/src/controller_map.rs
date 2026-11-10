@@ -46,24 +46,24 @@ fn deck_controls(side: &str, dx: f32) -> Vec<Ctl> {
     }
     v.extend([
         c("browse.encoder", Kind::Encoder(20.0), 294.0, 65.0),
-        c("browse.favorite", Kind::Rect(22.0, 14.0), 280.0, 22.0),
-        c("browse.add_to_list", Kind::Rect(22.0, 14.0), 308.0, 22.0),
-        c("browse.preview", Kind::Rect(22.0, 14.0), 280.0, 107.0),
-        c("browse.view", Kind::Rect(22.0, 14.0), 308.0, 107.0),
+        c("browse.favorite", Kind::Rect(31.5, 15.0), 276.0, 22.0),
+        c("browse.add_to_list", Kind::Rect(31.5, 15.0), 312.0, 22.0),
+        c("browse.preview", Kind::Rect(31.5, 15.0), 276.0, 108.0),
+        c("browse.view", Kind::Rect(31.5, 15.0), 312.0, 108.0),
         c("flux", Kind::Round(13.0), 50.0, 147.0),
         c("reverse", Kind::Round(13.0), 26.0, 182.0),
         c("mode.turntable", Kind::Round(13.0), 298.0, 147.0),
         c("mode.jogwheel", Kind::Round(13.0), 323.0, 182.0),
         c("shift", Kind::Rect(46.0, 18.0), 41.0, 404.0),
-        c("sync", Kind::Rect(26.0, 18.0), 293.0, 404.0),
-        c("master", Kind::Rect(26.0, 18.0), 323.0, 404.0),
+        c("sync", Kind::Rect(33.5, 18.0), 289.0, 404.0),
+        c("master", Kind::Rect(33.5, 18.0), 326.0, 404.0),
         c("loop_move", Kind::Encoder(14.0), 105.0, 432.0),
-        c("key_lock", Kind::Rect(36.0, 18.0), 175.0, 432.0),
+        c("key_lock", Kind::Rect(46.0, 18.0), 175.0, 432.0),
         c("loop_size", Kind::Encoder(14.0), 243.0, 432.0),
-        c("hotcues", Kind::Rect(38.0, 16.0), 107.0, 469.0),
-        c("stems", Kind::Rect(38.0, 16.0), 152.0, 469.0),
-        c("pattern", Kind::Rect(38.0, 16.0), 198.0, 469.0),
-        c("flux_loop", Kind::Rect(38.0, 16.0), 243.0, 469.0),
+        c("hotcues", Kind::Rect(42.0, 16.0), 107.0, 469.0),
+        c("stems", Kind::Rect(42.0, 16.0), 152.0, 469.0),
+        c("pattern", Kind::Rect(42.0, 16.0), 198.0, 469.0),
+        c("flux_loop", Kind::Rect(42.0, 16.0), 243.0, 469.0),
         c("cue", Kind::Round(21.0), 40.0, 467.0),
         c("play", Kind::Round(21.0), 40.0, 529.0),
         c("pitch.fader", Kind::VFader(120.0), 308.0, 497.0),
@@ -72,7 +72,7 @@ fn deck_controls(side: &str, dx: f32) -> Vec<Ctl> {
         .into_iter()
         .enumerate()
     {
-        v.push(c(&format!("pads.{}", i + 1), Kind::Pad(38.0, 26.0), x, y));
+        v.push(c(&format!("pads.{}", i + 1), Kind::Pad(40.0, 26.0), x, y));
     }
     v
 }
@@ -85,14 +85,14 @@ fn mx2_layout() -> Vec<Ctl> {
         let dx = if ch == 1 { -12.0 } else { -14.0 };
         v.extend([
             m(&format!("channels.{ch}.gain"), Kind::Knob(15.0), x, 29.0),
-            m(&format!("channels.{ch}.deck_fx_assign.1"), Kind::Rect(20.0, 14.0), x + dx, 74.0),
-            m(&format!("channels.{ch}.deck_fx_assign.2"), Kind::Rect(20.0, 14.0), x + dx + 24.0, 74.0),
+            m(&format!("channels.{ch}.deck_fx_assign.1"), Kind::Rect(25.0, 15.0), x + dx - 1.0, 74.0),
+            m(&format!("channels.{ch}.deck_fx_assign.2"), Kind::Rect(25.0, 15.0), x + dx + 26.0, 74.0),
             m(&format!("channels.{ch}.eq.high"), Kind::Knob(15.0), x, 119.0),
             m(&format!("channels.{ch}.eq.mid"), Kind::Knob(15.0), x, 174.0),
             m(&format!("channels.{ch}.eq.low"), Kind::Knob(15.0), x, 229.0),
             m(&format!("channels.{ch}.channel_fx.amount"), Kind::Knob(15.0), x, 284.0),
             m(&format!("channels.{ch}.channel_fx.on"), Kind::Ring(13.0), x, 327.0),
-            m(&format!("channels.{ch}.cue"), Kind::Rect(34.0, 16.0), x, 369.0),
+            m(&format!("channels.{ch}.cue"), Kind::Rect(38.0, 16.0), x, 369.0),
             m(&format!("channels.{ch}.volume"), Kind::VFader(90.0), x, 452.0),
         ]);
     }
@@ -100,11 +100,11 @@ fn mx2_layout() -> Vec<Ctl> {
         m("main.volume", Kind::Knob(17.0), 452.0, 29.0),
         m("cue_mix", Kind::Knob(15.0), 452.0, 174.0),
         m("cue_vol", Kind::Knob(15.0), 452.0, 229.0),
-        m("channel_fx.fx1", Kind::Rect(18.0, 16.0), 441.0, 279.0),
-        m("channel_fx.fx2", Kind::Rect(18.0, 16.0), 465.0, 279.0),
-        m("channel_fx.fx3", Kind::Rect(18.0, 16.0), 441.0, 304.0),
-        m("channel_fx.fx4", Kind::Rect(18.0, 16.0), 465.0, 304.0),
-        m("channel_fx.filter", Kind::Rect(44.0, 16.0), 452.0, 329.0),
+        m("channel_fx.fx1", Kind::Rect(24.0, 16.0), 439.0, 279.0),
+        m("channel_fx.fx2", Kind::Rect(24.0, 16.0), 466.0, 279.0),
+        m("channel_fx.fx3", Kind::Rect(24.0, 16.0), 439.0, 304.0),
+        m("channel_fx.fx4", Kind::Rect(24.0, 16.0), 466.0, 304.0),
+        m("channel_fx.filter", Kind::Rect(48.0, 16.0), 452.5, 329.0),
         m("mic", Kind::Round(11.0), 452.0, 372.0),
         m("xfader", Kind::HFader(80.0), 453.0, 537.0),
     ]);
@@ -296,9 +296,9 @@ fn short_label(action: &str) -> String {
         "stem_view" => "Stems",
         "pads" => match arg {
             "stems" => "Stems",
-            "pattern" => "Pattern",
+            "pattern" => "Pat",
             "loop" => "Roll",
-            _ => "Hotcues",
+            _ => "Cues",
         },
         "load" => "Load",
         "browse_down" => "Next",
@@ -306,8 +306,8 @@ fn short_label(action: &str) -> String {
         "browse" => "Browse",
         "filter_on" => "On",
         "filter" => "Filter",
-        "headphone" => "Phones",
-        "fx_on" => return format!("FX{} on", p.get(1).unwrap_or(&"1")),
+        "headphone" => "Cue",
+        "fx_on" => return format!("FX{}", p.get(1).unwrap_or(&"1")),
         "fx_mix" => "FX mix",
         "fx_param" => return format!("FX {arg}"),
         "fx_button" => return format!("FX {arg}"),
@@ -323,8 +323,22 @@ fn short_label(action: &str) -> String {
         "cue_vol" => "Phones",
         "loop_size" => "Size",
         "loop_move" => "Move",
-        "jog" => "",
-        "native" => return p.get(1).unwrap_or(&"").to_string(),
+        "jog" => "Jog",
+        "native" => match *p.get(1).unwrap_or(&"") {
+            "Master" => "Mst",
+            "Preview" => "Prev",
+            "Key lock" => "Key",
+            "Reverse" => "Rev",
+            "TT mode" => "TT",
+            "Jog mode" => "Jog",
+            "FX1 on" => "FX1",
+            "FX2 on" => "FX2",
+            "FX 1" => "FX1",
+            "FX 2" => "FX2",
+            "FX 3" => "FX3",
+            "FX 4" => "FX4",
+            other => return other.to_string(),
+        },
         "none" => "—",
         _ => return action_label(action),
     };
@@ -396,8 +410,9 @@ pub struct MapperState {
 }
 
 fn board_rect(ui: &Ui) -> (Rect, f32) {
-    // Fit both the available width and ~70% of the window height.
-    let max_h = ui.ctx().screen_rect().height() * 0.7;
+    // Fit both the available width and leave room below the board for the legend line and detail panel.
+    let sh = ui.ctx().screen_rect().height();
+    let max_h = (sh - 230.0).clamp(360.0, sh * 0.68);
     let scale = (ui.available_width().min(1500.0) / BOARD.x).min(max_h / BOARD.y);
     let min = ui.cursor().min + Vec2::new(((ui.available_width() - BOARD.x * scale) / 2.0).max(0.0), 0.0);
     (Rect::from_min_size(min, BOARD * scale), scale)
@@ -406,13 +421,46 @@ fn board_rect(ui: &Ui) -> (Rect, f32) {
 fn hit_rect(c: &Ctl, origin: Pos2, s: f32) -> Rect {
     let center = origin + c.at * s;
     let size = match c.kind {
-        Kind::Knob(r) | Kind::Encoder(r) | Kind::Ring(r) | Kind::Round(r) => Vec2::splat(r * 2.0 + 6.0),
-        Kind::Rect(w, h) | Kind::Pad(w, h) => Vec2::new(w + 4.0, h + 4.0),
+        Kind::Knob(r) | Kind::Encoder(r) | Kind::Ring(r) | Kind::Round(r) => Vec2::splat(r * 2.0 + 4.0),
+        Kind::Rect(w, h) | Kind::Pad(w, h) => Vec2::new(w + 2.0, h + 2.0),
         Kind::VFader(l) => Vec2::new(26.0, l + 10.0),
         Kind::HFader(l) => Vec2::new(l + 10.0, 26.0),
         Kind::Jog(r) => Vec2::splat(r * 2.0),
     };
-    Rect::from_center_size(center, size * s)
+    let screen_size = (size * s).max(Vec2::splat(24.1));
+    Rect::from_center_size(center, screen_size)
+}
+
+/// Label anchor in board units and alignment for any control.
+fn label_anchor(c: &Ctl) -> (Vec2, Align2) {
+    match c.kind {
+        Kind::Pad(..) | Kind::Rect(..) | Kind::Jog(_) => (c.at, Align2::CENTER_CENTER),
+        Kind::Knob(rad) | Kind::Encoder(rad) | Kind::Ring(rad) | Kind::Round(rad) => (c.at + Vec2::new(0.0, rad + 7.5), Align2::CENTER_CENTER),
+        Kind::VFader(len) => (c.at + Vec2::new(0.0, len / 2.0 + 8.0), Align2::CENTER_CENTER),
+        Kind::HFader(_) => (c.at + Vec2::new(0.0, 16.0), Align2::CENTER_CENTER),
+    }
+}
+
+/// Finds the nearest control in the given cardinal direction (`dir` unit vector).
+fn navigate_control<'a>(controls: &'a [Ctl], from_id: &str, dir: Vec2) -> Option<&'a str> {
+    let cur = controls.iter().find(|c| c.id == from_id)?;
+    controls
+        .iter()
+        .filter(|c| c.id != from_id)
+        .filter_map(|c| {
+            let delta = c.at - cur.at;
+            let along = delta.dot(dir);
+            if along <= 2.0 {
+                return None;
+            }
+            let perp = (delta - dir * along).length();
+            if perp > along * 1.5 {
+                return None;
+            }
+            Some((c.id.as_str(), along + perp * 2.2))
+        })
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(id, _)| id)
 }
 
 /// Draws the replica and the detail panel. Returns true when the mapping changed.
@@ -423,6 +471,32 @@ pub fn show(ui: &mut Ui, map: &mut Mapping, state: &mut MapperState, last_touche
             state.selected = Some(t.to_string());
         }
     }
+    let controls = mx2_layout();
+    if !ui.ctx().wants_keyboard_input() {
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            state.selected = None;
+        } else if let Some(sel) = state.selected.clone() {
+            let dir = ui.input(|i| {
+                if i.key_pressed(egui::Key::ArrowLeft) {
+                    Some(Vec2::new(-1.0, 0.0))
+                } else if i.key_pressed(egui::Key::ArrowRight) {
+                    Some(Vec2::new(1.0, 0.0))
+                } else if i.key_pressed(egui::Key::ArrowUp) {
+                    Some(Vec2::new(0.0, -1.0))
+                } else if i.key_pressed(egui::Key::ArrowDown) {
+                    Some(Vec2::new(0.0, 1.0))
+                } else {
+                    None
+                }
+            });
+            if let Some(d) = dir {
+                if let Some(next) = navigate_control(&controls, &sel, d) {
+                    state.selected = Some(next.to_string());
+                }
+            }
+        }
+    }
+
     ui.horizontal(|ui| {
         ui.label(RichText::new("Traktor MX2").size(16.0).strong());
         ui.label(RichText::new(if connected { "connected" } else { "not connected" }).size(12.0).color(if connected { TraktorTheme::PLAY_ACTIVE() } else { TraktorTheme::TEXT_MUTED() }));
@@ -440,14 +514,14 @@ pub fn show(ui: &mut Ui, map: &mut Mapping, state: &mut MapperState, last_touche
     });
     ui.add_space(6.0);
 
-    let controls = mx2_layout();
     let (board, s) = board_rect(ui);
     let response = ui.allocate_rect(board, Sense::hover());
-    let painter = ui.painter_at(board.expand(2.0));
+    let painter = ui.painter_at(board.expand(4.0));
     let line = TraktorTheme::TEXT_SECONDARY();
     let faint = TraktorTheme::BORDER_ACCENT();
     let accent = TraktorTheme::ACCENT();
     let stroke = |c: Color32, w: f32| Stroke::new(w * s.max(0.8), c);
+    painter.rect_filled(board, 10.0 * s, TraktorTheme::BG_WINDOW());
     painter.rect_stroke(board, 10.0 * s, stroke(line, 1.2));
     // Section dividers and meters: context only, not interactive.
     for x in [362.0, 543.0] {
@@ -458,16 +532,21 @@ pub fn show(ui: &mut Ui, map: &mut Mapping, state: &mut MapperState, last_touche
             painter.circle_filled(board.min + Vec2::new(x, 70.0 + i as f32 * 8.0) * s, 1.6 * s, faint);
         }
     }
-    let label_font = FontId::proportional((9.0 * s).clamp(9.0, 12.0));
+    let label_font = FontId::proportional((9.5 * s).clamp(9.0, 12.0));
 
     let mut clicked: Option<String> = None;
+    let mut hovered_ctl: Option<&Ctl> = None;
+    let mut dropped_labels = false;
     for c in &controls {
         let hit = hit_rect(c, board.min, s);
         let r = ui.interact(hit, ui.id().with(&c.id), Sense::click());
+        if r.hovered() {
+            hovered_ctl = Some(c);
+        }
         let selected = state.selected.as_deref() == Some(c.id.as_str());
         let custom = map.action.contains_key(&c.id) || map.colour.contains_key(&c.id);
-        let col = if selected { accent } else if r.hovered() { TraktorTheme::TEXT_PRIMARY() } else if custom { accent.gamma_multiply(0.8) } else { line };
-        let w = if selected { 2.2 } else { 1.1 };
+        let col = if selected { accent } else if r.hovered() { TraktorTheme::TEXT_PRIMARY() } else if custom { accent.gamma_multiply(0.85) } else { line };
+        let w = if selected { 2.4 } else { 1.1 };
         let center = board.min + c.at * s;
         let led = map.colour.get(&c.id).and_then(|code| LED_COLOURS.iter().find(|(_, v, _)| v == code)).map(|(_, _, col)| *col);
         match c.kind {
@@ -481,9 +560,9 @@ pub fn show(ui: &mut Ui, map: &mut Mapping, state: &mut MapperState, last_touche
             }
             Kind::Ring(rad) | Kind::Round(rad) => {
                 if let Some(l) = led {
-                    painter.circle_filled(center, rad * s, l.gamma_multiply(0.35));
+                    painter.circle_filled(center, rad * s, l);
                 }
-                painter.circle_stroke(center, rad * s, stroke(led.unwrap_or(col), w));
+                painter.circle_stroke(center, rad * s, stroke(if selected { accent } else { led.unwrap_or(col) }, w));
                 if matches!(c.kind, Kind::Ring(_)) {
                     painter.circle_stroke(center, rad * 0.6 * s, stroke(col, w * 0.7));
                 }
@@ -491,9 +570,9 @@ pub fn show(ui: &mut Ui, map: &mut Mapping, state: &mut MapperState, last_touche
             Kind::Rect(rw, rh) | Kind::Pad(rw, rh) => {
                 let rr = Rect::from_center_size(center, Vec2::new(rw, rh) * s);
                 if let Some(l) = led {
-                    painter.rect_filled(rr, 3.0 * s, l.gamma_multiply(0.35));
+                    painter.rect_filled(rr, 3.0 * s, l);
                 }
-                painter.rect_stroke(rr, 3.0 * s, stroke(led.unwrap_or(col), w));
+                painter.rect_stroke(rr, 3.0 * s, stroke(if selected { accent } else { led.unwrap_or(col) }, w));
             }
             Kind::VFader(len) => {
                 painter.line_segment([center - Vec2::new(0.0, len / 2.0) * s, center + Vec2::new(0.0, len / 2.0) * s], stroke(col, w));
@@ -509,30 +588,79 @@ pub fn show(ui: &mut Ui, map: &mut Mapping, state: &mut MapperState, last_touche
                 painter.line_segment([center + Vec2::new(0.0, -rad * 0.8) * s, center + Vec2::new(0.0, -rad * 0.5) * s], stroke(col, w));
             }
         }
-        // What it does, written on the replica.
+
+        // Non-colour markers for remapped (corner dot) and selected (corner brackets + top marker dot).
+        let bounds = match c.kind {
+            Kind::Knob(r) | Kind::Encoder(r) | Kind::Ring(r) | Kind::Round(r) | Kind::Jog(r) => Rect::from_center_size(center, Vec2::splat(r * 2.0 * s)),
+            Kind::Rect(rw, rh) | Kind::Pad(rw, rh) => Rect::from_center_size(center, Vec2::new(rw, rh) * s),
+            Kind::VFader(len) => Rect::from_center_size(center, Vec2::new(20.0, len) * s),
+            Kind::HFader(len) => Rect::from_center_size(center, Vec2::new(len, 20.0) * s),
+        };
+        if custom {
+            let dot_pos = bounds.right_top() + Vec2::new(-2.0, 2.0);
+            painter.circle_filled(dot_pos, 3.2, accent);
+            painter.circle_stroke(dot_pos, 3.2, Stroke::new(1.0_f32, crate::theme::on(accent)));
+        }
+        if selected {
+            let b = bounds.expand(3.5);
+            let arm = 5.0_f32.min(b.width() * 0.3).min(b.height() * 0.3);
+            let st = Stroke::new(2.0_f32, accent);
+            for (corner, dx, dy) in [
+                (b.left_top(), arm, arm),
+                (b.right_top(), -arm, arm),
+                (b.left_bottom(), arm, -arm),
+                (b.right_bottom(), -arm, -arm),
+            ] {
+                painter.line_segment([corner, corner + Vec2::new(dx, 0.0)], st);
+                painter.line_segment([corner, corner + Vec2::new(0.0, dy)], st);
+            }
+            painter.circle_filled(Pos2::new(b.center().x, b.top() - 2.0), 3.0, accent);
+        }
+
+        // What it does, written on the replica (font floor 9 px).
         let action = map.action.get(&c.id).cloned().unwrap_or_else(|| default_action(&c.id));
         let text = short_label(&action);
-        let text_col = if custom || selected { accent } else { TraktorTheme::TEXT_PRIMARY() };
+        let fill_col = match c.kind {
+            Kind::Rect(..) | Kind::Pad(..) => led,
+            _ => None,
+        };
+        let text_col = if let Some(fill) = fill_col {
+            crate::theme::on(fill)
+        } else if custom || selected {
+            accent
+        } else {
+            TraktorTheme::TEXT_PRIMARY()
+        };
+        let (anchor, align) = label_anchor(c);
+        let pos = board.min + anchor * s;
         match c.kind {
             Kind::Pad(rw, _) | Kind::Rect(rw, _) => {
-                // Shrink to fit inside the key; otherwise leave it to the hover text.
-                for size in [label_font.size, label_font.size * 0.85, 8.0] {
+                let mut drawn = false;
+                for size in [label_font.size, 9.0] {
                     let font = FontId::proportional(size);
                     let galley = painter.layout_no_wrap(text.clone(), font.clone(), text_col);
-                    if galley.size().x <= rw * s - 4.0 {
-                        painter.text(center, Align2::CENTER_CENTER, &text, font, text_col);
+                    if galley.size().x <= rw * s - 0.5 {
+                        painter.text(pos, align, &text, font, text_col);
+                        drawn = true;
                         break;
                     }
                 }
+                if !drawn {
+                    dropped_labels = true;
+                }
             }
-            Kind::Jog(rad) => {
-                painter.text(center, Align2::CENTER_CENTER, &text, label_font.clone(), text_col);
-                let _ = rad;
+            Kind::Jog(_) | Kind::VFader(_) | Kind::HFader(_) => {
+                painter.text(pos, align, &text, label_font.clone(), text_col);
             }
-            Kind::Knob(rad) | Kind::Encoder(rad) | Kind::Ring(rad) | Kind::Round(rad) if s >= 0.9 => {
-                painter.text(center + Vec2::new(0.0, rad + 7.0) * s, Align2::CENTER_CENTER, &text, label_font.clone(), text_col);
+            Kind::Knob(_) | Kind::Encoder(_) | Kind::Ring(_) | Kind::Round(_) => {
+                let font = FontId::proportional(label_font.size.max(9.0));
+                let galley = painter.layout_no_wrap(text.clone(), font.clone(), text_col);
+                if galley.size().x <= 46.0 * s {
+                    painter.text(pos, align, &text, font, text_col);
+                } else {
+                    dropped_labels = true;
+                }
             }
-            _ => {}
         }
         let r = r.on_hover_text(format!("{}\n{}", action_label(&action), pretty_control(&c.id)));
         if r.clicked() {
@@ -543,7 +671,26 @@ pub fn show(ui: &mut Ui, map: &mut Mapping, state: &mut MapperState, last_touche
         state.selected = if state.selected.as_ref() == Some(&id) { None } else { Some(id) };
     }
     let _ = response;
-    ui.add_space(10.0);
+    ui.add_space(4.0);
+
+    // Fixed status / legend line under the board so small windows & hover aren't tooltip-only.
+    let focus_ctl = hovered_ctl.or_else(|| state.selected.as_deref().and_then(|id| controls.iter().find(|c| c.id == id)));
+    ui.horizontal_wrapped(|ui| {
+        if let Some(c) = focus_ctl {
+            let act = map.action.get(&c.id).cloned().unwrap_or_else(|| default_action(&c.id));
+            ui.label(RichText::new(format!("{} → {}", pretty_control(&c.id), action_label(&act))).size(12.0).strong().color(TraktorTheme::TEXT_PRIMARY()));
+        } else {
+            ui.label(RichText::new("Hover or click any control (or use arrow keys) to inspect its action.").size(12.0).color(TraktorTheme::TEXT_SECONDARY()));
+        }
+        if dropped_labels || s < 1.0 {
+            ui.label(
+                RichText::new("· Legend: Fav/Add/Prev/View (library) · TT/Jog/Rev/Flux (jog) · Sync/Mst (tempo) · Cues/Stems/Pat/Roll (pads)")
+                    .size(11.0)
+                    .color(TraktorTheme::TEXT_MUTED()),
+            );
+        }
+    });
+    ui.add_space(4.0);
 
     // Detail panel for the selected control.
     let Some(sel) = state.selected.clone() else {
@@ -601,6 +748,7 @@ pub fn show(ui: &mut Ui, map: &mut Mapping, state: &mut MapperState, last_touche
                     ui.painter().circle_filled(rect.center(), 10.0, col);
                     if cur == Some(code) {
                         ui.painter().circle_stroke(rect.center(), 12.5, Stroke::new(2.0_f32, TraktorTheme::TEXT_PRIMARY()));
+                        ui.painter().circle_filled(rect.center(), 3.0, crate::theme::on(col));
                     }
                     if r.on_hover_text(name).clicked() {
                         map.colour.insert(sel.clone(), code);
@@ -691,4 +839,29 @@ mod tests {
         assert_eq!(parse("stem:2:4", false), Some(Mapped::Button { verb: "stem".into(), deck: 2, arg: "4".into() }));
         assert_eq!(parse("none", true), Some(Mapped::Nothing));
     }
+
+    #[test]
+    fn label_anchors_and_hit_rects_do_not_collide_in_row() {
+        let controls = mx2_layout();
+        // At 1024x640, scale is 410 / 572 ≈ 0.717; verify every hit_rect is >= 24x24 and same-row anchors/rects stay separated.
+        let s = (640.0 - 230.0) / BOARD.y;
+        for (i, a) in controls.iter().enumerate() {
+            let hr = hit_rect(a, Pos2::ZERO, s);
+            assert!(hr.width() >= 24.0 && hr.height() >= 24.0, "{} hit_rect too small: {:?}", a.id, hr.size());
+            let (pa, _) = label_anchor(a);
+            for b in &controls[i + 1..] {
+                let (pb, _) = label_anchor(b);
+                if (pa.y - pb.y).abs() < 6.0 {
+                    assert!((pa.x - pb.x).abs() >= 20.0, "label anchors collide: {} vs {}", a.id, b.id);
+                }
+                if !matches!(a.kind, Kind::Jog(_)) && !matches!(b.kind, Kind::Jog(_)) && (a.at.y - b.at.y).abs() < 6.0 {
+                    let hrb = hit_rect(b, Pos2::ZERO, s);
+                    assert!(hr.intersect(hrb).width() < hr.width() * 0.5, "hit rects collide on row: {} vs {}", a.id, b.id);
+                }
+            }
+        }
+        assert_eq!(navigate_control(&controls, "surface.left.sync", Vec2::new(1.0, 0.0)), Some("surface.left.master"));
+        assert_eq!(navigate_control(&controls, "surface.left.master", Vec2::new(-1.0, 0.0)), Some("surface.left.sync"));
+    }
 }
+
