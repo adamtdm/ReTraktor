@@ -15,6 +15,7 @@ mod app;
 mod audio;
 mod controller_map;
 mod demucs;
+mod dot;
 mod library_ui;
 mod preferences;
 mod theme;

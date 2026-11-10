@@ -1174,78 +1174,62 @@ pub fn render_shortcuts_hud(ctx: &egui::Context, is_open: &mut bool) {
             ui.add_space(8.0);
 
             ui.columns(3, |cols| {
-                // Column 1: Deck A & Deck B Transports
+                let key_row = |ui: &mut Ui, key: &str, desc: &str, col: Color32| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(format!("[ {key} ]"))
+                                .color(col)
+                                .font(egui::FontId::monospace(10.5))
+                                .strong(),
+                        );
+                        ui.label(RichText::new(desc).color(TraktorTheme::TEXT_PRIMARY()).font(egui::FontId::proportional(11.0)));
+                    });
+                };
+
+                // Column 1: Transport & Stems
                 cols[0].vertical(|ui| {
-                    ui.label(RichText::new("DECK A (Primary Left)").color(TraktorTheme::DECK_A()).strong());
+                    ui.label(RichText::new("TRANSPORT & STEMS (Shift = Deck B)").color(TraktorTheme::DECK_A()).strong());
                     ui.add_space(4.0);
-                    let key_row = |ui: &mut Ui, key: &str, desc: &str| {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(format!("[ {key} ]"))
-                                    .color(TraktorTheme::PLAY_ACTIVE())
-                                    .font(egui::FontId::monospace(11.0))
-                                    .strong(),
-                            );
-                            ui.label(RichText::new(desc).color(TraktorTheme::TEXT_PRIMARY()).font(egui::FontId::proportional(11.5)));
-                        });
-                    };
-                    key_row(ui, "Space", "Play / Pause Deck A");
-                    key_row(ui, "C", "Cue Deck A");
-                    key_row(ui, "S", "Sync Deck A BPM");
-                    key_row(ui, "1..4", "Hotcues 1 to 4");
-
-                    ui.add_space(12.0);
-                    ui.label(RichText::new("DECK B (Primary Right)").color(TraktorTheme::DECK_B()).strong());
-                    ui.add_space(4.0);
-                    key_row(ui, "Shift+Space", "Play / Pause Deck B");
-                    key_row(ui, "Shift+C", "Cue Deck B");
-                    key_row(ui, "Shift+S", "Sync Deck B BPM");
-                    key_row(ui, "5..8", "Hotcues 1 to 4");
+                    let c = TraktorTheme::PLAY_ACTIVE();
+                    key_row(ui, "Space / Shift+Space", "Play / Pause A / B", c);
+                    key_row(ui, "C / Shift+C", "Cue 1 Deck A / B", c);
+                    key_row(ui, "S / Shift+S", "Sync BPM & Phase A / B", c);
+                    key_row(ui, "L / Shift+L", "Loop On / Off A / B", c);
+                    key_row(ui, "1..4 / 5..8", "Hotcues 1..4 A / B", c);
+                    key_row(ui, "T / Shift+T", "EQ / Stems View A / B", c);
+                    key_row(ui, "G / Shift+G", "Create Demucs AI Stems A / B", c);
+                    key_row(ui, "Q W E R", "Mute Stems 1..4 (Deck A)", c);
+                    key_row(ui, "Shift+Q W E R", "Mute Stems 1..4 (Deck B)", c);
                 });
 
-                // Column 2: Workspace Layouts
+                // Column 2: Mixer, EQ, Filter & FX
                 cols[1].vertical(|ui| {
-                    ui.label(RichText::new("WORKSPACE LAYOUTS").color(TraktorTheme::TEXT_PRIMARY()).strong());
+                    ui.label(RichText::new("MIXER, EQ, FILTER & FX").color(TraktorTheme::DECK_B()).strong());
                     ui.add_space(4.0);
-                    let layout_row = |ui: &mut Ui, key: &str, desc: &str| {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(format!("[ {key} ]"))
-                                    .color(TraktorTheme::ACCENT())
-                                    .font(egui::FontId::monospace(11.0))
-                                    .strong(),
-                            );
-                            ui.label(RichText::new(desc).color(TraktorTheme::TEXT_PRIMARY()).font(egui::FontId::proportional(11.5)));
-                        });
-                    };
-                    layout_row(ui, "F1", "Parallel Full Waveforms");
-                    layout_row(ui, "F2", "Essential Compact");
-                    layout_row(ui, "F3", "Extended Mixer & FX");
-                    layout_row(ui, "F4", "Four-Deck Full Mix");
-                    layout_row(ui, "F5", "4-Stem Isolation View");
-                    layout_row(ui, "F6", "Full Music Browser");
+                    let c = TraktorTheme::ACCENT();
+                    key_row(ui, "Z X V", "EQ Kill Low / Mid / Hi (A)", c);
+                    key_row(ui, "Shift+Z X V", "EQ Kill Low / Mid / Hi (B)", c);
+                    key_row(ui, "H / Shift+H", "Headphone Cue On / Off A / B", c);
+                    key_row(ui, "F / Shift+F", "Filter On / Off A / B", c);
+                    key_row(ui, "D / Shift+D", "FX Unit On / Off A / B", c);
+                    key_row(ui, "- / =", "Channel Fader Down / Up (A)", c);
+                    key_row(ui, "Shift+- / +", "Channel Fader Down / Up (B)", c);
+                    key_row(ui, "[ / \\ / ]", "Crossfader Left / Centre / Right", c);
                 });
 
-                // Column 3: Mixer, FX & Stems
+                // Column 3: Layouts & System
                 cols[2].vertical(|ui| {
-                    ui.label(RichText::new("SYSTEM & STEMS").color(TraktorTheme::TEXT_PRIMARY()).strong());
+                    ui.label(RichText::new("LAYOUTS & SYSTEM").color(TraktorTheme::TEXT_PRIMARY()).strong());
                     ui.add_space(4.0);
-                    let sys_row = |ui: &mut Ui, key: &str, desc: &str| {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(format!("[ {key} ]"))
-                                    .color(TraktorTheme::ACCENT())
-                                    .font(egui::FontId::monospace(11.0))
-                                    .strong(),
-                            );
-                            ui.label(RichText::new(desc).color(TraktorTheme::TEXT_PRIMARY()).font(egui::FontId::proportional(11.5)));
-                        });
-                    };
-                    sys_row(ui, "Cmd / Ctrl + ,", "Preferences & Setup");
-                    sys_row(ui, "?", "Toggle Shortcuts HUD");
-                    sys_row(ui, "Esc", "Dismiss HUD / Modals");
-                    sys_row(ui, "Click Platter", "Vinyl Scratch / Stop");
-                    sys_row(ui, "◆ Stems", "Separate Audio via AI");
+                    let c = TraktorTheme::ACCENT();
+                    key_row(ui, "F1", "Mix (Parallel Waveforms)", c);
+                    key_row(ui, "F2", "4-Deck Full Mix", c);
+                    key_row(ui, "F3", "Browser (Full Library)", c);
+                    key_row(ui, "F4", "Timeline Studio", c);
+                    ui.add_space(8.0);
+                    key_row(ui, "Cmd / Ctrl + ,", "Preferences & Setup", c);
+                    key_row(ui, "?", "Toggle Shortcuts HUD", c);
+                    key_row(ui, "Esc", "Dismiss HUD / Modals", c);
                 });
             });
 
