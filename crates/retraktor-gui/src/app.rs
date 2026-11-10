@@ -1504,9 +1504,12 @@ impl ReTraktorApp {
                 if pill(ui, "+", false, Color32::TRANSPARENT, HIT).on_hover_text("Master tempo up 0.5 BPM").clicked() {
                     self.master_tempo = (self.master_tempo + 0.5).min(240.0);
                 }
-                if pill(ui, "ROUND", false, Color32::TRANSPARENT, 0.0)
-                    .on_hover_text("Round the master tempo to a whole BPM")
-                    .clicked()
+                // Below ~1150 px the bar drops its least-used items rather than overlap.
+                let roomy = ui.ctx().screen_rect().width() >= 1150.0;
+                if roomy
+                    && pill(ui, "ROUND", false, Color32::TRANSPARENT, 0.0)
+                        .on_hover_text("Round the master tempo to a whole BPM")
+                        .clicked()
                 {
                     self.master_tempo = self.master_tempo.round().clamp(60.0, 200.0);
                 }
@@ -1607,9 +1610,10 @@ impl ReTraktorApp {
                         self.preferences.is_open = true;
                         self.preferences.current_tab = PrefsTab::Controllers;
                     }
-                    if lamp(ui, "48 kHz", true)
-                        .on_hover_text("Audio out: PipeWire, 48 kHz. Click for audio settings")
-                        .clicked()
+                    if roomy
+                        && lamp(ui, "48 kHz", true)
+                            .on_hover_text("Audio out: PipeWire, 48 kHz. Click for audio settings")
+                            .clicked()
                     {
                         self.preferences.is_open = true;
                         self.preferences.current_tab = PrefsTab::AudioSetup;

@@ -1606,7 +1606,7 @@ impl LibraryManager {
 
     fn show_toolbar(&mut self, ui: &mut Ui, music_folders: &[PathBuf], columns: &mut LibraryColumnsConfig) {
         ui.horizontal(|ui| {
-            let r = ui.add(egui::TextEdit::singleline(&mut self.search_query).hint_text("Search… try bpm:120-128 key:~8m energy:>6").desired_width(260.0));
+            let r = ui.add(egui::TextEdit::singleline(&mut self.search_query).hint_text("Search… try bpm:120-128 key:~8m energy:>6").desired_width((ui.available_width() * 0.28).clamp(150.0, 320.0)));
             if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F)) {
                 r.request_focus();
             }
@@ -1615,13 +1615,13 @@ impl LibraryManager {
             }
             ui.separator();
             let busy = self.is_busy();
-            if ui.add_enabled(!busy, egui::Button::new("Rescan folders")).on_hover_text("Add new files from your music folders").clicked() {
+            if ui.add_enabled(!busy, egui::Button::new("Rescan")).on_hover_text("Add new files from your music folders").clicked() {
                 self.start_scan(music_folders.to_vec());
             }
             let pending = self.unanalyzed_ids();
             if !pending.is_empty()
                 && ui
-                    .add_enabled(!busy, egui::Button::new(format!("Analyze {} tracks", pending.len())))
+                    .add_enabled(!busy, egui::Button::new(format!("Analyze {}", pending.len())))
                     .on_hover_text("Detect BPM, key and energy where they're unknown (existing values are kept)")
                     .clicked()
             {

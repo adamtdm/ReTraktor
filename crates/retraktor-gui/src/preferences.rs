@@ -1390,7 +1390,10 @@ impl PreferencesDialog {
             "Mix Recording Directory",
             "Destination folder where recorded live WAV mixes are saved.",
             |ui| {
-                ui.label(RichText::new(path_str).monospace().color(TraktorTheme::DECK_A()));
+                // Long paths shorten to ~ and truncate instead of running over the label.
+                let home = std::env::var("HOME").unwrap_or_default();
+                let shown = if home.is_empty() { path_str.to_string() } else { path_str.replacen(&home, "~", 1) };
+                ui.add(egui::Label::new(RichText::new(shown).monospace().color(TraktorTheme::TEXT_PRIMARY())).truncate()).on_hover_text(path_str);
             },
         );
 
@@ -1693,7 +1696,7 @@ impl PreferencesDialog {
         let is_connected = self.mx2_connected_node.is_some();
         let (banner_bg, stroke_col, title_text, subtitle_text) = if is_connected {
             (
-                Color32::from_rgb(14, 32, 20),
+                TraktorTheme::BG_PANEL(),
                 TraktorTheme::PLAY_ACTIVE(),
                 format!("● Traktor MX2 Connected ({})", self.mx2_connected_node.as_deref().unwrap_or("")),
                 format!(
@@ -1704,15 +1707,15 @@ impl PreferencesDialog {
             )
         } else if let Some(ref status) = self.mx2_access_status {
             (
-                Color32::from_rgb(38, 28, 14),
-                Color32::from_rgb(255, 170, 0),
+                TraktorTheme::BG_PANEL(),
+                TraktorTheme::METER_YELLOW(),
                 "⚠ Traktor Controller Detected — Permission Check Needed".to_string(),
                 status.clone(),
             )
         } else {
             (
-                Color32::from_rgb(24, 26, 34),
-                Color32::from_rgb(70, 80, 95),
+                TraktorTheme::BG_PANEL(),
+                TraktorTheme::BORDER_ACCENT(),
                 "○ No Traktor MX2 Controller Attached via USB".to_string(),
                 "Plug in the 15V DC power supply and connect via USB-C cable to auto-detect.".to_string(),
             )
@@ -1724,7 +1727,7 @@ impl PreferencesDialog {
             .inner_margin(egui::Margin::symmetric(10.0, 6.0))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(title_text).color(stroke_col).strong());
+                    ui.label(RichText::new(title_text).color(TraktorTheme::TEXT_PRIMARY()).strong());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("🔄 Rescan Hardware").clicked() {
                             self.trigger_rescan = true;
@@ -1770,7 +1773,7 @@ impl PreferencesDialog {
         if let Some(ref report) = self.self_test_report {
             ui.add_space(4.0);
             egui::Frame::none()
-                .fill(Color32::from_rgb(18, 28, 20))
+                .fill(TraktorTheme::BG_PANEL())
                 .stroke(Stroke::new(1.0_f32, TraktorTheme::PLAY_ACTIVE()))
                 .inner_margin(egui::Margin::symmetric(8.0, 4.0))
                 .show(ui, |ui| {
@@ -1851,10 +1854,10 @@ impl PreferencesDialog {
                                         }
                                     }
                                     retraktor_hid::DeviceAccessLevel::ReadOnlyOk => {
-                                        ui.label(RichText::new("Read-Only").color(Color32::from_rgb(255, 170, 0)));
+                                        ui.label(RichText::new("Read-Only").color(TraktorTheme::METER_YELLOW()));
                                     }
                                     retraktor_hid::DeviceAccessLevel::PermissionDenied => {
-                                        ui.label(RichText::new("Permission Denied").color(Color32::from_rgb(255, 80, 80)));
+                                        ui.label(RichText::new("Permission Denied").color(TraktorTheme::METER_RED()));
                                     }
                                     _ => {
                                         ui.label("-");
