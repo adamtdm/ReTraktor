@@ -19,6 +19,582 @@ pub enum DotCell {
     Hollow(Color32),
 }
 
+/// Rendering mode for ASCII sprite `#` cells.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpriteMode {
+    /// Render lit dots as filled circles.
+    Filled,
+    /// Render lit dots as hollow ring circles (or dim outline when off).
+    Hollow,
+}
+
+/// A tiny dot-matrix sprite defined as ASCII bitmaps in code.
+/// Each frame is an array of string slices representing rows from top to bottom.
+/// In each row:
+/// '#' or '*' = lit dot (filled or hollow depending on `SpriteMode`)
+/// 'o' or 'O' = hollow dot
+/// '.' or ' ' = unlit dot
+#[derive(Clone, Copy, Debug)]
+pub struct Sprite {
+    pub name: &'static str,
+    pub frames: &'static [&'static [&'static str]],
+}
+
+impl Sprite {
+    pub const fn new(name: &'static str, frames: &'static [&'static [&'static str]]) -> Self {
+        Self { name, frames }
+    }
+
+    pub fn frame(&self, index: usize) -> &'static [&'static str] {
+        if self.frames.is_empty() {
+            &[]
+        } else {
+            self.frames[index % self.frames.len()]
+        }
+    }
+
+    pub fn dimensions(&self, frame_index: usize) -> (usize, usize) {
+        let f = self.frame(frame_index);
+        let h = f.len();
+        let w = if h > 0 { f[0].len() } else { 0 };
+        (w, h)
+    }
+}
+
+/// Pure helper: returns the vertical bounce offset in whole dots at elapsed seconds `elapsed_sec`
+/// within a bounce animation of total duration `duration_sec` (e.g. 0.6 s).
+/// Returns 0 when elapsed_sec >= duration_sec or if animations are disabled.
+pub fn bounce_dot_offset(elapsed_sec: f32, duration_sec: f32, max_hop_dots: i32) -> i32 {
+    if !theme::animations() || elapsed_sec <= 0.0 || elapsed_sec >= duration_sec || duration_sec <= 0.0 {
+        return 0;
+    }
+    let t = (elapsed_sec / duration_sec).clamp(0.0, 1.0);
+    // 2.5 decaying sinusoidal hops
+    let decay = (1.0 - t).powi(2);
+    let wave = (t * std::f32::consts::PI * 3.0).sin().abs();
+    (wave * decay * max_hop_dots as f32).round() as i32
+}
+
+/// Paints a dot-matrix sprite centered at `center` with dot spacing `pitch`.
+/// `bounce_dots`: vertical offset in integer dots (positive = bounced upwards by `bounce_dots * pitch.y`),
+/// keeping the sprite strictly on the grid.
+/// `draw_unlit`: if true, draws unlit dots with `unlit_col`; if false, leaves them transparent.
+pub fn paint_sprite(
+    painter: &Painter,
+    center: Pos2,
+    pitch: Vec2,
+    dot_radius: f32,
+    sprite: &Sprite,
+    frame_index: usize,
+    bounce_dots: i32,
+    mode: SpriteMode,
+    color: Color32,
+    unlit_col: Color32,
+    draw_unlit: bool,
+) {
+    let frame = sprite.frame(frame_index);
+    let h = frame.len();
+    if h == 0 {
+        return;
+    }
+    let w = frame[0].len();
+    if w == 0 {
+        return;
+    }
+
+    let start_x = center.x - (w as f32 - 1.0) * 0.5 * pitch.x;
+    let start_y = center.y - (h as f32 - 1.0) * 0.5 * pitch.y - (bounce_dots as f32 * pitch.y);
+
+    for (r, row_str) in frame.iter().enumerate() {
+        let y = start_y + r as f32 * pitch.y;
+        for (c, ch) in row_str.chars().enumerate() {
+            let x = start_x + c as f32 * pitch.x;
+            let pt = Pos2::new(x, y);
+            match ch {
+                '#' | '*' => {
+                    let cell = match mode {
+                        SpriteMode::Filled => DotCell::Filled(color),
+                        SpriteMode::Hollow => DotCell::Hollow(color),
+                    };
+                    paint_dot(painter, pt, dot_radius, cell, unlit_col);
+                }
+                'o' | 'O' => {
+                    paint_dot(painter, pt, dot_radius, DotCell::Hollow(color), unlit_col);
+                }
+                '.' | ' ' => {
+                    if draw_unlit {
+                        paint_dot(painter, pt, dot_radius, DotCell::Unlit, unlit_col);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stem & EQ Sprites
+// ---------------------------------------------------------------------------
+
+pub static SPRITE_DRUMS: Sprite = Sprite::new(
+    "DRUMS",
+    &[&[
+        "#...#",
+        "#####",
+        "#...#",
+        "#.#.#",
+        "#####",
+    ]],
+);
+
+pub static SPRITE_BASS: Sprite = Sprite::new(
+    "BASS",
+    &[&[
+        "..#..",
+        "..#..",
+        ".###.",
+        "#.#.#",
+        "#####",
+        ".###.",
+    ]],
+);
+
+pub static SPRITE_OTHER: Sprite = Sprite::new(
+    "OTHER",
+    &[&[
+        "#####",
+        "#.#.#",
+        "#.#.#",
+        "#####",
+        "#####",
+    ]],
+);
+
+pub static SPRITE_VOCALS: Sprite = Sprite::new(
+    "VOCALS",
+    &[&[
+        ".###.",
+        "#####",
+        "#####",
+        ".###.",
+        "..#..",
+    ]],
+);
+
+pub static STEM_SPRITES: [&Sprite; 4] = [
+    &SPRITE_DRUMS,
+    &SPRITE_BASS,
+    &SPRITE_OTHER,
+    &SPRITE_VOCALS,
+];
+
+pub static SPRITE_KILL_X: Sprite = Sprite::new(
+    "KILL",
+    &[&[
+        "#...#",
+        ".#.#.",
+        "..#..",
+        ".#.#.",
+        "#...#",
+    ]],
+);
+
+pub static SPRITE_TICK: Sprite = Sprite::new(
+    "RESTORE",
+    &[&[
+        "....#",
+        "...#.",
+        "#..#.",
+        ".#.#.",
+        "..#..",
+    ]],
+);
+
+// ---------------------------------------------------------------------------
+// Crossfade Cheer Sprites (10 distinct animations)
+// ---------------------------------------------------------------------------
+
+pub static SPRITE_THUMBS_UP: Sprite = Sprite::new(
+    "THUMBS UP",
+    &[&[
+        "...##....",
+        "...#.#...",
+        "...#.#...",
+        ".###.#...",
+        "#..#.#...",
+        "#..###...",
+        "#........",
+        ".#######.",
+        ".#.....#.",
+        ".#######.",
+    ]],
+);
+
+pub static SPRITE_SMILEY: Sprite = Sprite::new(
+    "SMILEY",
+    &[
+        &[
+            "..#####..",
+            ".#.....#.",
+            "#..#.#..#",
+            "#.......#",
+            "#.#...#.#",
+            "#..###..#",
+            "#.......#",
+            ".#.....#.",
+            "..#####..",
+        ],
+        &[
+            "..#####..",
+            ".#.....#.",
+            "#..###..#",
+            "#.......#",
+            "#.#...#.#",
+            "#..###..#",
+            "#.......#",
+            ".#.....#.",
+            "..#####..",
+        ],
+    ],
+);
+
+pub static SPRITE_HEART: Sprite = Sprite::new(
+    "HEART",
+    &[
+        &[
+            ".##...##.",
+            "####.####",
+            "#########",
+            "#########",
+            ".#######.",
+            "..#####..",
+            "...###...",
+            "....#....",
+            ".........",
+        ],
+        &[
+            "###...###",
+            "#########",
+            "#########",
+            "#########",
+            ".#######.",
+            "..#####..",
+            "...###...",
+            "....#....",
+            ".........",
+        ],
+    ],
+);
+
+pub static SPRITE_STAR: Sprite = Sprite::new(
+    "STAR",
+    &[
+        &[
+            "....#....",
+            "....#....",
+            "..#####..",
+            ".#######.",
+            "#########",
+            "..#####..",
+            ".##...##.",
+            "#.......#",
+            ".........",
+        ],
+        &[
+            "#...#...#",
+            ".#..#..#.",
+            "..#####..",
+            ".#######.",
+            "###.#.###",
+            "..#####..",
+            ".#..#..#.",
+            "#...#...#",
+            "....#....",
+        ],
+    ],
+);
+
+pub static SPRITE_FLAME: Sprite = Sprite::new(
+    "FLAME",
+    &[
+        &[
+            "....#....",
+            "...###...",
+            "...###...",
+            "..#####..",
+            ".######..",
+            ".#######.",
+            "#########",
+            ".#######.",
+            "..#####..",
+        ],
+        &[
+            ".....#...",
+            "....##...",
+            "...###...",
+            "..#####..",
+            "..######.",
+            ".#######.",
+            "#########",
+            ".#######.",
+            "..#####..",
+        ],
+    ],
+);
+
+pub static SPRITE_ROCKET: Sprite = Sprite::new(
+    "ROCKET",
+    &[
+        &[
+            "....#....",
+            "...###...",
+            "...###...",
+            "..#####..",
+            "..#####..",
+            ".#######.",
+            ".##.#.##.",
+            "##..#..##",
+            "....#....",
+            "...###...",
+            "....#....",
+        ],
+        &[
+            "....#....",
+            "...###...",
+            "...###...",
+            "..#####..",
+            "..#####..",
+            ".#######.",
+            ".##.#.##.",
+            "##..#..##",
+            "...###...",
+            "....#....",
+            "...###...",
+        ],
+    ],
+);
+
+pub static SPRITE_NICE: Sprite = Sprite::new(
+    "NICE",
+    &[&[
+        "#...#..###..###..####",
+        "##..#...#...#....#...",
+        "#.#.#...#...#....###.",
+        "#..##...#...#....#...",
+        "#...#..###..###..####",
+    ]],
+);
+
+pub static SPRITE_SMOOTH: Sprite = Sprite::new(
+    "SMOOTH",
+    &[&[
+        ".##.#...#.###.###.###.#.#",
+        "#...##.##.#.#.#.#..#..#.#",
+        ".##.#.#.#.#.#.#.#..#..###",
+        "..#.#...#.#.#.#.#..#..#.#",
+        "##..#...#.###.###..#..#.#",
+    ]],
+);
+
+pub static SPRITE_SHADES: Sprite = Sprite::new(
+    "SUNGLASSES",
+    &[&[
+        "..#####..",
+        ".#.....#.",
+        "#########",
+        "#.##.##.#",
+        "#########",
+        "#.......#",
+        "#..###..#",
+        ".#.....#.",
+        "..#####..",
+    ]],
+);
+
+pub static SPRITE_TROPHY: Sprite = Sprite::new(
+    "TROPHY",
+    &[&[
+        ".#######.",
+        ".#######.",
+        "#.#####.#",
+        "#..###..#",
+        "...###...",
+        "....#....",
+        "....#....",
+        "..#####..",
+        ".#######.",
+    ]],
+);
+
+pub static CHEER_SPRITES: [&Sprite; 10] = [
+    &SPRITE_THUMBS_UP,
+    &SPRITE_SMILEY,
+    &SPRITE_HEART,
+    &SPRITE_STAR,
+    &SPRITE_FLAME,
+    &SPRITE_ROCKET,
+    &SPRITE_NICE,
+    &SPRITE_SMOOTH,
+    &SPRITE_SHADES,
+    &SPRITE_TROPHY,
+];
+
+pub const CHEER_SPRITES_COUNT: usize = 10;
+
+// ---------------------------------------------------------------------------
+// Crossfade Cheer Detection & State
+// ---------------------------------------------------------------------------
+
+/// Active cheer animation state on a deck.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ActiveCheer {
+    pub deck: usize,
+    pub cheer_index: usize,
+    pub start_sec: f64,
+}
+
+/// Track side for the crossfader (< 0.1 or > 0.9).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum XfaderSide {
+    Left,
+    Right,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum CheerState {
+    Neutral,
+    AtSide {
+        side: XfaderSide,
+        arrived_at: f64,
+        can_cheer: bool,
+        cheered: bool,
+    },
+    InTransit {
+        from_side: XfaderSide,
+        both_playing: bool,
+    },
+}
+
+/// Pure state machine detecting a completed crossfade transition between decks A and B.
+///
+/// When the crossfader has travelled from one side (< 0.1 or > 0.9) to the other
+/// while both decks were playing, and then rests at the far side for 2 seconds,
+/// it emits a cheer event with the cheer sprite index.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CrossfadeCheerStateMachine {
+    state: CheerState,
+    last_cheer_index: Option<usize>,
+    pub target_deck: usize,
+}
+
+impl Default for CrossfadeCheerStateMachine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CrossfadeCheerStateMachine {
+    pub const fn new() -> Self {
+        Self {
+            state: CheerState::Neutral,
+            last_cheer_index: None,
+            target_deck: 0,
+        }
+    }
+
+    pub fn update(&mut self, crossfader: f32, both_playing: bool, now_sec: f64) -> Option<usize> {
+        let current_side = if crossfader < 0.1 {
+            Some(XfaderSide::Left)
+        } else if crossfader > 0.9 {
+            Some(XfaderSide::Right)
+        } else {
+            None
+        };
+
+        match self.state {
+            CheerState::Neutral => {
+                if let Some(side) = current_side {
+                    self.state = CheerState::AtSide {
+                        side,
+                        arrived_at: now_sec,
+                        can_cheer: false,
+                        cheered: false,
+                    };
+                }
+            }
+            CheerState::AtSide { side, arrived_at, can_cheer, cheered } => {
+                match current_side {
+                    Some(curr) if curr == side => {
+                        // Still resting at the same side
+                        if can_cheer && !cheered && (now_sec - arrived_at >= 2.0) {
+                            self.state = CheerState::AtSide {
+                                side,
+                                arrived_at,
+                                can_cheer,
+                                cheered: true,
+                            };
+                            self.target_deck = if side == XfaderSide::Left { 0 } else { 1 };
+                            let next_idx = match self.last_cheer_index {
+                                Some(last) => (last + 1) % CHEER_SPRITES_COUNT,
+                                None => (now_sec.floor() as usize) % CHEER_SPRITES_COUNT,
+                            };
+                            self.last_cheer_index = Some(next_idx);
+                            return Some(next_idx);
+                        }
+                    }
+                    Some(curr) => {
+                        // Direct jump from one side to the other in a single frame
+                        self.state = CheerState::AtSide {
+                            side: curr,
+                            arrived_at: now_sec,
+                            can_cheer: both_playing,
+                            cheered: false,
+                        };
+                    }
+                    None => {
+                        // Moving into transit from `side`
+                        self.state = CheerState::InTransit {
+                            from_side: side,
+                            both_playing,
+                        };
+                    }
+                }
+            }
+            CheerState::InTransit { from_side, both_playing: was_both_playing } => {
+                let still_both_playing = was_both_playing && both_playing;
+                match current_side {
+                    None => {
+                        // Still in transit
+                        self.state = CheerState::InTransit {
+                            from_side,
+                            both_playing: still_both_playing,
+                        };
+                    }
+                    Some(curr) if curr == from_side => {
+                        // Returned back to origin without reaching far side
+                        self.state = CheerState::AtSide {
+                            side: from_side,
+                            arrived_at: now_sec,
+                            can_cheer: false,
+                            cheered: false,
+                        };
+                    }
+                    Some(curr) => {
+                        // Reached the far side!
+                        self.state = CheerState::AtSide {
+                            side: curr,
+                            arrived_at: now_sec,
+                            can_cheer: still_both_playing,
+                            cheered: false,
+                        };
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
 /// Faint unlit dot colour on a regular panel surface (`BG_PANEL` / `BG_PANEL_ALT`).
 pub fn unlit_on_panel() -> Color32 {
     theme::mix(TraktorTheme::BG_PANEL(), TraktorTheme::TEXT_MUTED(), 0.32)
@@ -545,8 +1121,9 @@ pub fn eq_display(
     let labels = ["LOW", "MID", "HI"];
     let anim = theme::animations();
 
-    let rows = ((body_h / 8.5).floor() as usize).clamp(7, 13);
-    let cols_per_band = ((band_w / 9.5).floor() as usize).clamp(3, 5);
+    let rows = ((body_h / 4.8).floor() as usize).clamp(16, 32);
+    let cols_per_band = ((band_w / 4.6).floor() as usize).clamp(5, 12);
+    let dot_radius = 1.3_f32;
     let mut node_centers = [Pos2::ZERO; 3];
 
     for slot in 0..3 {
@@ -556,6 +1133,21 @@ pub fn eq_display(
         let val = vals[b].clamp(0.0, 1.0);
         let killed = kills[b];
         let live = if anim { band_levels[b].clamp(0.0, 1.0) } else { 0.0 };
+
+        // Detect kill state change between frames via egui temp memory
+        let kill_id = ui.make_persistent_id(("eq_kill_anim", mirrored, b));
+        let now = ui.input(|i| i.time);
+        let prev_kill: Option<(bool, f64)> = ui.ctx().data(|d| d.get_temp(kill_id));
+        let (last_killed, mut anim_start) = prev_kill.unwrap_or((killed, -100.0));
+        if killed != last_killed {
+            anim_start = now;
+            ui.ctx().data_mut(|d| d.insert_temp(kill_id, (killed, now)));
+        }
+        let elapsed = (now - anim_start) as f32;
+        let is_animating = anim && elapsed >= 0.0 && elapsed < 0.6;
+        if is_animating {
+            ui.ctx().request_repaint();
+        }
 
         // Top value readout in dot font
         painter.text(
@@ -577,11 +1169,11 @@ pub fn eq_display(
 
         // Dot-matrix column block for this band
         let col_rect = Rect::from_min_max(
-            Pos2::new(slot_left + 7.0, body_top + 4.0),
-            Pos2::new(slot_left + band_w - 7.0, body_bot - 4.0),
+            Pos2::new(slot_left + 4.0, body_top + 2.0),
+            Pos2::new(slot_left + band_w - 4.0, body_bot - 2.0),
         );
         let lit_rows = value_to_lit_rows(val, rows);
-        paint_dot_grid(painter, col_rect, cols_per_band, rows, 2.0, unlit, |c, r| {
+        paint_dot_grid(painter, col_rect, cols_per_band, rows, dot_radius, unlit, |c, r| {
             // Frequency position 0.0 (LOW) .. 1.0 (HI) for the filter sweep
             let sub = if cols_per_band > 1 { c as f32 / (cols_per_band - 1) as f32 } else { 0.5 };
             let sub_freq = if mirrored { 1.0 - sub } else { sub };
@@ -600,6 +1192,48 @@ pub fn eq_display(
                 DotCell::Unlit
             }
         });
+
+        if anim {
+            let step_x = if cols_per_band > 1 { (col_rect.width() - dot_radius * 2.0).max(1.0) / (cols_per_band - 1) as f32 } else { 0.0 };
+            let step_y = if rows > 1 { (col_rect.height() - dot_radius * 2.0).max(1.0) / (rows - 1) as f32 } else { 0.0 };
+            let top_dot_y = col_rect.top() + dot_radius;
+            let icon_cy = top_dot_y + 2.0 * step_y;
+
+            if is_animating {
+                let bounce = bounce_dot_offset(elapsed, 0.6, 5);
+                let pop_down = ((1.0 - (elapsed / 0.25).min(1.0)) * 6.0).round() as i32;
+                let eff_bounce = bounce - pop_down;
+                let sprite = if killed { &SPRITE_KILL_X } else { &SPRITE_TICK };
+                let col = if killed { TraktorTheme::METER_RED() } else { TraktorTheme::PLAY_ACTIVE() };
+                paint_sprite(
+                    painter,
+                    Pos2::new(slot_cx, icon_cy),
+                    Vec2::new(step_x, step_y),
+                    dot_radius,
+                    sprite,
+                    0,
+                    eff_bounce,
+                    SpriteMode::Filled,
+                    col,
+                    unlit,
+                    false,
+                );
+            } else if killed {
+                paint_sprite(
+                    painter,
+                    Pos2::new(slot_cx, icon_cy),
+                    Vec2::new(step_x, step_y),
+                    dot_radius,
+                    &SPRITE_KILL_X,
+                    0,
+                    0,
+                    SpriteMode::Hollow,
+                    TraktorTheme::METER_RED(),
+                    unlit,
+                    false,
+                );
+            }
+        }
 
         let node_y = body_bot - val * body_h;
         node_centers[slot] = Pos2::new(slot_cx, node_y);
@@ -694,8 +1328,9 @@ pub fn stem_display(
     let body_top = rect.top() + pad_top;
     let body_bot = (rect.bottom() - pad_bot).max(body_top + 24.0);
     let body_h = body_bot - body_top;
-    let rows = ((body_h / 8.5).floor() as usize).clamp(6, 12);
-    let cols = ((slot_w / 9.0).floor() as usize).clamp(2, 4);
+    let rows = ((body_h / 4.8).floor() as usize).clamp(16, 32);
+    let cols = ((slot_w / 4.6).floor() as usize).clamp(5, 12);
+    let dot_radius = 1.3_f32;
     let anim = theme::animations();
 
     for slot in 0..4 {
@@ -705,6 +1340,21 @@ pub fn stem_display(
         let muted = stem_muted[s];
         let fx = stem_fx_send[s];
         let open_t = theme::fade(ui.ctx(), ("stem_wipe", deck_idx, s), !muted);
+
+        // Detect toggle of stem_muted between frames via egui temp memory
+        let stem_id = ui.make_persistent_id(("stem_anim", deck_idx, s));
+        let now = ui.input(|i| i.time);
+        let prev_state: Option<(bool, f64)> = ui.ctx().data(|d| d.get_temp(stem_id));
+        let (last_muted, mut anim_start) = prev_state.unwrap_or((muted, -100.0));
+        if muted != last_muted {
+            anim_start = now;
+            ui.ctx().data_mut(|d| d.insert_temp(stem_id, (muted, now)));
+        }
+        let elapsed = (now - anim_start) as f32;
+        let is_animating = anim && elapsed >= 0.0 && elapsed < 0.6;
+        if is_animating {
+            ui.ctx().request_repaint();
+        }
 
         // Top state readout in dot font
         let top_txt = if muted {
@@ -732,8 +1382,8 @@ pub fn stem_display(
         );
 
         let block_rect = Rect::from_min_max(
-            Pos2::new(slot_left + 4.0, body_top + 2.0),
-            Pos2::new(slot_left + slot_w - 4.0, body_bot - 2.0),
+            Pos2::new(slot_left + 3.0, body_top + 2.0),
+            Pos2::new(slot_left + slot_w - 3.0, body_bot - 2.0),
         );
         let live = if anim { stem_levels[s].clamp(0.0, 1.0) } else { 0.45 };
         // Active stems always show at least 35% height so on/off state is unmistakable when paused
@@ -741,7 +1391,7 @@ pub fn stem_display(
         let lit_rows = value_to_lit_rows(active_frac, rows);
         let wipe_rows = value_to_lit_rows(open_t, rows);
 
-        paint_dot_grid(painter, block_rect, cols, rows, 2.0, unlit, |c, r| {
+        paint_dot_grid(painter, block_rect, cols, rows, dot_radius, unlit, |c, r| {
             let is_border = c == 0 || c == cols - 1 || r == 0 || r == rows - 1;
             if r < lit_rows {
                 let row_t = 0.6 + 0.4 * (1.0 - r as f32 / rows.max(1) as f32);
@@ -752,6 +1402,40 @@ pub fn stem_display(
                 DotCell::Unlit
             }
         });
+
+        if anim {
+            let step_x = if cols > 1 { (block_rect.width() - dot_radius * 2.0).max(1.0) / (cols - 1) as f32 } else { 0.0 };
+            let step_y = if rows > 1 { (block_rect.height() - dot_radius * 2.0).max(1.0) / (rows - 1) as f32 } else { 0.0 };
+            let top_dot_y = block_rect.top() + dot_radius;
+            let icon_cy = top_dot_y + 2.0 * step_y;
+            let sprite = STEM_SPRITES[s];
+
+            let (bounce_dots, mode, col) = if is_animating {
+                let b = bounce_dot_offset(elapsed, 0.6, 5);
+                let pop = ((1.0 - (elapsed / 0.25).min(1.0)) * 6.0).round() as i32;
+                let m = if muted { SpriteMode::Hollow } else { SpriteMode::Filled };
+                let c = if muted { accent_vis.gamma_multiply(0.45) } else { accent_vis };
+                (b - pop, m, c)
+            } else {
+                let m = if muted { SpriteMode::Hollow } else { SpriteMode::Filled };
+                let c = if muted { accent_vis.gamma_multiply(0.38) } else { accent_vis };
+                (0, m, c)
+            };
+
+            paint_sprite(
+                painter,
+                Pos2::new(slot_cx, icon_cy),
+                Vec2::new(step_x, step_y),
+                dot_radius,
+                sprite,
+                0,
+                bounce_dots,
+                mode,
+                col,
+                unlit,
+                false,
+            );
+        }
     }
 
     if let Some(pct) = stem_progress {
@@ -762,6 +1446,103 @@ pub fn stem_display(
     }
 
     response
+}
+
+/// Paints the cheer overlay animation on the deck display.
+/// Temporarily replaces the EQ/stem dots on that display and wipes in/out over 1.5 seconds.
+pub fn cheer_display(
+    ui: &mut Ui,
+    cheer_index: usize,
+    elapsed_sec: f32,
+    accent: Color32,
+    size: Vec2,
+) -> Response {
+    let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+
+    let painter = ui.painter();
+    let bg = TraktorTheme::WAVEFORM_BG();
+    let accent_vis = visible_on_inset(accent);
+    let unlit = unlit_on_inset();
+    painter.rect_filled(rect, 6.0, bg);
+    painter.rect_stroke(rect, 6.0, Stroke::new(1.0_f32, TraktorTheme::BORDER_COLOR()));
+
+    let pad_top = 18.0;
+    let pad_bot = 16.0;
+    let body_top = rect.top() + pad_top;
+    let body_bot = (rect.bottom() - pad_bot).max(body_top + 24.0);
+    let body_h = body_bot - body_top;
+    let body_w = (rect.width() - 16.0).max(20.0);
+    let grid_rect = Rect::from_center_size(rect.center(), Vec2::new(body_w, body_h));
+
+    let rows = ((body_h / 4.8).floor() as usize).clamp(16, 32);
+    let cols = ((body_w / 4.6).floor() as usize).clamp(16, 36);
+    let dot_radius = 1.3_f32;
+
+    let sprite = CHEER_SPRITES[cheer_index % CHEER_SPRITES.len()];
+    let frame_count = sprite.frames.len();
+    let frame_idx = if frame_count > 1 {
+        ((elapsed_sec * 4.0) as usize) % frame_count
+    } else {
+        0
+    };
+
+    let step_x = if cols > 1 { (grid_rect.width() - dot_radius * 2.0).max(1.0) / (cols - 1) as f32 } else { 0.0 };
+    let step_y = if rows > 1 { (grid_rect.height() - dot_radius * 2.0).max(1.0) / (rows - 1) as f32 } else { 0.0 };
+
+    let wipe_prog = if elapsed_sec < 0.25 {
+        (elapsed_sec / 0.25).clamp(0.0, 1.0)
+    } else if elapsed_sec > 1.25 {
+        ((1.5 - elapsed_sec) / 0.25).clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+
+    // Base unlit grid
+    paint_dot_grid(painter, grid_rect, cols, rows, dot_radius, unlit, |_c, _r| DotCell::Unlit);
+
+    let bounce_dots = if elapsed_sec < 0.6 {
+        bounce_dot_offset(elapsed_sec, 0.6, 3)
+    } else {
+        0
+    };
+
+    let (sw, _sh) = sprite.dimensions(frame_idx);
+    let eff_step_x = if sw as f32 * step_x > body_w - 4.0 {
+        (body_w - 4.0) / sw as f32
+    } else {
+        step_x
+    };
+
+    if wipe_prog > 0.05 {
+        paint_sprite(
+            painter,
+            grid_rect.center(),
+            Vec2::new(eff_step_x, step_y),
+            dot_radius,
+            sprite,
+            frame_idx,
+            bounce_dots,
+            SpriteMode::Filled,
+            accent_vis,
+            unlit,
+            false,
+        );
+    }
+
+    let alpha_t = wipe_prog.clamp(0.0, 1.0);
+    painter.text(
+        Pos2::new(rect.center().x, rect.top() + 10.0),
+        Align2::CENTER_CENTER,
+        "★ NICE MIX ★",
+        theme::dot_font(9.5),
+        accent_vis.gamma_multiply(alpha_t),
+    );
+
+    ui.ctx().request_repaint();
+    response.on_hover_text(format!("Cheers: {}", sprite.name))
 }
 
 /// Interactive 4-row dot-ribbon crossfader across the bottom of the mixer panel.
@@ -1052,5 +1833,43 @@ mod tests {
         assert!(format_eq_db(0.25, false).starts_with('-'));
         assert_eq!(format_db(0.0, 0.85), "-∞");
         assert_eq!(format_db(0.85, 0.85), "0");
+    }
+
+    #[test]
+    fn sprites_and_cheers_are_well_formed() {
+        assert!(CHEER_SPRITES_COUNT >= 8);
+        assert_eq!(CHEER_SPRITES.len(), CHEER_SPRITES_COUNT);
+        for s in CHEER_SPRITES.iter() {
+            assert!(!s.name.is_empty());
+            assert!(!s.frames.is_empty());
+            let (w, h) = s.dimensions(0);
+            assert!(w > 0 && h > 0, "sprite {} must have non-zero dimensions", s.name);
+        }
+
+        assert_eq!(STEM_SPRITES.len(), 4);
+        for s in STEM_SPRITES.iter() {
+            let (w, h) = s.dimensions(0);
+            assert_eq!(w, 5, "stem sprite {} must be 5 dots wide", s.name);
+            assert!(h >= 5 && h <= 6, "stem sprite {} must be 5-6 dots high", s.name);
+        }
+
+        let (kw, kh) = SPRITE_KILL_X.dimensions(0);
+        assert_eq!(kw, 5);
+        assert_eq!(kh, 5);
+        let (tw, th) = SPRITE_TICK.dimensions(0);
+        assert_eq!(tw, 5);
+        assert_eq!(th, 5);
+    }
+
+    #[test]
+    fn bounce_offset_is_bounded_and_settles() {
+        assert_eq!(bounce_dot_offset(0.0, 0.6, 5), 0);
+        assert_eq!(bounce_dot_offset(0.6, 0.6, 5), 0);
+        assert_eq!(bounce_dot_offset(1.0, 0.6, 5), 0);
+        // During the bounce, hops produce positive integer offsets
+        let hop1 = bounce_dot_offset(0.12, 0.6, 5);
+        assert!(hop1 >= 2 && hop1 <= 5, "hop1 was {hop1}");
+        let hop2 = bounce_dot_offset(0.48, 0.6, 5);
+        assert!(hop2 >= 0 && hop2 <= 2, "hop2 was {hop2}");
     }
 }
