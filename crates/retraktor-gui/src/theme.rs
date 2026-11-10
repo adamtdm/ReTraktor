@@ -368,6 +368,11 @@ pub fn apply_visuals(ctx: &egui::Context) {
     ctx.set_visuals(v);
 }
 
+/// Black or white, whichever reads better on `fill`.
+pub fn on(fill: Color32) -> Color32 {
+    if contrast(Color32::BLACK, fill) >= contrast(Color32::WHITE, fill) { Color32::BLACK } else { Color32::WHITE }
+}
+
 /// WCAG contrast ratio between two colours (1.0..=21.0).
 pub fn contrast(a: Color32, b: Color32) -> f32 {
     let lum = |c: Color32| {

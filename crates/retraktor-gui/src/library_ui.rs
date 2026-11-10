@@ -1778,7 +1778,7 @@ impl LibraryManager {
         let txt = |s: String| RichText::new(s).size(12.0);
         match col {
             SortColumn::Order => txt((row + 1).to_string()).color(TraktorTheme::TEXT_MUTED()),
-            SortColumn::Title => txt(t.title.clone()).color(if t.missing { Color32::from_rgb(200, 90, 80) } else { TraktorTheme::TEXT_PRIMARY() }),
+            SortColumn::Title => txt(t.title.clone()).color(if t.missing { TraktorTheme::METER_RED() } else { TraktorTheme::TEXT_PRIMARY() }),
             SortColumn::Artist => txt(t.artist.clone()),
             SortColumn::Album => txt(t.album.clone()).color(dim),
             SortColumn::Bpm if t.bpm > 0.0 => txt(format!("{:.1}", t.bpm)).monospace(),
@@ -1884,10 +1884,16 @@ impl LibraryManager {
                     let r = row.index();
                     let t = &self.tracks[self.view[r]];
                     let score = self.view_scores.get(r).copied().unwrap_or(0.0);
-                    row.set_selected(self.selection.contains(&t.id));
+                    let selected = self.selection.contains(&t.id);
+                    row.set_selected(selected);
                     for &c in &cols {
                         row.col(|ui| {
-                            ui.add(egui::Label::new(Self::cell_text(t, c, r, score)).truncate().selectable(false));
+                            let mut text = Self::cell_text(t, c, r, score);
+                            if selected {
+                                // Per-column colours (dim, key hue, missing red) vanish on the selection fill.
+                                text = text.color(crate::theme::on(TraktorTheme::ROW_SELECTED()));
+                            }
+                            ui.add(egui::Label::new(text).truncate().selectable(false));
                         });
                     }
                     let resp = row.response();
