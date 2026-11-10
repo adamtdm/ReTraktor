@@ -1587,7 +1587,7 @@ impl LibraryManager {
             return;
         }
         let busy = self.is_busy();
-        egui::Frame::none().fill(Color32::from_rgb(52, 36, 34)).rounding(4.0).inner_margin(egui::Margin::symmetric(10.0, 8.0)).show(ui, |ui| {
+        egui::Frame::none().fill(TraktorTheme::BG_PANEL()).stroke(Stroke::new(1.0_f32, TraktorTheme::METER_RED())).rounding(4.0).inner_margin(egui::Margin::symmetric(10.0, 8.0)).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 ui.label(RichText::new(format!("{} can't be found where they were saved.", plural(missing))).size(12.5).color(TraktorTheme::TEXT_PRIMARY()));
@@ -1628,7 +1628,7 @@ impl LibraryManager {
                 self.start_analysis(pending, false);
             }
             let missing = self.missing_count();
-            if missing > 0 && self.selected_nav != NavItem::Missing && ui.link(RichText::new(format!("{missing} missing")).color(Color32::from_rgb(214, 120, 100))).on_hover_text("Show tracks whose files can't be found").clicked() {
+            if missing > 0 && self.selected_nav != NavItem::Missing && ui.link(RichText::new(format!("{missing} missing")).color(TraktorTheme::METER_RED())).on_hover_text("Show tracks whose files can't be found").clicked() {
                 self.selected_nav = NavItem::Missing;
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1787,7 +1787,7 @@ impl LibraryManager {
                 let hue = KeyWheel::parse_open_key(&t.musical_key).map_or(0.0, |(n, _)| (n as f32 - 1.0) / 12.0);
                 {
                     // Light themes need darker, more saturated key colours to stay readable.
-                    let (sat, val) = if crate::theme::palette().is_dark() { (0.55, 0.95) } else { (0.9, 0.5) };
+                    let (sat, val) = if crate::theme::palette().is_dark() { (0.55, 0.95) } else { (1.0, 0.4) };
                     txt(t.musical_key.clone()).monospace().color(Color32::from(egui::ecolor::Hsva::new(hue, sat, val, 1.0)))
                 }
             }
@@ -1798,7 +1798,7 @@ impl LibraryManager {
                 txt(format!("{}:{:02}", s / 60, s % 60)).monospace().color(dim)
             }
             SortColumn::Genre => txt(t.genre.clone()).color(dim),
-            SortColumn::Rating => txt("★".repeat(t.rating.min(5) as usize)).color(Color32::from_rgb(98, 144, 196)),
+            SortColumn::Rating => txt("★".repeat(t.rating.min(5) as usize)).color(TraktorTheme::ACCENT()),
             SortColumn::Comment => txt(t.comment.clone()).color(dim),
             SortColumn::Remixer => txt(t.remixer.clone()).color(dim),
             SortColumn::Label => txt(t.label.clone()).color(dim),
