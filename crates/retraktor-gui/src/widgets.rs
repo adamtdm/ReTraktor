@@ -319,6 +319,245 @@ fn spectrum_colors(low: f32, mid: f32, high: f32) -> (Color32, Color32, Color32)
     (outer_col, mid_col, core_col)
 }
 
+/// Computes the quantized dot-matrix grid layout (`(cols, half_rows, pitch_x, pitch_y, radius)`)
+/// for `rect`, keeping the total circle count well under a few thousand shapes per frame.
+pub(crate) fn dot_grid_metrics(width: f32, height: f32, max_cols: usize, max_half_rows: usize) -> (usize, usize, f32, f32, f32) {
+    let pitch_x = (width / max_cols.max(1) as f32).max(5.5);
+    let cols = ((width / pitch_x).floor() as usize).clamp(1, max_cols.max(1));
+    let step_x = width / cols as f32;
+    let half_h = (height * 0.45).max(3.0);
+    let pitch_y = (half_h / max_half_rows.max(1) as f32).max(4.5);
+    let half_rows = ((half_h / pitch_y).floor() as usize).clamp(1, max_half_rows.max(1));
+    let step_y = half_h / half_rows as f32;
+    let radius = (step_x.min(step_y) * 0.34).clamp(1.1, 2.5);
+    (cols, half_rows, step_x, step_y, radius)
+}
+
+/// Quantises a `[0, 1]` amplitude into how many dot pairs (`0..=half_rows`) should light up.
+pub(crate) fn quantize_dot_rows(amp: f32, half_rows: usize) -> usize {
+    if half_rows == 0 || amp <= 0.02 {
+        return 0;
+    }
+    ((amp.clamp(0.0, 1.0) * half_rows as f32).ceil() as usize).clamp(1, half_rows)
+}
+
+/// Samples interpolated `[low, mid, high]` peak amplitudes at `time_sec` from `peaks`.
+fn sample_scrolling_3band(peaks: &[[f32; 3]], time_sec: f64) -> Option<(f32, f32, f32)> {
+    if peaks.is_empty() || time_sec < 0.0 {
+        return None;
+    }
+    let exact_idx = time_sec * PEAKS_PER_SEC as f64;
+    let idx0 = (exact_idx.floor() as usize) % peaks.len();
+    let idx1 = (idx0 + 1) % peaks.len();
+    let frac = exact_idx.fract() as f32;
+    let p0 = peaks[idx0];
+    let p1 = peaks[idx1];
+    Some((
+        p0[0] + (p1[0] - p0[0]) * frac,
+        p0[1] + (p1[1] - p0[1]) * frac,
+        p0[2] + (p1[2] - p0[2]) * frac,
+    ))
+}
+
+/// Draws a 3-band waveform inside `rect` in the given `style`.
+/// `sample_at_x` returns `Some((low, mid, high))` for a given `x` coordinate in `rect`.
+fn paint_3band_waveform(
+    painter: &egui::Painter,
+    rect: Rect,
+    playhead_x: f32,
+    style: crate::theme::WaveformStyle,
+    max_dot_cols: usize,
+    max_dot_half_rows: usize,
+    sample_at_x: impl Fn(f32) -> Option<(f32, f32, f32)>,
+) {
+    use crate::theme::WaveformStyle;
+    let center_y = rect.center().y;
+    let max_half_h = rect.height() * 0.45;
+
+    match style {
+        WaveformStyle::Classic => {
+            let col_w = 1.5_f32;
+            let cols = (rect.width() / col_w).ceil() as usize;
+            for i in 0..cols {
+                let col_x = rect.left() + (i as f32) * col_w;
+                let Some((low_amp, mid_amp, high_amp)) = sample_at_x(col_x) else { continue };
+                let (outer_col, mid_col, core_col) = spectrum_colors(low_amp, mid_amp, high_amp);
+                let total_env = low_amp.max(mid_amp * 0.92).max(high_amp * 0.85);
+                let h_outer = (total_env * max_half_h).max(1.0);
+                painter.line_segment(
+                    [Pos2::new(col_x, center_y - h_outer), Pos2::new(col_x, center_y + h_outer)],
+                    Stroke::new(col_w, outer_col),
+                );
+                let h_mid = (mid_amp.max(low_amp * 0.75) * max_half_h * 0.72).max(0.8);
+                painter.line_segment(
+                    [Pos2::new(col_x, center_y - h_mid), Pos2::new(col_x, center_y + h_mid)],
+                    Stroke::new(col_w, mid_col),
+                );
+                let h_core = (low_amp * max_half_h * 0.46).max(0.5);
+                painter.line_segment(
+                    [Pos2::new(col_x, center_y - h_core), Pos2::new(col_x, center_y + h_core)],
+                    Stroke::new(col_w, core_col),
+                );
+            }
+        }
+        WaveformStyle::Dots => {
+            let (cols, half_rows, step_x, step_y, radius) =
+                dot_grid_metrics(rect.width(), rect.height(), max_dot_cols, max_dot_half_rows);
+            let unlit = crate::theme::mix(TraktorTheme::WAVEFORM_BG(), TraktorTheme::WAVEFORM_GRID(), 0.22);
+            let glow_w = (step_x * 4.5).max(18.0);
+            for c in 0..cols {
+                let col_x = rect.left() + (c as f32 + 0.5) * step_x;
+                let near = (1.0 - ((col_x - playhead_x).abs() / glow_w)).clamp(0.0, 1.0);
+                let sampled = sample_at_x(col_x);
+                let (lit_outer, lit_mid, lit_core, outer_col, mid_col, core_col) =
+                    if let Some((low, mid, high)) = sampled {
+                        let (oc, mc, cc) = spectrum_colors(low, mid, high);
+                        let env = low.max(mid * 0.92).max(high * 0.85);
+                        let lo = quantize_dot_rows(env, half_rows);
+                        let lm = quantize_dot_rows(mid.max(low * 0.75) * 0.75, half_rows).min(lo);
+                        let lc = quantize_dot_rows(low * 0.52, half_rows).min(lm);
+                        (lo, lm, lc, oc, mc, cc)
+                    } else {
+                        (0, 0, 0, unlit, unlit, unlit)
+                    };
+                for r in 0..half_rows {
+                    let dy = (r as f32 + 0.5) * step_y;
+                    let col = if r < lit_core {
+                        core_col
+                    } else if r < lit_mid {
+                        mid_col
+                    } else if r < lit_outer {
+                        outer_col
+                    } else {
+                        unlit
+                    };
+                    let col = if r < lit_outer && near > 0.0 {
+                        crate::theme::mix(col, TraktorTheme::TEXT_HIGHLIGHT(), near * 0.42)
+                    } else if r >= lit_outer && near > 0.0 {
+                        crate::theme::mix(col, TraktorTheme::WAVEFORM_GRID(), near * 0.25)
+                    } else {
+                        col
+                    };
+                    let rad = if r < lit_outer && near > 0.0 { radius * (1.0 + 0.12 * near) } else { radius };
+                    painter.circle_filled(Pos2::new(col_x, center_y - dy), rad, col);
+                    painter.circle_filled(Pos2::new(col_x, center_y + dy), rad, col);
+                }
+            }
+        }
+        WaveformStyle::Bars => {
+            let pitch = if rect.height() <= 26.0 { 4.0_f32 } else { 5.0_f32 };
+            let bar_w = if rect.height() <= 26.0 { 2.4_f32 } else { 3.2_f32 };
+            let rounding = bar_w * 0.5;
+            let cols = (rect.width() / pitch).floor() as usize;
+            let glow_w = pitch * 4.0;
+            for c in 0..cols {
+                let col_x = rect.left() + (c as f32 + 0.5) * pitch;
+                let Some((low, mid, high)) = sample_at_x(col_x) else { continue };
+                let (outer_col, mid_col, core_col) = spectrum_colors(low, mid, high);
+                let near = (1.0 - ((col_x - playhead_x).abs() / glow_w)).clamp(0.0, 1.0);
+                let boost = |col: Color32| {
+                    if near > 0.0 {
+                        crate::theme::mix(col, TraktorTheme::TEXT_HIGHLIGHT(), near * 0.35)
+                    } else {
+                        col
+                    }
+                };
+                let env = low.max(mid * 0.92).max(high * 0.85);
+                let h_outer = (env * max_half_h).max(1.5);
+                painter.rect_filled(
+                    Rect::from_center_size(Pos2::new(col_x, center_y), Vec2::new(bar_w, h_outer * 2.0)),
+                    rounding,
+                    boost(outer_col),
+                );
+                let h_mid = (mid.max(low * 0.75) * max_half_h * 0.68).max(1.0).min(h_outer);
+                painter.rect_filled(
+                    Rect::from_center_size(Pos2::new(col_x, center_y), Vec2::new(bar_w, h_mid * 2.0)),
+                    rounding,
+                    boost(mid_col),
+                );
+                if low > 0.12 {
+                    let h_core = (low * max_half_h * 0.42).max(0.8).min(h_mid);
+                    painter.rect_filled(
+                        Rect::from_center_size(Pos2::new(col_x, center_y), Vec2::new(bar_w, h_core * 2.0)),
+                        rounding,
+                        boost(core_col),
+                    );
+                }
+            }
+        }
+        WaveformStyle::Line => {
+            let step = 2.0_f32;
+            let cols = (rect.width() / step).ceil() as usize;
+            let mut prev: Option<(Pos2, Pos2, Color32)> = None;
+            for c in 0..=cols {
+                let col_x = (rect.left() + (c as f32) * step).min(rect.right());
+                if let Some((low, mid, high)) = sample_at_x(col_x) {
+                    let (outer_col, mid_col, core_col) = spectrum_colors(low, mid, high);
+                    let env = low.max(mid * 0.92).max(high * 0.85);
+                    let h = (env * max_half_h).max(0.8);
+                    let top = Pos2::new(col_x, center_y - h);
+                    let bot = Pos2::new(col_x, center_y + h);
+                    let stroke_col = if low > 0.55 {
+                        core_col
+                    } else if mid >= high {
+                        mid_col
+                    } else {
+                        outer_col
+                    };
+                    if let Some((p_top, p_bot, p_col)) = prev {
+                        let seg_col = crate::theme::mix(p_col, stroke_col, 0.5);
+                        painter.line_segment([p_top, top], Stroke::new(1.5_f32, seg_col));
+                        painter.line_segment([p_bot, bot], Stroke::new(1.5_f32, seg_col));
+                    }
+                    prev = Some((top, bot, stroke_col));
+                } else {
+                    prev = None;
+                }
+            }
+        }
+    }
+}
+
+/// Paints a small live preview of `style` inside `rect` for the Preferences > Look style cards.
+pub fn paint_waveform_style_preview(
+    painter: &egui::Painter,
+    rect: Rect,
+    style: crate::theme::WaveformStyle,
+) {
+    painter.rect_filled(rect, 4.0, TraktorTheme::WAVEFORM_BG());
+    painter.rect_stroke(rect, 4.0, Stroke::new(1.0_f32, TraktorTheme::BORDER_COLOR()));
+    let cy = rect.center().y;
+    let cx = rect.center().x;
+    painter.line_segment(
+        [Pos2::new(rect.left(), cy), Pos2::new(rect.right(), cy)],
+        Stroke::new(0.5_f32, TraktorTheme::WAVEFORM_GRID().gamma_multiply(0.35)),
+    );
+    let sample_at_x = |x: f32| -> Option<(f32, f32, f32)> {
+        let t = ((x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
+        // Synthetic 4-beat phrase with kick transients, mid chord body, and hi-hat offbeats
+        let beat_phase = (t * 4.0).fract();
+        let kick = (1.0 - beat_phase * 3.2).max(0.0).powi(2);
+        let offbeat = (1.0 - ((beat_phase - 0.5).abs() * 4.5)).max(0.0);
+        let phrase = 0.35 + 0.65 * (t * PI).sin();
+        let low = (kick * 0.92 + 0.12 * phrase).clamp(0.08, 0.98);
+        let mid = ((0.35 + 0.45 * (t * PI * 3.0).sin().abs()) * phrase + kick * 0.25).clamp(0.12, 0.92);
+        let high = (offbeat * 0.78 + 0.22 * (t * PI * 7.0).cos().abs()).clamp(0.08, 0.90);
+        Some((low, mid, high))
+    };
+    paint_3band_waveform(painter, rect, cx, style, 22, 4, sample_at_x);
+    for b in 1..4 {
+        let bx = rect.left() + (b as f32 / 4.0) * rect.width();
+        painter.line_segment(
+            [Pos2::new(bx, rect.top()), Pos2::new(bx, rect.bottom())],
+            Stroke::new(0.6_f32, TraktorTheme::WAVEFORM_GRID().gamma_multiply(0.35)),
+        );
+    }
+    painter.line_segment(
+        [Pos2::new(cx, rect.top()), Pos2::new(cx, rect.bottom())],
+        Stroke::new(1.3_f32, TraktorTheme::WAVEFORM_PLAYHEAD()),
+    );
+}
+
 /// Real-Time 60 FPS Scrolling Traktor Pro 4 "Spectrum" Waveform Display
 #[allow(clippy::too_many_arguments)]
 pub fn scrolling_waveform(
@@ -375,70 +614,13 @@ pub fn scrolling_waveform(
         }
     }
 
-    // 2. Multi-Band Traktor Pro 4 "Spectrum" Waveform Columns (1.5px pitch for crisp detail)
+    // 2. Waveform body in active style
     let beat_len_sec = 60.0 / bpm.max(30.0);
-    let col_w = 1.5_f32;
-    let cols = (width / col_w).ceil() as usize;
-    let max_half_h = height * 0.45;
-
-    for i in 0..cols {
-        let col_x = rect.left() + (i as f32) * col_w;
+    let style = crate::theme::waveform_style();
+    paint_3band_waveform(painter, rect, center_x, style, 120, 7, |col_x| {
         let time_at_col = elapsed_sec + ((col_x - center_x) / pixels_per_sec) as f64;
-
-        if time_at_col < 0.0 {
-            continue;
-        }
-
-        let (low_amp, mid_amp, high_amp) = if !waveform_peaks.is_empty() {
-            let exact_idx = time_at_col * PEAKS_PER_SEC as f64;
-            let idx0 = (exact_idx.floor() as usize) % waveform_peaks.len();
-            let idx1 = (idx0 + 1) % waveform_peaks.len();
-            let frac = exact_idx.fract() as f32;
-            let p0 = waveform_peaks[idx0];
-            let p1 = waveform_peaks[idx1];
-            (
-                p0[0] + (p1[0] - p0[0]) * frac,
-                p0[1] + (p1[1] - p0[1]) * frac,
-                p0[2] + (p1[2] - p0[2]) * frac,
-            )
-        } else {
-            // Empty deck: nothing to draw.
-            continue;
-        };
-
-        let (outer_col, mid_col, core_col) = spectrum_colors(low_amp, mid_amp, high_amp);
-        let total_env = low_amp.max(mid_amp * 0.92).max(high_amp * 0.85);
-
-        // Layer 1: Outer Periwinkle/Sky-Blue silhouette
-        let h_outer = (total_env * max_half_h).max(1.0);
-        painter.line_segment(
-            [
-                Pos2::new(col_x, center_y - h_outer),
-                Pos2::new(col_x, center_y + h_outer),
-            ],
-            Stroke::new(col_w, outer_col),
-        );
-
-        // Layer 2: Middle Sage/Gold harmonic body
-        let h_mid = (mid_amp.max(low_amp * 0.75) * max_half_h * 0.72).max(0.8);
-        painter.line_segment(
-            [
-                Pos2::new(col_x, center_y - h_mid),
-                Pos2::new(col_x, center_y + h_mid),
-            ],
-            Stroke::new(col_w, mid_col),
-        );
-
-        // Layer 3: Inner Warm Coral-Orange Bass/Kick core
-        let h_core = (low_amp * max_half_h * 0.46).max(0.5);
-        painter.line_segment(
-            [
-                Pos2::new(col_x, center_y - h_core),
-                Pos2::new(col_x, center_y + h_core),
-            ],
-            Stroke::new(col_w, core_col),
-        );
-    }
+        sample_scrolling_3band(waveform_peaks, time_at_col)
+    });
 
     // 3. Subtle Beatgrid Lines (drawn cleanly over the waveform like Traktor Pro 4)
     let visible_sec_half = (width / 2.0 / pixels_per_sec) as f64;
@@ -551,18 +733,18 @@ pub fn scrolling_stem_waveforms(
     let center_x = wave_rect.center().x;
     let pixels_per_sec = 92.0_f32;
 
-    // Authentic Traktor Pro 4 Stem Lane Colors (from Traktor Pro 4 Deck B screenshot)
+    // Stem lane colours derived from theme tokens
     let stem_core_colors = [
-        Color32::from_rgb(218, 102, 54), // 0: DRUMS (Warm Coral-Orange core)
-        Color32::from_rgb(214, 118, 42), // 1: BASS  (Deep Warm Amber-Orange)
-        Color32::from_rgb(86, 162, 188), // 2: OTHER (Soft Steel-Teal / Blue)
-        Color32::from_rgb(98, 182, 118), // 3: VOCALS (Soft Emerald-Sage Green)
+        TraktorTheme::WAVEFORM_LOW(),
+        crate::theme::mix(TraktorTheme::WAVEFORM_LOW(), TraktorTheme::WAVEFORM_MID(), 0.45),
+        TraktorTheme::WAVEFORM_HIGH(),
+        TraktorTheme::LOOP_ACTIVE(),
     ];
     let stem_outer_colors = [
-        Color32::from_rgba_unmultiplied(128, 114, 206, 185), // Drums Highs (Periwinkle)
-        Color32::from_rgba_unmultiplied(186, 82, 48, 185),   // Bass Outer
-        Color32::from_rgba_unmultiplied(112, 134, 204, 185), // Other Outer
-        Color32::from_rgba_unmultiplied(88, 164, 192, 185),  // Vocals Outer
+        crate::theme::mix(TraktorTheme::WAVEFORM_LOW(), TraktorTheme::WAVEFORM_HIGH(), 0.5).gamma_multiply(0.72),
+        TraktorTheme::WAVEFORM_LOW().gamma_multiply(0.72),
+        TraktorTheme::WAVEFORM_HIGH().gamma_multiply(0.72),
+        crate::theme::mix(TraktorTheme::LOOP_ACTIVE(), TraktorTheme::WAVEFORM_HIGH(), 0.4).gamma_multiply(0.72),
     ];
     let stem_labels = ["DRUMS", "BASS", "OTHER", "VOCALS"];
 
@@ -587,59 +769,143 @@ pub fn scrolling_stem_waveforms(
         }
     }
 
-    // 2. Draw 4 Stem Waveform Ribbons
-    let col_w = 1.5_f32;
-    let cols = (wave_rect.width() / col_w).ceil() as usize;
+    // 2. Draw 4 Stem Waveform Ribbons in active style
     let max_lane_half = (lane_h * 0.44).max(2.0);
-
-    for i in 0..cols {
-        let col_x = wave_rect.left() + (i as f32) * col_w;
+    let sample_stems_at_x = |col_x: f32| -> Option<[f32; 4]> {
         let time_at_col = elapsed_sec + ((col_x - center_x) / pixels_per_sec) as f64;
-        if time_at_col < 0.0 {
-            continue;
+        if time_at_col < 0.0 || stem_peaks.is_empty() {
+            return None;
         }
+        let exact_idx = time_at_col * PEAKS_PER_SEC as f64;
+        let idx0 = (exact_idx.floor() as usize) % stem_peaks.len();
+        let idx1 = (idx0 + 1) % stem_peaks.len();
+        let frac = exact_idx.fract() as f32;
+        let p0 = stem_peaks[idx0];
+        let p1 = stem_peaks[idx1];
+        Some([
+            p0[0] + (p1[0] - p0[0]) * frac,
+            p0[1] + (p1[1] - p0[1]) * frac,
+            p0[2] + (p1[2] - p0[2]) * frac,
+            p0[3] + (p1[3] - p0[3]) * frac,
+        ])
+    };
 
-        let amps = if !stem_peaks.is_empty() {
-            let exact_idx = time_at_col * PEAKS_PER_SEC as f64;
-            let idx0 = (exact_idx.floor() as usize) % stem_peaks.len();
-            let idx1 = (idx0 + 1) % stem_peaks.len();
-            let frac = exact_idx.fract() as f32;
-            let p0 = stem_peaks[idx0];
-            let p1 = stem_peaks[idx1];
-            [
-                p0[0] + (p1[0] - p0[0]) * frac,
-                p0[1] + (p1[1] - p0[1]) * frac,
-                p0[2] + (p1[2] - p0[2]) * frac,
-                p0[3] + (p1[3] - p0[3]) * frac,
-            ]
-        } else {
-            continue;
-        };
-
-        for lane in 0..4 {
-            let lane_cy = wave_rect.top() + (lane as f32 + 0.5) * lane_h;
-            let vol = if stem_muted[lane] {
-                0.15
-            } else {
-                stem_volumes[lane].clamp(0.1, 1.0)
-            };
-            let h_outer = amps[lane] * vol * max_lane_half;
-            let h_core = h_outer * 0.62;
-
-            if stem_muted[lane] {
-                painter.line_segment(
-                    [Pos2::new(col_x, lane_cy - h_outer), Pos2::new(col_x, lane_cy + h_outer)],
-                    Stroke::new(col_w, TraktorTheme::WAVEFORM_GRID().gamma_multiply(0.4)),
-                );
-            } else {
-                painter.line_segment(
-                    [Pos2::new(col_x, lane_cy - h_outer), Pos2::new(col_x, lane_cy + h_outer)],
-                    Stroke::new(col_w, stem_outer_colors[lane]),
-                );
-                painter.line_segment(
-                    [Pos2::new(col_x, lane_cy - h_core), Pos2::new(col_x, lane_cy + h_core)],
-                    Stroke::new(col_w, stem_core_colors[lane]),
-                );
+    let muted_col = TraktorTheme::WAVEFORM_GRID().gamma_multiply(0.4);
+    match crate::theme::waveform_style() {
+        crate::theme::WaveformStyle::Classic => {
+            let col_w = 1.5_f32;
+            let cols = (wave_rect.width() / col_w).ceil() as usize;
+            for i in 0..cols {
+                let col_x = wave_rect.left() + (i as f32) * col_w;
+                let Some(amps) = sample_stems_at_x(col_x) else { continue };
+                for lane in 0..4 {
+                    let lane_cy = wave_rect.top() + (lane as f32 + 0.5) * lane_h;
+                    let vol = if stem_muted[lane] { 0.15 } else { stem_volumes[lane].clamp(0.1, 1.0) };
+                    let h_outer = amps[lane] * vol * max_lane_half;
+                    let h_core = h_outer * 0.62;
+                    if stem_muted[lane] {
+                        painter.line_segment(
+                            [Pos2::new(col_x, lane_cy - h_outer), Pos2::new(col_x, lane_cy + h_outer)],
+                            Stroke::new(col_w, muted_col),
+                        );
+                    } else {
+                        painter.line_segment(
+                            [Pos2::new(col_x, lane_cy - h_outer), Pos2::new(col_x, lane_cy + h_outer)],
+                            Stroke::new(col_w, stem_outer_colors[lane]),
+                        );
+                        painter.line_segment(
+                            [Pos2::new(col_x, lane_cy - h_core), Pos2::new(col_x, lane_cy + h_core)],
+                            Stroke::new(col_w, stem_core_colors[lane]),
+                        );
+                    }
+                }
+            }
+        }
+        crate::theme::WaveformStyle::Dots => {
+            let (cols, half_rows, step_x, step_y, radius) =
+                dot_grid_metrics(wave_rect.width(), lane_h, 96, 3);
+            let unlit = crate::theme::mix(TraktorTheme::WAVEFORM_BG(), TraktorTheme::WAVEFORM_GRID(), 0.22);
+            let glow_w = (step_x * 4.5).max(18.0);
+            for c in 0..cols {
+                let col_x = wave_rect.left() + (c as f32 + 0.5) * step_x;
+                let near = (1.0 - ((col_x - center_x).abs() / glow_w)).clamp(0.0, 1.0);
+                let amps = sample_stems_at_x(col_x);
+                for lane in 0..4 {
+                    let lane_cy = wave_rect.top() + (lane as f32 + 0.5) * lane_h;
+                    let vol = if stem_muted[lane] { 0.15 } else { stem_volumes[lane].clamp(0.1, 1.0) };
+                    let lit = amps.map(|a| quantize_dot_rows(a[lane] * vol, half_rows)).unwrap_or(0);
+                    let base_col = if stem_muted[lane] { muted_col } else { stem_core_colors[lane] };
+                    for r in 0..half_rows {
+                        let dy = (r as f32 + 0.5) * step_y;
+                        let col = if r < lit {
+                            if near > 0.0 {
+                                crate::theme::mix(base_col, TraktorTheme::TEXT_HIGHLIGHT(), near * 0.42)
+                            } else {
+                                base_col
+                            }
+                        } else if near > 0.0 {
+                            crate::theme::mix(unlit, TraktorTheme::WAVEFORM_GRID(), near * 0.25)
+                        } else {
+                            unlit
+                        };
+                        painter.circle_filled(Pos2::new(col_x, lane_cy - dy), radius, col);
+                        painter.circle_filled(Pos2::new(col_x, lane_cy + dy), radius, col);
+                    }
+                }
+            }
+        }
+        crate::theme::WaveformStyle::Bars => {
+            let pitch = 5.0_f32;
+            let bar_w = 3.2_f32;
+            let rounding = bar_w * 0.5;
+            let cols = (wave_rect.width() / pitch).floor() as usize;
+            let glow_w = pitch * 4.0;
+            for c in 0..cols {
+                let col_x = wave_rect.left() + (c as f32 + 0.5) * pitch;
+                let Some(amps) = sample_stems_at_x(col_x) else { continue };
+                let near = (1.0 - ((col_x - center_x).abs() / glow_w)).clamp(0.0, 1.0);
+                for lane in 0..4 {
+                    let lane_cy = wave_rect.top() + (lane as f32 + 0.5) * lane_h;
+                    let vol = if stem_muted[lane] { 0.15 } else { stem_volumes[lane].clamp(0.1, 1.0) };
+                    let h_outer = (amps[lane] * vol * max_lane_half).max(1.0);
+                    let col = if stem_muted[lane] {
+                        muted_col
+                    } else if near > 0.0 {
+                        crate::theme::mix(stem_core_colors[lane], TraktorTheme::TEXT_HIGHLIGHT(), near * 0.35)
+                    } else {
+                        stem_core_colors[lane]
+                    };
+                    painter.rect_filled(
+                        Rect::from_center_size(Pos2::new(col_x, lane_cy), Vec2::new(bar_w, h_outer * 2.0)),
+                        rounding,
+                        col,
+                    );
+                }
+            }
+        }
+        crate::theme::WaveformStyle::Line => {
+            let step = 2.0_f32;
+            let cols = (wave_rect.width() / step).ceil() as usize;
+            let mut prev: [Option<(Pos2, Pos2)>; 4] = [None; 4];
+            for c in 0..=cols {
+                let col_x = (wave_rect.left() + (c as f32) * step).min(wave_rect.right());
+                if let Some(amps) = sample_stems_at_x(col_x) {
+                    for lane in 0..4 {
+                        let lane_cy = wave_rect.top() + (lane as f32 + 0.5) * lane_h;
+                        let vol = if stem_muted[lane] { 0.15 } else { stem_volumes[lane].clamp(0.1, 1.0) };
+                        let h = (amps[lane] * vol * max_lane_half).max(0.6);
+                        let top = Pos2::new(col_x, lane_cy - h);
+                        let bot = Pos2::new(col_x, lane_cy + h);
+                        let col = if stem_muted[lane] { muted_col } else { stem_core_colors[lane] };
+                        if let Some((p_top, p_bot)) = prev[lane] {
+                            painter.line_segment([p_top, top], Stroke::new(1.4_f32, col));
+                            painter.line_segment([p_bot, bot], Stroke::new(1.4_f32, col));
+                        }
+                        prev[lane] = Some((top, bot));
+                    }
+                } else {
+                    prev = [None; 4];
+                }
             }
         }
     }
@@ -785,33 +1051,46 @@ pub fn stripe_overview(
         let norm_pos = (*elapsed_sec / total).clamp(0.0, 1.0) as f32;
         let scrub_x = rect.left() + norm_pos * rect.width();
         let cy = rect.center().y;
+        let style = crate::theme::waveform_style();
 
-        // Overview spectrum waveform columns (high density)
-        let cols = (rect.width() / 1.5).ceil() as usize;
-        for c in 0..cols {
-            let x = rect.left() + (c as f32) * 1.5;
-            let frac = c as f32 / cols.max(1) as f32;
-            let (low, mid, high) = if !waveform_peaks.is_empty() {
-                let idx = ((frac * waveform_peaks.len() as f32) as usize)
-                    .min(waveform_peaks.len() - 1);
+        if style == crate::theme::WaveformStyle::Classic {
+            // Overview spectrum waveform columns (high density)
+            let cols = (rect.width() / 1.5).ceil() as usize;
+            for c in 0..cols {
+                let x = rect.left() + (c as f32) * 1.5;
+                let frac = c as f32 / cols.max(1) as f32;
+                let (low, mid, high) = if !waveform_peaks.is_empty() {
+                    let idx = ((frac * waveform_peaks.len() as f32) as usize)
+                        .min(waveform_peaks.len() - 1);
+                    let p = waveform_peaks[idx];
+                    (p[0], p[1], p[2])
+                } else {
+                    continue;
+                };
+
+                let (outer_col, mid_col, core_col) = spectrum_colors(low, mid, high);
+                let h_outer = ((low.max(mid).max(high)) * (height - 6.0) * 0.5).max(1.0);
+                let h_core = (low * (height - 6.0) * 0.28).max(0.5);
+
+                painter.line_segment(
+                    [Pos2::new(x, cy - h_outer), Pos2::new(x, cy + h_outer)],
+                    Stroke::new(1.2_f32, outer_col),
+                );
+                painter.line_segment(
+                    [Pos2::new(x, cy - h_core), Pos2::new(x, cy + h_core)],
+                    Stroke::new(1.2_f32, if low > 0.55 { core_col } else { mid_col }),
+                );
+            }
+        } else {
+            paint_3band_waveform(painter, rect, scrub_x, style, 64, 2, |col_x| {
+                if waveform_peaks.is_empty() {
+                    return None;
+                }
+                let frac = ((col_x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
+                let idx = ((frac * waveform_peaks.len() as f32) as usize).min(waveform_peaks.len() - 1);
                 let p = waveform_peaks[idx];
-                (p[0], p[1], p[2])
-            } else {
-                continue;
-            };
-
-            let (outer_col, mid_col, core_col) = spectrum_colors(low, mid, high);
-            let h_outer = ((low.max(mid).max(high)) * (height - 6.0) * 0.5).max(1.0);
-            let h_core = (low * (height - 6.0) * 0.28).max(0.5);
-
-            painter.line_segment(
-                [Pos2::new(x, cy - h_outer), Pos2::new(x, cy + h_outer)],
-                Stroke::new(1.2_f32, outer_col),
-            );
-            painter.line_segment(
-                [Pos2::new(x, cy - h_core), Pos2::new(x, cy + h_core)],
-                Stroke::new(1.2_f32, if low > 0.55 { core_col } else { mid_col }),
-            );
+                Some((p[0], p[1], p[2]))
+            });
         }
 
         // Minute markers along top of stripe (like Traktor Pro 4)
@@ -1260,4 +1539,26 @@ pub fn render_shortcuts_hud(ctx: &egui::Context, is_open: &mut bool) {
                 );
             });
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dot_grid_quantisation_bounds_and_shape_budget() {
+        let (cols, half_rows, step_x, step_y, radius) = dot_grid_metrics(1920.0, 120.0, 120, 7);
+        assert!(cols <= 120 && cols > 0);
+        assert!(half_rows <= 7 && half_rows > 0);
+        assert!(cols * half_rows * 2 <= 2000, "dot waveform stays under 2000 circles");
+        assert!(step_x >= 5.5 && step_y >= 4.5);
+        assert!((1.1..=2.5).contains(&radius));
+
+        assert_eq!(quantize_dot_rows(0.0, half_rows), 0);
+        assert_eq!(quantize_dot_rows(0.01, half_rows), 0);
+        assert_eq!(quantize_dot_rows(0.05, half_rows), 1);
+        assert_eq!(quantize_dot_rows(0.5, 6), 3);
+        assert_eq!(quantize_dot_rows(1.0, half_rows), half_rows);
+        assert_eq!(quantize_dot_rows(1.5, half_rows), half_rows);
+    }
 }
