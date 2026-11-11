@@ -19,6 +19,7 @@ mod demucs;
 mod dot;
 mod library_ui;
 mod playlist_import;
+pub mod midi;
 mod preferences;
 pub mod setlist;
 mod theme;
