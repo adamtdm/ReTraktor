@@ -582,6 +582,7 @@ enum Action {
     Reveal(PathBuf),
     RemoveFromCollection(Vec<usize>),
     Sort(SortColumn),
+    AddToSet(Vec<usize>),
 }
 
 pub struct LibraryManager {
@@ -591,6 +592,7 @@ pub struct LibraryManager {
     pub search_query: String,
     pub selected_nav: NavItem,
     pub selected_track_id: Option<usize>,
+    pub add_to_set_requested: Option<Vec<usize>>,
     selection: BTreeSet<usize>,
     pub sort_col: SortColumn,
     pub sort_asc: bool,
@@ -657,6 +659,7 @@ impl LibraryManager {
             search_query: String::new(),
             selected_nav: NavItem::Collection,
             selected_track_id: None,
+            add_to_set_requested: None,
             selection: BTreeSet::new(),
             sort_col: SortColumn::Order,
             sort_asc: true,
@@ -1440,6 +1443,16 @@ impl LibraryManager {
         self.select_offset(-1);
     }
 
+    pub fn selected_ids(&self) -> Vec<usize> {
+        if !self.selection.is_empty() {
+            self.selection.iter().copied().collect()
+        } else if let Some(id) = self.selected_track_id {
+            vec![id]
+        } else {
+            Vec::new()
+        }
+    }
+
     fn selected_or(&self, id: usize) -> Vec<usize> {
         if self.selection.contains(&id) {
             self.selection.iter().copied().collect()
@@ -1529,6 +1542,11 @@ impl LibraryManager {
                 None => self.status_message = "All decks are playing and locked".to_string(),
             },
             Action::AddToPlaylist(ids, pl) => self.add_to_playlist(&ids, pl),
+            Action::AddToSet(ids) => {
+                let n = ids.len();
+                self.add_to_set_requested = Some(ids);
+                self.status_message = format!("Added {} to set list", plural(n));
+            }
             Action::RemoveFromPlaylist(ids) => {
                 if let NavItem::Playlist(i) = self.selected_nav {
                     if let Some(name) = self.playlists.get(i).map(|p| p.name.clone()) {
@@ -2051,7 +2069,7 @@ impl LibraryManager {
             self.undo();
         }
         if !ui.ctx().wants_keyboard_input() {
-            let (down, up, enter, shift, del, all) = ui.input(|i| {
+            let (down, up, enter, shift, del, all, add_set) = ui.input(|i| {
                 (
                     i.key_pressed(egui::Key::ArrowDown),
                     i.key_pressed(egui::Key::ArrowUp),
@@ -2059,6 +2077,7 @@ impl LibraryManager {
                     i.modifiers.shift,
                     i.key_pressed(egui::Key::Delete),
                     i.modifiers.command && i.key_pressed(egui::Key::A),
+                    i.modifiers.shift && i.key_pressed(egui::Key::A),
                 )
             });
             if down {
@@ -2075,6 +2094,12 @@ impl LibraryManager {
             }
             if all {
                 self.selection = self.view.iter().map(|&i| self.tracks[i].id).collect();
+            }
+            if add_set {
+                let ids = self.selected_ids();
+                if !ids.is_empty() {
+                    actions.push(Action::AddToSet(ids));
+                }
             }
         }
 
@@ -2166,6 +2191,10 @@ impl LibraryManager {
                                 }
                             });
                         });
+                        if ui.button(format!("Add {} to set list (Shift+A)", if ids.len() == 1 { "track" } else { "tracks" })).clicked() {
+                            actions.push(Action::AddToSet(ids.clone()));
+                            ui.close_menu();
+                        }
                         if in_playlist && ui.button("Remove from this playlist").clicked() {
                             actions.push(Action::RemoveFromPlaylist(ids.clone()));
                             ui.close_menu();

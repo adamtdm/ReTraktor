@@ -32,6 +32,8 @@ pub enum TraktorLayout {
     Timeline,
     /// Compact mini-decks at top + maximized full-screen library & file explorer
     Browser,
+    /// Build → Perform set sequencing, harmonic flow arc and warnings
+    Set,
 }
 
 impl TraktorLayout {
@@ -41,6 +43,7 @@ impl TraktorLayout {
             Self::FourDeck => "4-Deck",
             Self::Timeline => "Timeline",
             Self::Browser => "Browser",
+            Self::Set => "Set",
         }
     }
 }
@@ -164,6 +167,7 @@ pub struct ReTraktorApp {
     startup_scan_done: bool,
     /// Dev screenshot mode (RETRAKTOR_SHOT_DIR): output dir and steps.
     shot: Option<(String, Vec<String>)>,
+    pub set_state: crate::setlist::SetUiState,
 }
 
 impl Default for ReTraktorApp {
@@ -277,6 +281,7 @@ impl Default for ReTraktorApp {
                 let steps = std::env::var("SHOT_STEPS").unwrap_or_else(|_| "Mix,FourDeck,Browser,prefs".into());
                 (d, steps.split(',').map(str::to_string).collect())
             }),
+            set_state: crate::setlist::SetUiState::default(),
         }
     }
 }
@@ -327,6 +332,44 @@ impl eframe::App for ReTraktorApp {
         }
 
         self.handle_keyboard_shortcuts(ctx);
+        if let Some(ids) = self.library.add_to_set_requested.take() {
+            self.set_state.add_tracks(&ids);
+        }
+
+        if self.layout == TraktorLayout::Set {
+            let idle = self.idle_deck();
+            if let Some((deck, id)) = self.set_state.handle_keys(ctx, &self.library, idle) {
+                self.library.load_to_deck(deck, id, [false; 4]);
+                self.drain_pending_loads();
+            }
+        }
+
+        let dt = ctx.input(|i| i.stable_dt);
+        if let Ok(state) = self.audio.shared.lock() {
+            let is_rec = state.is_recording;
+            let rec_offset = if is_rec {
+                (state.recorded_samples.len() as f64) / (2.0 * 48_000.0)
+            } else {
+                0.0
+            };
+
+            for d in 0..2 {
+                let playing = state.is_playing[d];
+                self.set_state.update_playback(d, playing, dt);
+
+                if is_rec {
+                    let vol = self.channel_volume[d];
+                    let xfader = self.crossfader_pos;
+                    let (artist, title) = if let Some(ref loaded) = state.loaded_tracks[d] {
+                        (loaded.artist.clone(), loaded.title.clone())
+                    } else {
+                        (String::new(), String::new())
+                    };
+                    self.set_state.check_audible_track(d, playing, vol, xfader, &artist, &title, rec_offset);
+                }
+            }
+        }
+
         self.poll_mx2_hardware();
         self.sync_audio_state();
 
@@ -358,7 +401,13 @@ impl eframe::App for ReTraktorApp {
 
                 // 2. Active Workspace Layout (each fades in when chosen)
                 let mut layout_t = 1.0;
-                for lay in [TraktorLayout::Parallel, TraktorLayout::FourDeck, TraktorLayout::Timeline, TraktorLayout::Browser] {
+                for lay in [
+                    TraktorLayout::Parallel,
+                    TraktorLayout::FourDeck,
+                    TraktorLayout::Timeline,
+                    TraktorLayout::Browser,
+                    TraktorLayout::Set,
+                ] {
                     let t = crate::theme::fade(ctx, ("layout", lay.label()), self.layout == lay);
                     if self.layout == lay {
                         layout_t = t;
@@ -380,6 +429,11 @@ impl eframe::App for ReTraktorApp {
                     }
                     TraktorLayout::Browser => {
                         self.show_mini_decks_bar(ui);
+                        self.show_browser_panel(ui);
+                    }
+                    TraktorLayout::Set => {
+                        let idle = self.idle_deck();
+                        self.set_state.show_set_view(ui, &mut self.library, idle);
                         self.show_browser_panel(ui);
                     }
                 }
@@ -550,6 +604,63 @@ impl ReTraktorApp {
             "FourDeck" => self.layout = TraktorLayout::FourDeck,
             "Browser" => self.layout = TraktorLayout::Browser,
             "Timeline" => self.layout = TraktorLayout::Timeline,
+            "Set" => {
+                self.preferences.is_open = false;
+                self.layout = TraktorLayout::Set;
+                if self.set_state.set_list.track_ids.is_empty() {
+                    let sample_ids: Vec<usize> = self.library.tracks.iter().take(5).map(|t| t.id).collect();
+                    if sample_ids.is_empty() {
+                        let sample_tracks = vec![
+                            crate::library_ui::UiTrackEntry {
+                                id: 9001,
+                                title: "Solaris (Extended Mix)".to_string(),
+                                artist: "Articuno".to_string(),
+                                bpm: 124.0,
+                                musical_key: "8m".to_string(),
+                                energy: 7,
+                                duration_sec: 384.0,
+                                ..Default::default()
+                            },
+                            crate::library_ui::UiTrackEntry {
+                                id: 9002,
+                                title: "Midnight Sun (Original)".to_string(),
+                                artist: "Helios".to_string(),
+                                bpm: 125.0,
+                                musical_key: "9m".to_string(),
+                                energy: 8,
+                                duration_sec: 412.0,
+                                ..Default::default()
+                            },
+                            crate::library_ui::UiTrackEntry {
+                                id: 9003,
+                                title: "Deep Echoes".to_string(),
+                                artist: "Subway 21".to_string(),
+                                bpm: 126.0,
+                                musical_key: "10m".to_string(),
+                                energy: 6,
+                                duration_sec: 350.0,
+                                ..Default::default()
+                            },
+                            crate::library_ui::UiTrackEntry {
+                                id: 9004,
+                                title: "Velocity Peak".to_string(),
+                                artist: "Apex Drift".to_string(),
+                                bpm: 128.0,
+                                musical_key: "10d".to_string(),
+                                energy: 9,
+                                duration_sec: 295.0,
+                                ..Default::default()
+                            },
+                        ];
+                        for t in sample_tracks {
+                            self.library.tracks.push(t);
+                        }
+                        self.set_state.add_tracks(&[9001, 9002, 9003, 9004]);
+                    } else {
+                        self.set_state.add_tracks(&sample_ids);
+                    }
+                }
+            }
             "prefs" => self.preferences.is_open = true,
             "noprefs" => self.preferences.is_open = false,
             "expandA" => self.deck_expanded[0] = true,
@@ -692,6 +803,18 @@ impl ReTraktorApp {
         playing.map(|p| self.preferences.lock_playing_decks && p)
     }
 
+    /// The deck (1 = A, 2 = B) that is currently idle / not playing to receive the next track.
+    fn idle_deck(&self) -> usize {
+        if let Ok(state) = self.audio.shared.lock() {
+            if state.is_playing[0] && !state.is_playing[1] {
+                return 2;
+            } else if !state.is_playing[0] && state.is_playing[1] {
+                return 1;
+            }
+        }
+        if self.crossfader_pos < 0.5 { 2 } else { 1 }
+    }
+
     /// Decodes queued library loads on worker threads; real files only, never synthetic audio.
     fn drain_pending_loads(&mut self) {
         let library_tx = self.library.sender();
@@ -704,6 +827,7 @@ impl ReTraktorApp {
         for (deck_idx, track) in std::mem::take(&mut self.library.pending_loads) {
             let d = (deck_idx - 1).min(3);
             self.deck_track_ids[d] = Some(track.id);
+            self.set_state.on_track_loaded(d, track.id);
             let shared_audio = self.audio.shared.clone();
             let library_tx = library_tx.clone();
             thread::spawn(move || {
@@ -1389,6 +1513,7 @@ impl ReTraktorApp {
             (Key::F2, TraktorLayout::FourDeck),
             (Key::F3, TraktorLayout::Browser),
             (Key::F4, TraktorLayout::Timeline),
+            (Key::F5, TraktorLayout::Set),
         ] {
             if ctx.input(|i| i.key_pressed(key)) {
                 self.layout = lay;
@@ -1533,6 +1658,15 @@ impl ReTraktorApp {
                         state.is_playing[1] = true;
                     }
                 }
+
+                // Perform: Shift+N loads next unplayed set track into the deck that is not playing
+                if shift && i.key_pressed(Key::N) {
+                    if let Some((_, _, track)) = self.set_state.next_unplayed_track(&self.library) {
+                        let target_deck = self.idle_deck();
+                        self.library.load_to_deck(target_deck, track.id, [false; 4]);
+                        self.drain_pending_loads();
+                    }
+                }
             });
         }
     }
@@ -1646,6 +1780,7 @@ impl ReTraktorApp {
                         (TraktorLayout::FourDeck, "4-Deck", "F2"),
                         (TraktorLayout::Browser, "Browse", "F3"),
                         (TraktorLayout::Timeline, "Timeline", "F4"),
+                        (TraktorLayout::Set, "Set", "F5"),
                     ] {
                         let label = if roomy { lay.label() } else { short };
                         let min_w = if roomy { 46.0 } else { 36.0 };
@@ -1732,9 +1867,9 @@ impl ReTraktorApp {
                         };
                         if icon_pill(ui, Icon::Dot, &rec_label, rec_fill, rec_fg, Vec2::new(0.0, HIT))
                             .on_hover_text(if is_rec {
-                                "Stop and save the recording to ~/Music/ReTraktor_Master_Mix.wav"
+                                "Stop and save recording, CUE & tracklist to ~/Music/ReTraktor"
                             } else {
-                                "Record the main mix (16-bit 48 kHz WAV in ~/Music)"
+                                "Record master mix to ~/Music/ReTraktor (WAV, CUE & TXT)"
                             })
                             .clicked()
                         {
@@ -1746,17 +1881,33 @@ impl ReTraktorApp {
                                 } else {
                                     state.recorded_samples = Vec::with_capacity(48_000 * 2 * 1800);
                                     state.is_recording = true;
+                                    self.set_state.recorded_audible_tracks.clear();
+                                    self.set_state.recording_start = Some(std::time::Instant::now());
                                 }
                             }
                             if let Some(samples) = samples_to_save {
                                 let home = env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("."));
-                                let music_dir = home.join("Music");
-                                let out_dir = if music_dir.is_dir() { music_dir } else { home };
-                                let out_path = out_dir.join("ReTraktor_Master_Mix.wav");
-                                match AudioSystem::write_stereo_wav_file(&out_path, &samples, 48_000) {
+                                let rec_dir = home.join("Music").join("ReTraktor");
+                                let _ = std::fs::create_dir_all(&rec_dir);
+                                let (out_wav, out_cue, out_txt) = crate::setlist::unique_recording_paths(&rec_dir, std::time::SystemTime::now());
+                                match AudioSystem::write_stereo_wav_file(&out_wav, &samples, 48_000) {
                                     Ok(dur_s) => {
-                                        self.library.status_message =
-                                            format!("✔ Saved Master Mix recording ({dur_s:.1}s) to {}", out_path.display());
+                                        let entries: Vec<(f64, &str, &str)> = self
+                                            .set_state
+                                            .recorded_audible_tracks
+                                            .iter()
+                                            .map(|(s, a, t)| (*s, a.as_str(), t.as_str()))
+                                            .collect();
+                                        let wav_name = out_wav.file_name().and_then(|n| n.to_str()).unwrap_or("recording.wav");
+                                        let cue_str = crate::setlist::cue_sheet(&entries, wav_name);
+                                        let _ = std::fs::write(&out_cue, cue_str);
+                                        let txt_str = crate::setlist::plain_tracklist(&entries);
+                                        let _ = std::fs::write(&out_txt, txt_str);
+
+                                        self.library.status_message = format!(
+                                            "✔ Saved recording ({dur_s:.1}s), CUE & tracklist to {}",
+                                            rec_dir.display()
+                                        );
                                     }
                                     Err(e) => {
                                         self.library.status_message = format!("⚠ Failed to save WAV recording: {e}");
@@ -2068,6 +2219,9 @@ impl ReTraktorApp {
                 }
             });
         }
+
+        let idle = self.idle_deck();
+        self.set_state.show_next_up_strip(ui, &mut self.library, idle);
 
         ui.horizontal_top(|ui| {
             let mixer_w = (ui.available_width() * 0.38).clamp(380.0, 560.0);

@@ -19,6 +19,7 @@ mod dot;
 mod library_ui;
 mod playlist_import;
 mod preferences;
+pub mod setlist;
 mod theme;
 mod widgets;
 

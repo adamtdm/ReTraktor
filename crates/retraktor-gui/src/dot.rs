@@ -1922,6 +1922,145 @@ pub fn dot_transition_display(
     response
 }
 
+/// Simplified track info for the dot-matrix arc display.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SetArcTrack {
+    pub key: String,
+    pub bpm: f64,
+    pub energy: u8,
+}
+
+/// Dot-matrix "arc" display plotting energy as dot columns per track,
+/// with BPM as a dotted line across tracks, the musical key written under each column,
+/// and the selected track's column highlighted.
+pub fn set_arc_display(
+    ui: &mut Ui,
+    tracks: &[SetArcTrack],
+    selected_idx: Option<usize>,
+    size: Vec2,
+) -> (Response, Option<usize>) {
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    if !ui.is_rect_visible(rect) {
+        return (response, None);
+    }
+
+    let painter = ui.painter();
+    let bg = TraktorTheme::WAVEFORM_BG();
+    painter.rect(rect, 4.0, bg, Stroke::new(1.0_f32, TraktorTheme::BORDER_COLOR()));
+
+    // Title / legend
+    let top_y = rect.top() + 6.0;
+    painter.text(
+        Pos2::new(rect.left() + 8.0, top_y),
+        Align2::LEFT_TOP,
+        "SET FLOW & ENERGY ARC",
+        theme::dot_font(10.0),
+        TraktorTheme::TEXT_MUTED(),
+    );
+    painter.text(
+        Pos2::new(rect.right() - 8.0, top_y + 1.0),
+        Align2::RIGHT_TOP,
+        "▪ ENERGY  ·  ● BPM",
+        FontId::proportional(9.0),
+        TraktorTheme::TEXT_MUTED(),
+    );
+
+    let grid_rect = Rect::from_min_max(
+        Pos2::new(rect.left() + 16.0, rect.top() + 24.0),
+        Pos2::new(rect.right() - 16.0, rect.bottom() - 18.0),
+    );
+
+    let cols = tracks.len().max(8);
+    let rows = 10usize;
+    let unlit = unlit_on_inset();
+
+    let bpms: Vec<f64> = tracks.iter().map(|t| t.bpm).filter(|&b| b > 0.0).collect();
+    let (min_bpm, max_bpm) = if bpms.is_empty() {
+        (110.0, 140.0)
+    } else {
+        let mut min = bpms.iter().copied().fold(f64::INFINITY, f64::min);
+        let mut max = bpms.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        if (max - min) < 6.0 {
+            min -= 3.0;
+            max += 3.0;
+        }
+        (min, max)
+    };
+
+    let dot_radius = 2.0_f32;
+
+    paint_dot_grid(painter, grid_rect, cols, rows, dot_radius, unlit, |c, r| {
+        if c >= tracks.len() {
+            return DotCell::Unlit;
+        }
+        let t = &tracks[c];
+        let is_selected = selected_idx == Some(c);
+        let e_lit = (t.energy as usize).min(rows);
+
+        let bpm_ratio = if max_bpm > min_bpm && t.bpm > 0.0 {
+            ((t.bpm - min_bpm) / (max_bpm - min_bpm)).clamp(0.0, 1.0)
+        } else {
+            0.5
+        };
+        let bpm_r = ((bpm_ratio * (rows - 1) as f64).round() as usize).min(rows - 1);
+
+        if r == bpm_r {
+            let col = if is_selected {
+                TraktorTheme::TEXT_HIGHLIGHT()
+            } else {
+                TraktorTheme::PLAY_ACTIVE()
+            };
+            DotCell::Filled(col)
+        } else if r < e_lit {
+            let col = if is_selected {
+                TraktorTheme::TEXT_HIGHLIGHT()
+            } else {
+                visible_on_inset(TraktorTheme::ACCENT())
+            };
+            DotCell::Filled(col)
+        } else if is_selected {
+            DotCell::Scaled(visible_on_inset(TraktorTheme::ACCENT()), 0.4)
+        } else {
+            DotCell::Unlit
+        }
+    });
+
+    // Musical keys under each column
+    for (c, t) in tracks.iter().enumerate() {
+        let col_x = if cols > 1 {
+            grid_rect.left() + dot_radius + c as f32 * ((grid_rect.width() - dot_radius * 2.0) / (cols - 1) as f32)
+        } else {
+            grid_rect.center().x
+        };
+        let is_selected = selected_idx == Some(c);
+        let key_col = if is_selected {
+            TraktorTheme::TEXT_HIGHLIGHT()
+        } else {
+            TraktorTheme::TEXT_SECONDARY()
+        };
+        painter.text(
+            Pos2::new(col_x, grid_rect.bottom() + 3.0),
+            Align2::CENTER_TOP,
+            &t.key,
+            FontId::monospace(9.0),
+            key_col,
+        );
+    }
+
+    let mut clicked_col = None;
+    if response.clicked() {
+        if let Some(pos) = response.interact_pointer_pos() {
+            if grid_rect.contains(pos) && !tracks.is_empty() {
+                let step_x = if cols > 1 { (grid_rect.width() - dot_radius * 2.0) / (cols - 1) as f32 } else { 1.0 };
+                let col = (((pos.x - (grid_rect.left() + dot_radius)) / step_x).round() as usize).min(tracks.len().saturating_sub(1));
+                clicked_col = Some(col);
+            }
+        }
+    }
+
+    (response, clicked_col)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2054,5 +2193,17 @@ mod tests {
         let (a_vb_late, b_vb_late) = transition_curve_points(2, 0.8);
         assert!((a_vb_late - 0.5).abs() < 1e-5);
         assert_eq!(b_vb_late, 1.0);
+    }
+
+    #[test]
+    fn set_arc_track_instantiation() {
+        let t = SetArcTrack {
+            key: "8m".to_string(),
+            bpm: 124.0,
+            energy: 7,
+        };
+        assert_eq!(t.key, "8m");
+        assert_eq!(t.bpm, 124.0);
+        assert_eq!(t.energy, 7);
     }
 }

@@ -1515,6 +1515,14 @@ pub fn render_shortcuts_hud(ctx: &egui::Context, is_open: &mut bool) {
                     key_row(ui, "F2", "4-Deck Full Mix", c);
                     key_row(ui, "F3", "Browser (Full Library)", c);
                     key_row(ui, "F4", "Timeline Studio", c);
+                    key_row(ui, "F5", "Set Workflow (Build)", c);
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("SET & PERFORM").color(TraktorTheme::DECK_B()).strong());
+                    ui.add_space(4.0);
+                    key_row(ui, "Shift+A", "Add Selected to Set", c);
+                    key_row(ui, "Shift+N", "Load Next Up to Deck", c);
+                    key_row(ui, "O / Ctrl+Z", "Order Flow / Undo", c);
+                    key_row(ui, "Alt+↑ / ↓", "Reorder Track in Set", c);
                     ui.add_space(6.0);
                     ui.label(RichText::new("TIMELINE STUDIO").color(TraktorTheme::DECK_A()).strong());
                     ui.add_space(4.0);
