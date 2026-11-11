@@ -18,6 +18,7 @@ mod demucs;
 mod dot;
 mod library_ui;
 mod preferences;
+pub mod setlist;
 mod theme;
 mod widgets;
 
