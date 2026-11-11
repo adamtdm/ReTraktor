@@ -651,6 +651,7 @@ impl ReTraktorApp {
                                 pcm_bass: None,
                                 pcm_other: None,
                                 pcm_vocals: None,
+                                phrases: Vec::new(),
                             });
                         }
                     }
