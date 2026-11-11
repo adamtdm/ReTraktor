@@ -18,6 +18,7 @@ pub enum PrefsTab {
     AnalyzeOptions,
     Controllers,
     Look,
+    Ai,
     About,
 }
 
@@ -198,6 +199,9 @@ pub struct PreferencesDialog {
     pub mapper: crate::controller_map::MapperState,
     /// Last control touched on the hardware (for "press to select").
     pub last_surface_control: Option<String>,
+    pub ai_settings: crate::ai::AiSettings,
+    pub ai_test_runner: Option<crate::ai::AiTestRunner>,
+    pub ai_test_status: Option<Result<String, String>>,
 }
 
 impl Default for PreferencesDialog {
@@ -212,6 +216,9 @@ impl Default for PreferencesDialog {
             is_open: false,
             current_tab: PrefsTab::Controllers,
             search_query: String::new(),
+            ai_settings: crate::ai::AiSettings::load(),
+            ai_test_runner: None,
+            ai_test_status: None,
             sample_rate: 48000,
             buffer_size: 128,
             audio_device_name: "PipeWire pro-audio / ALSA Default".to_string(),
@@ -524,18 +531,20 @@ impl PreferencesDialog {
             PrefsTab::AnalyzeOptions => ("COLLECTION & HARDWARE", "Analyze & Musical Key"),
             PrefsTab::Controllers => ("COLLECTION & HARDWARE", "Controller Manager & Remapper"),
             PrefsTab::Look => ("LOOK", "Theme & colours"),
+            PrefsTab::Ai => ("AI ASSISTANT", "API Key & Assistant Setup"),
             PrefsTab::About => ("COLLECTION & HARDWARE", "About & Diagnostics"),
         }
     }
 
-    /// Settings pages grouped into the six top-level tabs.
-    pub const GROUPS: [(&'static str, &'static [PrefsTab]); 7] = [
+    /// Settings pages grouped into the top-level tabs.
+    pub const GROUPS: [(&'static str, &'static [PrefsTab]); 8] = [
         ("Audio", &[PrefsTab::AudioSetup, PrefsTab::OutputRouting, PrefsTab::InputRouting, PrefsTab::ExternalSync]),
         ("Decks & Mixer", &[PrefsTab::Decks, PrefsTab::TrackDecks, PrefsTab::Mixer, PrefsTab::Effects]),
         ("Library", &[PrefsTab::FileManagement, PrefsTab::BrowserColumns, PrefsTab::AnalyzeOptions]),
         ("Stems & Recording", &[PrefsTab::StemsAndAi, PrefsTab::Recording]),
         ("Controllers", &[PrefsTab::Controllers]),
         ("Look", &[PrefsTab::Look]),
+        ("AI", &[PrefsTab::Ai]),
         ("About", &[PrefsTab::About]),
     ];
 
@@ -584,6 +593,7 @@ impl PreferencesDialog {
             PrefsTab::AnalyzeOptions => self.show_analyze_prefs(ui),
             PrefsTab::Controllers => self.show_controller_prefs(ui),
             PrefsTab::Look => crate::theme::editor(ui),
+            PrefsTab::Ai => self.show_ai_prefs(ui),
             PrefsTab::About => self.show_about(ui),
         }
     }
@@ -2017,6 +2027,149 @@ impl PreferencesDialog {
                 ui.label(RichText::new(format!("Linux {}", std::env::consts::ARCH)).monospace());
             },
         );
+    }
+
+    fn show_ai_prefs(&mut self, ui: &mut Ui) {
+        if let Some(runner) = &self.ai_test_runner {
+            if let Some(res) = runner.poll() {
+                self.ai_test_status = Some(res);
+                self.ai_test_runner = None;
+            }
+        }
+
+        Self::list_section_header(ui, "AI Assistant");
+
+        // Provider picker
+        Self::list_row(
+            ui,
+            "AI Provider",
+            "Choose your model provider. ReTraktor communicates directly from your machine.",
+            |ui| {
+                let mut changed = false;
+                ui.horizontal(|ui| {
+                    for p in crate::ai::AiProvider::ALL {
+                        let sel = self.ai_settings.provider == p;
+                        let btn = egui::Button::new(
+                            RichText::new(p.label())
+                                .size(12.0)
+                                .color(if sel { on_selected_text() } else { TraktorTheme::TEXT_PRIMARY() }),
+                        )
+                        .fill(if sel { TraktorTheme::ROW_SELECTED() } else { TraktorTheme::CONTROL() })
+                        .rounding(4.0)
+                        .min_size(Vec2::new(70.0, 24.0));
+                        if ui.add(btn).clicked() && !sel {
+                            self.ai_settings.provider = p;
+                            self.ai_settings.model = p.default_model().to_string();
+                            if p == crate::ai::AiProvider::OpenAiCompatible && self.ai_settings.base_url.is_empty() {
+                                self.ai_settings.base_url = p.default_base_url().to_string();
+                            }
+                            changed = true;
+                        }
+                    }
+                });
+                if changed {
+                    let _ = self.ai_settings.save();
+                }
+            },
+        );
+
+        // API Key (password field)
+        let key_desc = match self.ai_settings.provider {
+            crate::ai::AiProvider::OpenAiCompatible => "API key (optional for local Ollama). Never logged or printed.",
+            _ => "Your secret API key. Never logged or printed.",
+        };
+        Self::list_row(ui, "API Key", key_desc, |ui| {
+            let r = ui.add(
+                egui::TextEdit::singleline(&mut self.ai_settings.api_key)
+                    .password(true)
+                    .desired_width(340.0)
+                    .hint_text("Enter API key…"),
+            );
+            if r.changed() {
+                let _ = self.ai_settings.save();
+            }
+        });
+
+        // Model
+        Self::list_row(
+            ui,
+            "Model",
+            "The model identifier sent in requests.",
+            |ui| {
+                let r = ui.add(
+                    egui::TextEdit::singleline(&mut self.ai_settings.model)
+                        .desired_width(240.0),
+                );
+                if r.changed() {
+                    let _ = self.ai_settings.save();
+                }
+            },
+        );
+
+        // Base URL (only for OpenAI-compatible)
+        if self.ai_settings.provider == crate::ai::AiProvider::OpenAiCompatible {
+            Self::list_row(
+                ui,
+                "Base URL",
+                "Custom OpenAI-compatible endpoint (e.g. http://localhost:11434/v1 for Ollama).",
+                |ui| {
+                    let r = ui.add(
+                        egui::TextEdit::singleline(&mut self.ai_settings.base_url)
+                            .desired_width(340.0)
+                            .hint_text("http://localhost:11434/v1"),
+                    );
+                    if r.changed() {
+                        let _ = self.ai_settings.save();
+                    }
+                },
+            );
+        }
+
+        // Connection Test
+        Self::list_row(
+            ui,
+            "Connection Test",
+            "Sends a one-word verification request to confirm connectivity.",
+            |ui| {
+                ui.horizontal(|ui| {
+                    let is_testing = self.ai_test_runner.is_some();
+                    let btn = egui::Button::new(
+                        RichText::new(if is_testing { "Testing…" } else { "TEST" })
+                            .color(on_selected_text())
+                            .strong(),
+                    )
+                    .fill(TraktorTheme::ROW_SELECTED())
+                    .rounding(4.0)
+                    .min_size(Vec2::new(80.0, 24.0));
+
+                    if ui.add_enabled(!is_testing, btn).clicked() {
+                        self.ai_test_status = None;
+                        self.ai_test_runner = Some(crate::ai::AiTestRunner::start(self.ai_settings.clone()));
+                    }
+
+                    if let Some(status) = &self.ai_test_status {
+                        match status {
+                            Ok(reply) => {
+                                ui.label(RichText::new(format!("✔ OK ({})", reply.trim())).color(TraktorTheme::PLAY_ACTIVE()).strong());
+                            }
+                            Err(err) => {
+                                ui.label(RichText::new(format!("⚠ {err}")).color(TraktorTheme::CUE_ACTIVE()));
+                            }
+                        }
+                    }
+                });
+            },
+        );
+
+        // Privacy notice
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("Only track titles, artists, BPM, key, genre and energy are sent. Never your audio or file paths.")
+                    .color(TraktorTheme::TEXT_MUTED())
+                    .font(egui::FontId::proportional(11.5)),
+            );
+        });
     }
 }
 

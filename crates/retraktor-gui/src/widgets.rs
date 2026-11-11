@@ -1530,6 +1530,7 @@ pub fn render_shortcuts_hud(ctx: &egui::Context, is_open: &mut bool) {
                     key_row(ui, "B", "Cycle Bar Length (8/16/32)", c);
                     key_row(ui, "A", "Audition Transition", c);
                     ui.add_space(6.0);
+                    key_row(ui, "N", "Suggest Next Track (idle deck)", c);
                     key_row(ui, "Cmd / Ctrl + ,", "Preferences & Setup", c);
                     key_row(ui, "?", "Toggle Shortcuts HUD", c);
                     key_row(ui, "Esc", "Dismiss HUD / Modals", c);
