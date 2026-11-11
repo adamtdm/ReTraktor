@@ -589,6 +589,11 @@ impl ReTraktorApp {
             }
             "muteA" if first => self.deck_stem_muted[0][0] ^= true,
             "relocate" if first => self.library.start_relocate(self.preferences.music_folders.clone()),
+            "import" | "import_playlist" | "playlist_import" if first => {
+                self.preferences.is_open = false;
+                self.layout = TraktorLayout::Browser;
+                self.library.demo_import_playlist();
+            }
             _ => {}
         }
         // SHOT_AT picks the frame within a step (default 80 = settled; small = mid-transition).

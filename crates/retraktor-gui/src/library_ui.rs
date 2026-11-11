@@ -468,6 +468,7 @@ pub fn match_score(r: &UiTrackEntry, t: &UiTrackEntry) -> f32 {
 pub struct UserPlaylist {
     pub name: String,
     pub track_ids: Vec<usize>,
+    pub missing: Vec<crate::playlist_import::Wanted>,
 }
 
 /// Drag-and-drop payload: track ids.
@@ -551,6 +552,7 @@ pub enum Pick {
     Collection,
     MusicFolder,
     RelocateFolder,
+    TrackList,
 }
 
 pub enum Msg {
@@ -702,6 +704,7 @@ impl LibraryManager {
             }
             mgr.dirty_since = None;
         }
+        mgr.load_missing_sidecar();
         mgr
     }
 
@@ -741,6 +744,10 @@ impl LibraryManager {
                 Pick::Collection => dialog.set_title("Choose your Traktor collection.nml").add_filter("Traktor collection", &["nml"]).pick_file(),
                 Pick::MusicFolder => dialog.set_title("Choose a music folder").pick_folder(),
                 Pick::RelocateFolder => dialog.set_title("Choose the folder your missing tracks moved to").pick_folder(),
+                Pick::TrackList => dialog
+                    .set_title("Import track list")
+                    .add_filter("Track list (*.csv, *.txt, *.m3u, *.m3u8)", &["csv", "txt", "m3u", "m3u8"])
+                    .pick_file(),
             };
             if let Some(p) = picked {
                 let _ = tx.send(Msg::Picked(kind, p));
@@ -763,6 +770,9 @@ impl LibraryManager {
                 Ok(_) => self.relocate_after_check = Some(music_folders.clone()),
                 Err(e) => self.status_message = format!("Couldn't read {}: {e}", path.display()),
             },
+            Pick::TrackList => {
+                self.import_track_list_file(&path);
+            }
             Pick::MusicFolder | Pick::RelocateFolder => {
                 if !music_folders.contains(&path) {
                     music_folders.push(path.clone());
@@ -857,6 +867,7 @@ impl LibraryManager {
         if path == self.collection_path {
             self.dirty_since = None;
         }
+        self.save_missing_sidecar();
         Ok(col.entries.len())
     }
 
@@ -937,6 +948,7 @@ impl LibraryManager {
                 NmlPlaylistNode::Playlist { name, track_keys, .. } => out.push(UserPlaylist {
                     name: if prefix.is_empty() { name.clone() } else { format!("{prefix} / {name}") },
                     track_ids: track_keys.iter().filter_map(|k| by_key.get(k).copied()).collect(),
+                    missing: Vec::new(),
                 }),
                 NmlPlaylistNode::Smartlist { .. } => {}
             }
@@ -959,6 +971,144 @@ impl LibraryManager {
         self.start_check();
         self.status_message = format!("Imported {added} new tracks and {} playlists from {}", self.playlists.len(), path.display());
         Ok(col.entries.len())
+    }
+
+    /// Imports a playlist from a track list file (.csv, .txt, .m3u, .m3u8).
+    pub fn import_track_list_file(&mut self, path: &Path) {
+        let text = match fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) => {
+                self.status_message = format!("Couldn't read {}: {e}", path.display());
+                return;
+            }
+        };
+        let wanted = crate::playlist_import::parse_track_list(&text);
+        if wanted.is_empty() {
+            self.status_message = format!("No tracks found in {}", path.display());
+            return;
+        }
+        let (matched_ids, missing) = crate::playlist_import::match_tracks(&wanted, &self.tracks);
+        let name = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "Imported Playlist".to_string());
+
+        let pl_idx = self.playlists.len();
+        self.playlists.push(UserPlaylist {
+            name,
+            track_ids: matched_ids.clone(),
+            missing,
+        });
+        self.selected_nav = NavItem::Playlist(pl_idx);
+        let missing_count = self.playlists[pl_idx].missing.len();
+        self.status_message = format!(
+            "Imported {} of {} tracks · {} not in your library",
+            matched_ids.len(),
+            wanted.len(),
+            missing_count
+        );
+        self.save_missing_sidecar();
+        self.touch();
+        self.ensure_view();
+    }
+
+    /// Bundled demo import for screenshot / visual check.
+    pub fn demo_import_playlist(&mut self) {
+        if self.tracks.is_empty() {
+            self.tracks.push(UiTrackEntry {
+                id: 1,
+                title: "One More Time".to_string(),
+                artist: "Daft Punk".to_string(),
+                album: "Discovery".to_string(),
+                bpm: 123.0,
+                musical_key: "11d".to_string(),
+                duration_sec: 320.0,
+                genre: "House".to_string(),
+                bitrate_kbps: 320,
+                format: "FLAC".to_string(),
+                file_path: Some(PathBuf::from("/music/daft_punk_one_more_time.flac")),
+                missing: false,
+                ..Default::default()
+            });
+            self.tracks.push(UiTrackEntry {
+                id: 2,
+                title: "Glue".to_string(),
+                artist: "Bicep".to_string(),
+                album: "Bicep".to_string(),
+                bpm: 130.0,
+                musical_key: "8m".to_string(),
+                duration_sec: 269.0,
+                genre: "Electronic".to_string(),
+                bitrate_kbps: 320,
+                format: "FLAC".to_string(),
+                file_path: Some(PathBuf::from("/music/bicep_glue.flac")),
+                missing: false,
+                ..Default::default()
+            });
+            self.rebuild_index();
+        }
+        let test_list = "\
+# Festival Warmup Track List
+1. Daft Punk - One More Time
+2. Bicep – Glue
+3. Burial - Archangel
+4. Four Tet - Baby
+";
+        let wanted = crate::playlist_import::parse_track_list(test_list);
+        let (matched_ids, missing) = crate::playlist_import::match_tracks(&wanted, &self.tracks);
+        let pl_idx = self.playlists.len();
+        self.playlists.push(UserPlaylist {
+            name: "Festival Warmup".to_string(),
+            track_ids: matched_ids.clone(),
+            missing: missing.clone(),
+        });
+        self.selected_nav = NavItem::Playlist(pl_idx);
+        self.status_message = format!(
+            "Imported {} of {} tracks · {} not in your library",
+            matched_ids.len(),
+            wanted.len(),
+            missing.len()
+        );
+        self.save_missing_sidecar();
+        self.touch();
+        self.ensure_view();
+    }
+
+    fn missing_sidecar_path() -> PathBuf {
+        let home = env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        PathBuf::from(home).join(".config/retraktor/playlist-missing.tsv")
+    }
+
+    fn save_missing_sidecar(&self) {
+        let path = Self::missing_sidecar_path();
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let mut out = String::new();
+        for pl in &self.playlists {
+            for m in &pl.missing {
+                out.push_str(&format!("{}\t{}\t{}\n", pl.name, m.artist, m.title));
+            }
+        }
+        let _ = fs::write(path, out);
+    }
+
+    fn load_missing_sidecar(&mut self) {
+        let path = Self::missing_sidecar_path();
+        let Ok(text) = fs::read_to_string(path) else { return };
+        for line in text.lines() {
+            let mut parts = line.split('\t');
+            let (Some(pl_name), Some(artist), Some(title)) = (parts.next(), parts.next(), parts.next()) else { continue };
+            if let Some(pl) = self.playlists.iter_mut().find(|p| p.name == pl_name) {
+                let w = crate::playlist_import::Wanted {
+                    artist: artist.to_string(),
+                    title: title.to_string(),
+                };
+                if !pl.missing.contains(&w) {
+                    pl.missing.push(w);
+                }
+            }
+        }
     }
 
     // ---------------------------------------------------------------- background jobs
@@ -1333,7 +1483,7 @@ impl LibraryManager {
 
     fn add_to_playlist(&mut self, ids: &[usize], playlist: Option<usize>) {
         let idx = playlist.unwrap_or_else(|| {
-            self.playlists.push(UserPlaylist { name: format!("New playlist {}", self.playlists.len() + 1), track_ids: Vec::new() });
+            self.playlists.push(UserPlaylist { name: format!("New playlist {}", self.playlists.len() + 1), track_ids: Vec::new(), missing: Vec::new() });
             self.renaming = Some((self.playlists.len() - 1, self.playlists.last().unwrap().name.clone()));
             self.playlists.len() - 1
         });
@@ -1350,7 +1500,7 @@ impl LibraryManager {
 
     fn preparation_index(&mut self) -> usize {
         self.playlists.iter().position(|p| p.name == "Preparation").unwrap_or_else(|| {
-            self.playlists.push(UserPlaylist { name: "Preparation".to_string(), track_ids: Vec::new() });
+            self.playlists.push(UserPlaylist { name: "Preparation".to_string(), track_ids: Vec::new(), missing: Vec::new() });
             self.playlists.len() - 1
         })
     }
@@ -1474,6 +1624,9 @@ impl LibraryManager {
                         self.add_to_playlist(&[], None);
                         self.selected_nav = NavItem::Playlist(self.playlists.len() - 1);
                     }
+                    if ui.small_button("Import…").on_hover_text("Import track list from CSV, M3U or text").clicked() {
+                        self.pick(Pick::TrackList);
+                    }
                 });
             });
 
@@ -1488,6 +1641,7 @@ impl LibraryManager {
                             let name = buf.trim().to_string();
                             if !name.is_empty() && !ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                                 self.playlists[i].name = name;
+                                self.save_missing_sidecar();
                                 self.touch();
                             }
                             self.renaming = None;
@@ -1500,6 +1654,10 @@ impl LibraryManager {
                 resp.context_menu(|ui| {
                     if ui.button("Rename").clicked() {
                         self.renaming = Some((i, self.playlists[i].name.clone()));
+                        ui.close_menu();
+                    }
+                    if ui.button("Import track list…").clicked() {
+                        self.pick(Pick::TrackList);
                         ui.close_menu();
                     }
                     if ui.button("Export as M3U8").clicked() {
@@ -1530,6 +1688,7 @@ impl LibraryManager {
                 self.status_message = format!("Deleted playlist '{}'", self.playlists[i].name);
                 self.playlists.remove(i);
                 self.selected_nav = NavItem::Collection;
+                self.save_missing_sidecar();
                 self.touch();
             }
         });
@@ -1564,6 +1723,16 @@ impl LibraryManager {
                 });
             });
         });
+
+        if let NavItem::Playlist(i) = self.selected_nav {
+            if let Some(pl) = self.playlists.get(i) {
+                if !pl.missing.is_empty() {
+                    egui::TopBottomPanel::bottom("playlist_missing").show_inside(ui, |ui| {
+                        Self::show_missing_shopping_list(ui, &pl.missing);
+                    });
+                }
+            }
+        }
 
         ui.vertical(|ui| {
             if self.selected_nav == NavItem::Explorer {
@@ -1613,6 +1782,55 @@ impl LibraryManager {
             });
         });
         ui.add_space(4.0);
+    }
+
+    fn show_missing_shopping_list(ui: &mut Ui, missing: &[crate::playlist_import::Wanted]) {
+        let border = TraktorTheme::BORDER_COLOR();
+        egui::Frame::none()
+            .fill(TraktorTheme::BG_PANEL())
+            .stroke(Stroke::new(1.0_f32, border))
+            .rounding(4.0)
+            .inner_margin(egui::Margin::symmetric(10.0, 6.0))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("Not in your library ({})", missing.len()))
+                            .size(12.0)
+                            .strong()
+                            .color(TraktorTheme::TEXT_PRIMARY()),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui
+                            .add_sized([90.0, 24.0], egui::Button::new(RichText::new("COPY LIST").size(11.0).strong()))
+                            .on_hover_text("Copy missing tracks to clipboard (shopping list)")
+                            .clicked()
+                        {
+                            let list = missing
+                                .iter()
+                                .map(|w| format!("{} - {}", w.artist, w.title))
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            ui.output_mut(|o| o.copied_text = list);
+                        }
+                    });
+                });
+                ui.add_space(2.0);
+                egui::ScrollArea::vertical()
+                    .max_height(80.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for item in missing {
+                            ui.horizontal(|ui| {
+                                ui.set_min_height(24.0);
+                                ui.label(RichText::new("•").size(11.0).color(TraktorTheme::TEXT_MUTED()));
+                                ui.label(RichText::new(&item.artist).size(12.0).color(TraktorTheme::TEXT_SECONDARY()));
+                                ui.label(RichText::new("–").size(12.0).color(TraktorTheme::TEXT_MUTED()));
+                                ui.label(RichText::new(&item.title).size(12.0).color(TraktorTheme::TEXT_PRIMARY()));
+                            });
+                        }
+                    });
+            });
     }
 
     fn show_toolbar(&mut self, ui: &mut Ui, music_folders: &[PathBuf], columns: &mut LibraryColumnsConfig) {
