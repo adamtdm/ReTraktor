@@ -3049,19 +3049,27 @@ impl ReTraktorApp {
         });
     }
 
-    /// Centre mixer, mirrored around the main meter: per-deck dot display (EQ, or stems when the deck is in
-    /// stems view), fader-on-meter columns, and the dot-ribbon crossfader underneath.
+    /// Centre mixer, mirrored around the main meter: unified continuous dot-matrix canvas
+    /// holding per-deck EQ/stems zones, channel fader-on-meter columns, MAIN meter,
+    /// and crossfader ribbon on a single continuous dot lattice.
     fn show_mixer_section(&mut self, ui: &mut Ui, two_channel_only: bool) {
         // Live levels for the displays: band and stem peaks at the playhead, silent when stopped.
         let mut bands = [[0.0f32; 3]; 4];
         let mut stems = [[0.0f32; 4]; 4];
         let (mut peaks, mut main) = ([0.0f32; 4], (0.0, 0.0));
         let mut both_playing = false;
+        let mut is_recording = false;
+        let mut in_key = false;
         if let Ok(state) = self.audio.shared.lock() {
             peaks = state.channel_peaks;
             main = (state.master_peak_l, state.master_peak_r);
-            // Either deck: the outgoing one is often stopped or muted to stems by the time the fader lands.
+            is_recording = state.is_recording;
             both_playing = state.is_playing[0] || state.is_playing[1];
+            in_key = state.loaded_tracks[0].as_ref().is_some_and(|a| {
+                state.loaded_tracks[1].as_ref().is_some_and(|b| {
+                    retraktor_library::KeyWheel::are_harmonically_compatible(&a.key, &b.key)
+                })
+            });
             for d in 0..4 {
                 if let (Some(t), true) = (&state.loaded_tracks[d], state.is_playing[d]) {
                     let at = (state.playhead_sec[d].max(0.0) * PEAKS_PER_SEC as f64) as usize;
@@ -3087,76 +3095,54 @@ impl ReTraktorApp {
         }
 
         if let Some(cheer) = self.active_cheer {
-            if !crate::theme::animations() || now_sec - cheer.start_sec >= 1.5 {
+            if !crate::theme::animations() || now_sec - cheer.start_sec >= 1.2 {
                 self.active_cheer = None;
             } else {
                 ui.ctx().request_repaint();
             }
         }
 
+        let stem_progress = [
+            self.library.stem_job_progress.filter(|(id, _)| self.deck_track_ids[0] == Some(*id)).map(|(_, p)| p),
+            self.library.stem_job_progress.filter(|(id, _)| self.deck_track_ids[1] == Some(*id)).map(|(_, p)| p),
+            self.library.stem_job_progress.filter(|(id, _)| self.deck_track_ids[2] == Some(*id)).map(|(_, p)| p),
+            self.library.stem_job_progress.filter(|(id, _)| self.deck_track_ids[3] == Some(*id)).map(|(_, p)| p),
+        ];
+
         let screen_h = ui.ctx().screen_rect().height();
-        let h = (132.0 + (screen_h - 640.0) * 0.25).clamp(132.0, 220.0);
-        const FADER_W: f32 = 44.0;
-        const MAIN_W: f32 = 34.0;
-        // shortcut: decks C and D get a fader but no EQ display, add one when a four-channel controller is mapped
-        let faders: &[usize] = if two_channel_only { &[0, 1] } else { &[0, 2, 3, 1] };
+        let h = (175.0 + (screen_h - 640.0) * 0.35).clamp(175.0, 270.0);
 
         panel(TraktorTheme::BG_PANEL_ALT()).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 8.0;
-                let fixed = faders.len() as f32 * (FADER_W + 8.0) + MAIN_W + 8.0;
-                let display = Vec2::new(((ui.available_width() - fixed - 8.0) / 2.0).max(96.0), h);
-                self.mixer_display(ui, 0, false, bands[0], stems[0], display);
-                for (n, &ch) in faders.iter().enumerate() {
-                    if n == faders.len() / 2 {
-                        dot::dot_meter(ui, main.0, main.1, "MAIN", h, MAIN_W).on_hover_text("Main output level");
-                    }
-                    dot::fader_meter(ui, &mut self.channel_volume[ch], peaks[ch], peaks[ch] * 0.94, &mut self.channel_cue[ch], TraktorTheme::deck_color(ch + 1), h, FADER_W)
-                        .on_hover_text(format!("Deck {} volume on its level meter. The lamp below is headphone cue.", DECK_LETTERS[ch]));
-                }
-                self.mixer_display(ui, 1, true, bands[1], stems[1], display);
-            });
-            ui.add_space(4.0);
-            let w = ui.available_width();
-            dot::dot_crossfader(ui, &mut self.crossfader_pos, peaks[0], peaks[1], w).on_hover_text(XFADER_TIP);
+            let mut mixer = dot::ContinuousMixer {
+                two_channel_only,
+                volume: &mut self.channel_volume,
+                cue: &mut self.channel_cue,
+                eq_low: &mut self.channel_eq_low,
+                eq_mid: &mut self.channel_eq_mid,
+                eq_hi: &mut self.channel_eq_hi,
+                eq_kill_low: &mut self.eq_kill_low,
+                eq_kill_mid: &mut self.eq_kill_mid,
+                eq_kill_hi: &mut self.eq_kill_hi,
+                filter: self.channel_filter,
+                filter_on: self.channel_filter_on,
+                stem_view: self.deck_stem_view,
+                stem_muted: &mut self.deck_stem_muted,
+                stem_fx_send: &mut self.deck_stem_fx_send,
+                crossfader: &mut self.crossfader_pos,
+                channel_peaks: peaks,
+                band_peaks: bands,
+                stem_peaks: stems,
+                main_peaks: main,
+                stem_progress,
+                active_cheer: &mut self.active_cheer,
+                deck_track_ids: self.deck_track_ids,
+                deck_sync_enabled: self.deck_sync_enabled,
+                in_key,
+                is_recording,
+                size: Vec2::new(ui.available_width(), h),
+            };
+            mixer.show(ui);
         });
-    }
-
-    fn mixer_display(&mut self, ui: &mut Ui, d: usize, mirrored: bool, bands: [f32; 3], stems: [f32; 4], size: Vec2) {
-        let accent = TraktorTheme::deck_color(d + 1);
-        let now_sec = ui.input(|i| i.time);
-        if let Some(cheer) = self.active_cheer {
-            if cheer.deck == d && crate::theme::animations() {
-                let elapsed = (now_sec - cheer.start_sec) as f32;
-                if elapsed < 1.5 {
-                    dot::cheer_display(ui, cheer.cheer_index, elapsed, accent, size);
-                    return;
-                }
-            }
-        }
-
-        if self.deck_stem_view[d] {
-            let progress = self.library.stem_job_progress.filter(|(id, _)| self.deck_track_ids[d] == Some(*id)).map(|(_, p)| p);
-            dot::stem_display(ui, d, &mut self.deck_stem_muted[d], &mut self.deck_stem_fx_send[d], stems, progress, mirrored, accent, size)
-                .on_hover_text("Stems: click one to turn it on or off");
-        } else {
-            dot::eq_display(
-                ui,
-                &mut self.channel_eq_low[d],
-                &mut self.channel_eq_mid[d],
-                &mut self.channel_eq_hi[d],
-                &mut self.eq_kill_low[d],
-                &mut self.eq_kill_mid[d],
-                &mut self.eq_kill_hi[d],
-                bands,
-                self.channel_filter[d],
-                self.channel_filter_on[d],
-                mirrored,
-                accent,
-                size,
-            )
-            .on_hover_text("Equaliser: drag a band up or down, right-click to cut it");
-        }
     }
 
     fn show_browser_panel(&mut self, ui: &mut Ui) {
