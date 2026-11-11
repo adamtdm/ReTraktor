@@ -570,6 +570,7 @@ pub fn scrolling_waveform(
     bpm: f64,
     grid_offset_sec: f64,
     cues: &[(u8, f64)],
+    phrases: &[retraktor_library::Phrase],
     waveform_peaks: &[[f32; 3]],
     loop_active: bool,
     loop_start_sec: f64,
@@ -662,6 +663,24 @@ pub fn scrolling_waveform(
         }
     }
 
+    // 4a. Phrase Boundaries (faint vertical line with 1-2 letter tag in dot font)
+    for phrase in phrases {
+        let px = center_x + ((phrase.start_sec - elapsed_sec) as f32) * pixels_per_sec;
+        if px >= rect.left() && px <= rect.right() {
+            painter.line_segment(
+                [Pos2::new(px, rect.top()), Pos2::new(px, rect.bottom())],
+                Stroke::new(0.8_f32, TraktorTheme::TEXT_MUTED().gamma_multiply(0.35)),
+            );
+            painter.text(
+                Pos2::new(px + 3.0, rect.top() + 3.0),
+                egui::Align2::LEFT_TOP,
+                phrase.kind.tag(),
+                crate::theme::dot_font(8.5),
+                TraktorTheme::TEXT_MUTED().gamma_multiply(0.75),
+            );
+        }
+    }
+
     // 5. Center Playhead Line (Traktor Red Vertical Hairline)
     painter.line_segment(
         [
@@ -697,6 +716,7 @@ pub fn scrolling_stem_waveforms(
     bpm: f64,
     grid_offset_sec: f64,
     cues: &[(u8, f64)],
+    phrases: &[retraktor_library::Phrase],
     stem_peaks: &[[f32; 4]],
     stem_volumes: &[f32; 4],
     stem_muted: &mut [bool; 4],
@@ -958,6 +978,24 @@ pub fn scrolling_stem_waveforms(
         }
     }
 
+    // 4a. Phrase Boundaries
+    for phrase in phrases {
+        let px = center_x + ((phrase.start_sec - elapsed_sec) as f32) * pixels_per_sec;
+        if px >= wave_rect.left() && px <= wave_rect.right() {
+            painter.line_segment(
+                [Pos2::new(px, wave_rect.top()), Pos2::new(px, wave_rect.bottom())],
+                Stroke::new(0.8_f32, TraktorTheme::TEXT_MUTED().gamma_multiply(0.35)),
+            );
+            painter.text(
+                Pos2::new(px + 3.0, wave_rect.top() + 3.0),
+                egui::Align2::LEFT_TOP,
+                phrase.kind.tag(),
+                crate::theme::dot_font(8.5),
+                TraktorTheme::TEXT_MUTED().gamma_multiply(0.75),
+            );
+        }
+    }
+
     painter.line_segment(
         [
             Pos2::new(center_x, wave_rect.top()),
@@ -1033,6 +1071,7 @@ pub fn stripe_overview(
     total_len_sec: f64,
     waveform_peaks: &[[f32; 3]],
     cues: &[(u8, f64)],
+    phrases: &[retraktor_library::Phrase],
     loop_active: bool,
     loop_start_sec: f64,
     loop_len_sec: f64,
@@ -1120,6 +1159,22 @@ pub fn stripe_overview(
             painter.line_segment(
                 [Pos2::new(cx, rect.top()), Pos2::new(cx, rect.bottom())],
                 Stroke::new(1.0_f32, col),
+            );
+        }
+
+        // Phrase boundaries on Stripe: thin ticks with 1-2 letter tag in dot font
+        for phrase in phrases {
+            let px = rect.left() + ((phrase.start_sec / total).clamp(0.0, 1.0) as f32) * rect.width();
+            painter.line_segment(
+                [Pos2::new(px, rect.top()), Pos2::new(px, rect.top() + 7.0)],
+                Stroke::new(0.8_f32, TraktorTheme::TEXT_MUTED().gamma_multiply(0.70)),
+            );
+            painter.text(
+                Pos2::new(px + 2.0, rect.top() + 1.0),
+                egui::Align2::LEFT_TOP,
+                phrase.kind.tag(),
+                crate::theme::dot_font(7.5),
+                TraktorTheme::TEXT_MUTED().gamma_multiply(0.85),
             );
         }
 
@@ -1485,6 +1540,7 @@ pub fn render_shortcuts_hud(ctx: &egui::Context, is_open: &mut bool) {
                     key_row(ui, "S / Shift+S", "Sync BPM & Phase A / B", c);
                     key_row(ui, "L / Shift+L", "Loop On / Off A / B", c);
                     key_row(ui, "1..4 / 5..8", "Hotcues 1..4 A / B", c);
+                    key_row(ui, "K / Shift+K", "Auto Cues Deck A / B", c);
                     key_row(ui, "T / Shift+T", "EQ / Stems View A / B", c);
                     key_row(ui, "G / Shift+G", "Create Demucs AI Stems A / B", c);
                     key_row(ui, "Q W E R", "Mute Stems 1..4 (Deck A)", c);

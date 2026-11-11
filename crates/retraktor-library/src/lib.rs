@@ -10,7 +10,7 @@ use retraktor_formats::{
 use std::collections::BTreeMap;
 
 pub mod analysis;
-pub use analysis::{analyze_mono, TrackAnalysis};
+pub use analysis::{analyze_mono, auto_cues, detect_phrases, Phrase, PhraseKind, TrackAnalysis};
 
 /// Harmonic Key Wheel mapping Traktor's `MUSICAL_KEY/@VALUE` (`0..=23`), Open Key (`1d..12d`, `1m..12m`),
 /// and Camelot (`1B..12B`, `1A..12A`) notation.
