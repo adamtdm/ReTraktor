@@ -39,6 +39,7 @@ pub struct LoadedTrackAudio {
     pub pcm_bass: Option<Vec<f32>>,
     pub pcm_other: Option<Vec<f32>>,
     pub pcm_vocals: Option<Vec<f32>>,
+    pub phrases: Vec<retraktor_library::Phrase>,
 }
 
 impl LoadedTrackAudio {
@@ -248,6 +249,7 @@ impl LoadedTrackAudio {
 
         let duration_sec = (pcm_stereo.len() / 2) as f64 / (sr as f64);
         let (waveform_peaks, stem_peaks) = Self::compute_waveform_peaks(&pcm_stereo, sr);
+        let phrases = retraktor_library::detect_phrases(&waveform_peaks, fallback_bpm, 0.0, duration_sec);
 
         let mut loaded = Self {
             title,
@@ -265,6 +267,7 @@ impl LoadedTrackAudio {
             pcm_bass: None,
             pcm_other: None,
             pcm_vocals: None,
+            phrases,
         };
 
         // Check if pre-separated Demucs stems are cached in ~/.cache/retraktor/stems/htdemucs/<file_stem>

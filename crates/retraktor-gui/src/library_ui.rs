@@ -52,6 +52,7 @@ pub struct UiTrackEntry {
     pub loudness: Option<NmlLoudness>,
     pub audio_id: Option<String>,
     pub release_date: Option<String>,
+    pub phrases: Vec<retraktor_library::Phrase>,
 }
 
 impl UiTrackEntry {
@@ -159,6 +160,9 @@ impl UiTrackEntry {
             for (i, t) in a.cue_points_sec.iter().take(8).enumerate() {
                 self.cues.push(cue(format!("Auto {}", i + 1), *t, CueType::Cue, i as i64, None));
             }
+        }
+        if overwrite || self.phrases.is_empty() {
+            self.phrases = a.phrases.clone();
         }
     }
 
@@ -810,6 +814,27 @@ impl LibraryManager {
         if let Some(grid) = t.cues.iter_mut().find(|c| c.cue_type == retraktor_core::CueType::Grid) {
             grid.start_ms = offset_sec * 1000.0;
             grid.grid_bpm = Some(bpm);
+        }
+        self.touch();
+    }
+
+    /// Stores deck-side hotcues on the track so they survive a reload and autosave to .nml.
+    pub fn set_hotcues(&mut self, id: usize, cues: &[(u8, f64)]) {
+        let Some(t) = self.tracks.iter_mut().find(|t| t.id == id) else { return };
+        t.cues.retain(|c| c.hotcue < 0 || c.hotcue >= 8);
+        for &(slot, sec) in cues {
+            if (1..=8).contains(&slot) {
+                t.cues.push(NmlCue {
+                    name: format!("Hotcue {slot}"),
+                    displ_order: 0,
+                    cue_type: retraktor_core::CueType::Cue,
+                    start_ms: sec * 1000.0,
+                    len_ms: 0.0,
+                    repeats: -1,
+                    hotcue: (slot - 1) as i64,
+                    grid_bpm: None,
+                });
+            }
         }
         self.touch();
     }
@@ -2687,7 +2712,7 @@ mod tests {
 
     #[test]
     fn analysis_fills_unknowns_and_keeps_user_cues() {
-        let a = TrackAnalysis { bpm: 126.0, beatgrid_offset_sec: 0.5, key_value: 21, key_open: "1m".into(), energy: 7, loudness_db: -9.0, peak_db: -0.3, cue_points_sec: vec![0.5, 31.0] };
+        let a = TrackAnalysis { bpm: 126.0, beatgrid_offset_sec: 0.5, key_value: 21, key_open: "1m".into(), energy: 7, loudness_db: -9.0, peak_db: -0.3, cue_points_sec: vec![0.5, 31.0], phrases: Vec::new() };
         let mut fresh = UiTrackEntry::default();
         fresh.apply_analysis(&a, false);
         assert_eq!((fresh.bpm, fresh.musical_key.as_str(), fresh.energy), (126.0, "1m", 7));

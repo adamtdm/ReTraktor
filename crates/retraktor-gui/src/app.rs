@@ -129,6 +129,7 @@ pub struct ReTraktorApp {
     pub deck_track_ids: [Option<usize>; 4],
     /// Per-deck "More": hotcue pads, pad modes, cue-play, flux and all loop sizes.
     pub deck_expanded: [bool; 4],
+    pub deck_auto_cue_status: [Option<String>; 4],
     /// Switched from Browser to Mix after the first track load.
     first_load_done: bool,
 
@@ -256,6 +257,7 @@ impl Default for ReTraktorApp {
             deck_stem_fx_send: [[false; 4]; 4],
             deck_stem_view: [false, false, false, false],
             deck_expanded: [false; 4],
+            deck_auto_cue_status: [None, None, None, None],
             deck_track_ids: [None; 4],
             first_load_done: false,
             show_pattern_player: false,
@@ -742,6 +744,38 @@ impl ReTraktorApp {
                 if let Some(id) = playable.nth(deck - 1).map(|t| t.id) {
                     self.library.load_to_deck(deck, id, [false; 4]);
                     self.drain_pending_loads();
+                } else if let Ok(mut state) = self.audio.shared.lock() {
+                    let d = deck - 1;
+                    state.loaded_tracks[d] = Some(crate::audio::LoadedTrackAudio {
+                        title: if d == 0 { "Solaris (Extended Mix)".into() } else { "Midnight Sun".into() },
+                        artist: if d == 0 { "Articuno".into() } else { "Helios".into() },
+                        duration_sec: 240.0,
+                        bpm: 128.0,
+                        grid_offset_sec: 0.0,
+                        key: if d == 0 { "8m".into() } else { "9m".into() },
+                        sample_rate: 44100,
+                        waveform_peaks: (0..1200).map(|i| {
+                            let phase = (i as f32 / 1200.0) * 8.0;
+                            let bass = ((phase * 3.14).sin().abs()).clamp(0.1, 0.9);
+                            [bass, 0.5, 0.3]
+                        }).collect(),
+                        stem_peaks: Vec::new(),
+                        pcm_stereo: Vec::new(),
+                        stems_ready: false,
+                        pcm_drums: None,
+                        pcm_bass: None,
+                        pcm_other: None,
+                        pcm_vocals: None,
+                        phrases: vec![
+                            retraktor_library::Phrase { start_sec: 0.0, kind: retraktor_library::PhraseKind::Intro },
+                            retraktor_library::Phrase { start_sec: 30.0, kind: retraktor_library::PhraseKind::Build },
+                            retraktor_library::Phrase { start_sec: 60.0, kind: retraktor_library::PhraseKind::Drop },
+                            retraktor_library::Phrase { start_sec: 120.0, kind: retraktor_library::PhraseKind::Breakdown },
+                            retraktor_library::Phrase { start_sec: 150.0, kind: retraktor_library::PhraseKind::Drop },
+                            retraktor_library::Phrase { start_sec: 210.0, kind: retraktor_library::PhraseKind::Outro },
+                        ],
+                    });
+                    state.playhead_sec[d] = 75.0;
                 }
             }
             "playA" | "playB" if first => self.toggle_play(if step == "playA" { 1 } else { 2 }),
@@ -959,6 +993,16 @@ impl ReTraktorApp {
         for (deck_idx, track) in std::mem::take(&mut self.library.pending_loads) {
             let d = (deck_idx - 1).min(3);
             self.deck_track_ids[d] = Some(track.id);
+            self.deck_auto_cue_status[d] = None;
+            let mut hotcues = Vec::new();
+            for cue in &track.cues {
+                if cue.hotcue >= 0 && cue.hotcue < 8 {
+                    hotcues.push(((cue.hotcue + 1) as u8, cue.start_ms / 1000.0));
+                }
+            }
+            if !hotcues.is_empty() {
+                self.deck_hotcues[d] = hotcues;
+            }
             self.set_state.on_track_loaded(d, track.id);
             let shared_audio = self.audio.shared.clone();
             let library_tx = library_tx.clone();
@@ -980,7 +1024,12 @@ impl ReTraktorApp {
                             if track.musical_key.is_empty() {
                                 loaded.key = a.key_open.clone();
                             }
+                            if !a.phrases.is_empty() {
+                                loaded.phrases = a.phrases.clone();
+                            }
                             let _ = library_tx.send(crate::library_ui::Msg::Analyzed(track.id, a, false));
+                        } else if !track.phrases.is_empty() {
+                            loaded.phrases = track.phrases.clone();
                         }
                         if let Ok(mut state) = shared_audio.lock() {
                             state.loaded_tracks[d] = Some(loaded);
@@ -1794,6 +1843,11 @@ impl ReTraktorApp {
                     }
                 }
 
+                // Auto Cues (K for Deck A, Shift+K for Deck B)
+                if i.key_pressed(Key::K) {
+                    self.apply_auto_cues(ch);
+                }
+
                 // EQ / Stems view toggle
                 if i.key_pressed(Key::T) {
                     self.deck_stem_view[ch] = !self.deck_stem_view[ch];
@@ -1946,7 +2000,42 @@ impl ReTraktorApp {
         } else if let Ok(state) = self.audio.shared.lock() {
             let current = state.playhead_sec[d];
             self.deck_hotcues[d].push((cue_num, current));
+            if let Some(track_id) = self.deck_track_ids[d] {
+                self.library.set_hotcues(track_id, &self.deck_hotcues[d]);
+            }
         }
+    }
+
+    fn apply_auto_cues(&mut self, d: usize) {
+        let Some(deck) = self.deck_view(d) else {
+            self.deck_auto_cue_status[d] = Some("No track loaded".to_string());
+            return;
+        };
+        if deck.phrases.is_empty() {
+            self.deck_auto_cue_status[d] = Some("No phrases detected".to_string());
+            return;
+        }
+        let existing = self.deck_hotcues[d].clone();
+        let proposed = retraktor_library::auto_cues(&deck.phrases, &existing);
+        if proposed.is_empty() {
+            if existing.len() >= 8 {
+                self.deck_auto_cue_status[d] = Some("All 8 hotcue slots filled".to_string());
+            } else {
+                self.deck_auto_cue_status[d] = Some("No new cue points found".to_string());
+            }
+            return;
+        }
+        let mut added_names = Vec::new();
+        for (slot, sec, label) in proposed {
+            self.deck_hotcues[d].push((slot, sec));
+            added_names.push(label.to_lowercase());
+        }
+        self.deck_hotcues[d].sort_by_key(|&(slot, _)| slot);
+        if let Some(track_id) = self.deck_track_ids[d] {
+            self.library.set_hotcues(track_id, &self.deck_hotcues[d]);
+        }
+        let status = format!("Added {} cues: {}", added_names.len(), added_names.join(", "));
+        self.deck_auto_cue_status[d] = Some(status);
     }
 
     fn sync_deck(&mut self, deck_idx: usize) {
@@ -2563,14 +2652,21 @@ impl ReTraktorApp {
                         ui.vertical(|ui| {
                             // Beat strip: the bar counter sweeps with the music, the phase meter shows drift from the other deck.
                             ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 10.0;
-                                let bar_w = ((display_w - 10.0) * 0.60).max(60.0);
+                                ui.spacing_mut().item_spacing.x = 8.0;
+                                let phrase_info = current_phrase_info(&deck.phrases, deck.elapsed_sec, deck.bpm, deck.grid_offset_sec);
+                                let phrase_w = if phrase_info.is_some() { 68.0 } else { 0.0 };
+                                let avail = (display_w - 16.0 - if phrase_w > 0.0 { phrase_w + 8.0 } else { 0.0 }).max(100.0);
+                                let bar_w = (avail * 0.58).max(50.0);
+                                let meter_w = (avail - bar_w - 8.0).max(35.0);
                                 let (bar, _) = ui.allocate_exact_size(Vec2::new(bar_w, 11.0), Sense::hover());
                                 dot::bar_counter(ui.painter(), bar, (deck.elapsed_sec - deck.grid_offset_sec) * deck.bpm / 60.0, deck.is_playing, accent_color, ink);
-                                let meter_w = (display_w - bar_w - 10.0).max(40.0);
                                 let (meter, resp) = ui.allocate_exact_size(Vec2::new(meter_w, 11.0), Sense::hover());
                                 dot::phase_meter(ui.painter(), meter, phase, accent_color, ink);
                                 resp.on_hover_text("Beat phase against the other deck: centre means the beats are locked");
+                                if let Some((kind_str, bars_rem)) = phrase_info {
+                                    let text = if bars_rem > 0 { format!("{kind_str} · {bars_rem}") } else { kind_str };
+                                    ui.label(RichText::new(text).font(crate::theme::dot_font(9.0)).color(ink));
+                                }
                             });
                             // Readout numbers in dot font: BPM, KEY, REMAIN with fixed columns so A and B headers align
                             ui.horizontal(|ui| {
@@ -2604,6 +2700,7 @@ impl ReTraktorApp {
                 deck.bpm,
                 deck.grid_offset_sec,
                 &cues,
+                &deck.phrases,
                 &deck.stem_peaks,
                 &self.deck_stem_volumes[d],
                 &mut self.deck_stem_muted[d],
@@ -2620,6 +2717,7 @@ impl ReTraktorApp {
                 deck.bpm,
                 deck.grid_offset_sec,
                 &cues,
+                &deck.phrases,
                 &deck.peaks,
                 self.deck_loop_active[d],
                 self.deck_loop_start_sec[d],
@@ -2766,6 +2864,7 @@ impl ReTraktorApp {
             is_playing: state.is_playing[d],
             peaks: t.waveform_peaks.clone(),
             stem_peaks: t.stem_peaks.clone(),
+            phrases: t.phrases.clone(),
         })
     }
 
@@ -2853,13 +2952,22 @@ impl ReTraktorApp {
                 ui.vertical(|ui| {
                     // Beat strip: the bar counter sweeps with the music, the phase meter shows drift from the other deck.
                     ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 12.0;
-                        let w = ui.available_width();
-                        let (bar, _) = ui.allocate_exact_size(Vec2::new((w - 12.0) * 0.62, 12.0), Sense::hover());
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        let phrase_info = current_phrase_info(&deck.phrases, deck.elapsed_sec, bpm, deck.grid_offset_sec);
+                        let phrase_w = if phrase_info.is_some() { 68.0 } else { 0.0 };
+                        let total_w = ui.available_width();
+                        let avail = (total_w - if phrase_w > 0.0 { phrase_w + 8.0 } else { 0.0 }).max(100.0);
+                        let bar_w = (avail * 0.58).max(50.0);
+                        let meter_w = (avail - bar_w - 8.0).max(35.0);
+                        let (bar, _) = ui.allocate_exact_size(Vec2::new(bar_w, 12.0), Sense::hover());
                         dot::bar_counter(ui.painter(), bar, (deck.elapsed_sec - deck.grid_offset_sec) * bpm / 60.0, deck.is_playing, accent_color, ink);
-                        let (meter, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 12.0), Sense::hover());
+                        let (meter, resp) = ui.allocate_exact_size(Vec2::new(meter_w, 12.0), Sense::hover());
                         dot::phase_meter(ui.painter(), meter, phase, accent_color, ink);
                         resp.on_hover_text("Beat phase against the other deck: centre means the beats are locked");
+                        if let Some((kind_str, bars_rem)) = phrase_info {
+                            let text = if bars_rem > 0 { format!("{kind_str} · {bars_rem}") } else { kind_str };
+                            ui.label(RichText::new(text).font(crate::theme::dot_font(9.0)).color(ink));
+                        }
                     });
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 14.0;
@@ -2917,6 +3025,7 @@ impl ReTraktorApp {
                         bpm,
                         deck.grid_offset_sec,
                         &cues,
+                        &deck.phrases,
                         &deck.stem_peaks,
                         &self.deck_stem_volumes[d],
                         &mut self.deck_stem_muted[d],
@@ -2933,6 +3042,7 @@ impl ReTraktorApp {
                         bpm,
                         deck.grid_offset_sec,
                         &cues,
+                        &deck.phrases,
                         &deck.peaks,
                         self.deck_loop_active[d],
                         self.deck_loop_start_sec[d],
@@ -2970,6 +3080,7 @@ impl ReTraktorApp {
                 deck.duration_sec,
                 &deck.peaks,
                 &cues,
+                &deck.phrases,
                 self.deck_loop_active[d],
                 self.deck_loop_start_sec[d],
                 loop_len_sec,
@@ -3067,6 +3178,16 @@ impl ReTraktorApp {
                         self.adjust_deck_grid(d, 0.0, factor);
                     }
                 }
+                ui.separator();
+                if pill(ui, "AUTO CUES", false, TraktorTheme::ACCENT(), 0.0)
+                    .on_hover_text(format!("Automatically detect phrases and set hotcues ({shift}K)"))
+                    .clicked()
+                {
+                    self.apply_auto_cues(d);
+                }
+                if let Some(status) = &self.deck_auto_cue_status[d] {
+                    ui.label(RichText::new(status).color(TraktorTheme::ACCENT()).font(egui::FontId::proportional(11.0)));
+                }
             });
             ui.horizontal(|ui| {
                 let w = (ui.available_width() - 7.0 * gap) / 8.0;
@@ -3094,6 +3215,9 @@ impl ReTraktorApp {
                     }
                     if pad.secondary_clicked() && mode == DeckPadMode::Hotcues {
                         self.deck_hotcues[d].retain(|(c, _)| *c != i as u8);
+                        if let Some(track_id) = self.deck_track_ids[d] {
+                            self.library.set_hotcues(track_id, &self.deck_hotcues[d]);
+                        }
                     }
                 }
             });
@@ -3530,6 +3654,29 @@ fn beat_phase_diff(master_beats: f64, beats: f64) -> f64 {
     if diff > 0.5 { diff - 1.0 } else { diff }
 }
 
+/// Helper to determine the current phrase and bars remaining until the next phrase boundary.
+fn current_phrase_info(
+    phrases: &[retraktor_library::Phrase],
+    elapsed_sec: f64,
+    bpm: f64,
+    _grid_offset_sec: f64,
+) -> Option<(String, usize)> {
+    if phrases.is_empty() || bpm <= 0.0 {
+        return None;
+    }
+    let current_idx = phrases.iter().rposition(|p| p.start_sec <= elapsed_sec)?;
+    let cur = &phrases[current_idx];
+    let next_boundary_sec = phrases.get(current_idx + 1).map(|p| p.start_sec);
+    let sec_per_bar = (60.0 / bpm) * 4.0;
+    let bars_rem = if let Some(next_sec) = next_boundary_sec {
+        let diff_sec = (next_sec - elapsed_sec).max(0.0);
+        (diff_sec / sec_per_bar).ceil() as usize
+    } else {
+        0
+    };
+    Some((cur.kind.as_str().to_uppercase(), bars_rem))
+}
+
 /// What a loaded deck needs to draw one frame.
 struct DeckView {
     title: String,
@@ -3542,6 +3689,7 @@ struct DeckView {
     is_playing: bool,
     peaks: Vec<[f32; 3]>,
     stem_peaks: Vec<[f32; 4]>,
+    phrases: Vec<retraktor_library::Phrase>,
 }
 
 impl DeckView {

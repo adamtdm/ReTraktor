@@ -4,6 +4,43 @@
 use crate::KeyWheel;
 use std::f32::consts::TAU;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PhraseKind {
+    Intro,
+    Build,
+    Drop,
+    Breakdown,
+    Outro,
+}
+
+impl PhraseKind {
+    pub fn tag(&self) -> &'static str {
+        match self {
+            Self::Intro => "I",
+            Self::Build => "B",
+            Self::Drop => "D",
+            Self::Breakdown => "BR",
+            Self::Outro => "O",
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Intro => "Intro",
+            Self::Build => "Build",
+            Self::Drop => "Drop",
+            Self::Breakdown => "Breakdown",
+            Self::Outro => "Outro",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Phrase {
+    pub start_sec: f64,
+    pub kind: PhraseKind,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct TrackAnalysis {
     pub bpm: f64,                 // 60..=200 range, folded sensibly (prefer 70..=180 for dance music)
@@ -14,6 +51,7 @@ pub struct TrackAnalysis {
     pub loudness_db: f32,         // integrated loudness estimate (RMS-based or simplified LUFS), dBFS
     pub peak_db: f32,
     pub cue_points_sec: Vec<f64>, // up to 8 auto cue points at structural changes (intro end, breakdowns, drops), snapped to beatgrid, ascending
+    pub phrases: Vec<Phrase>,
 }
 
 pub fn analyze_mono(samples: &[f32], sample_rate: u32) -> TrackAnalysis {
@@ -28,6 +66,7 @@ pub fn analyze_mono(samples: &[f32], sample_rate: u32) -> TrackAnalysis {
             loudness_db: -60.0,
             peak_db: -60.0,
             cue_points_sec: Vec::new(),
+            phrases: Vec::new(),
         };
     }
 
@@ -43,8 +82,8 @@ pub fn analyze_mono(samples: &[f32], sample_rate: u32) -> TrackAnalysis {
         ds.push(sum / (chunk.len() as f32));
     }
 
-    // 3. Onset envelope, BPM, Beatgrid offset, and Structural cue points
-    let (bpm, beatgrid_offset_sec, onset_density, cue_points_sec) =
+    // 3. Onset envelope, BPM, Beatgrid offset, Structural cue points, and Phrases
+    let (bpm, beatgrid_offset_sec, onset_density, cue_points_sec, phrases) =
         estimate_rhythm_and_cues(&ds, ds_sr);
 
     // 4. Musical Key via multi-octave harmonic pitch-class profile (chromagram)
@@ -67,6 +106,7 @@ pub fn analyze_mono(samples: &[f32], sample_rate: u32) -> TrackAnalysis {
         loudness_db,
         peak_db,
         cue_points_sec,
+        phrases,
     }
 }
 
@@ -162,13 +202,13 @@ fn fft_in_place(re: &mut [f32], im: &mut [f32]) {
     }
 }
 
-fn estimate_rhythm_and_cues(ds: &[f32], ds_sr: f64) -> (f64, f64, f32, Vec<f64>) {
+fn estimate_rhythm_and_cues(ds: &[f32], ds_sr: f64) -> (f64, f64, f32, Vec<f64>, Vec<Phrase>) {
     // Hop size 64 samples at ~11025 Hz -> 172.27 Hz onset envelope frame rate
     let hop = 64usize;
     let env_sr = ds_sr / (hop as f64);
     let n_frames = ds.len() / hop;
     if n_frames < 32 {
-        return (120.0, 0.0, 0.0, Vec::new());
+        return (120.0, 0.0, 0.0, Vec::new(), Vec::new());
     }
 
     // 3-band energy envelopes: sub/kick (<150 Hz), mid/snare (150..1400 Hz), high/hat (>1400 Hz)
@@ -448,7 +488,243 @@ fn estimate_rhythm_and_cues(ds: &[f32], ds_sr: f64) -> (f64, f64, f32, Vec<f64>)
     let mut cue_points_sec: Vec<f64> = candidates.into_iter().take(8).map(|(t, _)| t).collect();
     cue_points_sec.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
-    (refined_bpm, best_phase_sec, onset_density, cue_points_sec)
+    let env_peaks: Vec<[f32; 3]> = (0..low_env.len())
+        .map(|i| [low_env[i], mid_env[i], high_env[i]])
+        .collect();
+    let phrases = detect_phrases(&env_peaks, refined_bpm, best_phase_sec, duration_sec);
+
+    (refined_bpm, best_phase_sec, onset_density, cue_points_sec, phrases)
+}
+
+/// Pure function for dance music phrase detection:
+/// Works on bars (4 beats) aligned to the beat grid; computes per-bar loudness and bass energy;
+/// identifies boundaries snapped to 8-bar multiples from the first downbeat; classifies segments
+/// into Intro, Build, Drop, Breakdown, Outro. Returns empty vector if the track lacks clear structure.
+pub fn detect_phrases(
+    peaks: &[[f32; 3]],
+    bpm: f64,
+    grid_offset_sec: f64,
+    duration_sec: f64,
+) -> Vec<Phrase> {
+    if bpm.is_nan() || bpm <= 30.0 || bpm > 300.0 || duration_sec <= 0.0 || peaks.is_empty() {
+        return Vec::new();
+    }
+
+    let beat_len_sec = 60.0 / bpm;
+    let bar_len_sec = beat_len_sec * 4.0;
+    if duration_sec < bar_len_sec * 16.0 {
+        return Vec::new();
+    }
+
+    let downbeat_offset_sec = if grid_offset_sec.is_finite() && grid_offset_sec >= 0.0 {
+        grid_offset_sec.rem_euclid(bar_len_sec)
+    } else {
+        0.0
+    };
+
+    let num_bars = ((duration_sec - downbeat_offset_sec) / bar_len_sec).floor() as usize;
+    if num_bars < 16 {
+        return Vec::new();
+    }
+
+    let peaks_per_sec = peaks.len() as f64 / duration_sec;
+    let mut bar_bass = Vec::with_capacity(num_bars);
+    let mut bar_loudness = Vec::with_capacity(num_bars);
+
+    for b in 0..num_bars {
+        let t_start = downbeat_offset_sec + (b as f64) * bar_len_sec;
+        let t_end = t_start + bar_len_sec;
+        let i_start = ((t_start * peaks_per_sec).round() as usize).min(peaks.len());
+        let i_end = ((t_end * peaks_per_sec).round() as usize).min(peaks.len());
+
+        if i_end > i_start {
+            let count = (i_end - i_start) as f32;
+            let mut sum_bass = 0.0_f32;
+            let mut sum_loud = 0.0_f32;
+            for p in &peaks[i_start..i_end] {
+                sum_bass += p[0];
+                sum_loud += 0.5 * p[0] + 0.3 * p[1] + 0.2 * p[2];
+            }
+            bar_bass.push(sum_bass / count);
+            bar_loudness.push(sum_loud / count);
+        } else if let Some(&last_bass) = bar_bass.last() {
+            bar_bass.push(last_bass);
+            bar_loudness.push(*bar_loudness.last().unwrap_or(&0.0));
+        } else {
+            bar_bass.push(0.0);
+            bar_loudness.push(0.0);
+        }
+    }
+
+    let min_bass = bar_bass.iter().copied().fold(f32::INFINITY, f32::min);
+    let max_bass = bar_bass.iter().copied().fold(0.0_f32, f32::max);
+    let min_loud = bar_loudness.iter().copied().fold(f32::INFINITY, f32::min);
+    let max_loud = bar_loudness.iter().copied().fold(0.0_f32, f32::max);
+
+    let bass_range = max_bass - min_bass;
+    let loud_range = max_loud - min_loud;
+    if bass_range < 0.15 && loud_range < 0.15 {
+        return Vec::new();
+    }
+
+    let mean_bass: f32 = bar_bass.iter().sum::<f32>() / (bar_bass.len() as f32);
+    let var_bass: f32 = bar_bass.iter().map(|&x| (x - mean_bass).powi(2)).sum::<f32>() / (bar_bass.len() as f32);
+    if var_bass < 0.002 {
+        return Vec::new();
+    }
+
+    let n_blocks = num_bars / 8;
+    if n_blocks < 2 {
+        return Vec::new();
+    }
+
+    let mut block_bass = Vec::with_capacity(n_blocks);
+    let mut block_loud = Vec::with_capacity(n_blocks);
+    let mut block_trend = Vec::with_capacity(n_blocks);
+
+    for k in 0..n_blocks {
+        let b_start = k * 8;
+        let b_mid = b_start + 4;
+        let b_end = b_start + 8;
+
+        let b_slice = &bar_bass[b_start..b_end];
+        let l_slice = &bar_loudness[b_start..b_end];
+
+        let avg_bass = b_slice.iter().sum::<f32>() / 8.0;
+        let avg_loud = l_slice.iter().sum::<f32>() / 8.0;
+
+        let first_half_loud = bar_loudness[b_start..b_mid].iter().sum::<f32>() / 4.0;
+        let second_half_loud = bar_loudness[b_mid..b_end].iter().sum::<f32>() / 4.0;
+        let trend = second_half_loud - first_half_loud;
+
+        block_bass.push(avg_bass);
+        block_loud.push(avg_loud);
+        block_trend.push(trend);
+    }
+
+    let bass_thresh_high = min_bass + 0.55 * bass_range;
+    let bass_thresh_low = min_bass + 0.35 * bass_range;
+
+    let first_drop_idx = block_bass.iter().position(|&b| b >= bass_thresh_high);
+    let Some(first_drop) = first_drop_idx else {
+        return Vec::new();
+    };
+
+    let last_drop_idx = block_bass.iter().rposition(|&b| b >= bass_thresh_high).unwrap_or(first_drop);
+    let mut block_kinds = vec![PhraseKind::Intro; n_blocks];
+
+    for k in 0..n_blocks {
+        if k < first_drop {
+            if k + 1 == first_drop && (block_trend[k] > 0.08 || block_loud[k] > block_loud[k.saturating_sub(1)] + 0.10) {
+                block_kinds[k] = PhraseKind::Build;
+            } else {
+                block_kinds[k] = PhraseKind::Intro;
+            }
+        } else if k > last_drop_idx {
+            if block_bass[k] <= bass_thresh_low || block_loud[k] <= min_loud + 0.40 * loud_range {
+                block_kinds[k] = PhraseKind::Outro;
+            } else {
+                block_kinds[k] = PhraseKind::Breakdown;
+            }
+        } else {
+            if block_bass[k] >= bass_thresh_high {
+                block_kinds[k] = PhraseKind::Drop;
+            } else if k + 1 < n_blocks && block_bass[k + 1] >= bass_thresh_high && (block_trend[k] > 0.08 || block_loud[k] > block_bass[k] + 0.15) {
+                block_kinds[k] = PhraseKind::Build;
+            } else {
+                block_kinds[k] = PhraseKind::Breakdown;
+            }
+        }
+    }
+
+    let mut phrases = Vec::new();
+    let mut cur_kind = block_kinds[0];
+    let mut cur_bar = 0usize;
+
+    for k in 1..n_blocks {
+        if block_kinds[k] != cur_kind {
+            let start_sec = downbeat_offset_sec + (cur_bar as f64) * bar_len_sec;
+            phrases.push(Phrase {
+                start_sec,
+                kind: cur_kind,
+            });
+            cur_kind = block_kinds[k];
+            cur_bar = k * 8;
+        }
+    }
+    let start_sec = downbeat_offset_sec + (cur_bar as f64) * bar_len_sec;
+    phrases.push(Phrase {
+        start_sec,
+        kind: cur_kind,
+    });
+
+    phrases
+}
+
+/// Proposes hotcues at key structural points (first downbeat, first Drop, first Breakdown,
+/// second Drop, Outro start), only filling empty slots and never moving or overwriting existing cues.
+pub fn auto_cues(phrases: &[Phrase], existing_cues: &[(u8, f64)]) -> Vec<(u8, f64, String)> {
+    if phrases.is_empty() {
+        return Vec::new();
+    }
+
+    let occupied: std::collections::HashSet<u8> = existing_cues.iter().map(|(s, _)| *s).collect();
+    let mut free_slots: Vec<u8> = (1..=8).filter(|s| !occupied.contains(s)).collect();
+    if free_slots.is_empty() {
+        return Vec::new();
+    }
+
+    let mut candidates: Vec<(f64, String)> = Vec::new();
+
+    // 1. First downbeat
+    if let Some(first) = phrases.first() {
+        candidates.push((first.start_sec, "Downbeat".to_string()));
+    }
+
+    // 2. First Drop and 4. Second Drop
+    let mut drops = phrases.iter().filter(|p| p.kind == PhraseKind::Drop);
+    if let Some(drop1) = drops.next() {
+        candidates.push((drop1.start_sec, "Drop 1".to_string()));
+    }
+
+    // 3. First Breakdown
+    if let Some(breakdown) = phrases.iter().find(|p| p.kind == PhraseKind::Breakdown) {
+        candidates.push((breakdown.start_sec, "Breakdown".to_string()));
+    }
+
+    // 4. Second Drop
+    if let Some(drop2) = drops.next() {
+        candidates.push((drop2.start_sec, "Drop 2".to_string()));
+    }
+
+    // 5. Outro start
+    if let Some(outro) = phrases.iter().find(|p| p.kind == PhraseKind::Outro) {
+        candidates.push((outro.start_sec, "Outro".to_string()));
+    }
+
+    // Deduplicate candidate points by time (within 0.5s of each other or existing cues)
+    let mut unique_candidates: Vec<(f64, String)> = Vec::new();
+    for (t, label) in candidates {
+        if unique_candidates.iter().any(|(existing_t, _)| (existing_t - t).abs() < 0.5) {
+            continue;
+        }
+        if existing_cues.iter().any(|(_, existing_t)| (existing_t - t).abs() < 0.5) {
+            continue;
+        }
+        unique_candidates.push((t, label));
+    }
+
+    let mut result = Vec::new();
+    for (t, label) in unique_candidates {
+        if let Some(slot) = free_slots.first().copied() {
+            free_slots.remove(0);
+            result.push((slot, t, label));
+        } else {
+            break;
+        }
+    }
+
+    result
 }
 
 fn estimate_key(ds: &[f32], ds_sr: f32) -> u8 {
@@ -775,5 +1051,120 @@ mod tests {
             res_quiet.energy
         );
         assert!(res_loud.loudness_db > res_quiet.loudness_db);
+    }
+
+    #[test]
+    fn test_detect_phrases_synthetic_envelope() {
+        let bpm = 128.0;
+        let bar_sec = (60.0 / bpm) * 4.0;
+        // 80 bars total: 16 intro, 16 drop, 16 breakdown, 16 drop, 16 outro
+        let total_bars = 80;
+        let duration_sec = total_bars as f64 * bar_sec;
+        let peaks_per_sec = 60.0;
+        let n_peaks = (duration_sec * peaks_per_sec).round() as usize;
+        let mut peaks = vec![[0.0_f32; 3]; n_peaks];
+
+        for i in 0..n_peaks {
+            let t = i as f64 / peaks_per_sec;
+            let bar = (t / bar_sec).floor() as usize;
+            if bar < 16 {
+                // Intro: low bass, moderate mid/high
+                peaks[i] = [0.15, 0.20, 0.10];
+            } else if bar < 32 {
+                // Drop 1: high bass and loud
+                peaks[i] = [0.85, 0.80, 0.70];
+            } else if bar < 48 {
+                // Breakdown: clearly lower bass than drop neighbours
+                peaks[i] = [0.10, 0.40, 0.30];
+            } else if bar < 64 {
+                // Drop 2: high bass and loud
+                peaks[i] = [0.85, 0.80, 0.70];
+            } else {
+                // Outro: low bass and quiet
+                peaks[i] = [0.15, 0.20, 0.10];
+            }
+        }
+
+        let phrases = detect_phrases(&peaks, bpm, 0.0, duration_sec);
+        assert_eq!(phrases.len(), 5, "Expected 5 phrases, got {:?}", phrases);
+        assert_eq!(phrases[0].kind, PhraseKind::Intro);
+        assert_eq!(phrases[1].kind, PhraseKind::Drop);
+        assert_eq!(phrases[2].kind, PhraseKind::Breakdown);
+        assert_eq!(phrases[3].kind, PhraseKind::Drop);
+        assert_eq!(phrases[4].kind, PhraseKind::Outro);
+
+        // Check boundaries within one bar:
+        assert!((phrases[0].start_sec - 0.0).abs() <= bar_sec);
+        assert!((phrases[1].start_sec - 16.0 * bar_sec).abs() <= bar_sec);
+        assert!((phrases[2].start_sec - 32.0 * bar_sec).abs() <= bar_sec);
+        assert!((phrases[3].start_sec - 48.0 * bar_sec).abs() <= bar_sec);
+        assert!((phrases[4].start_sec - 64.0 * bar_sec).abs() <= bar_sec);
+
+        // Verify boundaries are always snapped to the bar grid
+        for p in &phrases {
+            let bar_idx = (p.start_sec / bar_sec).round();
+            assert!(
+                (p.start_sec - bar_idx * bar_sec).abs() < 1e-4,
+                "Boundary {} must be exactly on the bar grid",
+                p.start_sec
+            );
+        }
+    }
+
+    #[test]
+    fn test_detect_phrases_flat_noise_and_unknown_bpm() {
+        let bpm = 128.0;
+        let duration_sec = 120.0;
+        let peaks_flat = vec![[0.45, 0.45, 0.45]; (duration_sec * 60.0) as usize];
+        let res_flat = detect_phrases(&peaks_flat, bpm, 0.0, duration_sec);
+        assert!(res_flat.is_empty(), "Flat noise must yield empty phrase list");
+
+        let res_no_bpm = detect_phrases(&peaks_flat, 0.0, 0.0, duration_sec);
+        assert!(res_no_bpm.is_empty(), "0 BPM must yield empty phrase list");
+
+        let res_nan_bpm = detect_phrases(&peaks_flat, f64::NAN, 0.0, duration_sec);
+        assert!(res_nan_bpm.is_empty(), "NaN BPM must yield empty phrase list");
+
+        let res_too_short = detect_phrases(&peaks_flat[..30], bpm, 0.0, 0.5);
+        assert!(res_too_short.is_empty(), "Too short track must yield empty phrase list");
+    }
+
+    #[test]
+    fn test_auto_cues_empty_and_partial_and_full_slots() {
+        let phrases = vec![
+            Phrase { start_sec: 0.0, kind: PhraseKind::Intro },
+            Phrase { start_sec: 30.0, kind: PhraseKind::Drop },
+            Phrase { start_sec: 60.0, kind: PhraseKind::Breakdown },
+            Phrase { start_sec: 90.0, kind: PhraseKind::Drop },
+            Phrase { start_sec: 120.0, kind: PhraseKind::Outro },
+        ];
+
+        // 1. All empty -> takes slots 1..=5
+        let empty_cues = Vec::new();
+        let cues = auto_cues(&phrases, &empty_cues);
+        assert_eq!(cues.len(), 5);
+        assert_eq!(cues[0], (1, 0.0, "Downbeat".to_string()));
+        assert_eq!(cues[1], (2, 30.0, "Drop 1".to_string()));
+        assert_eq!(cues[2], (3, 60.0, "Breakdown".to_string()));
+        assert_eq!(cues[3], (4, 90.0, "Drop 2".to_string()));
+        assert_eq!(cues[4], (5, 120.0, "Outro".to_string()));
+
+        // 2. All 8 slots taken -> nothing added
+        let all_taken: Vec<(u8, f64)> = (1..=8).map(|i| (i, i as f64 * 10.0)).collect();
+        let cues_all = auto_cues(&phrases, &all_taken);
+        assert!(cues_all.is_empty(), "All slots taken must yield empty list");
+
+        // 3. Some taken -> only free slots filled, never moving or overwriting existing
+        let some_taken = vec![(1, 10.0), (2, 20.0), (4, 40.0)];
+        let cues_some = auto_cues(&phrases, &some_taken);
+        assert_eq!(cues_some.len(), 5);
+        assert_eq!(cues_some[0].0, 3);
+        assert_eq!(cues_some[1].0, 5);
+        assert_eq!(cues_some[2].0, 6);
+        assert_eq!(cues_some[3].0, 7);
+        assert_eq!(cues_some[4].0, 8);
+        for &(slot, _, _) in &cues_some {
+            assert!(slot != 1 && slot != 2 && slot != 4, "Must not overwrite existing cues");
+        }
     }
 }
