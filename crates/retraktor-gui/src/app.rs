@@ -806,6 +806,12 @@ impl ReTraktorApp {
     /// The deck (1 = A, 2 = B) that is currently idle / not playing to receive the next track.
     fn idle_deck(&self) -> usize {
         if let Ok(state) = self.audio.shared.lock() {
+            // An empty deck beats a loaded one.
+            match (state.loaded_tracks[0].is_some(), state.loaded_tracks[1].is_some()) {
+                (true, false) => return 2,
+                (false, true) => return 1,
+                _ => {}
+            }
             if state.is_playing[0] && !state.is_playing[1] {
                 return 2;
             } else if !state.is_playing[0] && state.is_playing[1] {
@@ -1830,7 +1836,7 @@ impl ReTraktorApp {
                     self.deck_strip(ui, 1);
                     ui.separator();
 
-                    if pill(ui, if roomy { "SETUP" } else { "SET" }, self.preferences.is_open, TraktorTheme::ROW_SELECTED(), 0.0)
+                    if pill(ui, if roomy { "SETUP" } else { "PREF" }, self.preferences.is_open, TraktorTheme::ROW_SELECTED(), 0.0)
                         .on_hover_text("Preferences (Ctrl+,)")
                         .clicked()
                     {

@@ -1970,7 +1970,8 @@ pub fn set_arc_display(
         Pos2::new(rect.right() - 16.0, rect.bottom() - 18.0),
     );
 
-    let cols = tracks.len().max(8);
+    // Each track is two dots wide with a one-dot gap.
+    let cols = (tracks.len() * 3).max(24) - 1;
     let rows = 10usize;
     let unlit = unlit_on_inset();
 
@@ -1990,11 +1991,11 @@ pub fn set_arc_display(
     let dot_radius = 2.0_f32;
 
     paint_dot_grid(painter, grid_rect, cols, rows, dot_radius, unlit, |c, r| {
-        if c >= tracks.len() {
+        if c % 3 == 2 || c / 3 >= tracks.len() {
             return DotCell::Unlit;
         }
-        let t = &tracks[c];
-        let is_selected = selected_idx == Some(c);
+        let t = &tracks[c / 3];
+        let is_selected = selected_idx == Some(c / 3);
         let e_lit = (t.energy as usize).min(rows);
 
         let bpm_ratio = if max_bpm > min_bpm && t.bpm > 0.0 {
@@ -2028,7 +2029,7 @@ pub fn set_arc_display(
     // Musical keys under each column
     for (c, t) in tracks.iter().enumerate() {
         let col_x = if cols > 1 {
-            grid_rect.left() + dot_radius + c as f32 * ((grid_rect.width() - dot_radius * 2.0) / (cols - 1) as f32)
+            grid_rect.left() + dot_radius + (c as f32 * 3.0 + 0.5) * ((grid_rect.width() - dot_radius * 2.0) / (cols - 1) as f32)
         } else {
             grid_rect.center().x
         };
@@ -2052,7 +2053,7 @@ pub fn set_arc_display(
         if let Some(pos) = response.interact_pointer_pos() {
             if grid_rect.contains(pos) && !tracks.is_empty() {
                 let step_x = if cols > 1 { (grid_rect.width() - dot_radius * 2.0) / (cols - 1) as f32 } else { 1.0 };
-                let col = (((pos.x - (grid_rect.left() + dot_radius)) / step_x).round() as usize).min(tracks.len().saturating_sub(1));
+                let col = (((pos.x - (grid_rect.left() + dot_radius)) / step_x).round() as usize / 3).min(tracks.len().saturating_sub(1));
                 clicked_col = Some(col);
             }
         }

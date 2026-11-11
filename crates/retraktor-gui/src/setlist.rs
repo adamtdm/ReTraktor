@@ -693,7 +693,7 @@ impl SetUiState {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing = Vec2::new(8.0, 0.0);
                 let list_w = (ui.available_width() * 0.52).clamp(320.0, 680.0);
-                let arc_w = (ui.available_width() - 8.0).max(280.0);
+                let arc_w = (ui.available_width() - list_w - 24.0).max(200.0);
 
                 // --- Left Column: Set List Rows ---
                 ui.allocate_ui_with_layout(Vec2::new(list_w, top_h), Layout::top_down(Align::Min), |ui| {
