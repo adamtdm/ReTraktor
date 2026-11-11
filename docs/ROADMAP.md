@@ -17,9 +17,9 @@ recording scripts.
 |---|---|
 | Stem icons never bounced; icon should rest at the bottom when muted, one row from the top when on | fixed in build 11 |
 | Crossfade cheers do not play when a deck is in stems view | fixed in build 11 |
-| Recording always overwrites `ReTraktor_Master_Mix.wav` | stage 3 |
-| Timeline header: title sits lower than the STEMS button | stage 2 |
-| Decks C and D have a fader but no EQ or stem display | stage 2 |
+| Recording always overwrites `ReTraktor_Master_Mix.wav` | fixed in build 12 (timestamped + .cue) |
+| Timeline header: title sits lower than the STEMS button | fixed in build 13 |
+| Decks C and D have a fader but no EQ or stem display | fixed in build 13 |
 | Grid nudge, tempo x½ / x2, sync by ear, MX2 end to end | needs the user's ears and hardware |
 
 ## 2. Finish the design language
@@ -91,5 +91,5 @@ From the 2026 Digital DJ Tips census (22,000 DJs) and current releases:
 2. In parallel, by Gemini agents: AI assistant, set modes, MIDI and controller learn,
    playlist import.
 3. Merge, review, score, publish.
-4. Dot canvas mixer, Preferences / mapper restyle, choreography.
-5. Phrase detection and auto cues; real-time stems research.
+4. Dot canvas mixer, Preferences / mapper restyle, choreography. (fixed in build 13)
+5. Phrase detection and auto cues (fixed in build 13); real-time stems research.
