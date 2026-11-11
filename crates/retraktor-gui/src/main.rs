@@ -17,6 +17,7 @@ mod controller_map;
 mod demucs;
 mod dot;
 mod library_ui;
+pub mod midi;
 mod preferences;
 mod theme;
 mod widgets;

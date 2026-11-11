@@ -435,6 +435,9 @@ impl eframe::App for ReTraktorApp {
         self.deck_turntable_mode[0] = self.preferences.jog_mode_turntable;
         self.deck_turntable_mode[1] = self.preferences.jog_mode_turntable;
         self.custom_mappings = self.preferences.mapping.action.clone();
+        for entry in &self.preferences.generic_manager.active_mapping.entries {
+            self.custom_mappings.insert(entry.control_id.clone(), entry.action.clone());
+        }
 
         // Demucs background installer & separation worker synchronization
         self.preferences.demucs_install_state = self.demucs.get_install_state();
@@ -554,6 +557,10 @@ impl ReTraktorApp {
             "noprefs" => self.preferences.is_open = false,
             "expandA" => self.deck_expanded[0] = true,
             s if s.starts_with("select:") => self.preferences.mapper.selected = Some(s[7..].to_string()),
+            "prefs:other" | "prefs:OtherControllers" | "prefs:Other" => {
+                self.preferences.is_open = true;
+                self.preferences.current_tab = PrefsTab::OtherControllers;
+            }
             s if s.starts_with("prefs:") => {
                 self.preferences.is_open = true;
                 if let Some((_, tabs)) = PreferencesDialog::GROUPS.iter().find(|(name, _)| name.replace(' ', "") == s[6..]) {
@@ -891,6 +898,12 @@ impl ReTraktorApp {
     /// or other Traktor Kontrol surface, decodes Input Reports `0x01`/`0x02`/`0x03`, and writes
     /// Output Report `0x80` (105 LEDs + 6 RGB Bottom-Shell LEDs per deck).
     fn poll_mx2_hardware(&mut self) {
+        // Non-blocking poll of connected generic MIDI & NI HID controllers
+        let generic_events = self.preferences.generic_manager.poll_events();
+        for ev in generic_events {
+            self.apply_mx2_surface_event(ev);
+        }
+
         if self.mx2_hidraw_file.is_none() {
             self.mx2_scan_counter = self.mx2_scan_counter.wrapping_add(1);
             if self.mx2_scan_counter % 90 == 1 {
@@ -1008,11 +1021,73 @@ impl ReTraktorApp {
         let touched = match &ev {
             SurfaceEvent::Button { control, pressed: true } => Some(control.clone()),
             SurfaceEvent::Fader { control, .. } => Some(control.clone()),
+            SurfaceEvent::Encoder { control, .. } => Some(control.clone()),
             _ => None,
         };
         if let Some(t) = touched {
             self.preferences.last_surface_control = Some(t);
         }
+
+        // Handle Encoder actions (e.g. browse, jog turn, loop size)
+        if let SurfaceEvent::Encoder { ref control, delta } = ev {
+            if let Some(act) = self.custom_mappings.get(control) {
+                match act.as_str() {
+                    "browse" => {
+                        if delta > 0 {
+                            self.library.select_next_track();
+                        } else if delta < 0 {
+                            self.library.select_prev_track();
+                        }
+                        return;
+                    }
+                    "jog:1" | "jog:2" => {
+                        let d = if act == "jog:2" { 1 } else { 0 };
+                        let sens = (self.jog_scratch_sensitivity as f64).clamp(0.2, 3.0);
+                        if let Ok(mut state) = self.audio.shared.lock() {
+                            if state.scratch_active[d] {
+                                let scaled_ticks = ((delta as f64) * sens).round() as i64;
+                                state.scratch_tick(d, scaled_ticks);
+                            } else {
+                                let nudge_sec = (delta as f64 / 1024.0) * 0.08 * sens;
+                                state.playhead_sec[d] = (state.playhead_sec[d] + nudge_sec).max(0.0);
+                            }
+                        }
+                        return;
+                    }
+                    "loop_size:1" | "loop_size:2" => {
+                        let d = if act == "loop_size:2" { 1 } else { 0 };
+                        if delta > 0 {
+                            self.deck_loop_size_beats[d] = (self.deck_loop_size_beats[d] * 2).min(32);
+                        } else if delta < 0 {
+                            self.deck_loop_size_beats[d] = (self.deck_loop_size_beats[d] / 2).max(1);
+                        }
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Handle Jog Touch (scratch enable / disable)
+        if let SurfaceEvent::Button { ref control, pressed } = ev {
+            if let Some(act) = self.custom_mappings.get(control) {
+                if act.starts_with("jog_touch:") || act == "jog:1" || act == "jog:2" {
+                    let d = if act.ends_with(":2") { 1 } else { 0 };
+                    if self.deck_turntable_mode[d] {
+                        self.deck_scratch_active[d] = pressed;
+                        if let Ok(mut state) = self.audio.shared.lock() {
+                            if pressed {
+                                state.enable_scratch(d, 1024, 33.333333333333336, 0.125, 0.125 / 32.0);
+                            } else {
+                                state.disable_scratch(d);
+                            }
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+
         // User mapping overrides the built-in behaviour.
         use crate::controller_map::{parse, Mapped};
         let mapped = match &ev {
@@ -1760,13 +1835,34 @@ impl ReTraktorApp {
                     }
 
                     if roomy {
-                        let controller_tip = match &self.mx2_dev_node {
-                            Some(node) => format!("Traktor MX2 connected ({node}). Click for controller settings"),
-                            None => "No controller connected. Click for controller settings".to_string(),
+                        let (ctl_label, ctl_ok, ctl_tab, controller_tip) = if let Some(ref node) = self.mx2_dev_node {
+                            ("MX2", true, PrefsTab::Controllers, format!("Traktor MX2 connected ({node}). Click for controller settings"))
+                        } else {
+                            let generic_devs = self.preferences.generic_manager.discovered.lock().map(|d| d.clone()).unwrap_or_default();
+                            if let Some(dev) = generic_devs.iter().find(|d| d.connected) {
+                                let label = if dev.slug.contains("flx4") {
+                                    "FLX4"
+                                } else if dev.slug.contains("x1") {
+                                    "X1"
+                                } else if dev.slug.contains("z1") {
+                                    "Z1"
+                                } else if dev.slug.contains("s4") {
+                                    "S4"
+                                } else if dev.slug.contains("s2") {
+                                    "S2"
+                                } else if dev.slug.contains("s3") {
+                                    "S3"
+                                } else {
+                                    "MIDI"
+                                };
+                                (label, true, PrefsTab::OtherControllers, format!("{} connected ({}). Click for controller settings", dev.name, dev.dev_node))
+                            } else {
+                                ("MX2", false, PrefsTab::Controllers, "No controller connected. Click for controller settings".to_string())
+                            }
                         };
-                        if lamp(ui, "MX2", self.mx2_dev_node.is_some()).on_hover_text(controller_tip).clicked() {
+                        if lamp(ui, ctl_label, ctl_ok).on_hover_text(controller_tip).clicked() {
                             self.preferences.is_open = true;
-                            self.preferences.current_tab = PrefsTab::Controllers;
+                            self.preferences.current_tab = ctl_tab;
                         }
                     }
 

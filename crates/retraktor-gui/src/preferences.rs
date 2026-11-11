@@ -17,6 +17,7 @@ pub enum PrefsTab {
     FileManagement,
     AnalyzeOptions,
     Controllers,
+    OtherControllers,
     Look,
     About,
 }
@@ -196,6 +197,8 @@ pub struct PreferencesDialog {
     /// User MX2 mapping, saved to ~/.config/retraktor/mx2-mapping.tsv.
     pub mapping: crate::controller_map::Mapping,
     pub mapper: crate::controller_map::MapperState,
+    /// Generic MIDI and NI HID controller manager and mapper.
+    pub generic_manager: crate::midi::GenericControllerManager,
     /// Last control touched on the hardware (for "press to select").
     pub last_surface_control: Option<String>,
 }
@@ -296,6 +299,7 @@ impl Default for PreferencesDialog {
             udev_command_copied: false,
             mapping: crate::controller_map::Mapping::load(),
             mapper: Default::default(),
+            generic_manager: Default::default(),
             last_surface_control: None,
         }
     }
@@ -523,6 +527,7 @@ impl PreferencesDialog {
             PrefsTab::FileManagement => ("COLLECTION & HARDWARE", "File Management & Folders"),
             PrefsTab::AnalyzeOptions => ("COLLECTION & HARDWARE", "Analyze & Musical Key"),
             PrefsTab::Controllers => ("COLLECTION & HARDWARE", "Controller Manager & Remapper"),
+            PrefsTab::OtherControllers => ("COLLECTION & HARDWARE", "Other Controllers"),
             PrefsTab::Look => ("LOOK", "Theme & colours"),
             PrefsTab::About => ("COLLECTION & HARDWARE", "About & Diagnostics"),
         }
@@ -534,7 +539,7 @@ impl PreferencesDialog {
         ("Decks & Mixer", &[PrefsTab::Decks, PrefsTab::TrackDecks, PrefsTab::Mixer, PrefsTab::Effects]),
         ("Library", &[PrefsTab::FileManagement, PrefsTab::BrowserColumns, PrefsTab::AnalyzeOptions]),
         ("Stems & Recording", &[PrefsTab::StemsAndAi, PrefsTab::Recording]),
-        ("Controllers", &[PrefsTab::Controllers]),
+        ("Controllers", &[PrefsTab::Controllers, PrefsTab::OtherControllers]),
         ("Look", &[PrefsTab::Look]),
         ("About", &[PrefsTab::About]),
     ];
@@ -583,6 +588,7 @@ impl PreferencesDialog {
             PrefsTab::FileManagement => self.show_file_management(ui),
             PrefsTab::AnalyzeOptions => self.show_analyze_prefs(ui),
             PrefsTab::Controllers => self.show_controller_prefs(ui),
+            PrefsTab::OtherControllers => self.show_other_controllers_prefs(ui),
             PrefsTab::Look => crate::theme::editor(ui),
             PrefsTab::About => self.show_about(ui),
         }
@@ -672,6 +678,9 @@ impl PreferencesDialog {
                                 ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
 
                                 for tab in self.current_group() {
+                                    if self.current_group() == &[PrefsTab::Controllers, PrefsTab::OtherControllers] && *tab != self.current_tab {
+                                        continue;
+                                    }
                                     self.show_section(ui, *tab);
                                     ui.add_space(12.0);
                                 }
@@ -1677,7 +1686,42 @@ impl PreferencesDialog {
         );
     }
 
+    fn show_controllers_subtabs(&mut self, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing = Vec2::new(8.0, 4.0);
+            let is_mx2 = self.current_tab == PrefsTab::Controllers;
+            let mx2_btn = egui::Button::new(
+                RichText::new("Traktor MX2")
+                    .size(13.0)
+                    .color(if is_mx2 { on_selected_text() } else { TraktorTheme::TEXT_PRIMARY() })
+                    .strong(),
+            )
+            .fill(if is_mx2 { TraktorTheme::ROW_SELECTED() } else { TraktorTheme::BG_PANEL() })
+            .rounding(4.0)
+            .min_size(Vec2::new(130.0, 28.0));
+            if ui.add(mx2_btn).clicked() {
+                self.current_tab = PrefsTab::Controllers;
+            }
+
+            let is_other = self.current_tab == PrefsTab::OtherControllers;
+            let other_btn = egui::Button::new(
+                RichText::new("Other controllers")
+                    .size(13.0)
+                    .color(if is_other { on_selected_text() } else { TraktorTheme::TEXT_PRIMARY() })
+                    .strong(),
+            )
+            .fill(if is_other { TraktorTheme::ROW_SELECTED() } else { TraktorTheme::BG_PANEL() })
+            .rounding(4.0)
+            .min_size(Vec2::new(150.0, 28.0));
+            if ui.add(other_btn).clicked() {
+                self.current_tab = PrefsTab::OtherControllers;
+            }
+        });
+        ui.add_space(8.0);
+    }
+
     fn show_controller_prefs(&mut self, ui: &mut Ui) {
+        self.show_controllers_subtabs(ui);
         // 6. Line-drawn replica of the MX2: see and change what every control does.
         ui.add_space(8.0);
         let connected = self.mx2_connected_node.is_some();
@@ -1693,6 +1737,11 @@ impl PreferencesDialog {
             .id_salt("controller_troubleshooting")
             .default_open(self.mx2_connected_node.is_none())
             .show(ui, |ui| self.show_controller_troubleshooting(ui));
+    }
+
+    fn show_other_controllers_prefs(&mut self, ui: &mut Ui) {
+        self.show_controllers_subtabs(ui);
+        crate::midi::show_other_controllers_page(ui, &mut self.generic_manager, self.last_surface_control.as_deref());
     }
 
     fn show_controller_troubleshooting(&mut self, ui: &mut Ui) {
@@ -2116,6 +2165,10 @@ mod tests {
         let (cat, sec) = prefs.get_tab_breadcrumb(PrefsTab::Controllers);
         assert_eq!(cat, "COLLECTION & HARDWARE");
         assert_eq!(sec, "Controller Manager & Remapper");
+
+        let (cat, sec) = prefs.get_tab_breadcrumb(PrefsTab::OtherControllers);
+        assert_eq!(cat, "COLLECTION & HARDWARE");
+        assert_eq!(sec, "Other Controllers");
 
         assert_eq!(prefs.buffer_size, 128);
         assert_eq!(prefs.sample_rate, 48000);

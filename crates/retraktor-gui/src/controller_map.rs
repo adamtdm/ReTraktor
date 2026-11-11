@@ -112,7 +112,7 @@ fn mx2_layout() -> Vec<Ctl> {
 }
 
 /// Mappable actions: (id, label, group). `{d}` is replaced by the deck number.
-const BUTTON_ACTIONS: &[(&str, &str, &str)] = &[
+pub(crate) const BUTTON_ACTIONS: &[(&str, &str, &str)] = &[
     ("play:{d}", "Play / pause", "Transport"),
     ("cue:{d}", "Cue", "Transport"),
     ("cueplay:{d}", "Cue & play", "Transport"),
@@ -148,7 +148,7 @@ const BUTTON_ACTIONS: &[(&str, &str, &str)] = &[
     ("none", "Do nothing", "Other"),
 ];
 
-const CONTINUOUS_ACTIONS: &[(&str, &str, &str)] = &[
+pub(crate) const CONTINUOUS_ACTIONS: &[(&str, &str, &str)] = &[
     ("volume:{d}", "Channel volume", "Mixer"),
     ("gain:{d}", "Gain", "Mixer"),
     ("eq_hi:{d}", "EQ high", "Mixer"),
@@ -265,6 +265,7 @@ pub fn action_label(action: &str) -> String {
             ["fx_param", d, n] => format!("FX {} knob {n}", deck(d)),
             ["fx_button", d, n] => format!("FX {} button {n}", deck(d)),
             ["jog", d] => format!("Jogwheel {}", deck(d)),
+            ["jog_touch", d] => format!("Jog touch {}", deck(d)),
             ["loop_size", d] => format!("Loop size {}", deck(d)),
             ["loop_move", d] => format!("Move loop {}", deck(d)),
             ["browse"] => "Browse library".into(),
