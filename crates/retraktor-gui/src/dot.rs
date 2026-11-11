@@ -839,166 +839,230 @@ pub fn dot_lamp(ui: &mut Ui, on: &mut bool, accent: Color32, hover: &str) -> Res
     resp.on_hover_text(hover)
 }
 
-/// Two-column dot meter with an interactive fader bracket, dB readout in `dot_font`, and headphone cue lamp.
-/// Dragging vertically moves `volume`; double-clicking resets `volume` to `0.85`; clicking the bottom
-/// headphone lamp toggles `cue`.
-#[allow(clippy::too_many_arguments)]
-pub fn fader_meter(
-    ui: &mut Ui,
-    volume: &mut f32,
-    level_l: f32,
-    level_r: f32,
-    cue: &mut bool,
-    accent: Color32,
-    height: f32,
-    width: f32,
-) -> Response {
-    let w = width.max(32.0);
-    let (rect, mut response) = ui.allocate_exact_size(Vec2::new(w, height), Sense::click_and_drag());
-
-    let footer_h = 34.0;
-    let meter_top = rect.top() + 6.0;
-    let meter_bot = (rect.bottom() - footer_h).max(meter_top + 36.0);
-    let track_h = (meter_bot - meter_top).max(20.0);
-    let cue_rect = Rect::from_min_max(Pos2::new(rect.left(), rect.bottom() - 22.0), rect.max);
-
-    if response.clicked() {
-        if let Some(pos) = response.interact_pointer_pos() {
-            if cue_rect.contains(pos) {
-                *cue = !*cue;
-                response.mark_changed();
-            }
-        }
+/// Pure timing/easing helper: computes circular ripple wave intensity (0.0..=1.0)
+/// across the dot matrix during a crossfade cheer.
+pub fn cheer_wave_intensity(
+    col: usize,
+    center_col: usize,
+    elapsed_sec: f32,
+    duration_sec: f32,
+    speed_cols_per_sec: f32,
+) -> f32 {
+    if elapsed_sec <= 0.0 || elapsed_sec >= duration_sec {
+        return 0.0;
     }
-    if response.dragged() {
-        let delta = -response.drag_delta().y / track_h;
-        *volume = (*volume + delta).clamp(0.0, 1.0);
-        response.mark_changed();
+    let wave_front = elapsed_sec * speed_cols_per_sec;
+    let dist = (col as f32 - center_col as f32).abs();
+    let diff = (dist - wave_front).abs();
+    let thickness = 2.8_f32;
+    if diff >= thickness {
+        return 0.0;
     }
-    if response.double_clicked() {
-        *volume = 0.85;
-        response.mark_changed();
-    }
-
-    if ui.is_rect_visible(rect) {
-        let painter = ui.painter();
-        let cx = rect.center().x;
-        let rows = ((track_h / 8.2).floor() as usize).clamp(10, 18);
-        let step_y = if rows > 1 { track_h / (rows - 1) as f32 } else { track_h };
-        let hy = meter_top + (1.0 - volume.clamp(0.0, 1.0)) * track_h;
-        let unlit_col = unlit_on_panel();
-        let anim = theme::animations();
-        let eff_l = if anim { level_l } else { 0.0 } * *volume;
-        let eff_r = if anim { level_r } else { 0.0 } * *volume;
-        let lit_l = value_to_lit_rows(eff_l, rows);
-        let lit_r = value_to_lit_rows(eff_r, rows);
-
-        for k in 0..rows {
-            let yy = meter_bot - k as f32 * step_y;
-            let above = yy < hy - 4.0;
-            let r = if above { 1.55 } else { 2.65 };
-            for (dx, lit_rows) in [(-4.5_f32, lit_l), (4.5_f32, lit_r)] {
-                let col = if k < lit_rows {
-                    if k >= rows.saturating_sub(2) {
-                        TraktorTheme::METER_RED()
-                    } else {
-                        accent
-                    }
-                } else {
-                    unlit_col
-                };
-                painter.circle_filled(Pos2::new(cx + dx, yy), r, col);
-            }
-        }
-
-        // Fader bracket with side wings (from mixer-v2.png)
-        let bw = (w - 8.0).clamp(24.0, 32.0);
-        let bh = 13.0;
-        let bracket = Rect::from_center_size(Pos2::new(cx, hy), Vec2::new(bw, bh));
-        let stroke = Stroke::new(1.8_f32, TraktorTheme::TEXT_PRIMARY());
-        painter.rect_stroke(bracket, 4.0, stroke);
-        painter.line_segment([Pos2::new(bracket.left() - 4.5, hy), Pos2::new(bracket.left(), hy)], stroke);
-        painter.line_segment([Pos2::new(bracket.right(), hy), Pos2::new(bracket.right() + 4.5, hy)], stroke);
-
-        // dB readout in dot font
-        let db_str = format_db(*volume, 0.85);
-        painter.text(
-            Pos2::new(cx, meter_bot + 10.0),
-            Align2::CENTER_CENTER,
-            db_str,
-            theme::dot_font(11.5),
-            TraktorTheme::TEXT_PRIMARY(),
-        );
-
-        // Small headphone cue lamp below the dB readout
-        let lamp_y = rect.bottom() - 8.0;
-        let cue_col = if *cue { TraktorTheme::CUE_ACTIVE() } else { TraktorTheme::TEXT_MUTED() };
-        if *cue {
-            painter.circle_filled(Pos2::new(cx - 8.0, lamp_y), 3.2, cue_col);
-        } else {
-            painter.circle_stroke(Pos2::new(cx - 8.0, lamp_y), 2.8, Stroke::new(1.1_f32, cue_col));
-        }
-        painter.text(
-            Pos2::new(cx + 4.0, lamp_y),
-            Align2::CENTER_CENTER,
-            "CUE",
-            FontId::proportional(7.5),
-            if *cue { TraktorTheme::TEXT_PRIMARY() } else { TraktorTheme::TEXT_MUTED() },
-        );
-    }
-
-    response
+    let shape = 1.0 - diff / thickness;
+    let fade = (1.0 - elapsed_sec / duration_sec).clamp(0.0, 1.0);
+    (shape * fade).clamp(0.0, 1.0)
 }
 
-/// Centre stereo two-column dot meter (for `MAIN`) in the same dot-matrix language as [`fader_meter`].
-pub fn dot_meter(ui: &mut Ui, level_l: f32, level_r: f32, label: &str, height: f32, width: f32) -> Response {
-    let w = width.max(26.0);
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(w, height), Sense::hover());
-    if !ui.is_rect_visible(rect) {
-        return response;
+/// Pure timing/easing helper: computes beam column wipe progress (0.0..=1.0)
+/// across a deck's half of the mixer display when a new track is loaded.
+pub fn track_load_wipe_col(
+    col: usize,
+    start_col: usize,
+    end_col: usize,
+    elapsed_sec: f32,
+    duration_sec: f32,
+) -> f32 {
+    if elapsed_sec <= 0.0 || elapsed_sec >= duration_sec {
+        return 0.0;
     }
+    let t = (elapsed_sec / duration_sec).clamp(0.0, 1.0);
+    let min_c = start_col.min(end_col) as f32;
+    let max_c = start_col.max(end_col) as f32;
+    let beam_col = if start_col <= end_col {
+        min_c + (max_c - min_c) * t
+    } else {
+        max_c - (max_c - min_c) * t
+    };
+    let diff = (col as f32 - beam_col).abs();
+    let beam_width = 2.4_f32;
+    if diff >= beam_width {
+        return 0.0;
+    }
+    let shape = 1.0 - diff / beam_width;
+    let fade = (1.0 - t * 0.35).clamp(0.0, 1.0);
+    (shape * fade).clamp(0.0, 1.0)
+}
 
-    let painter = ui.painter();
-    let cx = rect.center().x;
-    let footer_h = 34.0;
-    let meter_top = rect.top() + 6.0;
-    let meter_bot = (rect.bottom() - footer_h).max(meter_top + 36.0);
-    let track_h = (meter_bot - meter_top).max(20.0);
-    let rows = ((track_h / 8.2).floor() as usize).clamp(10, 18);
-    let step_y = if rows > 1 { track_h / (rows - 1) as f32 } else { track_h };
-    let unlit_col = unlit_on_panel();
-    let anim = theme::animations();
-    let lit_l = value_to_lit_rows(if anim { level_l } else { 0.0 }, rows);
-    let lit_r = value_to_lit_rows(if anim { level_r } else { 0.0 }, rows);
+/// Pure timing/easing helper: computes a traveling pulse packet (0.0..=1.0)
+/// across the dot lattice from the master deck to the newly locked synced deck.
+pub fn sync_pulse_col(
+    col: usize,
+    from_col: usize,
+    to_col: usize,
+    elapsed_sec: f32,
+    duration_sec: f32,
+) -> f32 {
+    if elapsed_sec <= 0.0 || elapsed_sec >= duration_sec {
+        return 0.0;
+    }
+    let t = (elapsed_sec / duration_sec).clamp(0.0, 1.0);
+    let eased = t * t * (3.0 - 2.0 * t);
+    let pulse_c = from_col as f32 + (to_col as f32 - from_col as f32) * eased;
+    let diff = (col as f32 - pulse_c).abs();
+    let pulse_width = 2.6_f32;
+    if diff >= pulse_width {
+        return 0.0;
+    }
+    let shape = 1.0 - diff / pulse_width;
+    let fade = (1.0 - t * 0.45).clamp(0.0, 1.0);
+    (shape * fade).clamp(0.0, 1.0)
+}
 
-    for k in 0..rows {
-        let yy = meter_bot - k as f32 * step_y;
-        for (dx, lit_rows) in [(-4.0_f32, lit_l), (4.0_f32, lit_r)] {
-            let col = if k < lit_rows {
-                if k >= rows.saturating_sub(2) {
-                    TraktorTheme::METER_RED()
-                } else if k >= rows.saturating_sub(4) {
-                    TraktorTheme::METER_YELLOW()
-                } else {
-                    TraktorTheme::TEXT_PRIMARY()
-                }
-            } else {
-                unlit_col
-            };
-            painter.circle_filled(Pos2::new(cx + dx, yy), 2.25, col);
+/// Pure helper: returns true during the ON phase of a slow 1 Hz blinking dot when recording is active.
+pub fn recording_blink_lit(now_sec: f64, is_recording: bool) -> bool {
+    if !is_recording {
+        return false;
+    }
+    (now_sec.fract() + 1.0).fract() < 0.5
+}
+
+/// Pure helper: returns true when two track keys are harmonically compatible.
+pub fn harmonically_compatible_link_dots(key_a: Option<&str>, key_b: Option<&str>) -> bool {
+    match (key_a, key_b) {
+        (Some(a), Some(b)) if !a.is_empty() && !b.is_empty() => {
+            retraktor_library::KeyWheel::are_harmonically_compatible(a, b)
+        }
+        _ => false,
+    }
+}
+
+/// Inclusive column range within the shared dot lattice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColRange {
+    pub start: usize,
+    pub end: usize,
+}
+
+impl ColRange {
+    #[inline]
+    pub fn new(start: usize, end: usize) -> Self {
+        Self { start, end: end.max(start) }
+    }
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.end - self.start + 1
+    }
+    #[inline]
+    pub fn contains(&self, col: usize) -> bool {
+        col >= self.start && col <= self.end
+    }
+    #[inline]
+    pub fn center(&self) -> f32 {
+        (self.start + self.end) as f32 * 0.5
+    }
+}
+
+/// Symmetrical zone layout across the shared lattice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MixerZoneLayout {
+    pub cols: usize,
+    pub mid: usize,
+    pub main_meter_l: usize,
+    pub main_meter_r: usize,
+    pub fader_meter: [Option<ColRange>; 4],
+    pub eq_stem_zone: [Option<ColRange>; 4],
+    pub is_compact: [bool; 4],
+    pub xfader_start: usize,
+    pub xfader_end: usize,
+}
+
+pub fn compute_mixer_zone_layout(cols: usize, two_channel_only: bool) -> MixerZoneLayout {
+    let mid = cols / 2;
+    let margin = 2usize;
+    let max_span = mid.saturating_sub(margin).min(cols.saturating_sub(margin + 1).saturating_sub(mid));
+    let xfader_start = mid.saturating_sub(max_span);
+    let xfader_end = mid + max_span;
+    let main_meter_l = mid.saturating_sub(1);
+    let main_meter_r = mid + 1;
+
+    let mut fader_meter = [None; 4];
+    let mut eq_stem_zone = [None; 4];
+    let mut is_compact = [false; 4];
+
+    if two_channel_only {
+        let a_fader_e = mid.saturating_sub(4);
+        let a_fader_s = mid.saturating_sub(5);
+        let b_fader_s = mid + 4;
+        let b_fader_e = mid + 5;
+
+        let a_eq_s = mid.saturating_sub(max_span);
+        let a_eq_e = mid.saturating_sub(8);
+        let b_eq_s = mid + 8;
+        let b_eq_e = mid + max_span;
+
+        fader_meter[0] = Some(ColRange::new(a_fader_s, a_fader_e));
+        fader_meter[1] = Some(ColRange::new(b_fader_s, b_fader_e));
+        if a_eq_e >= a_eq_s {
+            eq_stem_zone[0] = Some(ColRange::new(a_eq_s, a_eq_e));
+        }
+        if b_eq_e >= b_eq_s {
+            eq_stem_zone[1] = Some(ColRange::new(b_eq_s, b_eq_e));
+        }
+    } else {
+        // 4-Deck layout:
+        // Left: Deck A (outer), Deck C (inner).
+        // Right: Deck D (inner), Deck B (outer).
+        let c_fader_e = mid.saturating_sub(3);
+        let c_fader_s = mid.saturating_sub(4);
+        let d_fader_s = mid + 3;
+        let d_fader_e = mid + 4;
+
+        let c_eq_e = mid.saturating_sub(6);
+        let c_eq_s = mid.saturating_sub(11);
+        let d_eq_s = mid + 6;
+        let d_eq_e = mid + 11;
+
+        let a_fader_e = mid.saturating_sub(14);
+        let a_fader_s = mid.saturating_sub(15);
+        let b_fader_s = mid + 14;
+        let b_fader_e = mid + 15;
+
+        let a_eq_s = mid.saturating_sub(max_span);
+        let a_eq_e = mid.saturating_sub(18);
+        let b_eq_s = mid + 18;
+        let b_eq_e = mid + max_span;
+
+        fader_meter[0] = Some(ColRange::new(a_fader_s, a_fader_e));
+        fader_meter[1] = Some(ColRange::new(b_fader_s, b_fader_e));
+        fader_meter[2] = Some(ColRange::new(c_fader_s, c_fader_e));
+        fader_meter[3] = Some(ColRange::new(d_fader_s, d_fader_e));
+
+        eq_stem_zone[2] = Some(ColRange::new(c_eq_s, c_eq_e));
+        eq_stem_zone[3] = Some(ColRange::new(d_eq_s, d_eq_e));
+        is_compact[2] = true;
+        is_compact[3] = true;
+
+        if a_eq_e >= a_eq_s {
+            eq_stem_zone[0] = Some(ColRange::new(a_eq_s, a_eq_e));
+        }
+        if b_eq_e >= b_eq_s {
+            eq_stem_zone[1] = Some(ColRange::new(b_eq_s, b_eq_e));
         }
     }
 
-    painter.text(
-        Pos2::new(cx, meter_bot + 10.0),
-        Align2::CENTER_CENTER,
-        label,
-        FontId::proportional(8.5),
-        TraktorTheme::TEXT_SECONDARY(),
-    );
-
-    response
+    MixerZoneLayout {
+        cols,
+        mid,
+        main_meter_l,
+        main_meter_r,
+        fader_meter,
+        eq_stem_zone,
+        is_compact,
+        xfader_start,
+        xfader_end,
+    }
 }
+
 
 /// Pure helper: computes how much a filter (`0.0..=1.0`, `0.5` = neutral) attenuates a normalized
 /// frequency position `freq_pos` (`0.0` = LOW, `0.5` = MID, `1.0` = HI). Returns `1.0` when uncut,
@@ -1028,625 +1092,928 @@ pub fn filter_band_gain(filter: f32, filter_on: bool, freq_pos: f32) -> f32 {
     }
 }
 
-/// Per-deck dot-matrix EQ display (dark inset): three band columns/blocks `LOW / MID / HI`
-/// (mirrored on deck B so `LOW` is on the outer edge for both) whose lit height is the EQ knob value,
-/// brightness follows that band's live level, filter sweeps across it, and killed bands render as hollow dots.
-/// Also draws the smooth EQ contour curve from `mixer-v2.png`.
-/// Drag vertically on any band to adjust its EQ knob; double-click to reset to 0 dB; right-click or click
-/// the top dB readout to toggle EQ kill.
-#[allow(clippy::too_many_arguments)]
-pub fn eq_display(
-    ui: &mut Ui,
-    eq_low: &mut f32,
-    eq_mid: &mut f32,
-    eq_hi: &mut f32,
-    kill_low: &mut bool,
-    kill_mid: &mut bool,
-    kill_hi: &mut bool,
-    band_levels: [f32; 3],
-    filter: f32,
-    filter_on: bool,
-    mirrored: bool,
-    accent: Color32,
-    size: Vec2,
-) -> Response {
-    let (rect, mut response) = ui.allocate_exact_size(size, Sense::click_and_drag());
-    let band_w = rect.width() / 3.0;
+const DECK_LETTERS: [&str; 4] = ["A", "B", "C", "D"];
+const XFADER_TIP: &str = "Crossfader. Drag to blend A and B; double-click to centre";
 
-    // Band order left-to-right: A = [LOW(0), MID(1), HI(2)], B (mirrored) = [HI(2), MID(1), LOW(0)]
-    let band_at_slot = |slot: usize| -> usize {
-        if mirrored { 2 - slot.min(2) } else { slot.min(2) }
-    };
-
-    if let Some(pos) = response.interact_pointer_pos() {
-        let slot = (((pos.x - rect.left()) / band_w).floor() as usize).min(2);
-        let b = band_at_slot(slot);
-        if response.dragged() {
-            let delta = -response.drag_delta().y / (rect.height() * 0.65).max(30.0);
-            let val = match b {
-                0 => &mut *eq_low,
-                1 => &mut *eq_mid,
-                _ => &mut *eq_hi,
-            };
-            *val = (*val + delta).clamp(0.0, 1.0);
-            response.mark_changed();
-        }
-        if response.double_clicked() {
-            match b {
-                0 => *eq_low = 0.5,
-                1 => *eq_mid = 0.5,
-                _ => *eq_hi = 0.5,
-            }
-            response.mark_changed();
-        }
-        if response.secondary_clicked() || (response.clicked() && pos.y < rect.top() + 24.0) {
-            match b {
-                0 => *kill_low = !*kill_low,
-                1 => *kill_mid = !*kill_mid,
-                _ => *kill_hi = !*kill_hi,
-            }
-            response.mark_changed();
-        }
-    }
-
-    if !ui.is_rect_visible(rect) {
-        return response;
-    }
-
-    let painter = ui.painter();
-    let bg = TraktorTheme::WAVEFORM_BG();
-    let ink = theme::on(bg);
-    let accent_vis = visible_on_inset(accent);
-    let unlit = unlit_on_inset();
-    painter.rect_filled(rect, 6.0, bg);
-    painter.rect_stroke(rect, 6.0, Stroke::new(1.0_f32, TraktorTheme::BORDER_COLOR()));
-
-    let pad_top = 22.0;
-    let pad_bot = 18.0;
-    let body_top = rect.top() + pad_top;
-    let body_bot = (rect.bottom() - pad_bot).max(body_top + 24.0);
-    let body_h = body_bot - body_top;
-    let mid_y = (body_top + body_bot) * 0.5;
-
-    // Subtle 0 dB center reference line
-    let dash_step = 6.0_f32;
-    let mut dx = rect.left() + 8.0;
-    while dx < rect.right() - 8.0 {
-        painter.circle_filled(Pos2::new(dx, mid_y), 1.0, unlit);
-        dx += dash_step;
-    }
-
-    let vals = [*eq_low, *eq_mid, *eq_hi];
-    let kills = [*kill_low, *kill_mid, *kill_hi];
-    let labels = ["LOW", "MID", "HI"];
-    let anim = theme::animations();
-
-    let rows = ((body_h / 4.8).floor() as usize).clamp(16, 32);
-    let cols_per_band = ((band_w / 4.6).floor() as usize).clamp(5, 12);
-    let dot_radius = 1.3_f32;
-    let mut node_centers = [Pos2::ZERO; 3];
-
-    for slot in 0..3 {
-        let b = band_at_slot(slot);
-        let slot_left = rect.left() + slot as f32 * band_w;
-        let slot_cx = slot_left + band_w * 0.5;
-        let val = vals[b].clamp(0.0, 1.0);
-        let killed = kills[b];
-        let live = if anim { band_levels[b].clamp(0.0, 1.0) } else { 0.0 };
-
-        // Detect kill state change between frames via egui temp memory
-        let kill_id = ui.make_persistent_id(("eq_kill_anim", mirrored, b));
-        let now = ui.input(|i| i.time);
-        let prev_kill: Option<(bool, f64)> = ui.ctx().data(|d| d.get_temp(kill_id));
-        let (last_killed, mut anim_start) = prev_kill.unwrap_or((killed, -100.0));
-        if killed != last_killed {
-            anim_start = now;
-            ui.ctx().data_mut(|d| d.insert_temp(kill_id, (killed, now)));
-        }
-        let elapsed = (now - anim_start) as f32;
-        let is_animating = anim && elapsed >= 0.0 && elapsed < 0.6;
-        if is_animating {
-            ui.ctx().request_repaint();
-        }
-
-        // Top value readout in dot font
-        painter.text(
-            Pos2::new(slot_cx, rect.top() + 11.0),
-            Align2::CENTER_CENTER,
-            format_eq_db(val, killed),
-            theme::dot_font(11.0),
-            if killed { TraktorTheme::METER_RED() } else { ink },
-        );
-
-        // Bottom band label
-        painter.text(
-            Pos2::new(slot_cx, rect.bottom() - 8.0),
-            Align2::CENTER_CENTER,
-            labels[b],
-            FontId::proportional(8.5),
-            ink.gamma_multiply(0.68),
-        );
-
-        // Dot-matrix column block for this band
-        let col_rect = Rect::from_min_max(
-            Pos2::new(slot_left + 4.0, body_top + 2.0),
-            Pos2::new(slot_left + band_w - 4.0, body_bot - 2.0),
-        );
-        let lit_rows = value_to_lit_rows(val, rows);
-        paint_dot_grid(painter, col_rect, cols_per_band, rows, dot_radius, unlit, |c, r| {
-            // Frequency position 0.0 (LOW) .. 1.0 (HI) for the filter sweep
-            let sub = if cols_per_band > 1 { c as f32 / (cols_per_band - 1) as f32 } else { 0.5 };
-            let sub_freq = if mirrored { 1.0 - sub } else { sub };
-            let freq_pos = (b as f32 + (sub_freq - 0.5) * 0.8) / 2.0;
-            let flt_gain = filter_band_gain(filter, filter_on, freq_pos);
-
-            if r < lit_rows {
-                let level_boost = 0.65 + 0.35 * live;
-                let col = accent_vis.gamma_multiply((level_boost * flt_gain).clamp(0.22, 1.0));
-                if killed {
-                    DotCell::Hollow(col)
-                } else {
-                    DotCell::Filled(col)
-                }
-            } else {
-                DotCell::Unlit
-            }
-        });
-
-        if anim {
-            let step_x = if cols_per_band > 1 { (col_rect.width() - dot_radius * 2.0).max(1.0) / (cols_per_band - 1) as f32 } else { 0.0 };
-            let step_y = if rows > 1 { (col_rect.height() - dot_radius * 2.0).max(1.0) / (rows - 1) as f32 } else { 0.0 };
-            let top_dot_y = col_rect.top() + dot_radius;
-            let icon_cy = top_dot_y + 2.0 * step_y;
-
-            if is_animating {
-                let bounce = bounce_dot_offset(elapsed, 0.6, 5);
-                let pop_down = ((1.0 - (elapsed / 0.25).min(1.0)) * 6.0).round() as i32;
-                let eff_bounce = bounce - pop_down;
-                let sprite = if killed { &SPRITE_KILL_X } else { &SPRITE_TICK };
-                let col = if killed { TraktorTheme::METER_RED() } else { TraktorTheme::PLAY_ACTIVE() };
-                paint_sprite(
-                    painter,
-                    Pos2::new(slot_cx, icon_cy),
-                    Vec2::new(step_x, step_y),
-                    dot_radius,
-                    sprite,
-                    0,
-                    eff_bounce,
-                    SpriteMode::Filled,
-                    col,
-                    unlit,
-                    false,
-                );
-            } else if killed {
-                paint_sprite(
-                    painter,
-                    Pos2::new(slot_cx, icon_cy),
-                    Vec2::new(step_x, step_y),
-                    dot_radius,
-                    &SPRITE_KILL_X,
-                    0,
-                    0,
-                    SpriteMode::Hollow,
-                    TraktorTheme::METER_RED(),
-                    unlit,
-                    false,
-                );
-            }
-        }
-
-        let node_y = body_bot - val * body_h;
-        node_centers[slot] = Pos2::new(slot_cx, node_y);
-    }
-
-    // Smooth cubic EQ contour curve & circular band nodes (as in mixer-v2.png)
-    let left_edge = Pos2::new(rect.left() + 6.0, node_centers[0].y);
-    let right_edge = Pos2::new(rect.right() - 6.0, node_centers[2].y);
-    let anchors = [left_edge, node_centers[0], node_centers[1], node_centers[2], right_edge];
-    for pair in anchors.windows(2) {
-        let (a, b) = (pair[0], pair[1]);
-        let steps = 12usize;
-        let mut prev = a;
-        for s in 1..=steps {
-            let t = s as f32 / steps as f32;
-            // Smoothstep cubic interpolation
-            let smooth = t * t * (3.0 - 2.0 * t);
-            let next = Pos2::new(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * smooth);
-            painter.line_segment([prev, next], Stroke::new(2.0_f32, accent_vis));
-            prev = next;
-        }
-    }
-    for (slot, &center) in node_centers.iter().enumerate() {
-        let b = band_at_slot(slot);
-        let killed = kills[b];
-        painter.circle_filled(center, 5.5, bg);
-        painter.circle_stroke(
-            center,
-            5.5,
-            Stroke::new(1.8_f32, if killed { TraktorTheme::METER_RED() } else { ink }),
-        );
-    }
-
-    response
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+enum MixerDragTarget {
+    #[default]
+    Crossfader,
+    Fader(usize),
+    EqBand(usize, usize),
 }
 
-/// Per-deck dot-matrix STEMS display (dark inset): four blocks `DRUMS / BASS / OTHER / VOCALS`,
-/// each animated from that stem's live level. Clicking a block toggles mute (`stem_muted`);
-/// right-clicking toggles FX send (`stem_fx_send`). Muted stems collapse to a dim hollow outline
-/// with a staged dot wipe animation.
-#[allow(clippy::too_many_arguments)]
-pub fn stem_display(
-    ui: &mut Ui,
-    deck_idx: usize,
-    stem_muted: &mut [bool; 4],
-    stem_fx_send: &mut [bool; 4],
-    stem_levels: [f32; 4],
-    stem_progress: Option<f32>,
-    mirrored: bool,
-    accent: Color32,
-    size: Vec2,
-) -> Response {
-    let (rect, mut response) = ui.allocate_exact_size(size, Sense::click());
-    let slot_w = rect.width() / 4.0;
-    let stem_at_slot = |slot: usize| -> usize {
-        if mirrored { 3 - slot.min(3) } else { slot.min(3) }
-    };
-
-    if let Some(pos) = response.interact_pointer_pos() {
-        let slot = (((pos.x - rect.left()) / slot_w).floor() as usize).min(3);
-        let s = stem_at_slot(slot);
-        if response.clicked() {
-            stem_muted[s] = !stem_muted[s];
-            response.mark_changed();
-        }
-        if response.secondary_clicked() {
-            stem_fx_send[s] = !stem_fx_send[s];
-            response.mark_changed();
-        }
-    }
-
-    if !ui.is_rect_visible(rect) {
-        return response;
-    }
-
-    let painter = ui.painter();
-    let bg = TraktorTheme::WAVEFORM_BG();
-    let ink = theme::on(bg);
-    let accent_vis = visible_on_inset(accent);
-    let unlit = unlit_on_inset();
-    painter.rect_filled(rect, 6.0, bg);
-    painter.rect_stroke(rect, 6.0, Stroke::new(1.0_f32, TraktorTheme::BORDER_COLOR()));
-
-    let names = if rect.width() < 150.0 {
-        ["DRM", "BAS", "OTH", "VOC"]
-    } else {
-        ["DRUMS", "BASS", "OTHER", "VOCALS"]
-    };
-
-    let pad_top = 22.0;
-    let pad_bot = 18.0;
-    let body_top = rect.top() + pad_top;
-    let body_bot = (rect.bottom() - pad_bot).max(body_top + 24.0);
-    let body_h = body_bot - body_top;
-    let rows = ((body_h / 4.8).floor() as usize).clamp(16, 32);
-    let cols = ((slot_w / 4.6).floor() as usize).clamp(5, 12);
-    let dot_radius = 1.3_f32;
-    let anim = theme::animations();
-
-    for slot in 0..4 {
-        let s = stem_at_slot(slot);
-        let slot_left = rect.left() + slot as f32 * slot_w;
-        let slot_cx = slot_left + slot_w * 0.5;
-        let muted = stem_muted[s];
-        let fx = stem_fx_send[s];
-        let open_t = theme::fade(ui.ctx(), ("stem_wipe", deck_idx, s), !muted);
-
-        // Detect toggle of stem_muted between frames via egui temp memory
-        let stem_id = ui.make_persistent_id(("stem_anim", deck_idx, s));
-        let now = ui.input(|i| i.time);
-        let prev_state: Option<(bool, f64)> = ui.ctx().data(|d| d.get_temp(stem_id));
-        let (last_muted, mut anim_start) = prev_state.unwrap_or((muted, -100.0));
-        if muted != last_muted {
-            anim_start = now;
-        }
-        // Stored every frame: a first toggle has nothing to compare against otherwise.
-        ui.ctx().data_mut(|d| d.insert_temp(stem_id, (muted, anim_start)));
-        let elapsed = (now - anim_start) as f32;
-        let is_animating = anim && elapsed >= 0.0 && elapsed < 0.6;
-        if is_animating {
-            ui.ctx().request_repaint();
-        }
-
-        // Top state readout in dot font
-        let top_txt = if muted {
-            "OFF"
-        } else if fx {
-            "FX"
-        } else {
-            "ON"
-        };
-        painter.text(
-            Pos2::new(slot_cx, rect.top() + 11.0),
-            Align2::CENTER_CENTER,
-            top_txt,
-            theme::dot_font(10.0),
-            if muted { ink.gamma_multiply(0.4) } else if fx { TraktorTheme::ACCENT() } else { ink },
-        );
-
-        // Bottom stem label
-        painter.text(
-            Pos2::new(slot_cx, rect.bottom() - 8.0),
-            Align2::CENTER_CENTER,
-            names[s],
-            FontId::proportional(8.0),
-            if muted { ink.gamma_multiply(0.4) } else { ink.gamma_multiply(0.75) },
-        );
-
-        let block_rect = Rect::from_min_max(
-            Pos2::new(slot_left + 3.0, body_top + 2.0),
-            Pos2::new(slot_left + slot_w - 3.0, body_bot - 2.0),
-        );
-        let live = if anim { stem_levels[s].clamp(0.0, 1.0) } else { 0.45 };
-        // Active stems always show at least 35% height so on/off state is unmistakable when paused
-        let active_frac = (0.35 + 0.65 * live) * open_t;
-        let lit_rows = value_to_lit_rows(active_frac, rows);
-        let wipe_rows = value_to_lit_rows(open_t, rows);
-
-        paint_dot_grid(painter, block_rect, cols, rows, dot_radius, unlit, |c, r| {
-            let is_border = c == 0 || c == cols - 1 || r == 0 || r == rows - 1;
-            if r < lit_rows {
-                let row_t = 0.6 + 0.4 * (1.0 - r as f32 / rows.max(1) as f32);
-                DotCell::Filled(accent_vis.gamma_multiply(row_t))
-            } else if muted && is_border && r >= wipe_rows {
-                DotCell::Hollow(accent_vis.gamma_multiply(0.45))
-            } else {
-                DotCell::Unlit
-            }
-        });
-
-        if anim {
-            let step_x = if cols > 1 { (block_rect.width() - dot_radius * 2.0).max(1.0) / (cols - 1) as f32 } else { 0.0 };
-            let step_y = if rows > 1 { (block_rect.height() - dot_radius * 2.0).max(1.0) / (rows - 1) as f32 } else { 0.0 };
-            let top_dot_y = block_rect.top() + dot_radius;
-            let sprite = STEM_SPRITES[s];
-            // The icon rides the stem: one row from the top when on, resting on the floor when muted.
-            let sprite_h = sprite.dimensions(0).1 as f32;
-            let floor_row = rows as f32 - 1.0 - sprite_h;
-            let icon_top = (floor_row + (1.0 - floor_row) * open_t).round();
-            let icon_cy = top_dot_y + (icon_top + (sprite_h - 1.0) * 0.5) * step_y;
-
-            let (bounce_dots, mode, col) = if is_animating {
-                let b = bounce_dot_offset(elapsed, 0.6, 5);
-                let pop = ((1.0 - (elapsed / 0.25).min(1.0)) * 6.0).round() as i32;
-                let m = if muted { SpriteMode::Hollow } else { SpriteMode::Filled };
-                let c = if muted { accent_vis.gamma_multiply(0.45) } else { ink };
-                (b - pop, m, c)
-            } else {
-                let m = if muted { SpriteMode::Hollow } else { SpriteMode::Filled };
-                let c = if muted { accent_vis.gamma_multiply(0.38) } else { ink };
-                (0, m, c)
-            };
-
-            paint_sprite(
-                painter,
-                Pos2::new(slot_cx, icon_cy),
-                Vec2::new(step_x, step_y),
-                dot_radius,
-                sprite,
-                0,
-                bounce_dots,
-                mode,
-                col,
-                unlit,
-                false,
-            );
-        }
-    }
-
-    if let Some(pct) = stem_progress {
-        let bar_rect = Rect::from_min_max(Pos2::new(rect.left() + 6.0, rect.top() + 2.0), Pos2::new(rect.right() - 6.0, rect.top() + 5.0));
-        painter.rect_filled(bar_rect, 1.5, unlit);
-        let w = bar_rect.width() * pct.clamp(0.0, 1.0);
-        painter.rect_filled(Rect::from_min_size(bar_rect.min, Vec2::new(w, bar_rect.height())), 1.5, TraktorTheme::ACCENT());
-    }
-
-    response
+/// Unified centre mixer continuous dot-matrix canvas.
+/// Integrates EQ/stems, fader-on-meters, MAIN meter, and crossfader ribbon into ONE
+/// continuous dot-matrix lattice, mirrored around the centre.
+pub struct ContinuousMixer<'a> {
+    pub two_channel_only: bool,
+    pub volume: &'a mut [f32; 4],
+    pub cue: &'a mut [bool; 4],
+    pub eq_low: &'a mut [f32; 4],
+    pub eq_mid: &'a mut [f32; 4],
+    pub eq_hi: &'a mut [f32; 4],
+    pub eq_kill_low: &'a mut [bool; 4],
+    pub eq_kill_mid: &'a mut [bool; 4],
+    pub eq_kill_hi: &'a mut [bool; 4],
+    pub filter: [f32; 4],
+    pub filter_on: [bool; 4],
+    pub stem_view: [bool; 4],
+    pub stem_muted: &'a mut [[bool; 4]; 4],
+    pub stem_fx_send: &'a mut [[bool; 4]; 4],
+    pub crossfader: &'a mut f32,
+    pub channel_peaks: [f32; 4],
+    pub band_peaks: [[f32; 3]; 4],
+    pub stem_peaks: [[f32; 4]; 4],
+    pub main_peaks: (f32, f32),
+    pub stem_progress: [Option<f32>; 4],
+    pub active_cheer: &'a mut Option<ActiveCheer>,
+    pub deck_track_ids: [Option<usize>; 4],
+    pub deck_sync_enabled: [bool; 4],
+    pub in_key: bool,
+    pub is_recording: bool,
+    pub size: Vec2,
 }
 
-/// Paints the cheer overlay animation on the deck display.
-/// Temporarily replaces the EQ/stem dots on that display and wipes in/out over 1.5 seconds.
-pub fn cheer_display(
-    ui: &mut Ui,
-    cheer_index: usize,
-    elapsed_sec: f32,
-    accent: Color32,
-    size: Vec2,
-) -> Response {
-    let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
-    if !ui.is_rect_visible(rect) {
-        return response;
-    }
-
-    let painter = ui.painter();
-    let bg = TraktorTheme::WAVEFORM_BG();
-    let accent_vis = visible_on_inset(accent);
-    let unlit = unlit_on_inset();
-    painter.rect_filled(rect, 6.0, bg);
-    painter.rect_stroke(rect, 6.0, Stroke::new(1.0_f32, TraktorTheme::BORDER_COLOR()));
-
-    let pad_top = 18.0;
-    let pad_bot = 16.0;
-    let body_top = rect.top() + pad_top;
-    let body_bot = (rect.bottom() - pad_bot).max(body_top + 24.0);
-    let body_h = body_bot - body_top;
-    let body_w = (rect.width() - 16.0).max(20.0);
-    let grid_rect = Rect::from_center_size(rect.center(), Vec2::new(body_w, body_h));
-
-    let rows = ((body_h / 4.8).floor() as usize).clamp(16, 32);
-    let cols = ((body_w / 4.6).floor() as usize).clamp(16, 36);
-    let dot_radius = 1.3_f32;
-
-    let sprite = CHEER_SPRITES[cheer_index % CHEER_SPRITES.len()];
-    let frame_count = sprite.frames.len();
-    let frame_idx = if frame_count > 1 {
-        ((elapsed_sec * 4.0) as usize) % frame_count
-    } else {
-        0
-    };
-
-    let step_x = if cols > 1 { (grid_rect.width() - dot_radius * 2.0).max(1.0) / (cols - 1) as f32 } else { 0.0 };
-    let step_y = if rows > 1 { (grid_rect.height() - dot_radius * 2.0).max(1.0) / (rows - 1) as f32 } else { 0.0 };
-
-    let wipe_prog = if elapsed_sec < 0.25 {
-        (elapsed_sec / 0.25).clamp(0.0, 1.0)
-    } else if elapsed_sec > 1.25 {
-        ((1.5 - elapsed_sec) / 0.25).clamp(0.0, 1.0)
-    } else {
-        1.0
-    };
-
-    // Base unlit grid
-    paint_dot_grid(painter, grid_rect, cols, rows, dot_radius, unlit, |_c, _r| DotCell::Unlit);
-
-    let bounce_dots = if elapsed_sec < 0.6 {
-        bounce_dot_offset(elapsed_sec, 0.6, 3)
-    } else {
-        0
-    };
-
-    let (sw, _sh) = sprite.dimensions(frame_idx);
-    let eff_step_x = if sw as f32 * step_x > body_w - 4.0 {
-        (body_w - 4.0) / sw as f32
-    } else {
-        step_x
-    };
-
-    if wipe_prog > 0.05 {
-        paint_sprite(
-            painter,
-            grid_rect.center(),
-            Vec2::new(eff_step_x, step_y),
-            dot_radius,
-            sprite,
-            frame_idx,
-            bounce_dots,
-            SpriteMode::Filled,
-            accent_vis,
-            unlit,
-            false,
-        );
-    }
-
-    let alpha_t = wipe_prog.clamp(0.0, 1.0);
-    painter.text(
-        Pos2::new(rect.center().x, rect.top() + 10.0),
-        Align2::CENTER_CENTER,
-        "★ NICE MIX ★",
-        theme::dot_font(9.5),
-        accent_vis.gamma_multiply(alpha_t),
-    );
-
-    ui.ctx().request_repaint();
-    response.on_hover_text(format!("Cheers: {}", sprite.name))
-}
-
-/// Interactive 4-row dot-ribbon crossfader across the bottom of the mixer panel.
-/// Left of the 2-dot-wide handle is Deck A colour (`level_a` height); right is Deck B colour (`level_b` height).
-/// Dragging moves `value`; double-clicking centres (`0.5`).
-pub fn dot_crossfader(
-    ui: &mut Ui,
-    value: &mut f32,
-    level_a: f32,
-    level_b: f32,
-    width: f32,
-) -> Response {
-    let height = 42.0;
-    let (rect, mut response) = ui.allocate_exact_size(Vec2::new(width.max(120.0), height), Sense::click_and_drag());
-
-    let pad_side = 22.0;
-    let ribbon_left = rect.left() + pad_side;
-    let ribbon_right = (rect.right() - pad_side).max(ribbon_left + 40.0);
-    let ribbon_w = ribbon_right - ribbon_left;
-
-    if response.dragged() {
-        let delta = response.drag_delta().x / ribbon_w.max(20.0);
-        *value = (*value + delta).clamp(0.0, 1.0);
-        response.mark_changed();
-    } else if response.clicked() {
-        if let Some(pos) = response.interact_pointer_pos() {
-            if pos.x >= ribbon_left && pos.x <= ribbon_right {
-                *value = ((pos.x - ribbon_left) / ribbon_w).clamp(0.0, 1.0);
-                response.mark_changed();
-            }
+impl<'a> ContinuousMixer<'a> {
+    pub fn show(&mut self, ui: &mut Ui) -> Response {
+        let (rect, mut response) = ui.allocate_exact_size(self.size, Sense::click_and_drag());
+        if !ui.is_rect_visible(rect) {
+            return response;
         }
-    }
-    if response.double_clicked() {
-        *value = 0.5;
-        response.mark_changed();
-    }
 
-    if ui.is_rect_visible(rect) {
         let painter = ui.painter();
+        let bg = TraktorTheme::WAVEFORM_BG();
+        let ink = theme::on(bg);
+        let unlit = unlit_on_inset();
+        let anim = theme::animations();
+        let now_sec = ui.input(|i| i.time);
+
+        // Hardware display bezel
+        painter.rect_filled(rect, 6.0, bg);
+        painter.rect_stroke(rect, 6.0, Stroke::new(1.0_f32, TraktorTheme::BORDER_COLOR()));
+
+        let pad_x = 8.0_f32;
+        let pad_y = 6.0_f32;
+        let inner_rect = rect.shrink2(Vec2::new(pad_x, pad_y));
+
+        let pitch = 5.2_f32;
+        let dot_radius = 1.35_f32;
+        let raw_cols = ((inner_rect.width() - dot_radius * 2.0).max(10.0) / pitch).round() as usize;
+        let cols = (if raw_cols % 2 == 0 { raw_cols + 1 } else { raw_cols }).clamp(55, 141);
+        let rows = (((inner_rect.height() - dot_radius * 2.0).max(10.0) / pitch).round() as usize).clamp(26, 60);
+
+        let step_x = if cols > 1 { (inner_rect.width() - dot_radius * 2.0).max(1.0) / (cols - 1) as f32 } else { 0.0 };
+        let step_y = if rows > 1 { (inner_rect.height() - dot_radius * 2.0).max(1.0) / (rows - 1) as f32 } else { 0.0 };
+        let start_x = inner_rect.left() + dot_radius;
+        let start_y = inner_rect.bottom() - dot_radius;
+
+        let col_x = |c: usize| start_x + c as f32 * step_x;
+        let row_y = |r: usize| start_y - r as f32 * step_y;
+        let dot_pos = |c: usize, r: usize| Pos2::new(col_x(c), row_y(r));
+
+        let layout = compute_mixer_zone_layout(cols, self.two_channel_only);
+        let mid = layout.mid;
+
+        let body_bot_row = 7usize;
+        let body_top_row = rows.saturating_sub(4);
+        let track_rows = body_top_row.saturating_sub(body_bot_row) + 1;
+        let track_h = (row_y(body_bot_row) - row_y(body_top_row)).max(20.0);
+        let header_y = row_y(rows.saturating_sub(2));
+        let footer_label_y = row_y(5);
+        let cue_lamp_y = footer_label_y;
+
+        let ribbon_left_x = col_x(layout.xfader_start);
+        let ribbon_right_x = col_x(layout.xfader_end);
+        let ribbon_w = (ribbon_right_x - ribbon_left_x).max(20.0);
+
+        let active_channels: &[usize] = if self.two_channel_only { &[0, 1] } else { &[0, 2, 3, 1] };
+
+        // Drag target persistence
+        let drag_id = ui.make_persistent_id("continuous_mixer_drag");
+        let active_drag: Option<MixerDragTarget> = ui.ctx().data(|d| d.get_temp(drag_id));
+
+        if response.drag_started() {
+            if let Some(pos) = response.interact_pointer_pos() {
+                let target = if pos.y >= row_y(4) {
+                    Some(MixerDragTarget::Crossfader)
+                } else {
+                    let mut found = None;
+                    for &d in active_channels {
+                        if let Some(f_rng) = layout.fader_meter[d] {
+                            let fx1 = col_x(f_rng.start) - step_x * 1.5;
+                            let fx2 = col_x(f_rng.end) + step_x * 1.5;
+                            if pos.x >= fx1 && pos.x <= fx2 && pos.y >= row_y(body_top_row) - 8.0 && pos.y <= row_y(body_bot_row) + 8.0 {
+                                found = Some(MixerDragTarget::Fader(d));
+                                break;
+                            }
+                        }
+                        if let Some(eq_rng) = layout.eq_stem_zone[d] {
+                            let zx1 = col_x(eq_rng.start) - step_x * 0.5;
+                            let zx2 = col_x(eq_rng.end) + step_x * 0.5;
+                            if pos.x >= zx1 && pos.x <= zx2 && !self.stem_view[d] {
+                                let mirrored = d == 1 || d == 3;
+                                let frac = ((pos.x - zx1) / (zx2 - zx1).max(1.0)).clamp(0.0, 0.999);
+                                let slot = (frac * 3.0).floor() as usize;
+                                let b = if mirrored { 2 - slot.min(2) } else { slot.min(2) };
+                                found = Some(MixerDragTarget::EqBand(d, b));
+                                break;
+                            }
+                        }
+                    }
+                    found
+                };
+                ui.ctx().data_mut(|d| d.insert_temp(drag_id, target));
+            }
+        }
+
+        if response.dragged() {
+            let delta = response.drag_delta();
+            if let Some(target) = active_drag {
+                match target {
+                    MixerDragTarget::Crossfader => {
+                        *self.crossfader = (*self.crossfader + delta.x / ribbon_w).clamp(0.0, 1.0);
+                        response.mark_changed();
+                    }
+                    MixerDragTarget::Fader(d) => {
+                        self.volume[d] = (self.volume[d] - delta.y / track_h).clamp(0.0, 1.0);
+                        response.mark_changed();
+                    }
+                    MixerDragTarget::EqBand(d, b) => {
+                        let delta_val = -delta.y / (track_h * 0.7).max(20.0);
+                        let val = match b {
+                            0 => &mut self.eq_low[d],
+                            1 => &mut self.eq_mid[d],
+                            _ => &mut self.eq_hi[d],
+                        };
+                        *val = (*val + delta_val).clamp(0.0, 1.0);
+                        response.mark_changed();
+                    }
+                }
+            }
+        } else {
+            ui.ctx().data_mut(|d| d.remove_temp::<MixerDragTarget>(drag_id));
+        }
+
+        // Clicks, double clicks and right clicks
+        if let Some(pos) = response.interact_pointer_pos() {
+            if response.clicked() {
+                if pos.y >= row_y(4) {
+                    *self.crossfader = ((pos.x - ribbon_left_x) / ribbon_w).clamp(0.0, 1.0);
+                    response.mark_changed();
+                } else {
+                    for &d in active_channels {
+                        if let Some(f_rng) = layout.fader_meter[d] {
+                            let fx1 = col_x(f_rng.start) - step_x * 1.5;
+                            let fx2 = col_x(f_rng.end) + step_x * 1.5;
+                            if pos.x >= fx1 && pos.x <= fx2 && pos.y >= row_y(body_bot_row) + 2.0 {
+                                self.cue[d] = !self.cue[d];
+                                response.mark_changed();
+                            }
+                        }
+                        if let Some(eq_rng) = layout.eq_stem_zone[d] {
+                            let zx1 = col_x(eq_rng.start) - step_x * 0.5;
+                            let zx2 = col_x(eq_rng.end) + step_x * 0.5;
+                            if pos.x >= zx1 && pos.x <= zx2 {
+                                if self.stem_view[d] {
+                                    let mirrored = d == 1 || d == 3;
+                                    let frac = ((pos.x - zx1) / (zx2 - zx1).max(1.0)).clamp(0.0, 0.999);
+                                    let slot = (frac * 4.0).floor() as usize;
+                                    let s = if mirrored { 3 - slot.min(3) } else { slot.min(3) };
+                                    self.stem_muted[d][s] = !self.stem_muted[d][s];
+                                    response.mark_changed();
+                                } else if pos.y < row_y(body_top_row) + 6.0 {
+                                    let mirrored = d == 1 || d == 3;
+                                    let frac = ((pos.x - zx1) / (zx2 - zx1).max(1.0)).clamp(0.0, 0.999);
+                                    let slot = (frac * 3.0).floor() as usize;
+                                    let b = if mirrored { 2 - slot.min(2) } else { slot.min(2) };
+                                    let kill = match b {
+                                        0 => &mut self.eq_kill_low[d],
+                                        1 => &mut self.eq_kill_mid[d],
+                                        _ => &mut self.eq_kill_hi[d],
+                                    };
+                                    *kill = !*kill;
+                                    response.mark_changed();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if response.secondary_clicked() {
+                for &d in active_channels {
+                    if let Some(eq_rng) = layout.eq_stem_zone[d] {
+                        let zx1 = col_x(eq_rng.start) - step_x * 0.5;
+                        let zx2 = col_x(eq_rng.end) + step_x * 0.5;
+                        if pos.x >= zx1 && pos.x <= zx2 {
+                            if self.stem_view[d] {
+                                let mirrored = d == 1 || d == 3;
+                                let frac = ((pos.x - zx1) / (zx2 - zx1).max(1.0)).clamp(0.0, 0.999);
+                                let slot = (frac * 4.0).floor() as usize;
+                                let s = if mirrored { 3 - slot.min(3) } else { slot.min(3) };
+                                self.stem_fx_send[d][s] = !self.stem_fx_send[d][s];
+                                response.mark_changed();
+                            } else {
+                                let mirrored = d == 1 || d == 3;
+                                let frac = ((pos.x - zx1) / (zx2 - zx1).max(1.0)).clamp(0.0, 0.999);
+                                let slot = (frac * 3.0).floor() as usize;
+                                let b = if mirrored { 2 - slot.min(2) } else { slot.min(2) };
+                                let kill = match b {
+                                    0 => &mut self.eq_kill_low[d],
+                                    1 => &mut self.eq_kill_mid[d],
+                                    _ => &mut self.eq_kill_hi[d],
+                                };
+                                *kill = !*kill;
+                                response.mark_changed();
+                            }
+                        }
+                    }
+                }
+            }
+            if response.double_clicked() {
+                if pos.y >= row_y(4) {
+                    *self.crossfader = 0.5;
+                    response.mark_changed();
+                } else {
+                    for &d in active_channels {
+                        if let Some(f_rng) = layout.fader_meter[d] {
+                            let fx1 = col_x(f_rng.start) - step_x * 1.5;
+                            let fx2 = col_x(f_rng.end) + step_x * 1.5;
+                            if pos.x >= fx1 && pos.x <= fx2 {
+                                self.volume[d] = 0.85;
+                                response.mark_changed();
+                            }
+                        }
+                        if let Some(eq_rng) = layout.eq_stem_zone[d] {
+                            let zx1 = col_x(eq_rng.start) - step_x * 0.5;
+                            let zx2 = col_x(eq_rng.end) + step_x * 0.5;
+                            if pos.x >= zx1 && pos.x <= zx2 && !self.stem_view[d] {
+                                let mirrored = d == 1 || d == 3;
+                                let frac = ((pos.x - zx1) / (zx2 - zx1).max(1.0)).clamp(0.0, 0.999);
+                                let slot = (frac * 3.0).floor() as usize;
+                                let b = if mirrored { 2 - slot.min(2) } else { slot.min(2) };
+                                match b {
+                                    0 => self.eq_low[d] = 0.5,
+                                    1 => self.eq_mid[d] = 0.5,
+                                    _ => self.eq_hi[d] = 0.5,
+                                }
+                                response.mark_changed();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Hover tooltip inspection
+        if let Some(pos) = response.hover_pos() {
+            let mut tooltip = None;
+            if let Some(cheer) = self.active_cheer {
+                let elapsed = (now_sec - cheer.start_sec) as f32;
+                if elapsed < 1.2 {
+                    let sprite = CHEER_SPRITES[cheer.cheer_index % CHEER_SPRITES.len()];
+                    tooltip = Some(format!("Cheers: {}", sprite.name));
+                }
+            }
+            if tooltip.is_none() {
+                if pos.y >= row_y(4) {
+                    tooltip = Some(XFADER_TIP.to_string());
+                } else {
+                    let mx1 = col_x(layout.main_meter_l) - step_x * 1.0;
+                    let mx2 = col_x(layout.main_meter_r) + step_x * 1.0;
+                    if pos.x >= mx1 && pos.x <= mx2 {
+                        tooltip = Some("Main output level".to_string());
+                    } else {
+                        for &d in active_channels {
+                            if let Some(f_rng) = layout.fader_meter[d] {
+                                let fx1 = col_x(f_rng.start) - step_x * 1.5;
+                                let fx2 = col_x(f_rng.end) + step_x * 1.5;
+                                if pos.x >= fx1 && pos.x <= fx2 {
+                                    tooltip = Some(format!(
+                                        "Deck {} volume on its level meter. The lamp below is headphone cue.",
+                                        DECK_LETTERS[d]
+                                    ));
+                                    break;
+                                }
+                            }
+                            if let Some(eq_rng) = layout.eq_stem_zone[d] {
+                                let zx1 = col_x(eq_rng.start) - step_x * 0.5;
+                                let zx2 = col_x(eq_rng.end) + step_x * 0.5;
+                                if pos.x >= zx1 && pos.x <= zx2 {
+                                    if self.stem_view[d] {
+                                        tooltip = Some("Stems: click one to turn it on or off".to_string());
+                                    } else {
+                                        tooltip = Some("Equaliser: drag a band up or down, right-click to cut it".to_string());
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(tip) = tooltip {
+                response = response.on_hover_text(tip);
+            }
+        }
+
+        // Single continuous lattice grid
+        let mut cells = vec![DotCell::Unlit; cols * rows];
+        macro_rules! set_cell {
+            ($c:expr, $r:expr, $cell:expr) => {{
+                let c_val = $c;
+                let r_val = $r;
+                if c_val < cols && r_val < rows {
+                    cells[r_val * cols + c_val] = $cell;
+                }
+            }};
+        }
+
+        // 1. Crossfader Ribbon along bottom rows 0..=3
+        let xf_start = layout.xfader_start;
+        let xf_end = layout.xfader_end;
+        let xf_len = xf_end.saturating_sub(xf_start) + 1;
+        let handle_c = xf_start + ((self.crossfader.clamp(0.0, 1.0) * (xf_len.saturating_sub(2)) as f32).round() as usize).min(xf_len.saturating_sub(2));
+
+        let lv_a = if anim { self.channel_peaks[0].clamp(0.0, 1.0) } else { 0.25 };
+        let lv_b = if anim { self.channel_peaks[1].clamp(0.0, 1.0) } else { 0.25 };
+        let col_a = TraktorTheme::DECK_A();
+        let col_b = TraktorTheme::DECK_B();
+        let handle_fg = TraktorTheme::TEXT_PRIMARY();
+
+        for c in xf_start..=xf_end {
+            for r in 0..4 {
+                if c == handle_c || c == handle_c + 1 {
+                    set_cell!(c, r, DotCell::Filled(handle_fg));
+                } else {
+                    let is_left = c < handle_c;
+                    let lv = if is_left { lv_a } else { lv_b };
+                    let on = r == 0 || (r as f32 / 4.0) < lv;
+                    if on {
+                        let base = if is_left { col_a } else { col_b };
+                        let fade = 0.45 + 0.55 * (1.0 - r as f32 / 5.0);
+                        set_cell!(c, r, DotCell::Filled(base.gamma_multiply(fade)));
+                    }
+                }
+            }
+        }
+
         painter.text(
-            Pos2::new(rect.center().x, rect.top() + 5.0),
+            Pos2::new(inner_rect.left() + 6.0, row_y(1)),
             Align2::CENTER_CENTER,
-            "CROSSFADER",
+            "A",
+            theme::dot_font(12.0),
+            col_a,
+        );
+        painter.text(
+            Pos2::new(inner_rect.right() - 6.0, row_y(1)),
+            Align2::CENTER_CENTER,
+            "B",
+            theme::dot_font(12.0),
+            col_b,
+        );
+
+        // 2. MAIN Stereo Meter (centre)
+        let main_l = layout.main_meter_l;
+        let main_r = layout.main_meter_r;
+        let lit_ml = value_to_lit_rows(if anim { self.main_peaks.0 } else { 0.0 }, track_rows);
+        let lit_mr = value_to_lit_rows(if anim { self.main_peaks.1 } else { 0.0 }, track_rows);
+
+        for k in 0..track_rows {
+            let r = body_bot_row + k;
+            for (c, lit) in [(main_l, lit_ml), (main_r, lit_mr)] {
+                if k < lit {
+                    let col = if k >= track_rows.saturating_sub(2) {
+                        TraktorTheme::METER_RED()
+                    } else if k >= track_rows.saturating_sub(4) {
+                        TraktorTheme::METER_YELLOW()
+                    } else {
+                        TraktorTheme::TEXT_PRIMARY()
+                    };
+                    set_cell!(c, r, DotCell::Filled(col));
+                }
+            }
+        }
+        painter.text(
+            Pos2::new(col_x(mid), footer_label_y),
+            Align2::CENTER_CENTER,
+            "MAIN",
             FontId::proportional(8.0),
             TraktorTheme::TEXT_SECONDARY(),
         );
 
-        let ribbon_top = rect.top() + 14.0;
-        let ribbon_bot = rect.bottom() - 3.0;
-        let ribbon_rect = Rect::from_min_max(Pos2::new(ribbon_left, ribbon_top), Pos2::new(ribbon_right, ribbon_bot));
-        let ribbon_cy = ribbon_rect.center().y;
+        // 3. Faders-on-Meter for each active channel
+        for &d in active_channels {
+            let Some(f_rng) = layout.fader_meter[d] else { continue };
+            let accent = TraktorTheme::deck_color(d + 1);
+            let vol = self.volume[d].clamp(0.0, 1.0);
+            let eff_l = if anim { self.channel_peaks[d] } else { 0.0 } * vol;
+            let eff_r = if anim { self.channel_peaks[d] * 0.94 } else { 0.0 } * vol;
+            let lit_l = value_to_lit_rows(eff_l, track_rows);
+            let lit_r = value_to_lit_rows(eff_r, track_rows);
+            let fader_cx = (col_x(f_rng.start) + col_x(f_rng.end)) * 0.5;
+            let hy = row_y(body_bot_row) - vol * track_h;
+            let fader_row_f = body_bot_row as f32 + vol * (track_rows.saturating_sub(1)) as f32;
 
-        painter.text(
-            Pos2::new(rect.left() + 9.0, ribbon_cy),
-            Align2::CENTER_CENTER,
-            "A",
-            theme::dot_font(14.0),
-            TraktorTheme::DECK_A(),
-        );
-        painter.text(
-            Pos2::new(rect.right() - 9.0, ribbon_cy),
-            Align2::CENTER_CENTER,
-            "B",
-            theme::dot_font(14.0),
-            TraktorTheme::DECK_B(),
-        );
-
-        let cols = ((ribbon_w / 7.5).floor() as usize).clamp(16, 60);
-        let rows = 4usize;
-        let handle_col = ((value.clamp(0.0, 1.0) * (cols.saturating_sub(2)) as f32).round() as usize)
-            .min(cols.saturating_sub(2));
-        let anim = theme::animations();
-        let lv_a = if anim { level_a.clamp(0.0, 1.0) } else { 0.25 };
-        let lv_b = if anim { level_b.clamp(0.0, 1.0) } else { 0.25 };
-        let col_a = TraktorTheme::DECK_A();
-        let col_b = TraktorTheme::DECK_B();
-        let handle_fg = TraktorTheme::TEXT_PRIMARY();
-        let unlit = unlit_on_panel();
-
-        paint_dot_grid(painter, ribbon_rect, cols, rows, 2.2, unlit, |c, r| {
-            if c == handle_col || c == handle_col + 1 {
-                DotCell::Filled(handle_fg)
-            } else {
-                let is_left = c < handle_col;
-                let lv = if is_left { lv_a } else { lv_b };
-                let on = r == 0 || (r as f32 / rows as f32) < lv;
-                if on {
-                    let base = if is_left { col_a } else { col_b };
-                    let fade = 0.45 + 0.55 * (1.0 - r as f32 / (rows as f32 + 1.0));
-                    DotCell::Filled(base.gamma_multiply(fade))
-                } else {
-                    DotCell::Unlit
+            for k in 0..track_rows {
+                let r = body_bot_row + k;
+                let above = r as f32 > fader_row_f + 0.6;
+                for (c, lit) in [(f_rng.start, lit_l), (f_rng.end, lit_r)] {
+                    if k < lit {
+                        let col = if k >= track_rows.saturating_sub(2) {
+                            TraktorTheme::METER_RED()
+                        } else {
+                            accent
+                        };
+                        let cell = if above { DotCell::Scaled(col, 0.6) } else { DotCell::Filled(col) };
+                        set_cell!(c, r, cell);
+                    } else if above {
+                        set_cell!(c, r, DotCell::Scaled(unlit, 0.6));
+                    }
                 }
             }
-        });
-    }
 
-    response
+            // Fader bracket
+            let bw = (step_x * (f_rng.len() as f32 + 2.5)).clamp(22.0, 30.0);
+            let bh = 12.0_f32;
+            let bracket = Rect::from_center_size(Pos2::new(fader_cx, hy), Vec2::new(bw, bh));
+            let stroke = Stroke::new(1.8_f32, TraktorTheme::TEXT_PRIMARY());
+            painter.rect_stroke(bracket, 3.5, stroke);
+            painter.line_segment([Pos2::new(bracket.left() - 4.0, hy), bracket.left_center()], stroke);
+            painter.line_segment([bracket.right_center(), Pos2::new(bracket.right() + 4.0, hy)], stroke);
+
+            // dB readout at header
+            painter.text(
+                Pos2::new(fader_cx, header_y),
+                Align2::CENTER_CENTER,
+                format_db(vol, 0.85),
+                theme::dot_font(10.5),
+                TraktorTheme::TEXT_PRIMARY(),
+            );
+
+            // Headphone cue lamp along footer row
+            let is_cue = self.cue[d];
+            let cue_col = if is_cue { TraktorTheme::CUE_ACTIVE() } else { TraktorTheme::TEXT_MUTED() };
+            if is_cue {
+                painter.circle_filled(Pos2::new(fader_cx - 7.0, cue_lamp_y), 2.6, cue_col);
+            } else {
+                painter.circle_stroke(Pos2::new(fader_cx - 7.0, cue_lamp_y), 2.2, Stroke::new(1.1_f32, cue_col));
+            }
+            painter.text(
+                Pos2::new(fader_cx + 4.5, cue_lamp_y),
+                Align2::CENTER_CENTER,
+                "CUE",
+                FontId::proportional(7.5),
+                if is_cue { TraktorTheme::TEXT_PRIMARY() } else { TraktorTheme::TEXT_MUTED() },
+            );
+        }
+
+        // 4. EQ or Stems zone for each active channel
+        for &d in active_channels {
+            let Some(zone) = layout.eq_stem_zone[d] else { continue };
+            let accent = TraktorTheme::deck_color(d + 1);
+            let accent_vis = visible_on_inset(accent);
+            let mirrored = d == 1 || d == 3;
+            let is_compact = layout.is_compact[d];
+
+            if self.stem_view[d] {
+                // Stems mode
+                let stem_count = 4usize;
+                let sep_count = stem_count.saturating_sub(1);
+                let avail_cols = zone.len().saturating_sub(sep_count);
+                let stem_w = (avail_cols / stem_count).max(1);
+                let names = ["DRM", "BAS", "OTH", "VOC"];
+
+                for slot in 0..stem_count {
+                    let s = if mirrored { 3 - slot } else { slot };
+                    let slot_start_c = zone.start + slot * (stem_w + 1);
+                    let slot_end_c = (slot_start_c + stem_w - 1).min(zone.end);
+                    let slot_cx = (col_x(slot_start_c) + col_x(slot_end_c)) * 0.5;
+
+                    let muted = self.stem_muted[d][s];
+                    let fx = self.stem_fx_send[d][s];
+                    let open_t = theme::fade(ui.ctx(), ("stem_wipe", d, s), !muted);
+
+                    // Stem toggle bounce tracking
+                    let stem_id = ui.make_persistent_id(("stem_anim", d, s));
+                    let prev_state: Option<(bool, f64)> = ui.ctx().data(|d| d.get_temp(stem_id));
+                    let (last_muted, mut anim_start) = prev_state.unwrap_or((muted, -100.0));
+                    if muted != last_muted {
+                        anim_start = now_sec;
+                    }
+                    ui.ctx().data_mut(|d| d.insert_temp(stem_id, (muted, anim_start)));
+                    let elapsed = (now_sec - anim_start) as f32;
+                    let is_animating = anim && elapsed >= 0.0 && elapsed < 0.6;
+                    if is_animating {
+                        ui.ctx().request_repaint();
+                    }
+
+                    // Top state
+                    let top_txt = if muted { "OFF" } else if fx { "FX" } else { "ON" };
+                    painter.text(
+                        Pos2::new(slot_cx, header_y),
+                        Align2::CENTER_CENTER,
+                        top_txt,
+                        theme::dot_font(9.5),
+                        if muted { ink.gamma_multiply(0.4) } else if fx { TraktorTheme::ACCENT() } else { ink },
+                    );
+
+                    // Bottom label
+                    painter.text(
+                        Pos2::new(slot_cx, footer_label_y),
+                        Align2::CENTER_CENTER,
+                        names[s],
+                        FontId::proportional(7.5),
+                        if muted { ink.gamma_multiply(0.4) } else { ink.gamma_multiply(0.75) },
+                    );
+
+                    let live = if anim { self.stem_peaks[d][s].clamp(0.0, 1.0) } else { 0.45 };
+                    let active_frac = (0.35 + 0.65 * live) * open_t;
+                    let lit_rows = value_to_lit_rows(active_frac, track_rows);
+                    let wipe_rows = value_to_lit_rows(open_t, track_rows);
+
+                    for c in slot_start_c..=slot_end_c {
+                        let is_border_c = c == slot_start_c || c == slot_end_c;
+                        for k in 0..track_rows {
+                            let r = body_bot_row + k;
+                            let is_border = is_border_c || k == 0 || k == track_rows - 1;
+                            if k < lit_rows {
+                                let row_t = 0.6 + 0.4 * (1.0 - k as f32 / track_rows.max(1) as f32);
+                                set_cell!(c, r, DotCell::Filled(accent_vis.gamma_multiply(row_t)));
+                            } else if muted && is_border && k >= wipe_rows {
+                                set_cell!(c, r, DotCell::Hollow(accent_vis.gamma_multiply(0.45)));
+                            }
+                        }
+                    }
+
+                    if anim && !is_compact && stem_w >= 4 {
+                        let sprite = STEM_SPRITES[s];
+                        let sprite_h = sprite.dimensions(0).1 as f32;
+                        let floor_row = body_bot_row as f32;
+                        let ceil_row = (body_top_row as f32 - sprite_h).max(floor_row);
+                        let icon_top = (floor_row + (ceil_row - floor_row) * open_t).round();
+                        let icon_cy = row_y(icon_top as usize) - (sprite_h * 0.5) * step_y;
+
+                        let (bounce_dots, mode, col) = if is_animating {
+                            let b = bounce_dot_offset(elapsed, 0.6, 5);
+                            let pop = ((1.0 - (elapsed / 0.25).min(1.0)) * 6.0).round() as i32;
+                            let m = if muted { SpriteMode::Hollow } else { SpriteMode::Filled };
+                            let c = if muted { accent_vis.gamma_multiply(0.45) } else { ink };
+                            (b - pop, m, c)
+                        } else {
+                            let m = if muted { SpriteMode::Hollow } else { SpriteMode::Filled };
+                            let c = if muted { accent_vis.gamma_multiply(0.38) } else { ink };
+                            (0, m, c)
+                        };
+
+                        paint_sprite(
+                            painter,
+                            Pos2::new(slot_cx, icon_cy),
+                            Vec2::new(step_x, step_y),
+                            dot_radius,
+                            sprite,
+                            0,
+                            bounce_dots,
+                            mode,
+                            col,
+                            unlit,
+                            false,
+                        );
+                    }
+                }
+
+                if let Some(pct) = self.stem_progress[d] {
+                    let bar_rect = Rect::from_min_max(
+                        Pos2::new(col_x(zone.start), inner_rect.top() + 2.0),
+                        Pos2::new(col_x(zone.end), inner_rect.top() + 5.0),
+                    );
+                    painter.rect_filled(bar_rect, 1.5, unlit);
+                    let w = bar_rect.width() * pct.clamp(0.0, 1.0);
+                    painter.rect_filled(Rect::from_min_size(bar_rect.min, Vec2::new(w, bar_rect.height())), 1.5, TraktorTheme::ACCENT());
+                }
+            } else {
+                // EQ mode
+                let band_count = 3usize;
+                let sep_count = band_count.saturating_sub(1);
+                let avail_cols = zone.len().saturating_sub(sep_count);
+                let band_w = (avail_cols / band_count).max(1);
+                let labels = ["LOW", "MID", "HI"];
+                let vals = [self.eq_low[d], self.eq_mid[d], self.eq_hi[d]];
+                let kills = [self.eq_kill_low[d], self.eq_kill_mid[d], self.eq_kill_hi[d]];
+                let mut node_centers = [Pos2::ZERO; 3];
+
+                for slot in 0..band_count {
+                    let b = if mirrored { 2 - slot } else { slot };
+                    let slot_start_c = zone.start + slot * (band_w + 1);
+                    let slot_end_c = (slot_start_c + band_w - 1).min(zone.end);
+                    let slot_cx = (col_x(slot_start_c) + col_x(slot_end_c)) * 0.5;
+                    let val = vals[b].clamp(0.0, 1.0);
+                    let killed = kills[b];
+                    let live = if anim { self.band_peaks[d][b].clamp(0.0, 1.0) } else { 0.0 };
+
+                    let kill_id = ui.make_persistent_id(("eq_kill_anim", d, b));
+                    let prev_kill: Option<(bool, f64)> = ui.ctx().data(|d| d.get_temp(kill_id));
+                    let (last_killed, mut anim_start) = prev_kill.unwrap_or((killed, -100.0));
+                    if killed != last_killed {
+                        anim_start = now_sec;
+                    }
+                    ui.ctx().data_mut(|d| d.insert_temp(kill_id, (killed, anim_start)));
+                    let elapsed = (now_sec - anim_start) as f32;
+                    let is_animating = anim && elapsed >= 0.0 && elapsed < 0.6;
+                    if is_animating {
+                        ui.ctx().request_repaint();
+                    }
+
+                    // Top readout
+                    painter.text(
+                        Pos2::new(slot_cx, header_y),
+                        Align2::CENTER_CENTER,
+                        format_eq_db(val, killed),
+                        theme::dot_font(10.5),
+                        if killed { TraktorTheme::METER_RED() } else { ink },
+                    );
+
+                    // Bottom label
+                    let lbl = if is_compact { &labels[b][..1] } else { labels[b] };
+                    painter.text(
+                        Pos2::new(slot_cx, footer_label_y),
+                        Align2::CENTER_CENTER,
+                        lbl,
+                        FontId::proportional(8.0),
+                        ink.gamma_multiply(0.68),
+                    );
+
+                    let lit_rows = value_to_lit_rows(val, track_rows);
+                    for c in slot_start_c..=slot_end_c {
+                        let sub = if band_w > 1 { (c - slot_start_c) as f32 / (band_w - 1) as f32 } else { 0.5 };
+                        let sub_freq = if mirrored { 1.0 - sub } else { sub };
+                        let freq_pos = (b as f32 + (sub_freq - 0.5) * 0.8) / 2.0;
+                        let flt_gain = filter_band_gain(self.filter[d], self.filter_on[d], freq_pos);
+
+                        for k in 0..track_rows {
+                            let r = body_bot_row + k;
+                            if k < lit_rows {
+                                let level_boost = 0.65 + 0.35 * live;
+                                let col = accent_vis.gamma_multiply((level_boost * flt_gain).clamp(0.22, 1.0));
+                                let cell = if killed { DotCell::Hollow(col) } else { DotCell::Filled(col) };
+                                set_cell!(c, r, cell);
+                            }
+                        }
+                    }
+
+                    if anim && !is_compact && band_w >= 4 {
+                        let top_dot_y = row_y(body_top_row);
+                        let icon_cy = top_dot_y + 2.0 * step_y;
+                        if is_animating {
+                            let bounce = bounce_dot_offset(elapsed, 0.6, 5);
+                            let pop_down = ((1.0 - (elapsed / 0.25).min(1.0)) * 6.0).round() as i32;
+                            let sprite = if killed { &SPRITE_KILL_X } else { &SPRITE_TICK };
+                            let col = if killed { TraktorTheme::METER_RED() } else { TraktorTheme::PLAY_ACTIVE() };
+                            paint_sprite(
+                                painter,
+                                Pos2::new(slot_cx, icon_cy),
+                                Vec2::new(step_x, step_y),
+                                dot_radius,
+                                sprite,
+                                0,
+                                bounce - pop_down,
+                                SpriteMode::Filled,
+                                col,
+                                unlit,
+                                false,
+                            );
+                        } else if killed {
+                            paint_sprite(
+                                painter,
+                                Pos2::new(slot_cx, icon_cy),
+                                Vec2::new(step_x, step_y),
+                                dot_radius,
+                                &SPRITE_KILL_X,
+                                0,
+                                0,
+                                SpriteMode::Hollow,
+                                TraktorTheme::METER_RED(),
+                                unlit,
+                                false,
+                            );
+                        }
+                    }
+
+                    let node_y = row_y(body_bot_row) - val * track_h;
+                    node_centers[slot] = Pos2::new(slot_cx, node_y);
+                }
+
+                // Smooth cubic contour curve and circular band nodes
+                let left_edge = Pos2::new(col_x(zone.start) - step_x * 0.5, node_centers[0].y);
+                let right_edge = Pos2::new(col_x(zone.end) + step_x * 0.5, node_centers[2].y);
+                let anchors = [left_edge, node_centers[0], node_centers[1], node_centers[2], right_edge];
+                for pair in anchors.windows(2) {
+                    let (a, b) = (pair[0], pair[1]);
+                    let steps = 10usize;
+                    let mut prev = a;
+                    for s in 1..=steps {
+                        let t = s as f32 / steps as f32;
+                        let smooth = t * t * (3.0 - 2.0 * t);
+                        let next = Pos2::new(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * smooth);
+                        painter.line_segment([prev, next], Stroke::new(1.8_f32, accent_vis));
+                        prev = next;
+                    }
+                }
+                for (slot, &center) in node_centers.iter().enumerate() {
+                    let b = if mirrored { 2 - slot } else { slot };
+                    let killed = kills[b];
+                    painter.circle_filled(center, 4.5, bg);
+                    painter.circle_stroke(
+                        center,
+                        4.5,
+                        Stroke::new(1.5_f32, if killed { TraktorTheme::METER_RED() } else { ink }),
+                    );
+                }
+            }
+        }
+
+        // 5. Whole-canvas choreography:
+        // A. Crossfade cheers wave across full canvas width
+        if let Some(cheer) = self.active_cheer {
+            if anim {
+                let elapsed = (now_sec - cheer.start_sec) as f32;
+                if elapsed < 1.2 {
+                    let cheer_target_d = (cheer.deck).min(3);
+                    let target_cx = if let Some(z) = layout.eq_stem_zone[cheer_target_d] {
+                        z.center()
+                    } else {
+                        mid as f32 * 0.5
+                    };
+                    let cheer_cy_row = (body_bot_row + body_top_row) / 2;
+                    let sprite = CHEER_SPRITES[cheer.cheer_index % CHEER_SPRITES.len()];
+                    let bounce = if elapsed < 0.6 { bounce_dot_offset(elapsed, 0.6, 3) } else { 0 };
+                    let frame_idx = if sprite.frames.len() > 1 {
+                        ((elapsed * 4.0) as usize) % sprite.frames.len()
+                    } else {
+                        0
+                    };
+
+                    let cheer_accent = TraktorTheme::deck_color(cheer.deck + 1);
+                    paint_sprite(
+                        painter,
+                        Pos2::new(col_x(target_cx.round() as usize), row_y(cheer_cy_row)),
+                        Vec2::new(step_x, step_y),
+                        dot_radius,
+                        sprite,
+                        frame_idx,
+                        bounce,
+                        SpriteMode::Filled,
+                        cheer_accent,
+                        unlit,
+                        false,
+                    );
+
+                    // Wave ripple outwards across the other zones
+                    for c in 0..cols {
+                        let w = cheer_wave_intensity(c, target_cx.round() as usize, elapsed, 1.2, 45.0);
+                        if w > 0.0 {
+                            let wave_col = cheer_accent.gamma_multiply(w * 0.75);
+                            for r in 0..rows {
+                                if cells[r * cols + c] == DotCell::Unlit {
+                                    cells[r * cols + c] = DotCell::Filled(wave_col);
+                                }
+                            }
+                        }
+                    }
+
+                    painter.text(
+                        Pos2::new(col_x(target_cx.round() as usize), inner_rect.top() + 6.0),
+                        Align2::CENTER_CENTER,
+                        "★ NICE MIX ★",
+                        theme::dot_font(9.5),
+                        cheer_accent,
+                    );
+                    ui.ctx().request_repaint();
+                }
+            }
+        }
+
+        // B. Track load column wipe on loaded deck's half
+        let track_ids_key = ui.make_persistent_id("continuous_mixer_track_ids");
+        let load_starts_key = ui.make_persistent_id("continuous_mixer_load_starts");
+        let prev_ids: Option<[Option<usize>; 4]> = ui.ctx().data(|d| d.get_temp(track_ids_key));
+        let mut load_starts: [f64; 4] = ui.ctx().data(|d| d.get_temp(load_starts_key)).unwrap_or([-100.0; 4]);
+
+        if prev_ids != Some(self.deck_track_ids) {
+            for d in 0..4 {
+                if self.deck_track_ids[d].is_some() && prev_ids.map(|p| p[d]) != Some(self.deck_track_ids[d]) {
+                    load_starts[d] = now_sec;
+                }
+            }
+            ui.ctx().data_mut(|d| {
+                d.insert_temp(track_ids_key, self.deck_track_ids);
+                d.insert_temp(load_starts_key, load_starts);
+            });
+        }
+
+        if anim {
+            for &d in active_channels {
+                let elapsed = (now_sec - load_starts[d]) as f32;
+                if elapsed >= 0.0 && elapsed < 0.7 {
+                    let is_left = d == 0 || d == 2;
+                    let (sc, ec) = if is_left {
+                        (layout.xfader_start, mid.saturating_sub(2))
+                    } else {
+                        (layout.xfader_end, mid + 2)
+                    };
+                    let d_accent = TraktorTheme::deck_color(d + 1);
+                    for c in sc.min(ec)..=sc.max(ec) {
+                        let wipe = track_load_wipe_col(c, sc, ec, elapsed, 0.7);
+                        if wipe > 0.0 {
+                            let wcol = d_accent.gamma_multiply(wipe * 0.85);
+                            for r in body_bot_row..=body_top_row {
+                                if cells[r * cols + c] == DotCell::Unlit {
+                                    cells[r * cols + c] = DotCell::Filled(wcol);
+                                }
+                            }
+                        }
+                    }
+                    ui.ctx().request_repaint();
+                }
+            }
+        }
+
+        // C. Sync engaged pulse travelling between master and synced deck
+        let sync_state_key = ui.make_persistent_id("continuous_mixer_sync_state");
+        let sync_pulse_key = ui.make_persistent_id("continuous_mixer_sync_pulse");
+        let prev_sync: Option<[bool; 4]> = ui.ctx().data(|d| d.get_temp(sync_state_key));
+        let mut sync_pulse: Option<(usize, usize, f64)> = ui.ctx().data(|d| d.get_temp(sync_pulse_key));
+
+        if prev_sync != Some(self.deck_sync_enabled) {
+            for &d in active_channels {
+                if self.deck_sync_enabled[d] && prev_sync.is_some_and(|p| !p[d]) {
+                    let from_d = if d == 1 { 0 } else { 1 };
+                    sync_pulse = Some((from_d, d, now_sec));
+                    break;
+                }
+            }
+            ui.ctx().data_mut(|d| {
+                d.insert_temp(sync_state_key, self.deck_sync_enabled);
+                d.insert_temp(sync_pulse_key, sync_pulse);
+            });
+        }
+
+        if anim {
+            if let Some((from_d, to_d, start_t)) = sync_pulse {
+                let elapsed = (now_sec - start_t) as f32;
+                if elapsed < 0.6 {
+                    let from_c = if from_d == 0 || from_d == 2 {
+                        layout.eq_stem_zone[from_d].map(|z| z.center().round() as usize).unwrap_or(mid.saturating_sub(10))
+                    } else {
+                        layout.eq_stem_zone[from_d].map(|z| z.center().round() as usize).unwrap_or(mid + 10)
+                    };
+                    let to_c = if to_d == 0 || to_d == 2 {
+                        layout.eq_stem_zone[to_d].map(|z| z.center().round() as usize).unwrap_or(mid.saturating_sub(10))
+                    } else {
+                        layout.eq_stem_zone[to_d].map(|z| z.center().round() as usize).unwrap_or(mid + 10)
+                    };
+                    let pulse_row = (body_bot_row + body_top_row) / 2;
+                    for c in from_c.min(to_c)..=from_c.max(to_c) {
+                        let p = sync_pulse_col(c, from_c, to_c, elapsed, 0.6);
+                        if p > 0.0 {
+                            set_cell!(c, pulse_row, DotCell::Filled(TraktorTheme::ACCENT().gamma_multiply(p)));
+                        }
+                    }
+                    ui.ctx().request_repaint();
+                } else {
+                    ui.ctx().data_mut(|d| d.remove_temp::<(usize, usize, f64)>(sync_pulse_key));
+                }
+            }
+        }
+
+        // D. Both decks in key: subtle two-dot link glyph near MAIN meter
+        if self.in_key {
+            let link_r = rows.saturating_sub(3);
+            set_cell!(mid.saturating_sub(1), link_r, DotCell::Filled(TraktorTheme::ACCENT()));
+            set_cell!(mid + 1, link_r, DotCell::Filled(TraktorTheme::ACCENT()));
+            painter.line_segment(
+                [dot_pos(mid.saturating_sub(1), link_r), dot_pos(mid + 1, link_r)],
+                Stroke::new(1.2_f32, TraktorTheme::ACCENT().gamma_multiply(0.85)),
+            );
+        }
+
+        // E. Recording active: slow blinking red dot at top centre
+        if self.is_recording {
+            let lit = recording_blink_lit(now_sec, true);
+            let col = if lit { TraktorTheme::METER_RED() } else { unlit };
+            set_cell!(mid, rows.saturating_sub(1), DotCell::Filled(col));
+            ui.ctx().request_repaint();
+        }
+
+        // Paint the entire lattice in one pass
+        paint_dot_grid(painter, inner_rect, cols, rows, dot_radius, unlit, |c, r| {
+            cells[r * cols + c]
+        });
+
+        response
+    }
 }
+
 
 /// Pure helper: maps a phase difference in beats (`-0.5..=0.5`) to a column offset (`-half_cols..=half_cols`).
 pub fn phase_col_offset(phase_diff: f64, half_cols: isize) -> isize {
@@ -2206,5 +2573,100 @@ mod tests {
         assert_eq!(t.key, "8m");
         assert_eq!(t.bpm, 124.0);
         assert_eq!(t.energy, 7);
+    }
+
+    #[test]
+    fn cheer_wave_intensity_behavior() {
+        // Zero at or after duration
+        assert_eq!(cheer_wave_intensity(20, 20, 1.25, 1.2, 45.0), 0.0);
+        assert_eq!(cheer_wave_intensity(20, 20, -0.1, 1.2, 45.0), 0.0);
+
+        // At t = 0.2, wave has expanded by r = 0.2 * 45 = 9 cols.
+        // Near distance 9 it should have positive intensity
+        let near_wave = cheer_wave_intensity(29, 20, 0.2, 1.2, 45.0);
+        let far_wave = cheer_wave_intensity(50, 20, 0.2, 1.2, 45.0);
+        assert!(near_wave > 0.0, "near_wave should be positive: {near_wave}");
+        assert_eq!(far_wave, 0.0, "far away should be 0: {far_wave}");
+        assert!(near_wave <= 1.0, "intensity must be <= 1.0");
+    }
+
+    #[test]
+    fn track_load_wipe_col_behavior() {
+        assert_eq!(track_load_wipe_col(10, 0, 20, -0.05, 0.7), 0.0);
+        assert_eq!(track_load_wipe_col(10, 0, 20, 0.75, 0.7), 0.0);
+
+        // Halfway through (t = 0.35), wipe head is at 10
+        let at_head = track_load_wipe_col(10, 0, 20, 0.35, 0.7);
+        let far_away = track_load_wipe_col(0, 0, 20, 0.35, 0.7);
+        assert!(at_head > 0.5, "at_head should be bright: {at_head}");
+        assert!(far_away < at_head, "far from wipe head should be dimmer");
+    }
+
+    #[test]
+    fn sync_pulse_col_behavior() {
+        assert_eq!(sync_pulse_col(15, 0, 30, -0.1, 0.6), 0.0);
+        assert_eq!(sync_pulse_col(15, 0, 30, 0.65, 0.6), 0.0);
+
+        // Around halfway (t = 0.3), pulse should be around mid (15)
+        let at_mid = sync_pulse_col(15, 0, 30, 0.3, 0.6);
+        let at_end = sync_pulse_col(30, 0, 30, 0.3, 0.6);
+        assert!(at_mid > 0.5, "pulse should peak near curr pos: {at_mid}");
+        assert_eq!(at_end, 0.0, "far ahead of pulse should be 0: {at_end}");
+    }
+
+    #[test]
+    fn recording_blink_behavior() {
+        assert!(!recording_blink_lit(0.2, false));
+        assert!(recording_blink_lit(0.2, true));
+        assert!(!recording_blink_lit(0.7, true));
+        assert!(recording_blink_lit(1.2, true));
+    }
+
+    #[test]
+    fn harmonically_compatible_link_dots_behavior() {
+        assert!(!harmonically_compatible_link_dots(None, None));
+        assert!(!harmonically_compatible_link_dots(Some(""), Some("8m")));
+        // 8m (Am) is compatible with 8m (same), 7m (Em), 9m (Dm), 8d (C major)
+        assert!(harmonically_compatible_link_dots(Some("8m"), Some("8m")));
+        assert!(harmonically_compatible_link_dots(Some("8m"), Some("7m")));
+        assert!(harmonically_compatible_link_dots(Some("8m"), Some("8d")));
+        // Incompatible key (e.g. 2m vs 8m)
+        assert!(!harmonically_compatible_link_dots(Some("8m"), Some("2m")));
+    }
+
+    #[test]
+    fn compute_mixer_zone_layout_symmetry_and_bounds() {
+        for cols in [60, 80, 100, 140, 180] {
+            // 2-channel mode
+            let l2 = compute_mixer_zone_layout(cols, true);
+            assert_eq!(l2.mid, cols / 2);
+            assert!(l2.main_meter_l < l2.mid);
+            assert!(l2.main_meter_r > l2.mid);
+            assert_eq!(l2.mid - l2.main_meter_l, l2.main_meter_r - l2.mid);
+
+            // Mirror symmetry check between Deck A and Deck B
+            let a_eq = l2.eq_stem_zone[0].expect("Deck A EQ zone must exist");
+            let b_eq = l2.eq_stem_zone[1].expect("Deck B EQ zone must exist");
+            let a_fad = l2.fader_meter[0].expect("Deck A fader zone must exist");
+            let b_fad = l2.fader_meter[1].expect("Deck B fader zone must exist");
+
+            assert_eq!(a_eq.len(), b_eq.len(), "EQ zones must be symmetric in length");
+            assert_eq!(a_fad.len(), b_fad.len(), "Fader zones must be symmetric in length");
+            assert_eq!(l2.mid - a_eq.start, b_eq.end - l2.mid, "EQ outer ends must be equidistant from mid");
+            assert_eq!(l2.mid - a_fad.start, b_fad.end - l2.mid, "Faders must be equidistant from mid");
+
+            // 4-channel mode
+            let l4 = compute_mixer_zone_layout(cols, false);
+            assert_eq!(l4.mid, cols / 2);
+            for d in 0..4 {
+                assert!(l4.eq_stem_zone[d].is_some(), "Deck {d} must have EQ zone in 4-deck");
+                assert!(l4.fader_meter[d].is_some(), "Deck {d} must have fader zone in 4-deck");
+            }
+            // Decks C and D symmetry
+            let c_eq = l4.eq_stem_zone[2].unwrap();
+            let d_eq = l4.eq_stem_zone[3].unwrap();
+            assert_eq!(c_eq.len(), d_eq.len());
+            assert_eq!(l4.mid - c_eq.start, d_eq.end - l4.mid);
+        }
     }
 }
