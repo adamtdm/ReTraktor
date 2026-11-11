@@ -1101,10 +1101,15 @@ pub fn show_other_controllers_page(
 
             // Header Row
             ui.horizontal(|ui| {
-                ui.label(RichText::new("CONTROL ID").size(11.0).color(TraktorTheme::TEXT_MUTED()).monospace());
-                ui.add_space(120.0);
-                ui.label(RichText::new("LABEL").size(11.0).color(TraktorTheme::TEXT_MUTED()));
-                ui.add_space(120.0);
+                // Same widths as the row cells below.
+                ui.allocate_ui(Vec2::new(195.0, 16.0), |ui| {
+                    ui.set_width(195.0);
+                    ui.label(RichText::new("CONTROL ID").size(11.0).color(TraktorTheme::TEXT_MUTED()).monospace());
+                });
+                ui.allocate_ui(Vec2::new(170.0, 16.0), |ui| {
+                    ui.set_width(170.0);
+                    ui.label(RichText::new("LABEL").size(11.0).color(TraktorTheme::TEXT_MUTED()));
+                });
                 ui.label(RichText::new("MAPPED ACTION").size(11.0).color(TraktorTheme::TEXT_MUTED()));
             });
             ui.separator();
@@ -1123,11 +1128,13 @@ pub fn show_other_controllers_page(
                                 .font(egui::FontId::monospace(11.0))
                                 .color(if is_selected { TraktorTheme::TEXT_PRIMARY() } else { TraktorTheme::TEXT_SECONDARY() });
                             ui.allocate_ui(Vec2::new(195.0, 24.0), |ui| {
+                                ui.set_width(195.0);
                                 ui.label(id_text);
                             });
 
                             // Editable Friendly Label
                             ui.allocate_ui(Vec2::new(170.0, 24.0), |ui| {
+                                ui.set_width(170.0);
                                 if ui.add(egui::TextEdit::singleline(&mut entry.friendly_name).desired_width(160.0)).changed() {
                                     changed = true;
                                 }
@@ -1135,6 +1142,7 @@ pub fn show_other_controllers_page(
 
                             // Action ComboBox
                             ui.allocate_ui(Vec2::new(200.0, 24.0), |ui| {
+                                ui.set_width(200.0);
                                 let cur_label = action_label(&entry.action);
                                 egui::ComboBox::from_id_salt(("act_combo", idx))
                                     .selected_text(cur_label)

@@ -1665,7 +1665,7 @@ impl LibraryManager {
             // Entry point for AI playlist generator
             let ai_sel = self.show_ai_playlist_panel;
             let ai_btn = egui::Button::new(
-                RichText::new("✦ AI playlist")
+                RichText::new("AI playlist")
                     .size(11.5)
                     .color(if ai_sel { crate::theme::on(TraktorTheme::ROW_SELECTED()) } else { TraktorTheme::ACCENT() }),
             )
@@ -1849,7 +1849,7 @@ impl LibraryManager {
             .inner_margin(egui::Margin::symmetric(10.0, 8.0))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("✦ AI Playlist").color(TraktorTheme::TEXT_PRIMARY()).strong());
+                    ui.label(RichText::new("AI playlist").color(TraktorTheme::TEXT_PRIMARY()).strong());
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui.small_button("✕").on_hover_text("Close").clicked() {
                             self.show_ai_playlist_panel = false;

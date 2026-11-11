@@ -2016,7 +2016,7 @@ impl ReTraktorApp {
                 }
 
                 let next_fill = if self.show_next_track_panel { TraktorTheme::ACCENT() } else { TraktorTheme::ROW_SELECTED() };
-                if pill(ui, "NEXT", self.show_next_track_panel, next_fill, 0.0)
+                if roomy && pill(ui, "NEXT", self.show_next_track_panel, next_fill, 0.0)
                     .on_hover_text("Suggest next track for the idle deck (N)")
                     .clicked()
                 {
@@ -3403,7 +3403,8 @@ impl ReTraktorApp {
 
                             // Title & Artist
                             let text_pos = rect.min + Vec2::new(42.0, 4.0);
-                            ui.painter().text(
+                            // Clipped so a long title cannot run under the BPM and key on the right.
+                            ui.painter().with_clip_rect(egui::Rect::from_min_max(rect.min, egui::Pos2::new(rect.right() - 96.0, rect.bottom()))).text(
                                 text_pos,
                                 egui::Align2::LEFT_TOP,
                                 format!("{} – {}", track.title, track.artist),

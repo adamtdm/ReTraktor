@@ -35,9 +35,9 @@ impl AiProvider {
 
     pub fn default_model(self) -> &'static str {
         match self {
-            Self::Gemini => "gemini-1.5-flash",
+            Self::Gemini => "gemini-flash-latest",
             Self::OpenAi => "gpt-4o-mini",
-            Self::Anthropic => "claude-3-5-haiku-latest",
+            Self::Anthropic => "claude-haiku-5-5",
             Self::OpenAiCompatible => "llama3",
         }
     }
