@@ -4,7 +4,7 @@
 //! all motion is gated by [`crate::theme::animations`].
 
 use crate::theme::{self, TraktorTheme};
-use eframe::egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Response, Sense, Stroke, Ui, Vec2};
+use eframe::egui::{Align2, Color32, FontId, Key, Painter, Pos2, Rect, Response, Sense, Stroke, Ui, Vec2};
 
 /// Visual state of a single dot on a dot-matrix grid.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2429,6 +2429,153 @@ pub fn set_arc_display(
     (response, clicked_col)
 }
 
+/// Paints a short horizontal dot rule (e.g. for section headings in dot-matrix house style).
+pub fn paint_dot_rule(painter: &Painter, origin: Pos2, count: usize, spacing: f32, radius: f32, color: Color32) {
+    for i in 0..count {
+        let p = Pos2::new(origin.x + (i as f32) * spacing, origin.y);
+        painter.circle_filled(p, radius, color);
+    }
+}
+
+/// Interactive dot-matrix two-state toggle switch.
+/// Displays an animated sliding dot track (44x24 px) with ON/OFF label in dot font / monospace.
+/// Keyboard navigable (Space/Enter) and clickable.
+pub fn dot_toggle(ui: &mut Ui, value: &mut bool, accent: Color32, hover: &str) -> Response {
+    let size = Vec2::new(44.0, 24.0);
+    let (rect, mut resp) = ui.allocate_exact_size(size, Sense::click());
+    if resp.clicked()
+        || (resp.has_focus() && ui.input(|i| i.key_pressed(Key::Space) || i.key_pressed(Key::Enter)))
+    {
+        *value = !*value;
+        resp.mark_changed();
+    }
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        let anim = theme::animations();
+        let t = if anim {
+            ui.ctx().animate_bool(resp.id, *value)
+        } else if *value {
+            1.0
+        } else {
+            0.0
+        };
+
+        let bg = TraktorTheme::CONTROL();
+        let border = if resp.has_focus() || resp.hovered() {
+            TraktorTheme::BORDER_ACCENT()
+        } else {
+            TraktorTheme::BORDER_COLOR()
+        };
+        painter.rect(rect, 12.0, bg, Stroke::new(1.0_f32, border));
+
+        let left_x = rect.left() + 11.0;
+        let right_x = rect.right() - 11.0;
+        let dot_x = left_x + (right_x - left_x) * t;
+        let dot_center = Pos2::new(dot_x, rect.center().y);
+
+        let dot_col = theme::mix(unlit_on_panel(), accent, t);
+        painter.circle_filled(dot_center, 4.2, dot_col);
+        if t < 0.6 {
+            painter.circle_stroke(
+                dot_center,
+                4.2,
+                Stroke::new(1.0_f32, theme::mix(TraktorTheme::TEXT_MUTED(), Color32::TRANSPARENT, t / 0.6)),
+            );
+        }
+
+        let label_text = if *value { "ON" } else { "OFF" };
+        let label_pos = if *value {
+            Pos2::new(rect.left() + 12.0, rect.center().y)
+        } else {
+            Pos2::new(rect.right() - 12.0, rect.center().y)
+        };
+        let label_col = if *value {
+            TraktorTheme::TEXT_PRIMARY()
+        } else {
+            TraktorTheme::TEXT_MUTED()
+        };
+        painter.text(label_pos, Align2::CENTER_CENTER, label_text, FontId::monospace(8.0), label_col);
+
+        if resp.has_focus() {
+            painter.rect_stroke(rect.expand(1.5), 13.0, Stroke::new(1.0_f32, TraktorTheme::TEXT_SECONDARY()));
+        }
+    }
+    resp.on_hover_text(hover)
+}
+
+/// Interactive dot-matrix horizontal level slider (e.g. for sensitivity, resonance, brightness, offset).
+/// Shows a bar of dots, numeric readout in dot font, supports mouse drag, click, and arrow keys.
+pub fn dot_slider(
+    ui: &mut Ui,
+    value: &mut f32,
+    min: f32,
+    max: f32,
+    default: f32,
+    display_text: &str,
+    accent: Color32,
+) -> Response {
+    let size = Vec2::new(170.0, 24.0);
+    let (rect, mut resp) = ui.allocate_exact_size(size, Sense::click_and_drag());
+    let range = (max - min).max(1e-5);
+
+    let bar_w = 90.0_f32;
+    let bar_rect = Rect::from_min_size(rect.min + Vec2::new(0.0, 2.0), Vec2::new(bar_w, 20.0));
+
+    if resp.dragged() || resp.clicked() {
+        if let Some(pos) = resp.interact_pointer_pos() {
+            let frac = ((pos.x - bar_rect.left()) / bar_rect.width()).clamp(0.0, 1.0);
+            *value = (min + frac * range).clamp(min, max);
+            resp.mark_changed();
+        }
+    }
+    if resp.double_clicked() {
+        *value = default;
+        resp.mark_changed();
+    }
+    if resp.has_focus() {
+        let step = range * 0.05;
+        if ui.input(|i| i.key_pressed(Key::ArrowLeft) || i.key_pressed(Key::ArrowDown)) {
+            *value = (*value - step).clamp(min, max);
+            resp.mark_changed();
+        }
+        if ui.input(|i| i.key_pressed(Key::ArrowRight) || i.key_pressed(Key::ArrowUp)) {
+            *value = (*value + step).clamp(min, max);
+            resp.mark_changed();
+        }
+    }
+
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        let num_dots = 12usize;
+        let norm = ((*value - min) / range).clamp(0.0, 1.0);
+        let lit_count = (norm * num_dots as f32).round() as usize;
+
+        let dot_spacing = (bar_w - 6.0) / (num_dots - 1) as f32;
+        let cy = bar_rect.center().y;
+        for i in 0..num_dots {
+            let cx = bar_rect.left() + 3.0 + i as f32 * dot_spacing;
+            let is_lit = i < lit_count;
+            let col = if is_lit { accent } else { unlit_on_panel() };
+            painter.circle_filled(Pos2::new(cx, cy), if is_lit { 2.1 } else { 1.6 }, col);
+        }
+
+        let text_pos = Pos2::new(rect.right() - 2.0, rect.center().y);
+        painter.text(
+            text_pos,
+            Align2::RIGHT_CENTER,
+            display_text,
+            theme::dot_font(10.5),
+            TraktorTheme::TEXT_PRIMARY(),
+        );
+
+        if resp.hovered() || resp.has_focus() {
+            painter.rect_stroke(rect, 2.0, Stroke::new(1.0_f32, TraktorTheme::BORDER_ACCENT()));
+        }
+    }
+
+    resp
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2668,5 +2815,18 @@ mod tests {
             assert_eq!(c_eq.len(), d_eq.len());
             assert_eq!(l4.mid - c_eq.start, d_eq.end - l4.mid);
         }
+    }
+
+    #[test]
+    fn dot_slider_normalization_and_clamping() {
+        let min = -50.0_f32;
+        let max = 50.0_f32;
+        let range = max - min;
+        let norm = |v: f32| ((v - min) / range).clamp(0.0, 1.0);
+        assert_eq!(norm(-50.0), 0.0);
+        assert_eq!(norm(0.0), 0.5);
+        assert_eq!(norm(50.0), 1.0);
+        assert_eq!(norm(-100.0), 0.0);
+        assert_eq!(norm(100.0), 1.0);
     }
 }

@@ -183,6 +183,16 @@ fn deck_of(id: &str) -> usize {
     }
 }
 
+fn control_deck_color(id: &str) -> Color32 {
+    if id.contains(".left.") || id.contains("channels.1") {
+        TraktorTheme::DECK_A()
+    } else if id.contains(".right.") || id.contains("channels.2") {
+        TraktorTheme::DECK_B()
+    } else {
+        TraktorTheme::ACCENT()
+    }
+}
+
 /// What a control does when not remapped (mirrors the built-in MX2 handling).
 fn default_action(id: &str) -> String {
     let d = deck_of(id);
@@ -546,47 +556,99 @@ pub fn show(ui: &mut Ui, map: &mut Mapping, state: &mut MapperState, last_touche
         }
         let selected = state.selected.as_deref() == Some(c.id.as_str());
         let custom = map.action.contains_key(&c.id) || map.colour.contains_key(&c.id);
-        let col = if selected { accent } else if r.hovered() { TraktorTheme::TEXT_PRIMARY() } else if custom { accent.gamma_multiply(0.85) } else { line };
-        let w = if selected { 2.4 } else { 1.1 };
-        let center = board.min + c.at * s;
+        let action = map.action.get(&c.id).cloned().unwrap_or_else(|| default_action(&c.id));
+        let is_mapped = action != "none";
+        let deck_col = control_deck_color(&c.id);
         let led = map.colour.get(&c.id).and_then(|code| LED_COLOURS.iter().find(|(_, v, _)| v == code)).map(|(_, _, col)| *col);
+
+        let ctl_col = if !is_mapped {
+            crate::dot::unlit_on_panel()
+        } else if let Some(l) = led {
+            l
+        } else {
+            deck_col
+        };
+
+        let col = if selected {
+            accent
+        } else if r.hovered() {
+            TraktorTheme::TEXT_PRIMARY()
+        } else {
+            ctl_col
+        };
+        let w = if selected { 2.4 } else if is_mapped { 1.2 } else { 0.9 };
+        let center = board.min + c.at * s;
+
+        // Draw control shapes: lit as dots/rings in deck colors when mapped, hollow when unmapped
         match c.kind {
             Kind::Knob(rad) => {
                 painter.circle_stroke(center, rad * s, stroke(col, w));
-                painter.line_segment([center, center + Vec2::new(0.0, -rad * 0.8) * s], stroke(col, w));
+                if is_mapped {
+                    painter.circle_filled(center, 1.8 * s, col);
+                    painter.line_segment([center, center + Vec2::new(0.0, -rad * 0.8) * s], stroke(col, w * 1.2));
+                } else {
+                    painter.line_segment([center, center + Vec2::new(0.0, -rad * 0.8) * s], stroke(col, w * 0.7));
+                }
             }
             Kind::Encoder(rad) => {
                 painter.circle_stroke(center, rad * s, stroke(col, w));
                 painter.circle_stroke(center, rad * 0.7 * s, stroke(col, w * 0.7));
+                if is_mapped {
+                    painter.circle_filled(center, 2.0 * s, col);
+                }
             }
             Kind::Ring(rad) | Kind::Round(rad) => {
-                if let Some(l) = led {
-                    painter.circle_filled(center, rad * s, l);
+                let fill = led.unwrap_or(ctl_col);
+                if is_mapped {
+                    painter.circle_filled(center, (rad * 0.45 * s).clamp(2.5, 6.0), fill);
                 }
-                painter.circle_stroke(center, rad * s, stroke(if selected { accent } else { led.unwrap_or(col) }, w));
+                painter.circle_stroke(center, rad * s, stroke(if selected { accent } else { fill }, w));
                 if matches!(c.kind, Kind::Ring(_)) {
-                    painter.circle_stroke(center, rad * 0.6 * s, stroke(col, w * 0.7));
+                    painter.circle_stroke(center, rad * 0.65 * s, stroke(col, w * 0.7));
                 }
             }
             Kind::Rect(rw, rh) | Kind::Pad(rw, rh) => {
                 let rr = Rect::from_center_size(center, Vec2::new(rw, rh) * s);
-                if let Some(l) = led {
-                    painter.rect_filled(rr, 3.0 * s, l);
+                let fill = led.unwrap_or(ctl_col);
+                if is_mapped {
+                    painter.rect_filled(rr, 3.0 * s, fill.gamma_multiply(0.22));
+                    painter.rect_stroke(rr, 3.0 * s, stroke(if selected { accent } else { fill }, w));
+                    if matches!(c.kind, Kind::Pad(..)) {
+                        painter.circle_filled(rr.left_top() + Vec2::new(5.0, 5.0) * s, 1.8 * s, fill);
+                    }
+                } else {
+                    painter.rect_stroke(rr, 3.0 * s, stroke(col, 0.9));
                 }
-                painter.rect_stroke(rr, 3.0 * s, stroke(if selected { accent } else { led.unwrap_or(col) }, w));
             }
             Kind::VFader(len) => {
-                painter.line_segment([center - Vec2::new(0.0, len / 2.0) * s, center + Vec2::new(0.0, len / 2.0) * s], stroke(col, w));
-                painter.rect_stroke(Rect::from_center_size(center, Vec2::new(20.0, 8.0) * s), 2.0 * s, stroke(col, w));
+                painter.line_segment([center - Vec2::new(0.0, len / 2.0) * s, center + Vec2::new(0.0, len / 2.0) * s], stroke(faint, 0.9));
+                let cap = Rect::from_center_size(center, Vec2::new(20.0, 8.0) * s);
+                if is_mapped {
+                    painter.rect_filled(cap, 2.0 * s, col.gamma_multiply(0.35));
+                    painter.rect_stroke(cap, 2.0 * s, stroke(col, w));
+                    painter.line_segment([cap.left_center() + Vec2::new(2.0, 0.0), cap.right_center() - Vec2::new(2.0, 0.0)], stroke(col, 1.5 * s));
+                } else {
+                    painter.rect_stroke(cap, 2.0 * s, stroke(col, 0.9));
+                }
             }
             Kind::HFader(len) => {
-                painter.line_segment([center - Vec2::new(len / 2.0, 0.0) * s, center + Vec2::new(len / 2.0, 0.0) * s], stroke(col, w));
-                painter.rect_stroke(Rect::from_center_size(center, Vec2::new(8.0, 20.0) * s), 2.0 * s, stroke(col, w));
+                painter.line_segment([center - Vec2::new(len / 2.0, 0.0) * s, center + Vec2::new(len / 2.0, 0.0) * s], stroke(faint, 0.9));
+                let cap = Rect::from_center_size(center, Vec2::new(8.0, 20.0) * s);
+                if is_mapped {
+                    painter.rect_filled(cap, 2.0 * s, col.gamma_multiply(0.35));
+                    painter.rect_stroke(cap, 2.0 * s, stroke(col, w));
+                    painter.line_segment([cap.center_top() + Vec2::new(0.0, 2.0), cap.center_bottom() - Vec2::new(0.0, 2.0)], stroke(col, 1.5 * s));
+                } else {
+                    painter.rect_stroke(cap, 2.0 * s, stroke(col, 0.9));
+                }
             }
             Kind::Jog(rad) => {
                 painter.circle_stroke(center, rad * s, stroke(col, w));
                 painter.circle_stroke(center, rad * 0.83 * s, stroke(col, w * 0.7));
-                painter.line_segment([center + Vec2::new(0.0, -rad * 0.8) * s, center + Vec2::new(0.0, -rad * 0.5) * s], stroke(col, w));
+                if is_mapped {
+                    painter.circle_filled(center, 3.0 * s, col);
+                    painter.line_segment([center + Vec2::new(0.0, -rad * 0.8) * s, center + Vec2::new(0.0, -rad * 0.5) * s], stroke(col, w * 1.2));
+                }
             }
         }
 
@@ -597,6 +659,42 @@ pub fn show(ui: &mut Ui, map: &mut Mapping, state: &mut MapperState, last_touche
             Kind::VFader(len) => Rect::from_center_size(center, Vec2::new(20.0, len) * s),
             Kind::HFader(len) => Rect::from_center_size(center, Vec2::new(len, 20.0) * s),
         };
+
+        // Pulsing animation for the last-touched control (gated by theme::animations())
+        let is_last_touched = last_touched == Some(c.id.as_str());
+        if is_last_touched {
+            if crate::theme::animations() {
+                ui.ctx().request_repaint();
+            }
+            let pulse = if crate::theme::animations() {
+                let t = ui.input(|i| i.time);
+                ((t * 5.0).sin() * 0.5 + 0.5) as f32
+            } else {
+                1.0
+            };
+            let halo_expand = (2.0 + 3.5 * pulse) * s;
+            let halo_alpha = 0.35 + 0.55 * pulse;
+            let halo_col = ctl_col.gamma_multiply(halo_alpha);
+            let halo_st = Stroke::new((1.5 + 1.0 * pulse) * s, halo_col);
+            match c.kind {
+                Kind::Knob(rad) | Kind::Encoder(rad) | Kind::Ring(rad) | Kind::Round(rad) | Kind::Jog(rad) => {
+                    painter.circle_stroke(center, (rad * s) + halo_expand, halo_st);
+                }
+                Kind::Rect(rw, rh) | Kind::Pad(rw, rh) => {
+                    let pr = Rect::from_center_size(center, Vec2::new(rw, rh) * s).expand(halo_expand);
+                    painter.rect_stroke(pr, 4.0 * s, halo_st);
+                }
+                Kind::VFader(_) => {
+                    let pr = Rect::from_center_size(center, Vec2::new(22.0, 10.0) * s).expand(halo_expand);
+                    painter.rect_stroke(pr, 3.0 * s, halo_st);
+                }
+                Kind::HFader(_) => {
+                    let pr = Rect::from_center_size(center, Vec2::new(10.0, 22.0) * s).expand(halo_expand);
+                    painter.rect_stroke(pr, 3.0 * s, halo_st);
+                }
+            }
+        }
+
         if custom {
             let dot_pos = bounds.right_top() + Vec2::new(-2.0, 2.0);
             painter.circle_filled(dot_pos, 3.2, accent);
@@ -618,8 +716,7 @@ pub fn show(ui: &mut Ui, map: &mut Mapping, state: &mut MapperState, last_touche
             painter.circle_filled(Pos2::new(b.center().x, b.top() - 2.0), 3.0, accent);
         }
 
-        // What it does, written on the replica (font floor 9 px).
-        let action = map.action.get(&c.id).cloned().unwrap_or_else(|| default_action(&c.id));
+        // What it does, written on the replica (font floor 8.5 px).
         let text = short_label(&action);
         let fill_col = match c.kind {
             Kind::Rect(..) | Kind::Pad(..) => led,
@@ -627,8 +724,10 @@ pub fn show(ui: &mut Ui, map: &mut Mapping, state: &mut MapperState, last_touche
         };
         let text_col = if let Some(fill) = fill_col {
             crate::theme::on(fill)
-        } else if custom || selected {
+        } else if selected || custom {
             accent
+        } else if !is_mapped {
+            TraktorTheme::TEXT_MUTED()
         } else {
             TraktorTheme::TEXT_PRIMARY()
         };
@@ -637,7 +736,7 @@ pub fn show(ui: &mut Ui, map: &mut Mapping, state: &mut MapperState, last_touche
         match c.kind {
             Kind::Pad(rw, _) | Kind::Rect(rw, _) => {
                 let mut drawn = false;
-                for size in [label_font.size, 9.0] {
+                for size in [label_font.size, 9.0, 8.5] {
                     let font = FontId::proportional(size);
                     let galley = painter.layout_no_wrap(text.clone(), font.clone(), text_col);
                     if galley.size().x <= rw * s - 0.5 {
@@ -656,10 +755,16 @@ pub fn show(ui: &mut Ui, map: &mut Mapping, state: &mut MapperState, last_touche
             Kind::Knob(_) | Kind::Encoder(_) | Kind::Ring(_) | Kind::Round(_) => {
                 let font = FontId::proportional(label_font.size.max(9.0));
                 let galley = painter.layout_no_wrap(text.clone(), font.clone(), text_col);
-                if galley.size().x <= 46.0 * s {
+                if galley.size().x <= 48.0 * s {
                     painter.text(pos, align, &text, font, text_col);
                 } else {
-                    dropped_labels = true;
+                    let font8 = FontId::proportional(8.5);
+                    let galley8 = painter.layout_no_wrap(text.clone(), font8.clone(), text_col);
+                    if galley8.size().x <= 48.0 * s {
+                        painter.text(pos, align, &text, font8, text_col);
+                    } else {
+                        dropped_labels = true;
+                    }
                 }
             }
         }
@@ -705,7 +810,11 @@ pub fn show(ui: &mut Ui, map: &mut Mapping, state: &mut MapperState, last_touche
     egui::Frame::none().fill(TraktorTheme::BG_PANEL()).rounding(6.0).inner_margin(14.0).show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
-            ui.label(RichText::new(pretty_control(&sel)).size(16.0).strong());
+            ui.label(
+                RichText::new(pretty_control(&sel))
+                    .font(crate::theme::dot_font(14.0))
+                    .color(TraktorTheme::TEXT_PRIMARY()),
+            );
             ui.label(RichText::new(&sel).size(11.0).color(TraktorTheme::TEXT_MUTED()));
         });
         ui.add_space(6.0);
