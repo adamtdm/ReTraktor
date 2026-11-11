@@ -11,29 +11,45 @@
 
 use eframe::egui::{self, Vec2};
 
+mod ai;
 mod app;
 mod audio;
+mod controller_map;
 mod demucs;
+mod dot;
 mod library_ui;
+mod playlist_import;
+pub mod midi;
 mod preferences;
+pub mod setlist;
 mod theme;
 mod widgets;
 
 use app::ReTraktorApp;
 
+/// Screenshot mode can test other window sizes via SHOT_SIZE=WxH.
+fn shot_window_size() -> Option<Vec2> {
+    std::env::var("RETRAKTOR_SHOT_DIR").ok()?;
+    let (w, h) = std::env::var("SHOT_SIZE").ok()?.split_once('x').map(|(w, h)| (w.parse().ok(), h.parse().ok()))?;
+    Some(Vec2::new(w?, h?))
+}
+
 fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("ReTraktor 4.5.1 — Traktor Pro 4 on Linux")
-            .with_inner_size(Vec2::new(1280.0, 820.0))
+            .with_title("ReTraktor")
+            .with_inner_size(shot_window_size().unwrap_or(Vec2::new(1280.0, 820.0)))
             .with_min_inner_size(Vec2::new(1024.0, 640.0))
             .with_active(true),
         ..Default::default()
     };
 
     eframe::run_native(
-        "ReTraktor Pro 4",
+        "ReTraktor",
         native_options,
-        Box::new(|_cc| Ok(Box::new(ReTraktorApp::default()))),
+        Box::new(|cc| {
+            theme::install_fonts(&cc.egui_ctx);
+            Ok(Box::new(ReTraktorApp::default()))
+        }),
     )
 }

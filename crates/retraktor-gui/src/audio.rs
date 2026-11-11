@@ -1,3 +1,4 @@
+#[cfg(not(test))]
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use retraktor_audio::FourDeckAudioEngine;
 use std::f32::consts::PI;
@@ -5,7 +6,9 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+#[cfg(not(test))]
 use std::thread;
+#[cfg(not(test))]
 use std::time::{Duration, Instant};
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::DecoderOptions;
@@ -23,20 +26,23 @@ pub struct LoadedTrackAudio {
     pub title: String,
     pub artist: String,
     pub bpm: f64,
+    /// Time of the first beat; every beat is `grid_offset_sec + n * 60 / bpm`.
+    pub grid_offset_sec: f64,
     pub key: String,
     pub duration_sec: f64,
     pub pcm_stereo: Vec<f32>, // Interleaved [L, R, L, R, ...]
     pub sample_rate: u32,
     /// Precomputed 3-band `[low, mid, high]` amplitude peaks at `PEAKS_PER_SEC` Hz.
-    pub waveform_peaks: Vec<[f32; 3]>,
+    pub waveform_peaks: Arc<[[f32; 3]]>,
     /// Precomputed 4-stem `[drums, bass, instruments, vocals]` amplitude peaks at `PEAKS_PER_SEC` Hz.
-    pub stem_peaks: Vec<[f32; 4]>,
+    pub stem_peaks: Arc<[[f32; 4]]>,
     pub stems_ready: bool,
     /// True isolated AI stems (from Demucs or synthesis). If Some, played with zero bleed.
     pub pcm_drums: Option<Vec<f32>>,
     pub pcm_bass: Option<Vec<f32>>,
     pub pcm_other: Option<Vec<f32>>,
     pub pcm_vocals: Option<Vec<f32>>,
+    pub phrases: Vec<retraktor_library::Phrase>,
 }
 
 impl LoadedTrackAudio {
@@ -246,37 +252,29 @@ impl LoadedTrackAudio {
 
         let duration_sec = (pcm_stereo.len() / 2) as f64 / (sr as f64);
         let (waveform_peaks, stem_peaks) = Self::compute_waveform_peaks(&pcm_stereo, sr);
+        let phrases = retraktor_library::detect_phrases(&waveform_peaks, fallback_bpm, 0.0, duration_sec);
 
         let mut loaded = Self {
             title,
             artist,
             bpm: fallback_bpm,
+            grid_offset_sec: 0.0,
             key: fallback_key.to_string(),
             duration_sec,
             pcm_stereo,
             sample_rate: sr,
-            waveform_peaks,
-            stem_peaks,
+            waveform_peaks: waveform_peaks.into(),
+            stem_peaks: stem_peaks.into(),
             stems_ready: false,
             pcm_drums: None,
             pcm_bass: None,
             pcm_other: None,
             pcm_vocals: None,
+            phrases,
         };
 
-        // Check if pre-separated Demucs stems are cached in ~/.cache/retraktor/stems/htdemucs/<file_stem>
-        if let Some(stem_name) = path.file_stem().and_then(|s| s.to_str()) {
-            if let Ok(home) = std::env::var("HOME") {
-                let cache_root = std::path::PathBuf::from(home).join(".cache/retraktor/stems/htdemucs");
-                let candidate_1 = cache_root.join(stem_name);
-                let candidate_2 = cache_root.join("htdemucs").join(stem_name);
-
-                if candidate_1.is_dir() {
-                    let _ = loaded.load_stems_from_dir(&candidate_1);
-                } else if candidate_2.is_dir() {
-                    let _ = loaded.load_stems_from_dir(&candidate_2);
-                }
-            }
+        if let Some(dir) = crate::demucs::DemucsManager::get_cached_stem_dir(path) {
+            loaded.load_stems_from_dir(&dir);
         }
 
         Ok(loaded)
@@ -410,180 +408,12 @@ impl LoadedTrackAudio {
                 self.pcm_bass = Some(b);
                 self.pcm_other = Some(o);
                 self.pcm_vocals = Some(v);
-                self.stem_peaks = real_peaks;
+                self.stem_peaks = real_peaks.into();
                 self.stems_ready = true;
                 return true;
             }
         }
         false
-    }
-
-    /// Generates high quality electronic music stems / demo tracks for instant playback.
-    pub fn new_synthetic(
-        title: &str,
-        artist: &str,
-        bpm: f64,
-        key: &str,
-        duration_sec: f64,
-        style: usize,
-    ) -> Self {
-        let sr = 48000;
-        // Synthesize a 32-second seamless musical loop and tile metadata to `duration_sec`
-        let synth_sec = duration_sec.min(120.0);
-        let total_frames = (synth_sec * sr as f64) as usize;
-        let mut pcm = Vec::with_capacity(total_frames * 2);
-        let mut pcm_drums = Vec::with_capacity(total_frames * 2);
-        let mut pcm_bass = Vec::with_capacity(total_frames * 2);
-        let mut pcm_other = Vec::with_capacity(total_frames * 2);
-        let mut pcm_vocals = Vec::with_capacity(total_frames * 2);
-
-        let beat_period = (sr as f64) * 60.0 / bpm;
-        let pi64 = PI as f64;
-
-        for f in 0..total_frames {
-            let t = f as f64 / sr as f64;
-            let beat_pos = (f as f64 / beat_period).fract();
-            let bar_pos = ((f as f64 / beat_period) / 4.0).fract();
-
-            let (((d_l, d_r), (b_l, b_r)), ((o_l, o_r), (v_l, v_r))) = match style {
-                // Style 0: Melodic Techno / Tale of Us ("Berlin Midnight")
-                0 => {
-                    let kick_env = (-beat_pos * 12.0).exp() as f32;
-                    let kick_freq = 55.0 + 120.0 * (kick_env as f64);
-                    let kick = (t * kick_freq * 2.0 * pi64).sin() as f32 * kick_env * 0.9;
-
-                    let hat_env = if beat_pos > 0.4 && beat_pos < 0.75 {
-                        let hp = (beat_pos - 0.5).abs();
-                        ((-hp * 18.0).exp() * 0.4) as f32
-                    } else {
-                        0.0
-                    };
-                    let noise =
-                        (((f * 1103515245 + 12345) & 0x7FFF) as f32 / 32768.0) * 2.0 - 1.0;
-                    let hat = noise * hat_env;
-
-                    let sixteenth = (beat_pos * 4.0).fract();
-                    let bass_env = (-sixteenth * 10.0).exp() as f32;
-                    let root_hz = 55.0 * 1.5;
-                    let bass = (t * root_hz * 2.0 * pi64).sin() as f32 * bass_env * 0.5;
-
-                    let pad = (t * 220.0 * 2.0 * pi64).sin() as f32 * 0.15;
-                    let voc_env = ((-((beat_pos - 0.25).abs()) * 14.0).exp() * 0.18) as f32;
-                    let voc = (t * 440.0 * 2.0 * pi64).sin() as f32 * voc_env;
-
-                    (
-                        ((kick + hat * 0.8, kick + hat * 0.9), (bass, bass)),
-                        ((pad, pad * 1.1), (voc, voc)),
-                    )
-                }
-                // Style 1: Acid Peak Time Techno ("Detroit Dawn")
-                1 => {
-                    let kick_env = (-beat_pos * 14.0).exp() as f32;
-                    let kick = (t * (60.0 + 140.0 * kick_env as f64) * 2.0 * pi64).sin() as f32
-                        * kick_env;
-
-                    let beat_idx = (f as f64 / beat_period).floor() as i64 % 4;
-                    let clap_env = if (beat_idx == 1 || beat_idx == 3) && beat_pos < 0.25 {
-                        (-beat_pos * 20.0).exp() as f32 * 0.5
-                    } else {
-                        0.0
-                    };
-                    let noise = (((f * 65537 + 89) & 0x7FFF) as f32 / 32768.0) * 2.0 - 1.0;
-                    let clap = noise * clap_env;
-
-                    let sixteenth = (beat_pos * 4.0).fract();
-                    let acid_env = (-sixteenth * 11.5).exp() as f32;
-                    let cutoff = 400.0 + 1100.0 * (bar_pos * 2.0 * pi64).sin().abs() as f32;
-                    let saw = ((t * 110.0 * 2.0 * pi64).fract() * 2.0 - 1.0) as f32;
-                    let acid = saw * acid_env * (cutoff / 1600.0) * 0.42;
-
-                    let synth = (t * 330.0 * 2.0 * pi64).sin() as f32 * 0.12 * acid_env;
-                    let voc_env = if beat_idx == 2 && beat_pos < 0.3 { (-beat_pos * 12.0).exp() as f32 * 0.22 } else { 0.0 };
-                    let voc = (t * 523.25 * 2.0 * pi64).sin() as f32 * voc_env;
-
-                    (
-                        ((kick * 0.85 + clap, kick * 0.85 + clap), (acid, acid * 1.05)),
-                        ((synth, synth * 1.1), (voc, voc)),
-                    )
-                }
-                // Style 2: Deep House / Ibiza Sunset
-                _ => {
-                    let kick_env = (-beat_pos * 9.0).exp() as f32;
-                    let kick = (t * 50.0 * 2.0 * pi64).sin() as f32 * kick_env * 0.8;
-                    let sub = (t * 55.0 * 2.0 * pi64).sin() as f32 * kick_env * 0.45;
-                    let chord = ((t * 261.63 * 2.0 * pi64).sin()
-                        + (t * 329.63 * 2.0 * pi64).sin()) as f32
-                        * 0.2;
-                    let vocal_lead = (t * 392.00 * 2.0 * pi64).sin() as f32 * 0.15 * ((-beat_pos * 6.0).exp() as f32);
-
-                    (
-                        ((kick, kick), (sub, sub)),
-                        ((chord, chord), (vocal_lead, vocal_lead)),
-                    )
-                }
-            };
-
-            let l = d_l + b_l + o_l + v_l;
-            let r = d_r + b_r + o_r + v_r;
-
-            pcm.push(l.clamp(-1.0, 1.0));
-            pcm.push(r.clamp(-1.0, 1.0));
-            pcm_drums.push(d_l.clamp(-1.0, 1.0));
-            pcm_drums.push(d_r.clamp(-1.0, 1.0));
-            pcm_bass.push(b_l.clamp(-1.0, 1.0));
-            pcm_bass.push(b_r.clamp(-1.0, 1.0));
-            pcm_other.push(o_l.clamp(-1.0, 1.0));
-            pcm_other.push(o_r.clamp(-1.0, 1.0));
-            pcm_vocals.push(v_l.clamp(-1.0, 1.0));
-            pcm_vocals.push(v_r.clamp(-1.0, 1.0));
-        }
-
-        let (waveform_peaks, _) = Self::compute_waveform_peaks(&pcm, sr);
-
-        // Compute true stem peaks
-        let frames_per_bucket = ((sr as usize) / PEAKS_PER_SEC).max(64);
-        let num_buckets = (total_frames / frames_per_bucket).max(1);
-        let mut real_stem_peaks = Vec::with_capacity(num_buckets);
-
-        for b_idx in 0..num_buckets {
-            let start = b_idx * frames_per_bucket * 2;
-            let end = ((b_idx + 1) * frames_per_bucket * 2).min(pcm.len());
-            let mut max_d = 0.0_f32;
-            let mut max_b = 0.0_f32;
-            let mut max_o = 0.0_f32;
-            let mut max_v = 0.0_f32;
-
-            for i in (start..end).step_by(2) {
-                max_d = max_d.max(pcm_drums[i].abs());
-                max_b = max_b.max(pcm_bass[i].abs());
-                max_o = max_o.max(pcm_other[i].abs());
-                max_v = max_v.max(pcm_vocals[i].abs());
-            }
-
-            real_stem_peaks.push([
-                max_d.clamp(0.04, 1.0),
-                max_b.clamp(0.04, 1.0),
-                max_o.clamp(0.04, 1.0),
-                max_v.clamp(0.04, 1.0),
-            ]);
-        }
-
-        Self {
-            title: title.to_string(),
-            artist: artist.to_string(),
-            bpm,
-            key: key.to_string(),
-            duration_sec: synth_sec,
-            pcm_stereo: pcm,
-            sample_rate: sr,
-            waveform_peaks,
-            stem_peaks: real_stem_peaks,
-            stems_ready: true,
-            pcm_drums: Some(pcm_drums),
-            pcm_bass: Some(pcm_bass),
-            pcm_other: Some(pcm_other),
-            pcm_vocals: Some(pcm_vocals),
-        }
     }
 }
 
@@ -851,42 +681,18 @@ pub struct AudioSystem {
 }
 
 impl AudioSystem {
+    #[cfg(test)]
     pub fn new() -> Self {
-        let mut initial_state = AudioSharedState::default();
+        Self {
+            shared: Arc::new(Mutex::new(AudioSharedState::default())),
+            _stream: None,
+            running: Arc::new(AtomicBool::new(false)),
+        }
+    }
 
-        // Preload Decks A, B, C, D with Traktor Pro 4 demo tracks
-        initial_state.loaded_tracks[0] = Some(LoadedTrackAudio::new_synthetic(
-            "Berlin Midnight (Stem Edit)",
-            "Tale of Us & Anyma",
-            128.00,
-            "4m",
-            120.0,
-            0,
-        ));
-        initial_state.loaded_tracks[1] = Some(LoadedTrackAudio::new_synthetic(
-            "Detroit Dawn (Peak Time)",
-            "Jeff Mills & Robert Hood",
-            130.00,
-            "5m",
-            120.0,
-            1,
-        ));
-        initial_state.loaded_tracks[2] = Some(LoadedTrackAudio::new_synthetic(
-            "Ibiza Sunset (Groove Mix)",
-            "Defected Collective",
-            124.00,
-            "4d",
-            90.0,
-            2,
-        ));
-        initial_state.loaded_tracks[3] = Some(LoadedTrackAudio::new_synthetic(
-            "Tokyo Neon Expressway",
-            "Ken Ishii",
-            132.00,
-            "3m",
-            90.0,
-            1,
-        ));
+    #[cfg(not(test))]
+    pub fn new() -> Self {
+        let initial_state = AudioSharedState::default();
 
         let shared = Arc::new(Mutex::new(initial_state));
         let running = Arc::new(AtomicBool::new(true));

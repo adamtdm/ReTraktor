@@ -1,0 +1,42 @@
+<!doctype html><html><head><meta charset="utf-8">
+<link href="https://fonts.googleapis.com/css2?family=Doto:wght@700&family=Space+Grotesk:wght@400;500&display=swap" rel="stylesheet">
+<style>
+svg{display:block;width:100%;height:auto;border-radius:var(--radius);background:#17181b}
+text{font-family:'Space Grotesk',sans-serif}
+.dot{font-family:'Doto',monospace;font-weight:700}
+</style></head><body><div id="m"></div>
+<script>
+const A='#4fa9e6',B='#e8832f',T='#ececec',D='#8a8f98',C='#2e3138',P='#212329',K='#101114',W=712,H=404;
+const t=(x,y,s,o={})=>`<text x="${x}" y="${y}" fill="${o.f||D}" font-size="${o.z||10}" text-anchor="${o.a||'middle'}" class="${o.c||''}" letter-spacing="${o.l||0}">${s}</text>`;
+const r=(x,y,w,h,f,o={})=>`<rect x="${x}" y="${y}" width="${w}" height="${h}" rx="${o.r??4}" fill="${f}" stroke="${o.s||'none'}" stroke-width="${o.w||1}"/>`;
+const dot=(x,y,R,f,o=1)=>`<circle cx="${x}" cy="${y}" r="${R}" fill="${f}" opacity="${o}"/>`;
+// small display knob: dot ring + value
+const ring=(x,y,v,l,col,val)=>{let s='';for(let i=0;i<11;i++){const q=i/10,a=(-135+270*q)*Math.PI/180,on=v>=.5?(q>=.5&&q<=v+.01):(q<=.5&&q>=v-.01);s+=dot(x+Math.sin(a)*15,y-Math.cos(a)*15,i==5?2.4:1.9,on?col:'#3a3e47')}
+ return s+t(x,y+5,val,{f:T,z:13,c:'dot'})+t(x,y+31,l,{z:9,l:.5})};
+let s=r(8,8,W-16,70,P,{r:10})+r(8,86,W-16,H-94,P,{r:10});
+// deck strips in the top bar
+[[0,A,'A',[.62,'+2'],[.5,'0'],[.3,'30']],[1,B,'B',[.5,'0'],[.72,'HP'],[0,'--']]].forEach(([i,c,L,g,f,fx])=>{
+ const m=x=>i?W-x:x;
+ s+=t(m(30),50,L,{f:c,z:22,c:'dot'})+ring(m(78),38,g[0],'GAIN',c,g[1])+ring(m(134),38,f[0],'FILTER',c,f[1])+ring(m(190),38,.5+fx[0]/2,'FX · DELAY',c,fx[1]);
+ s+=dot(m(226),38,3.5,fx[0]?c:'#3a3e47')+t(m(226),55,fx[0]?'ON':'OFF',{z:8});});
+s+=t(W/2,30,'MASTER',{z:9,l:2})+t(W/2,58,'128.00',{f:T,z:26,c:'dot'});
+// EQ scopes, mirrored
+[[0,A,[0,-18,16],.8,.62,'-2'],[1,B,[0,0,0],.72,.2,'-4']].forEach(([i,c,d,vol,lv,db])=>{
+ const w=232,x=i?W-24-w:24,y=102,h=168,mid=y+h/2,px=i?[x+w-40,x+w/2,x+40]:[x+40,x+w/2,x+w-40],e=i?[x+w-6,x+6]:[x+6,x+w-6];
+ s+=r(x,y,w,h,K,{r:8,s:'#2c2f36'})+`<line x1="${x+8}" y1="${mid}" x2="${x+w-8}" y2="${mid}" stroke="#2c2f36" stroke-dasharray="2 4"/>`;
+ const pts=[[e[0],mid+d[2]],[px[0],mid+d[2]],[px[1],mid+d[1]],[px[2],mid+d[0]],[e[1],mid+d[0]]];
+ let p=`M${pts[0]}`;for(let k=1;k<pts.length;k++){const[a,b]=[pts[k-1],pts[k]],h2=(b[0]-a[0])/2;p+=` C${a[0]+h2} ${a[1]},${b[0]-h2} ${b[1]},${b}`}
+ s+=`<path d="${p}" fill="none" stroke="${c}" stroke-width="2.5"/>`;
+ ['LOW','MID','HI'].forEach((l,k)=>s+=`<circle cx="${px[k]}" cy="${mid+d[2-k]}" r="7" fill="${K}" stroke="${T}" stroke-width="2"/>`+t(px[k],y+h-10,l)+t(px[k],y+20,['-5','+4','0'].map(v=>i?'0':v)[k],{f:T,z:12,c:'dot'}));
+ // combined fader + meter
+ const fx=i?W-300:300,n=18,top=108,st=8.6,hy=top+(1-vol)*(n-1)*st;
+ for(let k=0;k<n;k++){const yy=top+(n-1-k)*st,above=yy<hy-4;for(const dx of[-5,5])s+=dot(fx+dx,yy,above?1.6:3,k/n<lv*vol?(k>n-3?'#e5484d':c):above?'#3a3e47':C)}
+ s+=r(fx-17,hy-8,34,16,'none',{s:T,w:2,r:5})+`<path d="M${fx-23} ${hy} h6 M${fx+17} ${hy} h6" stroke="${T}" stroke-width="2"/>`+t(fx,286,db,{f:T,z:13,c:'dot'});});
+// main meter in the centre
+for(let k=0;k<18;k++)for(const dx of[-5,5])s+=dot(W/2+dx,108+(17-k)*8.6,2.4,k<11?T:C);
+s+=t(W/2,286,'MAIN',{z:9,l:1.5});
+// dot ribbon crossfader
+for(let i=0;i<60;i++)for(let j=0;j<4;j++){const left=i<27,lv=left?.9:.35,on=j/4<lv||j==0,h=i==27||i==28;s+=dot(62+i*10,376-j*8,2.9,h?T:on?(left?A:B):C,h?1:on?.35+.65*(1-j/5):.8)}
+s+=t(40,370,'A',{f:A,z:16,c:'dot'})+t(W-40,370,'B',{f:B,z:16,c:'dot'})+t(W/2,330,'CROSSFADER',{z:9,l:2});
+m.innerHTML=`<svg viewBox="0 0 ${W} ${H}">${s}</svg>`;
+</script></body></html>

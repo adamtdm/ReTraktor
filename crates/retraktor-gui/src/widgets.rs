@@ -50,15 +50,15 @@ pub fn rotary_knob_sized(
         painter.circle_stroke(
             center,
             radius + 1.2,
-            Stroke::new(1.2_f32, Color32::from_rgb(24, 25, 28)),
+            Stroke::new(1.2_f32, TraktorTheme::BORDER_COLOR()),
         );
 
         // Matte charcoal knob cap (matching Traktor Pro 4 knobs)
-        painter.circle_filled(center, radius, Color32::from_rgb(52, 55, 60));
+        painter.circle_filled(center, radius, TraktorTheme::CONTROL());
         painter.circle_stroke(
             center,
             radius,
-            Stroke::new(1.0_f32, Color32::from_rgb(72, 76, 82)),
+            Stroke::new(1.0_f32, TraktorTheme::BORDER_ACCENT()),
         );
 
         // Angular calculations (-135° to +135°)
@@ -94,7 +94,7 @@ pub fn rotary_knob_sized(
             center + Vec2::new(current_angle.cos(), current_angle.sin()) * (radius - 1.2);
         painter.line_segment(
             [ptr_inner, ptr_outer],
-            Stroke::new(1.5_f32, Color32::from_rgb(215, 220, 226)),
+            Stroke::new(1.5_f32, TraktorTheme::TEXT_PRIMARY()),
         );
 
         // Knob label underneath
@@ -104,7 +104,7 @@ pub fn rotary_knob_sized(
             egui::Align2::CENTER_CENTER,
             label,
             egui::FontId::proportional(8.5),
-            TraktorTheme::TEXT_SECONDARY,
+            TraktorTheme::TEXT_SECONDARY(),
         );
     }
 
@@ -152,11 +152,11 @@ pub fn vertical_fader(
             };
             painter.line_segment(
                 [Pos2::new(track_x - tick_w - 2.0, y), Pos2::new(track_x - 2.5, y)],
-                Stroke::new(0.8_f32, Color32::from_rgb(76, 80, 88)),
+                Stroke::new(0.8_f32, TraktorTheme::BORDER_ACCENT()),
             );
             painter.line_segment(
                 [Pos2::new(track_x + 2.5, y), Pos2::new(track_x + tick_w + 2.0, y)],
-                Stroke::new(0.8_f32, Color32::from_rgb(76, 80, 88)),
+                Stroke::new(0.8_f32, TraktorTheme::BORDER_ACCENT()),
             );
         }
 
@@ -165,7 +165,7 @@ pub fn vertical_fader(
             Pos2::new(track_x - 1.5, track_top),
             Pos2::new(track_x + 1.5, track_bot),
         );
-        painter.rect_filled(slot_rect, 0.5, Color32::from_rgb(22, 23, 26));
+        painter.rect_filled(slot_rect, 0.5, TraktorTheme::BG_INPUT());
 
         let norm_val = (*value - min) / (max - min).max(1e-5);
         let cap_y = track_bot - norm_val * track_h;
@@ -175,18 +175,18 @@ pub fn vertical_fader(
         let cap_h = 9.0;
         let cap_rect = Rect::from_center_size(Pos2::new(track_x, cap_y), Vec2::new(cap_w, cap_h));
 
-        painter.rect_filled(cap_rect, 1.5, Color32::from_rgb(66, 70, 76));
+        painter.rect_filled(cap_rect, 1.5, TraktorTheme::CONTROL_HOVER());
         painter.rect_stroke(
             cap_rect,
             1.5,
-            Stroke::new(0.8_f32, Color32::from_rgb(24, 25, 28)),
+            Stroke::new(0.8_f32, TraktorTheme::BORDER_COLOR()),
         );
         painter.line_segment(
             [
                 Pos2::new(cap_rect.left() + 2.0, cap_y),
                 Pos2::new(cap_rect.right() - 2.0, cap_y),
             ],
-            Stroke::new(1.5_f32, Color32::from_rgb(210, 215, 222)),
+            Stroke::new(1.5_f32, TraktorTheme::TEXT_PRIMARY()),
         );
     }
 
@@ -221,7 +221,7 @@ pub fn crossfader(ui: &mut Ui, value: &mut f32, width: f32) -> Response {
             Pos2::new(slot_left, slot_y - 1.5),
             Pos2::new(slot_right, slot_y + 1.5),
         );
-        painter.rect_filled(slot_rect, 1.0, Color32::from_rgb(22, 23, 26));
+        painter.rect_filled(slot_rect, 1.0, TraktorTheme::BG_INPUT());
 
         // Center marker
         painter.line_segment(
@@ -229,25 +229,25 @@ pub fn crossfader(ui: &mut Ui, value: &mut f32, width: f32) -> Response {
                 Pos2::new(rect.center().x, slot_y - 5.0),
                 Pos2::new(rect.center().x, slot_y + 5.0),
             ],
-            Stroke::new(1.0_f32, TraktorTheme::TEXT_MUTED),
+            Stroke::new(1.0_f32, TraktorTheme::TEXT_MUTED()),
         );
 
         // Crossfader Cap
         let cap_x = slot_left + *value * slot_w;
         let cap_rect = Rect::from_center_size(Pos2::new(cap_x, slot_y), Vec2::new(12.0, 15.0));
 
-        painter.rect_filled(cap_rect, 1.5, Color32::from_rgb(66, 70, 76));
+        painter.rect_filled(cap_rect, 1.5, TraktorTheme::CONTROL_HOVER());
         painter.rect_stroke(
             cap_rect,
             1.5,
-            Stroke::new(0.8_f32, Color32::from_rgb(24, 25, 28)),
+            Stroke::new(0.8_f32, TraktorTheme::BORDER_COLOR()),
         );
         painter.line_segment(
             [
                 Pos2::new(cap_x, cap_rect.top() + 2.0),
                 Pos2::new(cap_x, cap_rect.bottom() - 2.0),
             ],
-            Stroke::new(1.5_f32, Color32::from_rgb(220, 224, 230)),
+            Stroke::new(1.5_f32, TraktorTheme::TEXT_PRIMARY()),
         );
     }
 
@@ -264,7 +264,7 @@ pub fn vu_meter(ui: &mut Ui, level_l: f32, level_r: f32, height: f32) {
     }
 
     let painter = ui.painter();
-    painter.rect_filled(rect, 1.0, TraktorTheme::METER_BG);
+    painter.rect_filled(rect, 1.0, TraktorTheme::METER_BG());
 
     let segments = 16;
     let seg_w = (width - 3.0) / 2.0;
@@ -278,14 +278,14 @@ pub fn vu_meter(ui: &mut Ui, level_l: f32, level_r: f32, height: f32) {
 
             let color = if seg_idx < lit_count {
                 if seg_idx >= segments - 2 {
-                    TraktorTheme::METER_RED
+                    TraktorTheme::METER_RED()
                 } else if seg_idx >= segments - 4 {
-                    TraktorTheme::METER_YELLOW
+                    TraktorTheme::METER_YELLOW()
                 } else {
-                    TraktorTheme::METER_GREEN
+                    TraktorTheme::METER_GREEN()
                 }
             } else {
-                Color32::from_rgb(35, 37, 41)
+                TraktorTheme::METER_GREEN().gamma_multiply(0.15)
             };
             painter.rect_filled(seg_rect, 0.0, color);
         }
@@ -295,32 +295,271 @@ pub fn vu_meter(ui: &mut Ui, level_l: f32, level_r: f32, height: f32) {
     draw_channel(rect.left() + 1.0 + seg_w + 1.0, level_r);
 }
 
-/// Maps 3-band `[low, mid, high]` amplitudes into Traktor Pro 4's signature "Spectrum" colors:
-/// - Outer silhouette: Periwinkle / Indigo / Sky-Blue highs & Teal-Sage mids
-/// - Inner body: Warm Olive-Gold / Amber mids & Coral-Orange bass transients
+/// Maps 3-band `[low, mid, high]` amplitudes into the active theme's `WAVEFORM_*` spectrum colors:
+/// - Outer silhouette: `WAVEFORM_HIGH` blended with `WAVEFORM_MID`
+/// - Inner body: `WAVEFORM_MID` blended with `WAVEFORM_LOW`
+/// - Core transients: `WAVEFORM_LOW`
 fn spectrum_colors(low: f32, mid: f32, high: f32) -> (Color32, Color32, Color32) {
-    // Outer band (Highs + Mids): blends between Periwinkle-Violet (118, 112, 212) and Sky-Teal (82, 168, 206)
+    let mix = |a: Color32, b: Color32, t: f32| -> Color32 {
+        Color32::from(egui::Rgba::from(a) * (1.0 - t) + egui::Rgba::from(b) * t)
+    };
+    let low_c = TraktorTheme::WAVEFORM_LOW();
+    let mid_c = TraktorTheme::WAVEFORM_MID();
+    let high_c = TraktorTheme::WAVEFORM_HIGH();
+
     let h_ratio = (high / (high + mid + 0.05)).clamp(0.0, 1.0);
-    let outer_r = (96.0 + 36.0 * (1.0 - h_ratio)) as u8;
-    let outer_g = (118.0 + 54.0 * h_ratio) as u8;
-    let outer_b = (208.0 + 18.0 * h_ratio) as u8;
-    let outer_col = Color32::from_rgba_unmultiplied(outer_r, outer_g, outer_b, 195);
+    let outer_col = mix(mid_c, high_c, 0.5 + 0.5 * h_ratio).gamma_multiply(195.0 / 255.0);
 
-    // Middle band (Mids + Harmonics): blends between Sage-Green (88, 178, 118) and Warm Gold (206, 174, 58)
     let m_ratio = (mid / (low + mid + 0.05)).clamp(0.0, 1.0);
-    let mid_r = (94.0 + 112.0 * (1.0 - m_ratio)) as u8;
-    let mid_g = (176.0 - 10.0 * (1.0 - m_ratio)) as u8;
-    let mid_b = (122.0 - 62.0 * (1.0 - m_ratio)) as u8;
-    let mid_col = Color32::from_rgba_unmultiplied(mid_r, mid_g, mid_b, 220);
+    let mid_col = mix(low_c, mid_c, 0.5 + 0.5 * m_ratio).gamma_multiply(220.0 / 255.0);
 
-    // Core band (Bass / Kick Transients): Warm Coral-Orange (218, 98, 52) to Warm Amber (226, 142, 54)
     let l_boost = low.clamp(0.0, 1.0);
-    let core_r = (205.0 + 22.0 * l_boost) as u8;
-    let core_g = (88.0 + 48.0 * (1.0 - l_boost)) as u8;
-    let core_b = 52;
-    let core_col = Color32::from_rgba_unmultiplied(core_r, core_g, core_b, 240);
+    let core_col = mix(mid_c, low_c, 0.65 + 0.35 * l_boost).gamma_multiply(240.0 / 255.0);
 
     (outer_col, mid_col, core_col)
+}
+
+/// Computes the quantized dot-matrix grid layout (`(cols, half_rows, pitch_x, pitch_y, radius)`)
+/// for `rect`, keeping the total circle count well under a few thousand shapes per frame.
+pub(crate) fn dot_grid_metrics(width: f32, height: f32, max_cols: usize, max_half_rows: usize) -> (usize, usize, f32, f32, f32) {
+    let pitch_x = (width / max_cols.max(1) as f32).max(5.5);
+    let cols = ((width / pitch_x).floor() as usize).clamp(1, max_cols.max(1));
+    let step_x = width / cols as f32;
+    let half_h = (height * 0.45).max(3.0);
+    let pitch_y = (half_h / max_half_rows.max(1) as f32).max(4.5);
+    let half_rows = ((half_h / pitch_y).floor() as usize).clamp(1, max_half_rows.max(1));
+    let step_y = half_h / half_rows as f32;
+    let radius = (step_x.min(step_y) * 0.34).clamp(1.1, 2.5);
+    (cols, half_rows, step_x, step_y, radius)
+}
+
+/// Quantises a `[0, 1]` amplitude into how many dot pairs (`0..=half_rows`) should light up.
+pub(crate) fn quantize_dot_rows(amp: f32, half_rows: usize) -> usize {
+    if half_rows == 0 || amp <= 0.02 {
+        return 0;
+    }
+    ((amp.clamp(0.0, 1.0) * half_rows as f32).ceil() as usize).clamp(1, half_rows)
+}
+
+/// Samples interpolated `[low, mid, high]` peak amplitudes at `time_sec` from `peaks`.
+fn sample_scrolling_3band(peaks: &[[f32; 3]], time_sec: f64) -> Option<(f32, f32, f32)> {
+    if peaks.is_empty() || time_sec < 0.0 {
+        return None;
+    }
+    let exact_idx = time_sec * PEAKS_PER_SEC as f64;
+    let idx0 = (exact_idx.floor() as usize) % peaks.len();
+    let idx1 = (idx0 + 1) % peaks.len();
+    let frac = exact_idx.fract() as f32;
+    let p0 = peaks[idx0];
+    let p1 = peaks[idx1];
+    Some((
+        p0[0] + (p1[0] - p0[0]) * frac,
+        p0[1] + (p1[1] - p0[1]) * frac,
+        p0[2] + (p1[2] - p0[2]) * frac,
+    ))
+}
+
+/// Draws a 3-band waveform inside `rect` in the given `style`.
+/// `sample_at_x` returns `Some((low, mid, high))` for a given `x` coordinate in `rect`.
+fn paint_3band_waveform(
+    painter: &egui::Painter,
+    rect: Rect,
+    playhead_x: f32,
+    style: crate::theme::WaveformStyle,
+    max_dot_cols: usize,
+    max_dot_half_rows: usize,
+    scroll_px: f64,
+    sample_at_x: impl Fn(f32) -> Option<(f32, f32, f32)>,
+) {
+    use crate::theme::WaveformStyle;
+    // Columns sit on fixed track positions and glide with the audio; screen-fixed columns shimmer.
+    let shift = |pitch: f32| scroll_px.rem_euclid(pitch as f64) as f32;
+    let painter = &painter.with_clip_rect(rect);
+    let center_y = rect.center().y;
+    let max_half_h = rect.height() * 0.45;
+
+    match style {
+        WaveformStyle::Classic => {
+            let col_w = 1.5_f32;
+            let cols = (rect.width() / col_w).ceil() as usize;
+            for i in 0..cols + 2 {
+                let col_x = rect.left() + (i as f32) * col_w - shift(col_w);
+                let Some((low_amp, mid_amp, high_amp)) = sample_at_x(col_x) else { continue };
+                let (outer_col, mid_col, core_col) = spectrum_colors(low_amp, mid_amp, high_amp);
+                let total_env = low_amp.max(mid_amp * 0.92).max(high_amp * 0.85);
+                let h_outer = (total_env * max_half_h).max(1.0);
+                painter.line_segment(
+                    [Pos2::new(col_x, center_y - h_outer), Pos2::new(col_x, center_y + h_outer)],
+                    Stroke::new(col_w, outer_col),
+                );
+                let h_mid = (mid_amp.max(low_amp * 0.75) * max_half_h * 0.72).max(0.8);
+                painter.line_segment(
+                    [Pos2::new(col_x, center_y - h_mid), Pos2::new(col_x, center_y + h_mid)],
+                    Stroke::new(col_w, mid_col),
+                );
+                let h_core = (low_amp * max_half_h * 0.46).max(0.5);
+                painter.line_segment(
+                    [Pos2::new(col_x, center_y - h_core), Pos2::new(col_x, center_y + h_core)],
+                    Stroke::new(col_w, core_col),
+                );
+            }
+        }
+        WaveformStyle::Dots => {
+            let (cols, half_rows, step_x, step_y, radius) =
+                dot_grid_metrics(rect.width(), rect.height(), max_dot_cols, max_dot_half_rows);
+            let unlit = crate::theme::mix(TraktorTheme::WAVEFORM_BG(), TraktorTheme::WAVEFORM_GRID(), 0.22);
+            let glow_w = (step_x * 4.5).max(18.0);
+            for c in 0..cols + 2 {
+                let col_x = rect.left() + (c as f32 + 0.5) * step_x - shift(step_x);
+                let near = (1.0 - ((col_x - playhead_x).abs() / glow_w)).clamp(0.0, 1.0);
+                let sampled = sample_at_x(col_x);
+                let (lit_outer, lit_mid, lit_core, outer_col, mid_col, core_col) =
+                    if let Some((low, mid, high)) = sampled {
+                        let (oc, mc, cc) = spectrum_colors(low, mid, high);
+                        let env = low.max(mid * 0.92).max(high * 0.85);
+                        let lo = quantize_dot_rows(env, half_rows);
+                        let lm = quantize_dot_rows(mid.max(low * 0.75) * 0.75, half_rows).min(lo);
+                        let lc = quantize_dot_rows(low * 0.52, half_rows).min(lm);
+                        (lo, lm, lc, oc, mc, cc)
+                    } else {
+                        (0, 0, 0, unlit, unlit, unlit)
+                    };
+                for r in 0..half_rows {
+                    let dy = (r as f32 + 0.5) * step_y;
+                    let col = if r < lit_core {
+                        core_col
+                    } else if r < lit_mid {
+                        mid_col
+                    } else if r < lit_outer {
+                        outer_col
+                    } else {
+                        unlit
+                    };
+                    let col = if r < lit_outer && near > 0.0 {
+                        crate::theme::mix(col, TraktorTheme::TEXT_HIGHLIGHT(), near * 0.42)
+                    } else if r >= lit_outer && near > 0.0 {
+                        crate::theme::mix(col, TraktorTheme::WAVEFORM_GRID(), near * 0.25)
+                    } else {
+                        col
+                    };
+                    let rad = if r < lit_outer && near > 0.0 { radius * (1.0 + 0.12 * near) } else { radius };
+                    painter.circle_filled(Pos2::new(col_x, center_y - dy), rad, col);
+                    painter.circle_filled(Pos2::new(col_x, center_y + dy), rad, col);
+                }
+            }
+        }
+        WaveformStyle::Bars => {
+            let pitch = if rect.height() <= 26.0 { 4.0_f32 } else { 5.0_f32 };
+            let bar_w = if rect.height() <= 26.0 { 2.4_f32 } else { 3.2_f32 };
+            let rounding = bar_w * 0.5;
+            let cols = (rect.width() / pitch).floor() as usize;
+            let glow_w = pitch * 4.0;
+            for c in 0..cols + 2 {
+                let col_x = rect.left() + (c as f32 + 0.5) * pitch - shift(pitch);
+                let Some((low, mid, high)) = sample_at_x(col_x) else { continue };
+                let (outer_col, mid_col, core_col) = spectrum_colors(low, mid, high);
+                let near = (1.0 - ((col_x - playhead_x).abs() / glow_w)).clamp(0.0, 1.0);
+                let boost = |col: Color32| {
+                    if near > 0.0 {
+                        crate::theme::mix(col, TraktorTheme::TEXT_HIGHLIGHT(), near * 0.35)
+                    } else {
+                        col
+                    }
+                };
+                let env = low.max(mid * 0.92).max(high * 0.85);
+                let h_outer = (env * max_half_h).max(1.5);
+                painter.rect_filled(
+                    Rect::from_center_size(Pos2::new(col_x, center_y), Vec2::new(bar_w, h_outer * 2.0)),
+                    rounding,
+                    boost(outer_col),
+                );
+                let h_mid = (mid.max(low * 0.75) * max_half_h * 0.68).max(1.0).min(h_outer);
+                painter.rect_filled(
+                    Rect::from_center_size(Pos2::new(col_x, center_y), Vec2::new(bar_w, h_mid * 2.0)),
+                    rounding,
+                    boost(mid_col),
+                );
+                if low > 0.12 {
+                    let h_core = (low * max_half_h * 0.42).max(0.8).min(h_mid);
+                    painter.rect_filled(
+                        Rect::from_center_size(Pos2::new(col_x, center_y), Vec2::new(bar_w, h_core * 2.0)),
+                        rounding,
+                        boost(core_col),
+                    );
+                }
+            }
+        }
+        WaveformStyle::Line => {
+            let step = 2.0_f32;
+            let cols = (rect.width() / step).ceil() as usize;
+            let mut prev: Option<(Pos2, Pos2, Color32)> = None;
+            for c in 0..=cols + 1 {
+                let col_x = (rect.left() + (c as f32) * step - shift(step)).min(rect.right());
+                if let Some((low, mid, high)) = sample_at_x(col_x) {
+                    let (outer_col, mid_col, core_col) = spectrum_colors(low, mid, high);
+                    let env = low.max(mid * 0.92).max(high * 0.85);
+                    let h = (env * max_half_h).max(0.8);
+                    let top = Pos2::new(col_x, center_y - h);
+                    let bot = Pos2::new(col_x, center_y + h);
+                    let stroke_col = if low > 0.55 {
+                        core_col
+                    } else if mid >= high {
+                        mid_col
+                    } else {
+                        outer_col
+                    };
+                    if let Some((p_top, p_bot, p_col)) = prev {
+                        let seg_col = crate::theme::mix(p_col, stroke_col, 0.5);
+                        painter.line_segment([p_top, top], Stroke::new(1.5_f32, seg_col));
+                        painter.line_segment([p_bot, bot], Stroke::new(1.5_f32, seg_col));
+                    }
+                    prev = Some((top, bot, stroke_col));
+                } else {
+                    prev = None;
+                }
+            }
+        }
+    }
+}
+
+/// Paints a small live preview of `style` inside `rect` for the Preferences > Look style cards.
+pub fn paint_waveform_style_preview(
+    painter: &egui::Painter,
+    rect: Rect,
+    style: crate::theme::WaveformStyle,
+) {
+    painter.rect_filled(rect, 4.0, TraktorTheme::WAVEFORM_BG());
+    painter.rect_stroke(rect, 4.0, Stroke::new(1.0_f32, TraktorTheme::BORDER_COLOR()));
+    let cy = rect.center().y;
+    let cx = rect.center().x;
+    painter.line_segment(
+        [Pos2::new(rect.left(), cy), Pos2::new(rect.right(), cy)],
+        Stroke::new(0.5_f32, TraktorTheme::WAVEFORM_GRID().gamma_multiply(0.35)),
+    );
+    let sample_at_x = |x: f32| -> Option<(f32, f32, f32)> {
+        let t = ((x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
+        // Synthetic 4-beat phrase with kick transients, mid chord body, and hi-hat offbeats
+        let beat_phase = (t * 4.0).fract();
+        let kick = (1.0 - beat_phase * 3.2).max(0.0).powi(2);
+        let offbeat = (1.0 - ((beat_phase - 0.5).abs() * 4.5)).max(0.0);
+        let phrase = 0.35 + 0.65 * (t * PI).sin();
+        let low = (kick * 0.92 + 0.12 * phrase).clamp(0.08, 0.98);
+        let mid = ((0.35 + 0.45 * (t * PI * 3.0).sin().abs()) * phrase + kick * 0.25).clamp(0.12, 0.92);
+        let high = (offbeat * 0.78 + 0.22 * (t * PI * 7.0).cos().abs()).clamp(0.08, 0.90);
+        Some((low, mid, high))
+    };
+    paint_3band_waveform(painter, rect, cx, style, 22, 4, 0.0, sample_at_x);
+    for b in 1..4 {
+        let bx = rect.left() + (b as f32 / 4.0) * rect.width();
+        painter.line_segment(
+            [Pos2::new(bx, rect.top()), Pos2::new(bx, rect.bottom())],
+            Stroke::new(0.6_f32, TraktorTheme::WAVEFORM_GRID().gamma_multiply(0.35)),
+        );
+    }
+    painter.line_segment(
+        [Pos2::new(cx, rect.top()), Pos2::new(cx, rect.bottom())],
+        Stroke::new(1.3_f32, TraktorTheme::WAVEFORM_PLAYHEAD()),
+    );
 }
 
 /// Real-Time 60 FPS Scrolling Traktor Pro 4 "Spectrum" Waveform Display
@@ -329,7 +568,9 @@ pub fn scrolling_waveform(
     ui: &mut Ui,
     elapsed_sec: f64,
     bpm: f64,
+    grid_offset_sec: f64,
     cues: &[(u8, f64)],
+    phrases: &[retraktor_library::Phrase],
     waveform_peaks: &[[f32; 3]],
     loop_active: bool,
     loop_start_sec: f64,
@@ -346,8 +587,8 @@ pub fn scrolling_waveform(
     }
 
     let painter = ui.painter();
-    painter.rect_filled(rect, 1.0, TraktorTheme::WAVEFORM_BG);
-    painter.rect_stroke(rect, 1.0, Stroke::new(1.0_f32, TraktorTheme::BORDER_COLOR));
+    painter.rect_filled(rect, 1.0, TraktorTheme::WAVEFORM_BG());
+    painter.rect_stroke(rect, 1.0, Stroke::new(1.0_f32, TraktorTheme::BORDER_COLOR()));
 
     let center_y = rect.center().y;
     let center_x = rect.center().x;
@@ -356,7 +597,7 @@ pub fn scrolling_waveform(
     // Subtle horizontal zero-crossing baseline
     painter.line_segment(
         [Pos2::new(rect.left(), center_y), Pos2::new(rect.right(), center_y)],
-        Stroke::new(0.5_f32, Color32::from_rgb(44, 47, 52)),
+        Stroke::new(0.5_f32, TraktorTheme::WAVEFORM_GRID().gamma_multiply(0.35)),
     );
 
     // 1. Active Loop Overlay
@@ -372,92 +613,30 @@ pub fn scrolling_waveform(
             painter.rect_filled(
                 loop_rect,
                 0.0,
-                Color32::from_rgba_unmultiplied(114, 182, 102, 28),
+                TraktorTheme::LOOP_ACTIVE().gamma_multiply(0.11),
             );
-            painter.rect_stroke(loop_rect, 0.0, Stroke::new(1.0_f32, TraktorTheme::LOOP_ACTIVE));
+            painter.rect_stroke(loop_rect, 0.0, Stroke::new(1.0_f32, TraktorTheme::LOOP_ACTIVE()));
         }
     }
 
-    // 2. Multi-Band Traktor Pro 4 "Spectrum" Waveform Columns (1.5px pitch for crisp detail)
+    // 2. Waveform body in active style
     let beat_len_sec = 60.0 / bpm.max(30.0);
-    let col_w = 1.5_f32;
-    let cols = (width / col_w).ceil() as usize;
-    let max_half_h = height * 0.45;
-
-    for i in 0..cols {
-        let col_x = rect.left() + (i as f32) * col_w;
+    let style = crate::theme::waveform_style();
+    let scroll_px = (elapsed_sec + ((rect.left() - center_x) / pixels_per_sec) as f64) * pixels_per_sec as f64;
+    paint_3band_waveform(painter, rect, center_x, style, 120, 7, scroll_px, |col_x| {
         let time_at_col = elapsed_sec + ((col_x - center_x) / pixels_per_sec) as f64;
-
-        if time_at_col < 0.0 {
-            continue;
-        }
-
-        let (low_amp, mid_amp, high_amp) = if !waveform_peaks.is_empty() {
-            let exact_idx = time_at_col * PEAKS_PER_SEC as f64;
-            let idx0 = (exact_idx.floor() as usize) % waveform_peaks.len();
-            let idx1 = (idx0 + 1) % waveform_peaks.len();
-            let frac = exact_idx.fract() as f32;
-            let p0 = waveform_peaks[idx0];
-            let p1 = waveform_peaks[idx1];
-            (
-                p0[0] + (p1[0] - p0[0]) * frac,
-                p0[1] + (p1[1] - p0[1]) * frac,
-                p0[2] + (p1[2] - p0[2]) * frac,
-            )
-        } else {
-            let phase = time_at_col * (bpm / 60.0) * 2.0 * PI as f64;
-            let beat_frac = (time_at_col / beat_len_sec).fract();
-            let kick_env = (-beat_frac * 9.5).exp() as f32;
-            let low = (kick_env * 0.82 + 0.12 * (phase * 0.5).sin().abs() as f32).clamp(0.03, 0.95);
-            let mid = ((phase * 2.0).sin().abs() * 0.42 + 0.15).clamp(0.03, 0.78) as f32;
-            let hat_phase = (time_at_col / (beat_len_sec * 0.5)).fract();
-            let high = ((-hat_phase * 14.0).exp() * 0.55 + 0.06) as f32;
-            (low, mid, high)
-        };
-
-        let (outer_col, mid_col, core_col) = spectrum_colors(low_amp, mid_amp, high_amp);
-        let total_env = low_amp.max(mid_amp * 0.92).max(high_amp * 0.85);
-
-        // Layer 1: Outer Periwinkle/Sky-Blue silhouette
-        let h_outer = (total_env * max_half_h).max(1.0);
-        painter.line_segment(
-            [
-                Pos2::new(col_x, center_y - h_outer),
-                Pos2::new(col_x, center_y + h_outer),
-            ],
-            Stroke::new(col_w, outer_col),
-        );
-
-        // Layer 2: Middle Sage/Gold harmonic body
-        let h_mid = (mid_amp.max(low_amp * 0.75) * max_half_h * 0.72).max(0.8);
-        painter.line_segment(
-            [
-                Pos2::new(col_x, center_y - h_mid),
-                Pos2::new(col_x, center_y + h_mid),
-            ],
-            Stroke::new(col_w, mid_col),
-        );
-
-        // Layer 3: Inner Warm Coral-Orange Bass/Kick core
-        let h_core = (low_amp * max_half_h * 0.46).max(0.5);
-        painter.line_segment(
-            [
-                Pos2::new(col_x, center_y - h_core),
-                Pos2::new(col_x, center_y + h_core),
-            ],
-            Stroke::new(col_w, core_col),
-        );
-    }
+        sample_scrolling_3band(waveform_peaks, time_at_col)
+    });
 
     // 3. Subtle Beatgrid Lines (drawn cleanly over the waveform like Traktor Pro 4)
     let visible_sec_half = (width / 2.0 / pixels_per_sec) as f64;
     let min_sec = (elapsed_sec - visible_sec_half).max(0.0);
     let max_sec = elapsed_sec + visible_sec_half;
-    let start_beat = (min_sec / beat_len_sec).floor() as i64;
-    let end_beat = (max_sec / beat_len_sec).ceil() as i64;
+    let start_beat = ((min_sec - grid_offset_sec) / beat_len_sec).floor() as i64;
+    let end_beat = ((max_sec - grid_offset_sec) / beat_len_sec).ceil() as i64;
 
     for b in start_beat..=end_beat {
-        let beat_time = b as f64 * beat_len_sec;
+        let beat_time = grid_offset_sec + b as f64 * beat_len_sec;
         let x = center_x + ((beat_time - elapsed_sec) as f32) * pixels_per_sec;
         if x < rect.left() || x > rect.right() {
             continue;
@@ -465,9 +644,9 @@ pub fn scrolling_waveform(
 
         let is_bar_start = b % 4 == 0;
         let stroke = if is_bar_start {
-            Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(230, 234, 240, 110))
+            Stroke::new(1.0_f32, TraktorTheme::WAVEFORM_GRID().gamma_multiply(0.5))
         } else {
-            Stroke::new(0.6_f32, Color32::from_rgba_unmultiplied(200, 205, 212, 42))
+            Stroke::new(0.6_f32, TraktorTheme::WAVEFORM_GRID().gamma_multiply(0.2))
         };
         painter.line_segment([Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())], stroke);
     }
@@ -484,26 +663,44 @@ pub fn scrolling_waveform(
         }
     }
 
+    // 4a. Phrase Boundaries (faint vertical line with 1-2 letter tag in dot font)
+    for phrase in phrases {
+        let px = center_x + ((phrase.start_sec - elapsed_sec) as f32) * pixels_per_sec;
+        if px >= rect.left() && px <= rect.right() {
+            painter.line_segment(
+                [Pos2::new(px, rect.top()), Pos2::new(px, rect.bottom())],
+                Stroke::new(0.8_f32, TraktorTheme::TEXT_MUTED().gamma_multiply(0.35)),
+            );
+            painter.text(
+                Pos2::new(px + 3.0, rect.top() + 3.0),
+                egui::Align2::LEFT_TOP,
+                phrase.kind.tag(),
+                crate::theme::dot_font(8.5),
+                TraktorTheme::TEXT_MUTED().gamma_multiply(0.75),
+            );
+        }
+    }
+
     // 5. Center Playhead Line (Traktor Red Vertical Hairline)
     painter.line_segment(
         [
             Pos2::new(center_x, rect.top()),
             Pos2::new(center_x, rect.bottom()),
         ],
-        Stroke::new(1.5_f32, TraktorTheme::WAVEFORM_PLAYHEAD),
+        Stroke::new(1.5_f32, TraktorTheme::WAVEFORM_PLAYHEAD()),
     );
 
     // Optional Subtle Deck Letter on Left Edge (used in Parallel layout)
     if let Some((badge_txt, _badge_col)) = deck_badge {
         let badge_rect =
             Rect::from_min_size(Pos2::new(rect.left() + 5.0, rect.top() + 5.0), Vec2::new(18.0, 16.0));
-        painter.rect_filled(badge_rect, 2.0, Color32::from_rgba_unmultiplied(45, 48, 54, 210));
+        painter.rect_filled(badge_rect, 2.0, TraktorTheme::BG_PANEL().gamma_multiply(0.85));
         painter.text(
             badge_rect.center(),
             egui::Align2::CENTER_CENTER,
             badge_txt,
             egui::FontId::proportional(11.0),
-            TraktorTheme::TEXT_PRIMARY,
+            TraktorTheme::TEXT_PRIMARY(),
         );
     }
 
@@ -517,7 +714,9 @@ pub fn scrolling_stem_waveforms(
     ui: &mut Ui,
     elapsed_sec: f64,
     bpm: f64,
+    grid_offset_sec: f64,
     cues: &[(u8, f64)],
+    phrases: &[retraktor_library::Phrase],
     stem_peaks: &[[f32; 4]],
     stem_volumes: &[f32; 4],
     stem_muted: &mut [bool; 4],
@@ -552,25 +751,25 @@ pub fn scrolling_stem_waveforms(
     }
 
     let painter = ui.painter();
-    painter.rect_filled(wave_rect, 1.0, TraktorTheme::WAVEFORM_BG);
-    painter.rect_filled(header_rect, 1.0, Color32::from_rgb(48, 51, 56));
-    painter.rect_stroke(rect, 1.0, Stroke::new(1.0_f32, TraktorTheme::BORDER_COLOR));
+    painter.rect_filled(wave_rect, 1.0, TraktorTheme::WAVEFORM_BG());
+    painter.rect_filled(header_rect, 1.0, TraktorTheme::BG_SECTION());
+    painter.rect_stroke(rect, 1.0, Stroke::new(1.0_f32, TraktorTheme::BORDER_COLOR()));
 
     let center_x = wave_rect.center().x;
     let pixels_per_sec = 92.0_f32;
 
-    // Authentic Traktor Pro 4 Stem Lane Colors (from Traktor Pro 4 Deck B screenshot)
+    // Stem lane colours derived from theme tokens
     let stem_core_colors = [
-        Color32::from_rgb(218, 102, 54), // 0: DRUMS (Warm Coral-Orange core)
-        Color32::from_rgb(214, 118, 42), // 1: BASS  (Deep Warm Amber-Orange)
-        Color32::from_rgb(86, 162, 188), // 2: OTHER (Soft Steel-Teal / Blue)
-        Color32::from_rgb(98, 182, 118), // 3: VOCALS (Soft Emerald-Sage Green)
+        TraktorTheme::WAVEFORM_LOW(),
+        crate::theme::mix(TraktorTheme::WAVEFORM_LOW(), TraktorTheme::WAVEFORM_MID(), 0.45),
+        TraktorTheme::WAVEFORM_HIGH(),
+        TraktorTheme::LOOP_ACTIVE(),
     ];
     let stem_outer_colors = [
-        Color32::from_rgba_unmultiplied(128, 114, 206, 185), // Drums Highs (Periwinkle)
-        Color32::from_rgba_unmultiplied(186, 82, 48, 185),   // Bass Outer
-        Color32::from_rgba_unmultiplied(112, 134, 204, 185), // Other Outer
-        Color32::from_rgba_unmultiplied(88, 164, 192, 185),  // Vocals Outer
+        crate::theme::mix(TraktorTheme::WAVEFORM_LOW(), TraktorTheme::WAVEFORM_HIGH(), 0.5).gamma_multiply(0.72),
+        TraktorTheme::WAVEFORM_LOW().gamma_multiply(0.72),
+        TraktorTheme::WAVEFORM_HIGH().gamma_multiply(0.72),
+        crate::theme::mix(TraktorTheme::LOOP_ACTIVE(), TraktorTheme::WAVEFORM_HIGH(), 0.4).gamma_multiply(0.72),
     ];
     let stem_labels = ["DRUMS", "BASS", "OTHER", "VOCALS"];
 
@@ -589,88 +788,177 @@ pub fn scrolling_stem_waveforms(
             painter.rect_filled(
                 loop_rect,
                 0.0,
-                Color32::from_rgba_unmultiplied(114, 182, 102, 24),
+                TraktorTheme::LOOP_ACTIVE().gamma_multiply(0.1),
             );
-            painter.rect_stroke(loop_rect, 0.0, Stroke::new(1.0_f32, TraktorTheme::LOOP_ACTIVE));
+            painter.rect_stroke(loop_rect, 0.0, Stroke::new(1.0_f32, TraktorTheme::LOOP_ACTIVE()));
         }
     }
 
-    // 2. Draw 4 Stem Waveform Ribbons
-    let col_w = 1.5_f32;
-    let cols = (wave_rect.width() / col_w).ceil() as usize;
+    // 2. Draw 4 Stem Waveform Ribbons in active style
     let max_lane_half = (lane_h * 0.44).max(2.0);
-
-    for i in 0..cols {
-        let col_x = wave_rect.left() + (i as f32) * col_w;
+    let sample_stems_at_x = |col_x: f32| -> Option<[f32; 4]> {
         let time_at_col = elapsed_sec + ((col_x - center_x) / pixels_per_sec) as f64;
-        if time_at_col < 0.0 {
-            continue;
+        if time_at_col < 0.0 || stem_peaks.is_empty() {
+            return None;
         }
+        let exact_idx = time_at_col * PEAKS_PER_SEC as f64;
+        let idx0 = (exact_idx.floor() as usize) % stem_peaks.len();
+        let idx1 = (idx0 + 1) % stem_peaks.len();
+        let frac = exact_idx.fract() as f32;
+        let p0 = stem_peaks[idx0];
+        let p1 = stem_peaks[idx1];
+        Some([
+            p0[0] + (p1[0] - p0[0]) * frac,
+            p0[1] + (p1[1] - p0[1]) * frac,
+            p0[2] + (p1[2] - p0[2]) * frac,
+            p0[3] + (p1[3] - p0[3]) * frac,
+        ])
+    };
 
-        let amps = if !stem_peaks.is_empty() {
-            let exact_idx = time_at_col * PEAKS_PER_SEC as f64;
-            let idx0 = (exact_idx.floor() as usize) % stem_peaks.len();
-            let idx1 = (idx0 + 1) % stem_peaks.len();
-            let frac = exact_idx.fract() as f32;
-            let p0 = stem_peaks[idx0];
-            let p1 = stem_peaks[idx1];
-            [
-                p0[0] + (p1[0] - p0[0]) * frac,
-                p0[1] + (p1[1] - p0[1]) * frac,
-                p0[2] + (p1[2] - p0[2]) * frac,
-                p0[3] + (p1[3] - p0[3]) * frac,
-            ]
-        } else {
-            [0.45, 0.5, 0.35, 0.3]
-        };
-
-        for lane in 0..4 {
-            let lane_cy = wave_rect.top() + (lane as f32 + 0.5) * lane_h;
-            let vol = if stem_muted[lane] {
-                0.15
-            } else {
-                stem_volumes[lane].clamp(0.1, 1.0)
-            };
-            let h_outer = amps[lane] * vol * max_lane_half;
-            let h_core = h_outer * 0.62;
-
-            if stem_muted[lane] {
-                painter.line_segment(
-                    [Pos2::new(col_x, lane_cy - h_outer), Pos2::new(col_x, lane_cy + h_outer)],
-                    Stroke::new(col_w, Color32::from_rgb(56, 59, 65)),
-                );
-            } else {
-                painter.line_segment(
-                    [Pos2::new(col_x, lane_cy - h_outer), Pos2::new(col_x, lane_cy + h_outer)],
-                    Stroke::new(col_w, stem_outer_colors[lane]),
-                );
-                painter.line_segment(
-                    [Pos2::new(col_x, lane_cy - h_core), Pos2::new(col_x, lane_cy + h_core)],
-                    Stroke::new(col_w, stem_core_colors[lane]),
-                );
+    let muted_col = TraktorTheme::WAVEFORM_GRID().gamma_multiply(0.4);
+    let scroll_px = (elapsed_sec + ((wave_rect.left() - center_x) / pixels_per_sec) as f64) * pixels_per_sec as f64;
+    let shift = |pitch: f32| scroll_px.rem_euclid(pitch as f64) as f32;
+    let full_painter = painter;
+    let painter = &full_painter.with_clip_rect(wave_rect);
+    match crate::theme::waveform_style() {
+        crate::theme::WaveformStyle::Classic => {
+            let col_w = 1.5_f32;
+            let cols = (wave_rect.width() / col_w).ceil() as usize;
+            for i in 0..cols + 2 {
+                let col_x = wave_rect.left() + (i as f32) * col_w - shift(col_w);
+                let Some(amps) = sample_stems_at_x(col_x) else { continue };
+                for lane in 0..4 {
+                    let lane_cy = wave_rect.top() + (lane as f32 + 0.5) * lane_h;
+                    let vol = if stem_muted[lane] { 0.15 } else { stem_volumes[lane].clamp(0.1, 1.0) };
+                    let h_outer = amps[lane] * vol * max_lane_half;
+                    let h_core = h_outer * 0.62;
+                    if stem_muted[lane] {
+                        painter.line_segment(
+                            [Pos2::new(col_x, lane_cy - h_outer), Pos2::new(col_x, lane_cy + h_outer)],
+                            Stroke::new(col_w, muted_col),
+                        );
+                    } else {
+                        painter.line_segment(
+                            [Pos2::new(col_x, lane_cy - h_outer), Pos2::new(col_x, lane_cy + h_outer)],
+                            Stroke::new(col_w, stem_outer_colors[lane]),
+                        );
+                        painter.line_segment(
+                            [Pos2::new(col_x, lane_cy - h_core), Pos2::new(col_x, lane_cy + h_core)],
+                            Stroke::new(col_w, stem_core_colors[lane]),
+                        );
+                    }
+                }
+            }
+        }
+        crate::theme::WaveformStyle::Dots => {
+            let (cols, half_rows, step_x, step_y, radius) =
+                dot_grid_metrics(wave_rect.width(), lane_h, 96, 3);
+            let unlit = crate::theme::mix(TraktorTheme::WAVEFORM_BG(), TraktorTheme::WAVEFORM_GRID(), 0.22);
+            let glow_w = (step_x * 4.5).max(18.0);
+            for c in 0..cols + 2 {
+                let col_x = wave_rect.left() + (c as f32 + 0.5) * step_x - shift(step_x);
+                let near = (1.0 - ((col_x - center_x).abs() / glow_w)).clamp(0.0, 1.0);
+                let amps = sample_stems_at_x(col_x);
+                for lane in 0..4 {
+                    let lane_cy = wave_rect.top() + (lane as f32 + 0.5) * lane_h;
+                    let vol = if stem_muted[lane] { 0.15 } else { stem_volumes[lane].clamp(0.1, 1.0) };
+                    let lit = amps.map(|a| quantize_dot_rows(a[lane] * vol, half_rows)).unwrap_or(0);
+                    let base_col = if stem_muted[lane] { muted_col } else { stem_core_colors[lane] };
+                    for r in 0..half_rows {
+                        let dy = (r as f32 + 0.5) * step_y;
+                        let col = if r < lit {
+                            if near > 0.0 {
+                                crate::theme::mix(base_col, TraktorTheme::TEXT_HIGHLIGHT(), near * 0.42)
+                            } else {
+                                base_col
+                            }
+                        } else if near > 0.0 {
+                            crate::theme::mix(unlit, TraktorTheme::WAVEFORM_GRID(), near * 0.25)
+                        } else {
+                            unlit
+                        };
+                        painter.circle_filled(Pos2::new(col_x, lane_cy - dy), radius, col);
+                        painter.circle_filled(Pos2::new(col_x, lane_cy + dy), radius, col);
+                    }
+                }
+            }
+        }
+        crate::theme::WaveformStyle::Bars => {
+            let pitch = 5.0_f32;
+            let bar_w = 3.2_f32;
+            let rounding = bar_w * 0.5;
+            let cols = (wave_rect.width() / pitch).floor() as usize;
+            let glow_w = pitch * 4.0;
+            for c in 0..cols + 2 {
+                let col_x = wave_rect.left() + (c as f32 + 0.5) * pitch - shift(pitch);
+                let Some(amps) = sample_stems_at_x(col_x) else { continue };
+                let near = (1.0 - ((col_x - center_x).abs() / glow_w)).clamp(0.0, 1.0);
+                for lane in 0..4 {
+                    let lane_cy = wave_rect.top() + (lane as f32 + 0.5) * lane_h;
+                    let vol = if stem_muted[lane] { 0.15 } else { stem_volumes[lane].clamp(0.1, 1.0) };
+                    let h_outer = (amps[lane] * vol * max_lane_half).max(1.0);
+                    let col = if stem_muted[lane] {
+                        muted_col
+                    } else if near > 0.0 {
+                        crate::theme::mix(stem_core_colors[lane], TraktorTheme::TEXT_HIGHLIGHT(), near * 0.35)
+                    } else {
+                        stem_core_colors[lane]
+                    };
+                    painter.rect_filled(
+                        Rect::from_center_size(Pos2::new(col_x, lane_cy), Vec2::new(bar_w, h_outer * 2.0)),
+                        rounding,
+                        col,
+                    );
+                }
+            }
+        }
+        crate::theme::WaveformStyle::Line => {
+            let step = 2.0_f32;
+            let cols = (wave_rect.width() / step).ceil() as usize;
+            let mut prev: [Option<(Pos2, Pos2)>; 4] = [None; 4];
+            for c in 0..=cols + 1 {
+                let col_x = (wave_rect.left() + (c as f32) * step - shift(step)).min(wave_rect.right());
+                if let Some(amps) = sample_stems_at_x(col_x) {
+                    for lane in 0..4 {
+                        let lane_cy = wave_rect.top() + (lane as f32 + 0.5) * lane_h;
+                        let vol = if stem_muted[lane] { 0.15 } else { stem_volumes[lane].clamp(0.1, 1.0) };
+                        let h = (amps[lane] * vol * max_lane_half).max(0.6);
+                        let top = Pos2::new(col_x, lane_cy - h);
+                        let bot = Pos2::new(col_x, lane_cy + h);
+                        let col = if stem_muted[lane] { muted_col } else { stem_core_colors[lane] };
+                        if let Some((p_top, p_bot)) = prev[lane] {
+                            painter.line_segment([p_top, top], Stroke::new(1.4_f32, col));
+                            painter.line_segment([p_bot, bot], Stroke::new(1.4_f32, col));
+                        }
+                        prev[lane] = Some((top, bot));
+                    }
+                } else {
+                    prev = [None; 4];
+                }
             }
         }
     }
+    let painter = full_painter;
 
     // 3. Beatgrid Lines in Waveform Area
     let beat_len_sec = 60.0 / bpm.max(30.0);
     let visible_sec_half = (wave_rect.width() / 2.0 / pixels_per_sec) as f64;
     let min_sec = (elapsed_sec - visible_sec_half).max(0.0);
     let max_sec = elapsed_sec + visible_sec_half;
-    let start_beat = (min_sec / beat_len_sec).floor() as i64;
-    let end_beat = (max_sec / beat_len_sec).ceil() as i64;
+    let start_beat = ((min_sec - grid_offset_sec) / beat_len_sec).floor() as i64;
+    let end_beat = ((max_sec - grid_offset_sec) / beat_len_sec).ceil() as i64;
 
     for b in start_beat..=end_beat {
-        let beat_time = b as f64 * beat_len_sec;
+        let beat_time = grid_offset_sec + b as f64 * beat_len_sec;
         let x = center_x + ((beat_time - elapsed_sec) as f32) * pixels_per_sec;
         if x < wave_rect.left() || x > wave_rect.right() {
             continue;
         }
         let is_bar_start = b % 4 == 0;
         let stroke = if is_bar_start {
-            Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(230, 234, 240, 100))
+            Stroke::new(1.0_f32, TraktorTheme::WAVEFORM_GRID().gamma_multiply(0.45))
         } else {
-            Stroke::new(0.5_f32, Color32::from_rgba_unmultiplied(200, 205, 212, 38))
+            Stroke::new(0.5_f32, TraktorTheme::WAVEFORM_GRID().gamma_multiply(0.18))
         };
         painter.line_segment(
             [Pos2::new(x, wave_rect.top()), Pos2::new(x, wave_rect.bottom())],
@@ -690,12 +978,30 @@ pub fn scrolling_stem_waveforms(
         }
     }
 
+    // 4a. Phrase Boundaries
+    for phrase in phrases {
+        let px = center_x + ((phrase.start_sec - elapsed_sec) as f32) * pixels_per_sec;
+        if px >= wave_rect.left() && px <= wave_rect.right() {
+            painter.line_segment(
+                [Pos2::new(px, wave_rect.top()), Pos2::new(px, wave_rect.bottom())],
+                Stroke::new(0.8_f32, TraktorTheme::TEXT_MUTED().gamma_multiply(0.35)),
+            );
+            painter.text(
+                Pos2::new(px + 3.0, wave_rect.top() + 3.0),
+                egui::Align2::LEFT_TOP,
+                phrase.kind.tag(),
+                crate::theme::dot_font(8.5),
+                TraktorTheme::TEXT_MUTED().gamma_multiply(0.75),
+            );
+        }
+    }
+
     painter.line_segment(
         [
             Pos2::new(center_x, wave_rect.top()),
             Pos2::new(center_x, wave_rect.bottom()),
         ],
-        Stroke::new(1.5_f32, TraktorTheme::WAVEFORM_PLAYHEAD),
+        Stroke::new(1.5_f32, TraktorTheme::WAVEFORM_PLAYHEAD()),
     );
 
     // 5. Left Stem Header Column (DRUMS / BASS / OTHER / VOCALS + Mini Knob/Mute Indicators)
@@ -704,7 +1010,7 @@ pub fn scrolling_stem_waveforms(
             Pos2::new(header_rect.right(), header_rect.top()),
             Pos2::new(header_rect.right(), header_rect.bottom()),
         ],
-        Stroke::new(1.0_f32, TraktorTheme::BORDER_COLOR),
+        Stroke::new(1.0_f32, TraktorTheme::BORDER_COLOR()),
     );
 
     for lane in 0..4 {
@@ -713,15 +1019,15 @@ pub fn scrolling_stem_waveforms(
         if lane > 0 {
             painter.line_segment(
                 [Pos2::new(rect.left(), top_y), Pos2::new(rect.right(), top_y)],
-                Stroke::new(0.8_f32, Color32::from_rgb(30, 32, 36)),
+                Stroke::new(0.8_f32, TraktorTheme::BORDER_COLOR()),
             );
         }
 
         let muted = stem_muted[lane];
         let text_col = if muted {
-            TraktorTheme::TEXT_MUTED
+            TraktorTheme::TEXT_MUTED()
         } else {
-            TraktorTheme::TEXT_PRIMARY
+            TraktorTheme::TEXT_PRIMARY()
         };
         painter.text(
             Pos2::new(header_rect.left() + 6.0, lane_cy),
@@ -739,29 +1045,18 @@ pub fn scrolling_stem_waveforms(
         painter.circle_stroke(
             ring1_c,
             ring_r,
-            Stroke::new(
-                1.1_f32,
-                if muted {
-                    Color32::from_rgb(80, 84, 92)
-                } else {
-                    Color32::from_rgb(205, 210, 218)
-                },
-            ),
+            Stroke::new(1.1_f32, text_col),
         );
         painter.circle_filled(
             Pos2::new(ring1_c.x + ring_r + 3.0, lane_cy + 1.5),
             1.6,
-            if muted {
-                Color32::from_rgb(75, 78, 84)
-            } else {
-                Color32::from_rgb(220, 224, 230)
-            },
+            text_col,
         );
 
         painter.circle_stroke(
             ring2_c,
             ring_r,
-            Stroke::new(1.1_f32, TraktorTheme::DECK_B),
+            Stroke::new(1.1_f32, TraktorTheme::DECK_B()),
         );
     }
 
@@ -776,6 +1071,7 @@ pub fn stripe_overview(
     total_len_sec: f64,
     waveform_peaks: &[[f32; 3]],
     cues: &[(u8, f64)],
+    phrases: &[retraktor_library::Phrase],
     loop_active: bool,
     loop_start_sec: f64,
     loop_len_sec: f64,
@@ -798,40 +1094,52 @@ pub fn stripe_overview(
 
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
-        painter.rect_filled(rect, 1.0, Color32::from_rgb(28, 30, 33));
-        painter.rect_stroke(rect, 1.0, Stroke::new(1.0_f32, TraktorTheme::BORDER_COLOR));
+        painter.rect_filled(rect, 1.0, TraktorTheme::WAVEFORM_BG());
+        painter.rect_stroke(rect, 1.0, Stroke::new(1.0_f32, TraktorTheme::BORDER_COLOR()));
 
         let norm_pos = (*elapsed_sec / total).clamp(0.0, 1.0) as f32;
         let scrub_x = rect.left() + norm_pos * rect.width();
         let cy = rect.center().y;
+        let style = crate::theme::waveform_style();
 
-        // Overview spectrum waveform columns (high density)
-        let cols = (rect.width() / 1.5).ceil() as usize;
-        for c in 0..cols {
-            let x = rect.left() + (c as f32) * 1.5;
-            let frac = c as f32 / cols.max(1) as f32;
-            let (low, mid, high) = if !waveform_peaks.is_empty() {
-                let idx = ((frac * waveform_peaks.len() as f32) as usize)
-                    .min(waveform_peaks.len() - 1);
+        if style == crate::theme::WaveformStyle::Classic {
+            // Overview spectrum waveform columns (high density)
+            let cols = (rect.width() / 1.5).ceil() as usize;
+            for c in 0..cols {
+                let x = rect.left() + (c as f32) * 1.5;
+                let frac = c as f32 / cols.max(1) as f32;
+                let (low, mid, high) = if !waveform_peaks.is_empty() {
+                    let idx = ((frac * waveform_peaks.len() as f32) as usize)
+                        .min(waveform_peaks.len() - 1);
+                    let p = waveform_peaks[idx];
+                    (p[0], p[1], p[2])
+                } else {
+                    continue;
+                };
+
+                let (outer_col, mid_col, core_col) = spectrum_colors(low, mid, high);
+                let h_outer = ((low.max(mid).max(high)) * (height - 6.0) * 0.5).max(1.0);
+                let h_core = (low * (height - 6.0) * 0.28).max(0.5);
+
+                painter.line_segment(
+                    [Pos2::new(x, cy - h_outer), Pos2::new(x, cy + h_outer)],
+                    Stroke::new(1.2_f32, outer_col),
+                );
+                painter.line_segment(
+                    [Pos2::new(x, cy - h_core), Pos2::new(x, cy + h_core)],
+                    Stroke::new(1.2_f32, if low > 0.55 { core_col } else { mid_col }),
+                );
+            }
+        } else {
+            paint_3band_waveform(painter, rect, scrub_x, style, 64, 2, 0.0, |col_x| {
+                if waveform_peaks.is_empty() {
+                    return None;
+                }
+                let frac = ((col_x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
+                let idx = ((frac * waveform_peaks.len() as f32) as usize).min(waveform_peaks.len() - 1);
                 let p = waveform_peaks[idx];
-                (p[0], p[1], p[2])
-            } else {
-                let env = (frac * 6.0 * PI).sin().abs() * 0.55 + 0.2;
-                (env * 0.8, env * 0.7, env * 0.6)
-            };
-
-            let (outer_col, mid_col, core_col) = spectrum_colors(low, mid, high);
-            let h_outer = ((low.max(mid).max(high)) * (height - 6.0) * 0.5).max(1.0);
-            let h_core = (low * (height - 6.0) * 0.28).max(0.5);
-
-            painter.line_segment(
-                [Pos2::new(x, cy - h_outer), Pos2::new(x, cy + h_outer)],
-                Stroke::new(1.2_f32, outer_col),
-            );
-            painter.line_segment(
-                [Pos2::new(x, cy - h_core), Pos2::new(x, cy + h_core)],
-                Stroke::new(1.2_f32, if low > 0.55 { core_col } else { mid_col }),
-            );
+                Some((p[0], p[1], p[2]))
+            });
         }
 
         // Minute markers along top of stripe (like Traktor Pro 4)
@@ -840,7 +1148,7 @@ pub fn stripe_overview(
             let mx = rect.left() + ((m as f64 * 60.0 / total) as f32) * rect.width();
             painter.line_segment(
                 [Pos2::new(mx, rect.top()), Pos2::new(mx, rect.top() + 4.0)],
-                Stroke::new(1.0_f32, Color32::from_rgb(160, 165, 175)),
+                Stroke::new(1.0_f32, TraktorTheme::WAVEFORM_GRID()),
             );
         }
 
@@ -851,6 +1159,22 @@ pub fn stripe_overview(
             painter.line_segment(
                 [Pos2::new(cx, rect.top()), Pos2::new(cx, rect.bottom())],
                 Stroke::new(1.0_f32, col),
+            );
+        }
+
+        // Phrase boundaries on Stripe: thin ticks with 1-2 letter tag in dot font
+        for phrase in phrases {
+            let px = rect.left() + ((phrase.start_sec / total).clamp(0.0, 1.0) as f32) * rect.width();
+            painter.line_segment(
+                [Pos2::new(px, rect.top()), Pos2::new(px, rect.top() + 7.0)],
+                Stroke::new(0.8_f32, TraktorTheme::TEXT_MUTED().gamma_multiply(0.70)),
+            );
+            painter.text(
+                Pos2::new(px + 2.0, rect.top() + 1.0),
+                egui::Align2::LEFT_TOP,
+                phrase.kind.tag(),
+                crate::theme::dot_font(7.5),
+                TraktorTheme::TEXT_MUTED().gamma_multiply(0.85),
             );
         }
 
@@ -866,9 +1190,9 @@ pub fn stripe_overview(
             painter.rect_filled(
                 loop_rect,
                 1.0,
-                Color32::from_rgba_unmultiplied(114, 182, 102, 35),
+                TraktorTheme::LOOP_ACTIVE().gamma_multiply(0.14),
             );
-            painter.rect_stroke(loop_rect, 1.0, Stroke::new(1.0_f32, TraktorTheme::LOOP_ACTIVE));
+            painter.rect_stroke(loop_rect, 1.0, Stroke::new(1.0_f32, TraktorTheme::LOOP_ACTIVE()));
         }
 
         // Translucent Playhead Window Box + Red Center Hairline (matching Traktor Pro 4 stripe)
@@ -880,11 +1204,11 @@ pub fn stripe_overview(
         painter.rect_filled(
             win_rect,
             1.0,
-            Color32::from_rgba_unmultiplied(230, 235, 242, 32),
+            TraktorTheme::WAVEFORM_GRID().gamma_multiply(0.15),
         );
         painter.line_segment(
             [Pos2::new(scrub_x, rect.top()), Pos2::new(scrub_x, rect.bottom())],
-            Stroke::new(1.5_f32, TraktorTheme::WAVEFORM_PLAYHEAD),
+            Stroke::new(1.5_f32, TraktorTheme::WAVEFORM_PLAYHEAD()),
         );
     }
 
@@ -899,15 +1223,15 @@ pub fn cue_pad(ui: &mut Ui, index: usize, has_cue: bool, active: bool, width: f3
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
         let bg = if active {
-            TraktorTheme::DECK_A
+            TraktorTheme::DECK_A()
         } else if has_cue {
-            Color32::from_rgb(64, 68, 74)
+            TraktorTheme::CONTROL_HOVER()
         } else {
-            Color32::from_rgb(52, 55, 60)
+            TraktorTheme::HOTCUE_EMPTY()
         };
 
         painter.rect_filled(rect, 1.0, bg);
-        painter.rect_stroke(rect, 1.0, Stroke::new(0.8_f32, TraktorTheme::BORDER_COLOR));
+        painter.rect_stroke(rect, 1.0, Stroke::new(0.8_f32, TraktorTheme::BORDER_COLOR()));
 
         // Subtle bottom accent bar when a cue/state is stored
         if has_cue {
@@ -920,11 +1244,11 @@ pub fn cue_pad(ui: &mut Ui, index: usize, has_cue: bool, active: bool, width: f3
         }
 
         let text_color = if active {
-            Color32::BLACK
+            TraktorTheme::BG_INPUT()
         } else if has_cue {
-            TraktorTheme::TEXT_PRIMARY
+            TraktorTheme::TEXT_PRIMARY()
         } else {
-            TraktorTheme::TEXT_MUTED
+            TraktorTheme::TEXT_MUTED()
         };
 
         painter.text(
@@ -937,6 +1261,56 @@ pub fn cue_pad(ui: &mut Ui, index: usize, has_cue: bool, active: bool, width: f3
     }
 
     response
+}
+
+/// Small vector icons drawn with the painter, so they render identically on every system font.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Icon {
+    Play,
+    Pause,
+    Prev,
+    Next,
+    Dot,
+}
+
+/// Paints `icon` centred in `rect`.
+pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
+    let c = rect.center();
+    let r = rect.width().min(rect.height()) * 0.3;
+    let tri = |pts: [Pos2; 3]| egui::Shape::convex_polygon(pts.to_vec(), color, Stroke::NONE);
+    match icon {
+        Icon::Play => {
+            painter.add(tri([Pos2::new(c.x - r * 0.75, c.y - r), Pos2::new(c.x + r, c.y), Pos2::new(c.x - r * 0.75, c.y + r)]));
+        }
+        Icon::Pause => {
+            for dx in [-r * 0.5, r * 0.5] {
+                painter.rect_filled(Rect::from_center_size(Pos2::new(c.x + dx, c.y), Vec2::new(r * 0.55, r * 2.0)), 1.0, color);
+            }
+        }
+        Icon::Prev => {
+            painter.add(tri([Pos2::new(c.x + r * 0.6, c.y - r * 0.8), Pos2::new(c.x - r * 0.6, c.y), Pos2::new(c.x + r * 0.6, c.y + r * 0.8)]));
+        }
+        Icon::Next => {
+            painter.add(tri([Pos2::new(c.x - r * 0.6, c.y - r * 0.8), Pos2::new(c.x + r * 0.6, c.y), Pos2::new(c.x - r * 0.6, c.y + r * 0.8)]));
+        }
+        Icon::Dot => {
+            painter.circle_filled(c, r * 0.6, color);
+        }
+    }
+}
+
+/// Button showing a painted icon, optionally followed by a label.
+pub fn icon_button(ui: &mut Ui, icon: Icon, label: &str, fill: Color32, fg: Color32, min_size: Vec2) -> Response {
+    // Leading spaces reserve room for the icon when there's a label.
+    let text = if label.is_empty() { String::new() } else { format!("    {label}") };
+    let resp = ui.add(egui::Button::new(RichText::new(text).color(fg).size(11.5)).fill(fill).min_size(min_size));
+    let icon_rect = if label.is_empty() {
+        resp.rect
+    } else {
+        Rect::from_min_size(resp.rect.min + Vec2::new(4.0, 0.0), Vec2::new(resp.rect.height() * 0.8, resp.rect.height()))
+    };
+    paint_icon(ui.painter(), icon_rect, icon, fg);
+    resp
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -957,34 +1331,30 @@ pub fn deck_transport_bar(
     flux_active: bool,
     loop_active: bool,
     current_loop_beats: u32,
+    compact: bool,
 ) -> Option<TransportAction> {
     let mut action = None;
+    let active_fg = if crate::theme::palette().is_dark() {
+        TraktorTheme::BG_WINDOW()
+    } else {
+        TraktorTheme::TEXT_HIGHLIGHT()
+    };
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing = Vec2::new(3.0, 0.0);
 
         let play_color = if is_playing {
-            TraktorTheme::PLAY_ACTIVE
+            TraktorTheme::PLAY_ACTIVE()
         } else {
-            TraktorTheme::PLAY_INACTIVE
+            TraktorTheme::PLAY_INACTIVE()
         };
         let play_text_color = if is_playing {
-            Color32::BLACK
+            active_fg
         } else {
-            TraktorTheme::TEXT_PRIMARY
+            TraktorTheme::TEXT_PRIMARY()
         };
-        if ui
-            .add(
-                egui::Button::new(
-                    RichText::new("▶")
-                        .color(play_text_color)
-                        .font(egui::FontId::proportional(12.0))
-                        .strong(),
-                )
-                .fill(play_color)
-                .stroke(Stroke::new(0.5_f32, TraktorTheme::BORDER_COLOR))
-                .min_size(Vec2::new(34.0, 22.0)),
-            )
-            .on_hover_text("Play / Pause Deck (Space)")
+        let play_icon = if is_playing { Icon::Pause } else { Icon::Play };
+        if icon_button(ui, play_icon, "", play_color, play_text_color, Vec2::new(34.0, 22.0))
+            .on_hover_text(if is_playing { "Pause (Space)" } else { "Play (Space)" })
             .clicked()
         {
             action = Some(TransportAction::TogglePlay);
@@ -994,12 +1364,12 @@ pub fn deck_transport_bar(
             .add(
                 egui::Button::new(
                     RichText::new("CUE")
-                        .color(TraktorTheme::TEXT_PRIMARY)
+                        .color(TraktorTheme::TEXT_PRIMARY())
                         .font(egui::FontId::monospace(9.5))
                         .strong(),
                 )
-                .fill(TraktorTheme::CUE_INACTIVE)
-                .stroke(Stroke::new(0.5_f32, TraktorTheme::BORDER_COLOR))
+                .fill(TraktorTheme::CUE_INACTIVE())
+                .stroke(Stroke::new(0.5_f32, TraktorTheme::BORDER_COLOR()))
                 .min_size(Vec2::new(34.0, 22.0)),
             )
             .on_hover_text("Jump to Cue 1")
@@ -1008,15 +1378,15 @@ pub fn deck_transport_bar(
             action = Some(TransportAction::Cue);
         }
 
-        if ui
+        if !compact && ui
             .add(
                 egui::Button::new(
                     RichText::new("CUP")
-                        .color(TraktorTheme::TEXT_SECONDARY)
+                        .color(TraktorTheme::TEXT_SECONDARY())
                         .font(egui::FontId::monospace(9.0)),
                 )
-                .fill(TraktorTheme::CUE_INACTIVE)
-                .stroke(Stroke::new(0.5_f32, TraktorTheme::BORDER_COLOR))
+                .fill(TraktorTheme::CUE_INACTIVE())
+                .stroke(Stroke::new(0.5_f32, TraktorTheme::BORDER_COLOR()))
                 .min_size(Vec2::new(32.0, 22.0)),
             )
             .on_hover_text("Cue Play (Jump to Cue 1 & Play)")
@@ -1025,24 +1395,24 @@ pub fn deck_transport_bar(
             action = Some(TransportAction::Cup);
         }
 
-        if ui
+        if !compact && ui
             .add(
                 egui::Button::new(
                     RichText::new("FLX")
                         .color(if flux_active {
-                            Color32::BLACK
+                            active_fg
                         } else {
-                            TraktorTheme::TEXT_SECONDARY
+                            TraktorTheme::TEXT_SECONDARY()
                         })
                         .font(egui::FontId::monospace(9.0))
                         .strong(),
                 )
                 .fill(if flux_active {
-                    TraktorTheme::FLUX_ACTIVE
+                    TraktorTheme::FLUX_ACTIVE()
                 } else {
-                    TraktorTheme::CUE_INACTIVE
+                    TraktorTheme::CUE_INACTIVE()
                 })
-                .stroke(Stroke::new(0.5_f32, TraktorTheme::BORDER_COLOR))
+                .stroke(Stroke::new(0.5_f32, TraktorTheme::BORDER_COLOR()))
                 .min_size(Vec2::new(30.0, 22.0)),
             )
             .on_hover_text("Toggle Flux / Slip Mode")
@@ -1053,38 +1423,32 @@ pub fn deck_transport_bar(
 
         ui.separator();
 
-        if ui
-            .add(
-                egui::Button::new(
-                    RichText::new("◄")
-                        .color(TraktorTheme::TEXT_SECONDARY)
-                        .font(egui::FontId::monospace(8.5)),
-                )
-                .fill(Color32::from_rgb(48, 51, 57))
-                .min_size(Vec2::new(18.0, 22.0)),
-            )
-            .on_hover_text("Halve Loop Size (/2)")
+        let chevron_fill = TraktorTheme::CONTROL();
+        if icon_button(ui, Icon::Prev, "", chevron_fill, TraktorTheme::TEXT_SECONDARY(), Vec2::new(18.0, 22.0))
+            .on_hover_text("Halve loop length")
             .clicked()
         {
             action = Some(TransportAction::HalveLoop);
         }
 
-        for beats in [1u32, 2, 4, 8, 16] {
+        // Compact decks show only the current loop length; it toggles the loop.
+        let sizes: &[u32] = if compact { std::slice::from_ref(&current_loop_beats) } else { &[1, 2, 4, 8, 16] };
+        for &beats in sizes {
             let is_selected_size = current_loop_beats == beats;
             let is_active_loop = loop_active && is_selected_size;
             let fill = if is_active_loop {
-                TraktorTheme::LOOP_ACTIVE
+                TraktorTheme::LOOP_ACTIVE()
             } else if is_selected_size {
-                Color32::from_rgb(64, 68, 76)
+                TraktorTheme::CONTROL_HOVER()
             } else {
-                Color32::from_rgb(46, 49, 55)
+                TraktorTheme::CONTROL()
             };
             let fg = if is_active_loop {
-                Color32::BLACK
+                active_fg
             } else if is_selected_size {
-                TraktorTheme::LOOP_ACTIVE
+                TraktorTheme::LOOP_ACTIVE()
             } else {
-                TraktorTheme::TEXT_SECONDARY
+                TraktorTheme::TEXT_SECONDARY()
             };
             if ui
                 .add(
@@ -1097,23 +1461,15 @@ pub fn deck_transport_bar(
                     .fill(fill)
                     .min_size(Vec2::new(20.0, 22.0)),
                 )
+                .on_hover_text(format!("Loop {beats} beats (L)"))
                 .clicked()
             {
                 action = Some(TransportAction::SelectLoop(beats));
             }
         }
 
-        if ui
-            .add(
-                egui::Button::new(
-                    RichText::new("►")
-                        .color(TraktorTheme::TEXT_SECONDARY)
-                        .font(egui::FontId::monospace(8.5)),
-                )
-                .fill(Color32::from_rgb(48, 51, 57))
-                .min_size(Vec2::new(18.0, 22.0)),
-            )
-            .on_hover_text("Double Loop Size (*2)")
+        if icon_button(ui, Icon::Next, "", chevron_fill, TraktorTheme::TEXT_SECONDARY(), Vec2::new(18.0, 22.0))
+            .on_hover_text("Double loop length")
             .clicked()
         {
             action = Some(TransportAction::DoubleLoop);
@@ -1128,7 +1484,7 @@ pub fn render_shortcuts_hud(ctx: &egui::Context, is_open: &mut bool) {
         return;
     }
 
-    egui::Window::new("⌨ ReTraktor Live Performance Keyboard Matrix")
+    egui::Window::new("Keyboard shortcuts")
         .open(is_open)
         .collapsible(false)
         .resizable(false)
@@ -1136,8 +1492,8 @@ pub fn render_shortcuts_hud(ctx: &egui::Context, is_open: &mut bool) {
         .default_width(680.0)
         .frame(
             egui::Frame::window(&ctx.style())
-                .fill(Color32::from_rgb(26, 28, 32))
-                .stroke(Stroke::new(1.0_f32, TraktorTheme::BORDER_ACCENT))
+                .fill(TraktorTheme::BG_PANEL())
+                .stroke(Stroke::new(1.0_f32, TraktorTheme::BORDER_ACCENT()))
                 .rounding(6.0)
                 .inner_margin(16.0),
         )
@@ -1145,14 +1501,14 @@ pub fn render_shortcuts_hud(ctx: &egui::Context, is_open: &mut bool) {
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new("LIVE PERFORMANCE SHORTCUTS")
-                        .color(TraktorTheme::TEXT_PRIMARY)
+                        .color(TraktorTheme::TEXT_PRIMARY())
                         .font(egui::FontId::monospace(14.0))
                         .strong(),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
                         RichText::new("Press Esc or ? to close")
-                            .color(TraktorTheme::TEXT_MUTED)
+                            .color(TraktorTheme::TEXT_MUTED())
                             .font(egui::FontId::proportional(11.0)),
                     );
                 });
@@ -1162,78 +1518,79 @@ pub fn render_shortcuts_hud(ctx: &egui::Context, is_open: &mut bool) {
             ui.add_space(8.0);
 
             ui.columns(3, |cols| {
-                // Column 1: Deck A & Deck B Transports
+                let key_row = |ui: &mut Ui, key: &str, desc: &str, col: Color32| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(format!("[ {key} ]"))
+                                .color(col)
+                                .font(egui::FontId::monospace(10.5))
+                                .strong(),
+                        );
+                        ui.label(RichText::new(desc).color(TraktorTheme::TEXT_PRIMARY()).font(egui::FontId::proportional(11.0)));
+                    });
+                };
+
+                // Column 1: Transport & Stems
                 cols[0].vertical(|ui| {
-                    ui.label(RichText::new("DECK A (Primary Left)").color(TraktorTheme::DECK_A).strong());
+                    ui.label(RichText::new("TRANSPORT & STEMS (Shift = Deck B)").color(TraktorTheme::DECK_A()).strong());
                     ui.add_space(4.0);
-                    let key_row = |ui: &mut Ui, key: &str, desc: &str| {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(format!("[ {key} ]"))
-                                    .color(TraktorTheme::PLAY_ACTIVE)
-                                    .font(egui::FontId::monospace(11.0))
-                                    .strong(),
-                            );
-                            ui.label(RichText::new(desc).color(TraktorTheme::TEXT_PRIMARY).font(egui::FontId::proportional(11.5)));
-                        });
-                    };
-                    key_row(ui, "Space", "Play / Pause Deck A");
-                    key_row(ui, "C", "Cue Deck A");
-                    key_row(ui, "S", "Sync Deck A BPM");
-                    key_row(ui, "1..4", "Hotcues 1 to 4");
-
-                    ui.add_space(12.0);
-                    ui.label(RichText::new("DECK B (Primary Right)").color(TraktorTheme::DECK_B).strong());
-                    ui.add_space(4.0);
-                    key_row(ui, "Shift+Space", "Play / Pause Deck B");
-                    key_row(ui, "Shift+C", "Cue Deck B");
-                    key_row(ui, "Shift+S", "Sync Deck B BPM");
-                    key_row(ui, "5..8", "Hotcues 1 to 4");
+                    let c = TraktorTheme::PLAY_ACTIVE();
+                    key_row(ui, "Space / Shift+Space", "Play / Pause A / B", c);
+                    key_row(ui, "C / Shift+C", "Cue 1 Deck A / B", c);
+                    key_row(ui, "S / Shift+S", "Sync BPM & Phase A / B", c);
+                    key_row(ui, "L / Shift+L", "Loop On / Off A / B", c);
+                    key_row(ui, "1..4 / 5..8", "Hotcues 1..4 A / B", c);
+                    key_row(ui, "K / Shift+K", "Auto Cues Deck A / B", c);
+                    key_row(ui, "T / Shift+T", "EQ / Stems View A / B", c);
+                    key_row(ui, "G / Shift+G", "Create Demucs AI Stems A / B", c);
+                    key_row(ui, "Q W E R", "Mute Stems 1..4 (Deck A)", c);
+                    key_row(ui, "Shift+Q W E R", "Mute Stems 1..4 (Deck B)", c);
                 });
 
-                // Column 2: Workspace Layouts
+                // Column 2: Mixer, EQ, Filter & FX
                 cols[1].vertical(|ui| {
-                    ui.label(RichText::new("WORKSPACE LAYOUTS").color(TraktorTheme::TEXT_PRIMARY).strong());
+                    ui.label(RichText::new("MIXER, EQ, FILTER & FX").color(TraktorTheme::DECK_B()).strong());
                     ui.add_space(4.0);
-                    let layout_row = |ui: &mut Ui, key: &str, desc: &str| {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(format!("[ {key} ]"))
-                                    .color(Color32::from_rgb(180, 200, 240))
-                                    .font(egui::FontId::monospace(11.0))
-                                    .strong(),
-                            );
-                            ui.label(RichText::new(desc).color(TraktorTheme::TEXT_PRIMARY).font(egui::FontId::proportional(11.5)));
-                        });
-                    };
-                    layout_row(ui, "F1", "Parallel Full Waveforms");
-                    layout_row(ui, "F2", "Essential Compact");
-                    layout_row(ui, "F3", "Extended Mixer & FX");
-                    layout_row(ui, "F4", "Four-Deck Full Mix");
-                    layout_row(ui, "F5", "4-Stem Isolation View");
-                    layout_row(ui, "F6", "Full Music Browser");
+                    let c = TraktorTheme::ACCENT();
+                    key_row(ui, "Z X V", "EQ Kill Low / Mid / Hi (A)", c);
+                    key_row(ui, "Shift+Z X V", "EQ Kill Low / Mid / Hi (B)", c);
+                    key_row(ui, "H / Shift+H", "Headphone Cue On / Off A / B", c);
+                    key_row(ui, "F / Shift+F", "Filter On / Off A / B", c);
+                    key_row(ui, "D / Shift+D", "FX Unit On / Off A / B", c);
+                    key_row(ui, "- / =", "Channel Fader Down / Up (A)", c);
+                    key_row(ui, "Shift+- / +", "Channel Fader Down / Up (B)", c);
+                    key_row(ui, "[ / \\ / ]", "Crossfader Left / Centre / Right", c);
                 });
 
-                // Column 3: Mixer, FX & Stems
+                // Column 3: Layouts & System
                 cols[2].vertical(|ui| {
-                    ui.label(RichText::new("SYSTEM & STEMS").color(TraktorTheme::TEXT_PRIMARY).strong());
+                    ui.label(RichText::new("LAYOUTS & SYSTEM").color(TraktorTheme::TEXT_PRIMARY()).strong());
                     ui.add_space(4.0);
-                    let sys_row = |ui: &mut Ui, key: &str, desc: &str| {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(format!("[ {key} ]"))
-                                    .color(Color32::from_rgb(240, 200, 140))
-                                    .font(egui::FontId::monospace(11.0))
-                                    .strong(),
-                            );
-                            ui.label(RichText::new(desc).color(TraktorTheme::TEXT_PRIMARY).font(egui::FontId::proportional(11.5)));
-                        });
-                    };
-                    sys_row(ui, "Cmd / Ctrl + ,", "Preferences & Setup");
-                    sys_row(ui, "?", "Toggle Shortcuts HUD");
-                    sys_row(ui, "Esc", "Dismiss HUD / Modals");
-                    sys_row(ui, "Click Platter", "Vinyl Scratch / Stop");
-                    sys_row(ui, "✦ Stems", "Separate Audio via AI");
+                    let c = TraktorTheme::ACCENT();
+                    key_row(ui, "F1", "Mix (Parallel Waveforms)", c);
+                    key_row(ui, "F2", "4-Deck Full Mix", c);
+                    key_row(ui, "F3", "Browser (Full Library)", c);
+                    key_row(ui, "F4", "Timeline Studio", c);
+                    key_row(ui, "F5", "Set Workflow (Build)", c);
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("SET & PERFORM").color(TraktorTheme::DECK_B()).strong());
+                    ui.add_space(4.0);
+                    key_row(ui, "Shift+A", "Add Selected to Set", c);
+                    key_row(ui, "Shift+N", "Load Next Up to Deck", c);
+                    key_row(ui, "O / Ctrl+Z", "Order Flow / Undo", c);
+                    key_row(ui, "Alt+↑ / ↓", "Reorder Track in Set", c);
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("TIMELINE STUDIO").color(TraktorTheme::DECK_A()).strong());
+                    ui.add_space(4.0);
+                    key_row(ui, "U", "Cycle Transition Curve", c);
+                    key_row(ui, "B", "Cycle Bar Length (8/16/32)", c);
+                    key_row(ui, "A", "Audition Transition", c);
+                    ui.add_space(6.0);
+                    key_row(ui, "N", "Suggest Next Track (idle deck)", c);
+                    key_row(ui, "Cmd / Ctrl + ,", "Preferences & Setup", c);
+                    key_row(ui, "Ctrl+1..8", "Jump Prefs Group (in dialog)", c);
+                    key_row(ui, "?", "Toggle Shortcuts HUD", c);
+                    key_row(ui, "Esc", "Dismiss HUD / Modals", c);
                 });
             });
 
@@ -1243,9 +1600,31 @@ pub fn render_shortcuts_hud(ctx: &egui::Context, is_open: &mut bool) {
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new("💡 Pro Tip: Hardware USB DJ controllers (Traktor Kontrol / MX2) operate at 1000 Hz alongside keyboard shortcuts.")
-                        .color(TraktorTheme::TEXT_MUTED)
+                        .color(TraktorTheme::TEXT_MUTED())
                         .font(egui::FontId::proportional(11.0)),
                 );
             });
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dot_grid_quantisation_bounds_and_shape_budget() {
+        let (cols, half_rows, step_x, step_y, radius) = dot_grid_metrics(1920.0, 120.0, 120, 7);
+        assert!(cols <= 120 && cols > 0);
+        assert!(half_rows <= 7 && half_rows > 0);
+        assert!(cols * half_rows * 2 <= 2000, "dot waveform stays under 2000 circles");
+        assert!(step_x >= 5.5 && step_y >= 4.5);
+        assert!((1.1..=2.5).contains(&radius));
+
+        assert_eq!(quantize_dot_rows(0.0, half_rows), 0);
+        assert_eq!(quantize_dot_rows(0.01, half_rows), 0);
+        assert_eq!(quantize_dot_rows(0.05, half_rows), 1);
+        assert_eq!(quantize_dot_rows(0.5, 6), 3);
+        assert_eq!(quantize_dot_rows(1.0, half_rows), half_rows);
+        assert_eq!(quantize_dot_rows(1.5, half_rows), half_rows);
+    }
 }

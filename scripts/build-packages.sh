@@ -11,7 +11,7 @@ export PATH="$HOME/.cargo/bin:$PATH"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$SCRIPT_DIR"
 
-VERSION="$(grep -m1 '^version' Cargo.toml | awk -F '"' '{print $2}')"
+VERSION="${RETRAKTOR_VERSION:-$(grep -m1 '^version' Cargo.toml | awk -F '"' '{print $2}')}"
 ARCH="$(uname -m)"
 if [ "$ARCH" = "x86_64" ]; then
     DEB_ARCH="amd64"

@@ -15,6 +15,7 @@ package-lock.json
 *.wav
 *.log
 /tmp/
+/shots/
 
 # OS / Editor metadata
 .DS_Store

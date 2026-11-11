@@ -17,21 +17,29 @@ use retraktor_core::{
     PropValue, PropertyBus, ScreenFlavor, SurfaceEvent, TraktorColor,
 };
 use retraktor_formats::{
-    NmlCollection, NmlEntry, NmlLocation, StemMetadata, TransientFile, TsiFile, WaveformStripe,
+    to_rekordbox_xml, NmlCollection, NmlEntry, NmlLocation, StemMetadata, TransientFile, TsiFile,
+    WaveformStripe,
 };
 use retraktor_hid::{
     generate_linux_udev_rules, KontrolScreenFramebuffer, S4Mk3HapticPlatterConfig, NI_DEVICES,
 };
-use retraktor_library::{KeyWheel, TrackAnalyzer, TrackLibrary};
+use retraktor_library::{analyze_mono, KeyWheel, TrackAnalyzer, TrackLibrary};
+use std::collections::HashMap;
 use std::env;
-use std::fs;
+use std::fs::{self, File};
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
+use symphonia::core::audio::SampleBuffer;
+use symphonia::core::codecs::DecoderOptions;
+use symphonia::core::formats::FormatOptions;
+use symphonia::core::io::MediaSourceStream;
+use symphonia::core::meta::MetadataOptions;
+use symphonia::core::probe::Hint;
 
 fn launch_gui() -> Result<(), String> {
     // Attempt to launch the native ReTraktor egui desktop binary
@@ -115,6 +123,39 @@ fn main() {
                     entry.location.to_posix_path()
                 );
             }
+        }
+        "export-rekordbox" => {
+            let Some(in_path) = args.get(2) else {
+                eprintln!("Usage: retraktor-cli export-rekordbox <in.nml> <out.xml>");
+                process::exit(1);
+            };
+            let Some(out_path) = args.get(3) else {
+                eprintln!("Usage: retraktor-cli export-rekordbox <in.nml> <out.xml>");
+                process::exit(1);
+            };
+            let xml = fs::read_to_string(in_path).unwrap_or_else(|e| {
+                eprintln!("Failed to read {in_path}: {e}");
+                process::exit(1);
+            });
+            let col = NmlCollection::parse_xml(&xml).unwrap_or_else(|e| {
+                eprintln!("Failed to parse NML: {e}");
+                process::exit(1);
+            });
+            let out_xml = to_rekordbox_xml(&col);
+            if let Some(parent) = Path::new(out_path).parent() {
+                if !parent.as_os_str().is_empty() {
+                    let _ = fs::create_dir_all(parent);
+                }
+            }
+            fs::write(out_path, out_xml).unwrap_or_else(|e| {
+                eprintln!("Failed to write {out_path}: {e}");
+                process::exit(1);
+            });
+            println!(
+                "Exported {} tracks to rekordbox XML at {}",
+                col.entries.len(),
+                out_path
+            );
         }
         "inspect-tsi" => {
             let Some(path) = args.get(2) else {
@@ -274,6 +315,54 @@ fn main() {
         "simulate-mix" => {
             run_simulation();
         }
+        "analyze" => {
+            if args.len() < 3 {
+                eprintln!("Usage: retraktor-cli analyze <audio-file>...");
+                process::exit(1);
+            }
+            for f in &args[2..] {
+                match decode_mono_pcm(Path::new(f)) {
+                    Ok((pcm, sr)) => {
+                        let a = retraktor_library::analyze_mono(&pcm, sr);
+                        println!("{:7.2} BPM  {:>3}  energy {:2}  {:6.1} dB  {f}", a.bpm, a.key_open, a.energy, a.loudness_db);
+                    }
+                    Err(e) => eprintln!("{f}: {e}"),
+                }
+            }
+        }
+        "analyze-bench" => {
+            let Some(nml_path) = args.get(2) else {
+                eprintln!(
+                    "Usage: retraktor-cli analyze-bench <collection.nml> <index-file> [--limit N]"
+                );
+                process::exit(1);
+            };
+            let Some(index_path) = args.get(3) else {
+                eprintln!(
+                    "Usage: retraktor-cli analyze-bench <collection.nml> <index-file> [--limit N]"
+                );
+                process::exit(1);
+            };
+            let mut limit = 300usize;
+            let mut i = 4;
+            while i < args.len() {
+                if args[i] == "--limit" {
+                    if let Some(val) = args.get(i + 1).and_then(|s| s.parse::<usize>().ok()) {
+                        limit = val;
+                    }
+                    i += 2;
+                } else if let Some(val) = args[i]
+                    .strip_prefix("--limit=")
+                    .and_then(|s| s.parse::<usize>().ok())
+                {
+                    limit = val;
+                    i += 1;
+                } else {
+                    i += 1;
+                }
+            }
+            run_analyze_bench(nml_path, index_path, limit);
+        }
         _ => {
             print_usage();
             process::exit(1);
@@ -319,6 +408,7 @@ fn run_simulation() {
         musical_key_value: Some(12),
         cues: vec![grid_a],
         stems_path: Some("/:home/:dj/:Music/:berlin_midnight.stem.m4a".to_string()),
+        ..Default::default()
     });
     col.entries.push(NmlEntry {
         title: "Detroit Dawn".to_string(),
@@ -340,6 +430,7 @@ fn run_simulation() {
         musical_key_value: Some(19),
         cues: Vec::new(),
         stems_path: None,
+        ..Default::default()
     });
 
     let mut lib = TrackLibrary::from_nml(&col);
@@ -473,6 +564,7 @@ fn print_usage() {
     println!("  run                          Start interactive live 4-deck DJ player & audio engine (Default)");
     println!("  doctor                       Run system diagnostics, check audio, udev & permissions");
     println!("  inspect-nml <file.nml>       Parse and summarize a Traktor .nml collection");
+    println!("  export-rekordbox <in> <out>  Export Traktor .nml collection to rekordbox DJ_PLAYLISTS XML");
     println!("  inspect-tsi <file.tsi>       Decode and summarize a Traktor .tsi controller mapping");
     println!("  inspect-stripe <file>        Inspect a Traktor PRTS binary waveform stripe cache");
     println!("  inspect-transients <file>    Inspect a Traktor binary transient cache");
@@ -481,6 +573,7 @@ fn print_usage() {
     println!("  list-devices                 List supported NI Kontrol USB VID/PID controllers");
     println!("  udev-rules                   Output Linux /etc/udev/rules.d/99-retraktor-ni.rules");
     println!("  simulate-mix                 Run end-to-end 4-deck audio/library/CSI/screen simulation");
+    println!("  analyze-bench <nml> <index>  Benchmark offline BPM/Key analysis against Traktor NML");
 }
 
 fn run_interactive_player() {
@@ -864,3 +957,387 @@ fn run_doctor() {
     }
     println!("\n=== Diagnostics complete ===");
 }
+
+fn strip_sync_conflict_and_dupes(name: &str) -> String {
+    let mut s = name.to_string();
+    while let Some(pos) = s.find(".sync-conflict-") {
+        let rest = &s[pos + ".sync-conflict-".len()..];
+        if let Some(dot) = rest.find('.') {
+            s = format!("{}{}", &s[..pos], &rest[dot..]);
+        } else {
+            s.truncate(pos);
+            break;
+        }
+    }
+    let (stem, ext) = match s.rfind('.') {
+        Some(idx) => (&s[..idx], &s[idx..]),
+        None => (s.as_str(), ""),
+    };
+    let mut clean_stem = stem.trim().to_string();
+    for suffix in [" - {genre}", " - {Genre}", "_1", "(1)", "(2)", "(3)"] {
+        if let Some(stripped) = clean_stem.strip_suffix(suffix) {
+            clean_stem = stripped.trim().to_string();
+        }
+    }
+    format!("{}{}", clean_stem.to_ascii_lowercase(), ext.to_ascii_lowercase())
+}
+
+fn score_candidate(entry: &NmlEntry, path: &Path) -> i32 {
+    let p_low = path.to_string_lossy().to_ascii_lowercase();
+    let mut score = 0;
+    let artist = entry.artist.to_ascii_lowercase();
+    if artist.len() >= 3 && p_low.contains(&artist) {
+        score += 10;
+    }
+    let title = entry.title.to_ascii_lowercase();
+    if title.len() >= 3 && p_low.contains(&title) {
+        score += 10;
+    }
+    if let Some(alb) = &entry.album_title {
+        let a_low = alb.to_ascii_lowercase();
+        if a_low.len() >= 3 && p_low.contains(&a_low) {
+            score += 6;
+        }
+    }
+    for seg in entry.location.dir.split("/:") {
+        let s = seg.trim().to_ascii_lowercase();
+        if s.len() >= 4
+            && s != "users"
+            && s != "meekp"
+            && s != "music"
+            && s != "music-dj"
+            && s != "audio"
+            && s != "audio tracks"
+            && p_low.contains(&s)
+        {
+            score += 4;
+        }
+    }
+    // Slight preference against /dupes/ if a primary folder copy exists
+    if p_low.contains("/dupes/") {
+        score -= 1;
+    }
+    score
+}
+
+fn decode_mono_pcm(path: &Path) -> Result<(Vec<f32>, u32), String> {
+    let file = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+    let mut probed = symphonia::default::get_probe()
+        .format(
+            &hint,
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
+        .map_err(|e| format!("probe {}: {e}", path.display()))?;
+
+    let track = probed
+        .format
+        .default_track()
+        .ok_or_else(|| "no default audio track".to_string())?;
+    let track_id = track.id;
+    let codec_params = track.codec_params.clone();
+    let sr = codec_params.sample_rate.unwrap_or(44_100);
+
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&codec_params, &DecoderOptions::default())
+        .map_err(|e| format!("codec {}: {e}", path.display()))?;
+
+    let mut mono = Vec::new();
+    // Cap decoded length at 10 minutes per track
+    let max_frames = (sr as usize) * 600;
+
+    while let Ok(packet) = probed.format.next_packet() {
+        if packet.track_id() != track_id {
+            continue;
+        }
+        if let Ok(decoded) = decoder.decode(&packet) {
+            let spec = *decoded.spec();
+            let ch = spec.channels.count().max(1);
+            let mut buf = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
+            buf.copy_interleaved_ref(decoded);
+            let samples = buf.samples();
+            if ch == 1 {
+                mono.extend_from_slice(samples);
+            } else {
+                for frame in samples.chunks(ch) {
+                    mono.push(0.5 * (frame[0] + frame[1]));
+                }
+            }
+            if mono.len() >= max_frames {
+                break;
+            }
+        }
+    }
+
+    if mono.is_empty() {
+        return Err("decoded 0 samples".to_string());
+    }
+    Ok((mono, sr))
+}
+
+fn run_analyze_bench(nml_path: &str, index_path: &str, limit: usize) {
+    let xml = fs::read_to_string(nml_path).unwrap_or_else(|e| {
+        eprintln!("Failed to read NML {nml_path}: {e}");
+        process::exit(1);
+    });
+    let col = NmlCollection::parse_xml(&xml).unwrap_or_else(|e| {
+        eprintln!("Failed to parse NML {nml_path}: {e}");
+        process::exit(1);
+    });
+
+    let index_text = fs::read_to_string(index_path).unwrap_or_else(|e| {
+        eprintln!("Failed to read index {index_path}: {e}");
+        process::exit(1);
+    });
+
+    let music_root = Path::new("/DATA/Media/Music");
+    let mut by_exact: HashMap<String, Vec<PathBuf>> = HashMap::new();
+    let mut by_clean: HashMap<String, Vec<PathBuf>> = HashMap::new();
+
+    for line in index_text.lines() {
+        let rel = line.trim();
+        if rel.is_empty() {
+            continue;
+        }
+        let rel_stripped = rel.strip_prefix("./").unwrap_or(rel);
+        let full = if Path::new(rel_stripped).is_absolute() {
+            PathBuf::from(rel_stripped)
+        } else {
+            music_root.join(rel_stripped)
+        };
+        if let Some(fname) = full.file_name().and_then(|n| n.to_str()) {
+            by_exact
+                .entry(fname.to_string())
+                .or_default()
+                .push(full.clone());
+            let clean = strip_sync_conflict_and_dupes(fname);
+            by_clean.entry(clean).or_default().push(full);
+        }
+    }
+
+    let resolve_entry = |entry: &NmlEntry| -> Option<PathBuf> {
+        // Skip entries where NML filename clearly disagrees with entry title (corrupted duplicate NML rows)
+        let f = &entry.location.file;
+        let f_low = f.to_ascii_lowercase();
+        let t_low = entry.title.to_ascii_lowercase();
+        let first_word = t_low
+            .split(|c: char| !c.is_alphanumeric())
+            .find(|w| w.len() >= 4);
+        if let Some(w) = first_word {
+            if !f_low.contains(w) {
+                return None;
+            }
+        }
+        if let Some(cands) = by_exact.get(f) {
+            return cands
+                .iter()
+                .max_by_key(|p| score_candidate(entry, p))
+                .cloned();
+        }
+        let clean = strip_sync_conflict_and_dupes(f);
+        by_clean.get(&clean).and_then(|cands| {
+            cands
+                .iter()
+                .max_by_key(|p| score_candidate(entry, p))
+                .cloned()
+        })
+    };
+
+    // Collect entries that have ground-truth BPM and/or MUSICAL_KEY and resolve to a real file.
+    // Prioritize entries that have BOTH BPM and Key so Key metrics are evaluated across up to 300 tracks,
+    // then fill any remaining slots from BPM-only entries.
+    let mut both_pool: Vec<(&NmlEntry, PathBuf)> = Vec::new();
+    let mut single_pool: Vec<(&NmlEntry, PathBuf)> = Vec::new();
+    for entry in &col.entries {
+        let has_bpm = entry.tempo.as_ref().map(|t| t.bpm > 0.0).unwrap_or(false);
+        let has_key = entry.musical_key_value.is_some();
+        if !has_bpm && !has_key {
+            continue;
+        }
+        let f = &entry.location.file;
+        let resolved = if let Some(cands) = by_exact.get(f) {
+            cands
+                .iter()
+                .max_by_key(|p| score_candidate(entry, p))
+                .cloned()
+        } else {
+            resolve_entry(entry)
+        };
+        if let Some(path) = resolved {
+            if has_bpm && has_key {
+                both_pool.push((entry, path));
+            } else {
+                single_pool.push((entry, path));
+            }
+        }
+    }
+
+    let total_avail = both_pool.len() + single_pool.len();
+    let target_count = limit.min(total_avail).max(1);
+    let mut selected = Vec::with_capacity(target_count);
+    let take_both = target_count.min(both_pool.len());
+    for i in 0..take_both {
+        let idx = (i * both_pool.len()) / take_both;
+        selected.push(both_pool[idx].clone());
+    }
+    let rem = target_count.saturating_sub(take_both);
+    if rem > 0 && !single_pool.is_empty() {
+        for i in 0..rem {
+            let idx = (i * single_pool.len()) / rem;
+            selected.push(single_pool[idx].clone());
+        }
+    }
+
+    let mut bpm_total = 0usize;
+    let mut bpm_exact = 0usize;
+    let mut bpm_octave = 0usize;
+
+    let mut key_total = 0usize;
+    let mut key_exact = 0usize;
+    let mut key_compat = 0usize;
+    let mut key_rel_err = 0usize;
+    let mut key_fifth_err = 0usize;
+
+    let mut total_analysis_sec = 0.0_f64;
+    let mut analyzed_tracks = 0usize;
+
+    let verbose = env::var("RETRAKTOR_BENCH_VERBOSE").is_ok();
+
+    for (entry, path) in &selected {
+        let Ok((mono, sr)) = decode_mono_pcm(path) else {
+            continue;
+        };
+        let t0 = Instant::now();
+        let res = analyze_mono(&mono, sr);
+        total_analysis_sec += t0.elapsed().as_secs_f64();
+        analyzed_tracks += 1;
+
+        if let Some(gt_bpm) = entry.tempo.as_ref().map(|t| t.bpm).filter(|&b| b > 0.0) {
+            bpm_total += 1;
+            let diff_exact = (res.bpm - gt_bpm).abs();
+            let is_exact = diff_exact <= 0.5;
+            let is_oct = is_exact
+                || (res.bpm * 2.0 - gt_bpm).abs() <= 0.5
+                || (res.bpm * 0.5 - gt_bpm).abs() <= 0.5
+                || (res.bpm - gt_bpm * 2.0).abs() <= 0.5
+                || (res.bpm - gt_bpm * 0.5).abs() <= 0.5;
+            if is_exact {
+                bpm_exact += 1;
+            }
+            if is_oct {
+                bpm_octave += 1;
+            } else if verbose {
+                eprintln!(
+                    "[BPM MISS] pred={:.2} gt={:.2} | {} - {} ({})",
+                    res.bpm,
+                    gt_bpm,
+                    entry.artist,
+                    entry.title,
+                    path.display()
+                );
+            }
+        }
+
+        if let Some(gt_key) = entry.musical_key_value {
+            if let Some(gt_open) = KeyWheel::to_open_key(gt_key) {
+                key_total += 1;
+                let pred_open = res.key_open.as_str();
+                if res.key_value == gt_key {
+                    key_exact += 1;
+                    key_compat += 1;
+                    if verbose {
+                        eprintln!(
+                            "[KEY HIT ] pred={}({}) gt={}({}) | {} - {}",
+                            res.key_value, pred_open, gt_key, gt_open, entry.artist, entry.title
+                        );
+                    }
+                } else if KeyWheel::are_harmonically_compatible(pred_open, gt_open) {
+                    key_compat += 1;
+                    if let (Some((na, ma)), Some((nb, mb))) = (
+                        KeyWheel::parse_open_key(pred_open),
+                        KeyWheel::parse_open_key(gt_open),
+                    ) {
+                        if na == nb && ma != mb {
+                            key_rel_err += 1;
+                        } else if ma == mb {
+                            key_fifth_err += 1;
+                        }
+                    }
+                    if verbose {
+                        eprintln!(
+                            "[KEY COMP] pred={}({}) gt={}({}) | {} - {}",
+                            res.key_value, pred_open, gt_key, gt_open, entry.artist, entry.title
+                        );
+                    }
+                } else if verbose {
+                    eprintln!(
+                        "[KEY MISS] pred={}({}) gt={}({}) | {} - {}",
+                        res.key_value, pred_open, gt_key, gt_open, entry.artist, entry.title
+                    );
+                }
+            }
+        }
+    }
+
+    let pct = |num: usize, den: usize| -> f64 {
+        if den == 0 {
+            0.0
+        } else {
+            100.0 * (num as f64) / (den as f64)
+        }
+    };
+    let mean_ms = if analyzed_tracks > 0 {
+        (total_analysis_sec * 1000.0) / (analyzed_tracks as f64)
+    } else {
+        0.0
+    };
+
+    println!("┌──────────────────────────────────────┬──────────────────────────┐");
+    println!("│ ReTraktor Offline Analysis Benchmark │ Result                   │");
+    println!("├──────────────────────────────────────┼──────────────────────────┤");
+    println!(
+        "│ Tracks decoded & analyzed            │ {:>4} / {:<4}              │",
+        analyzed_tracks,
+        selected.len()
+    );
+    println!(
+        "│ BPM exact (±0.5 BPM)                 │ {:>4}/{:<4} ({:>5.1}%)       │",
+        bpm_exact,
+        bpm_total,
+        pct(bpm_exact, bpm_total)
+    );
+    println!(
+        "│ BPM octave-tolerant (±0.5, ½x/2x)    │ {:>4}/{:<4} ({:>5.1}%)       │",
+        bpm_octave,
+        bpm_total,
+        pct(bpm_octave, bpm_total)
+    );
+    println!(
+        "│ Key exact (MUSICAL_KEY 0..=23)       │ {:>4}/{:<4} ({:>5.1}%)       │",
+        key_exact,
+        key_total,
+        pct(key_exact, key_total)
+    );
+    println!(
+        "│ Key compatible (KeyWheel)            │ {:>4}/{:<4} ({:>5.1}%)       │",
+        key_compat,
+        key_total,
+        pct(key_compat, key_total)
+    );
+    println!(
+        "│ Key relative / fifth errors          │ {:>4} rel / {:<4} fifth    │",
+        key_rel_err, key_fifth_err
+    );
+    println!(
+        "│ Mean analysis time per track         │ {:>7.1} ms               │",
+        mean_ms
+    );
+    println!("└──────────────────────────────────────┴──────────────────────────┘");
+}
+

@@ -9,6 +9,9 @@ use retraktor_formats::{
 };
 use std::collections::BTreeMap;
 
+pub mod analysis;
+pub use analysis::{analyze_mono, auto_cues, detect_phrases, Phrase, PhraseKind, TrackAnalysis};
+
 /// Harmonic Key Wheel mapping Traktor's `MUSICAL_KEY/@VALUE` (`0..=23`), Open Key (`1d..12d`, `1m..12m`),
 /// and Camelot (`1B..12B`, `1A..12A`) notation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +30,53 @@ impl KeyWheel {
     /// Converts a Traktor musical key ID (`0..=23`) to Open Key string (e.g. `0` -> `"1d"` C, `21` -> `"1m"` Am).
     pub fn to_open_key(key_id: u8) -> Option<&'static str> {
         Self::OPEN_KEY_TABLE.get(key_id as usize).copied()
+    }
+
+    /// Parses any common key notation — Open Key (`1m`), Camelot (`8A`), or musical (`Am`, `F#m`,
+    /// `Bb`, `C major`, `Ebmin`) — into a Traktor musical key ID `0..=23`.
+    pub fn normalize(text: &str) -> Option<u8> {
+        let s: String = text.split_whitespace().collect::<String>().to_ascii_lowercase();
+        let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if let Ok(n) = digits.parse::<u8>() {
+            if !(1..=12).contains(&n) {
+                return None;
+            }
+            let (open_num, minor) = match &s[digits.len()..] {
+                "m" => (n, true),
+                "d" => (n, false),
+                // Camelot 8A = Am = Open Key 1m (offset of 7 around the wheel)
+                "a" => ((n + 4) % 12 + 1, true),
+                "b" => ((n + 4) % 12 + 1, false),
+                _ => return None,
+            };
+            let open = format!("{open_num}{}", if minor { 'm' } else { 'd' });
+            return Self::OPEN_KEY_TABLE.iter().position(|k| *k == open).map(|i| i as u8);
+        }
+        let mut chars = s.chars();
+        let pc: i32 = match chars.next()? {
+            'c' => 0,
+            'd' => 2,
+            'e' => 4,
+            'f' => 5,
+            'g' => 7,
+            'a' => 9,
+            'b' => 11,
+            _ => return None,
+        };
+        let rest = chars.as_str();
+        let (pc, quality) = if let Some(r) = rest.strip_prefix('#') {
+            (pc + 1, r)
+        } else if let Some(r) = rest.strip_prefix('b').filter(|r| matches!(*r, "" | "m" | "min" | "minor" | "maj" | "major")) {
+            (pc - 1, r)
+        } else {
+            (pc, rest)
+        };
+        let minor = match quality {
+            "" | "maj" | "major" => false,
+            "m" | "min" | "minor" => true,
+            _ => return None,
+        };
+        Some(pc.rem_euclid(12) as u8 + if minor { 12 } else { 0 })
     }
 
     /// Parses an Open Key string (`"1m".."12m"` or `"1d".."12d"`) into `(number: 1..=12, is_minor: bool)`.
@@ -83,22 +133,18 @@ impl TrackAnalyzer {
         let frames = samples.len() / 2;
         let duration_sec = (frames as f32) / (sample_rate as f32).max(1.0);
 
-        let mut peak = 0.0_f32;
-        let mut sum_sq = 0.0_f64;
-        for &s in samples {
-            let a = s.abs();
-            if a > peak {
-                peak = a;
-            }
-            sum_sq += (s as f64) * (s as f64);
+        let mut mono_samples = Vec::with_capacity(frames);
+        for f in 0..frames {
+            mono_samples.push(0.5 * (samples[f * 2] + samples[f * 2 + 1]));
         }
-        let rms = if !samples.is_empty() {
-            (sum_sq / (samples.len() as f64)).sqrt() as f32
+        let analysis = analyze_mono(&mono_samples, sample_rate);
+        let bpm = if estimated_bpm > 0.0 {
+            estimated_bpm
         } else {
-            1e-6
+            analysis.bpm
         };
-        let peak_db = 20.0 * (peak.max(1e-6) as f64).log10();
-        let rms_db = 20.0 * (rms.max(1e-6) as f64).log10();
+        let rms_db = analysis.loudness_db as f64;
+        let peak_db = analysis.peak_db as f64;
         // Autogain target: -12 dBFS RMS reference
         let perceived_db = (-12.0 - rms_db).clamp(-18.0, 18.0);
 
@@ -108,18 +154,18 @@ impl TrackAnalyzer {
             peak_db,
         };
         let tempo = NmlTempo {
-            bpm: estimated_bpm,
+            bpm,
             bpm_quality: 100.0,
         };
         let grid_cue = NmlCue {
             name: "AutoGrid".to_string(),
             displ_order: 0,
             cue_type: CueType::Grid,
-            start_ms: 0.0,
+            start_ms: analysis.beatgrid_offset_sec * 1000.0,
             len_ms: 0.0,
             repeats: -1,
             hotcue: 0,
-            grid_bpm: Some(estimated_bpm),
+            grid_bpm: Some(bpm),
         };
 
         // Compute 3-band waveform stripe columns
@@ -403,6 +449,26 @@ mod tests {
     use retraktor_formats::NmlLocation;
 
     #[test]
+    fn key_normalize_handles_all_notations() {
+        let open = |t: &str| KeyWheel::normalize(t).and_then(KeyWheel::to_open_key);
+        assert_eq!(open("8A"), Some("1m")); // Am
+        assert_eq!(open("8B"), Some("1d")); // C
+        assert_eq!(open("1A"), Some("6m")); // Abm
+        assert_eq!(open("Am"), Some("1m"));
+        assert_eq!(open("A minor"), Some("1m"));
+        assert_eq!(open("Bbm"), Some("8m"));
+        assert_eq!(open("Bb"), Some("11d"));
+        assert_eq!(open("Bm"), Some("3m"));
+        assert_eq!(open("F#m"), Some("4m"));
+        assert_eq!(open("Ebmin"), Some("7m"));
+        assert_eq!(open("C"), Some("1d"));
+        assert_eq!(open("12m"), Some("12m"));
+        assert_eq!(open("13m"), None);
+        assert_eq!(open("H"), None);
+        assert_eq!(open(""), None);
+    }
+
+    #[test]
     fn test_library_harmonic_keywheel_and_analyzer() {
         assert!(KeyWheel::are_harmonically_compatible("4m", "4m"));
         assert!(KeyWheel::are_harmonically_compatible("4m", "5m"));
@@ -439,6 +505,7 @@ mod tests {
             musical_key_value: Some(12),
             cues: vec![grid],
             stems_path: None,
+            ..Default::default()
         });
 
         let mut lib = TrackLibrary::from_nml(&col);

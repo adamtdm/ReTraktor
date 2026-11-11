@@ -276,11 +276,11 @@ if [ "$INSTALL_DEMUCS" = "true" ]; then
     mkdir -p "$VENV_DIR"
     if [ -n "$TARGET_USER" ] && [ "$(id -u)" -eq 0 ]; then
         chown -R "$TARGET_USER:" "$TARGET_HOME/.local"
-        su - "$TARGET_USER" -c "python3 -m venv '$VENV_DIR' && '$VENV_DIR/bin/pip' install --upgrade pip setuptools wheel && '$VENV_DIR/bin/pip' install --extra-index-url https://download.pytorch.org/whl/cpu torch torchaudio demucs" || true
+        su - "$TARGET_USER" -c "python3 -m venv '$VENV_DIR' && '$VENV_DIR/bin/pip' install --upgrade pip setuptools wheel && '$VENV_DIR/bin/pip' install --extra-index-url https://download.pytorch.org/whl/cpu torch torchaudio demucs numpy" || true
     else
         python3 -m venv "$VENV_DIR" || true
         "$VENV_DIR/bin/pip" install --upgrade pip setuptools wheel || true
-        "$VENV_DIR/bin/pip" install --extra-index-url https://download.pytorch.org/whl/cpu torch torchaudio demucs || true
+        "$VENV_DIR/bin/pip" install --extra-index-url https://download.pytorch.org/whl/cpu torch torchaudio demucs numpy || true
     fi
     log_success "Demucs AI Stem Separation Engine installed to $VENV_DIR/bin/demucs"
 fi
