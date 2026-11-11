@@ -8,7 +8,7 @@
 //! - [`DDJ_FLX4_DEFAULT_MAPPING`]: Official Pioneer DJ DDJ-FLX4 factory mapping preset.
 //! - [`GenericControllerManager`]: Hot-plug background reader for ALSA raw MIDI and read-only generic NI hidraw nodes.
 
-use eframe::egui::{self, RichText, Sense, Stroke, Ui, Vec2};
+use eframe::egui::{self, Pos2, RichText, Sense, Stroke, Ui, Vec2};
 use retraktor_core::SurfaceEvent;
 use retraktor_hid::{lookup_ni_device, NI_USB_VID, TRAKTOR_MX2_PID};
 use std::collections::HashMap;
@@ -924,23 +924,24 @@ pub fn show_other_controllers_page(
     mgr: &mut GenericControllerManager,
     last_touched_ctl: Option<&str>,
 ) {
-    ui.add_space(4.0);
+    crate::preferences::PreferencesDialog::list_section_header(ui, "Other controllers");
 
-    // 1. Experimental Notice Banner
+    // 1. Notice Banner
     egui::Frame::none()
         .fill(TraktorTheme::BG_PANEL())
         .stroke(Stroke::new(1.0_f32, TraktorTheme::BORDER_ACCENT()))
         .rounding(4.0)
-        .inner_margin(egui::Margin::symmetric(12.0, 8.0))
+        .inner_margin(egui::Margin::symmetric(14.0, 10.0))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(
-                    RichText::new("ℹ Experimental: learn mode, no lights or screens")
+                    RichText::new("Generic MIDI & NI HID Support")
                         .size(12.5)
                         .color(TraktorTheme::TEXT_PRIMARY())
                         .strong(),
                 );
             });
+            ui.add_space(2.0);
             ui.label(
                 RichText::new("Generic MIDI controllers and non-MX2 Native Instruments HID hardware (X1 MK3, Z1 MK2, S4 MK3) are supported via read-only input learning.")
                     .size(11.0)
@@ -948,22 +949,22 @@ pub fn show_other_controllers_page(
             );
         });
 
-    ui.add_space(8.0);
+    ui.add_space(6.0);
 
     // 2. Hardware Devices List
-    let devices = mgr.discovered.lock().map(|d| d.clone()).unwrap_or_default();
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("Connected hardware").size(14.0).strong());
-        if devices.is_empty() {
-            ui.label(
-                RichText::new("— No generic MIDI or NI HID controllers detected")
-                    .size(12.0)
-                    .color(TraktorTheme::TEXT_MUTED()),
-            );
-        }
-    });
+    crate::preferences::PreferencesDialog::list_section_header(ui, "Connected hardware");
 
-    if !devices.is_empty() {
+    let devices = mgr.discovered.lock().map(|d| d.clone()).unwrap_or_default();
+    if devices.is_empty() {
+        crate::preferences::PreferencesDialog::list_row(
+            ui,
+            "Hardware devices",
+            "No generic MIDI or NI HID controllers detected on USB.",
+            |ui| {
+                ui.label(RichText::new("No controllers found").color(TraktorTheme::TEXT_MUTED()));
+            },
+        );
+    } else {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = Vec2::new(8.0, 6.0);
             for d in &devices {
@@ -971,31 +972,52 @@ pub fn show_other_controllers_page(
                 let (lamp_col, tip) = if d.connected {
                     (TraktorTheme::PLAY_ACTIVE(), format!("{} connected at {}", d.name, d.dev_node))
                 } else {
-                    (TraktorTheme::TEXT_MUTED(), format!("{} disconnected", d.name))
+                    (crate::dot::unlit_on_panel(), format!("{} disconnected", d.name))
                 };
 
-                let btn_text = format!("● {}", d.name);
-                let btn = egui::Button::new(RichText::new(btn_text).color(if is_selected { TraktorTheme::TEXT_PRIMARY() } else { TraktorTheme::TEXT_SECONDARY() }))
-                    .fill(if is_selected { TraktorTheme::ROW_SELECTED() } else { TraktorTheme::BG_PANEL() })
-                    .min_size(Vec2::new(130.0, 26.0));
+                let (rect, resp) = ui.allocate_exact_size(Vec2::new(140.0, 26.0), Sense::click());
+                let fill = if is_selected { TraktorTheme::ROW_SELECTED() } else { TraktorTheme::BG_PANEL() };
+                ui.painter().rect_filled(rect, 4.0, fill);
+                let stroke_col = if resp.hovered() {
+                    TraktorTheme::TEXT_PRIMARY()
+                } else if is_selected {
+                    TraktorTheme::BORDER_ACCENT()
+                } else {
+                    TraktorTheme::BORDER_COLOR()
+                };
+                ui.painter().rect_stroke(rect, 4.0, Stroke::new(1.0_f32, stroke_col));
 
-                let resp = ui.add(btn).on_hover_text(tip);
-                ui.painter().circle_filled(resp.rect.left_center() + Vec2::new(8.0, 0.0), 3.0, lamp_col);
+                // Clean dot lamp
+                let lamp_pos = Pos2::new(rect.left() + 14.0, rect.center().y);
+                ui.painter().circle_filled(lamp_pos, 3.5, lamp_col);
+                if d.connected {
+                    ui.painter().circle_stroke(lamp_pos, 5.0, Stroke::new(1.0_f32, lamp_col.gamma_multiply(0.4)));
+                }
 
-                if resp.clicked() {
+                let text_col = if is_selected { TraktorTheme::TEXT_PRIMARY() } else { TraktorTheme::TEXT_SECONDARY() };
+                ui.painter().text(
+                    Pos2::new(rect.left() + 26.0, rect.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    &d.name,
+                    egui::FontId::proportional(11.5),
+                    text_col,
+                );
+
+                if resp.on_hover_text(tip).clicked() {
                     mgr.select_device(&d.slug, &d.name);
                 }
             }
         });
     }
 
-    ui.add_space(10.0);
+    ui.add_space(8.0);
 
     // 3. Active Controller Mappings & Learn Section
+    crate::preferences::PreferencesDialog::list_section_header(ui, "Mapping & Learn");
+
     let active_name = if let Some(ref slug) = mgr.active_device_slug {
         slug.clone()
     } else {
-        // Default to DDJ-FLX4 preset view if no device selected yet
         "ddj_flx4".to_string()
     };
 
@@ -1003,10 +1025,51 @@ pub fn show_other_controllers_page(
         mgr.active_mapping = flx4_default_mapping();
     }
 
+    // Animation & pulse for LEARN mode
+    if mgr.learn_mode {
+        if crate::theme::animations() {
+            ui.ctx().request_repaint();
+        }
+    }
+    let pulse = if mgr.learn_mode && crate::theme::animations() {
+        let t = ui.input(|i| i.time);
+        ((t * 5.0).sin() * 0.5 + 0.5) as f32
+    } else if mgr.learn_mode {
+        1.0
+    } else {
+        0.0
+    };
+
+    // Unmistakable LEARN state indicator banner
+    if mgr.learn_mode {
+        let alert_col = TraktorTheme::METER_RED();
+        egui::Frame::none()
+            .fill(TraktorTheme::BG_PANEL())
+            .stroke(Stroke::new(1.5_f32, alert_col.gamma_multiply(0.5 + 0.5 * pulse)))
+            .rounding(4.0)
+            .inner_margin(egui::Margin::symmetric(14.0, 10.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let (lamp_rect, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
+                    ui.painter().circle_filled(lamp_rect.center(), 4.5 + 1.5 * pulse, alert_col);
+                    ui.painter().circle_stroke(lamp_rect.center(), 7.0 + 3.0 * pulse, Stroke::new(1.2_f32, alert_col.gamma_multiply(0.4 * (1.0 - pulse))));
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new("● WAITING FOR INPUT… Move a control on your hardware")
+                            .size(13.0)
+                            .color(alert_col)
+                            .strong(),
+                    );
+                });
+            });
+        ui.add_space(6.0);
+    }
+
     ui.horizontal(|ui| {
         ui.label(
             RichText::new(format!("Mapping: {}", mgr.active_mapping.device_name))
-                .size(14.0)
+                .size(13.5)
+                .color(TraktorTheme::TEXT_PRIMARY())
                 .strong(),
         );
 
@@ -1016,7 +1079,7 @@ pub fn show_other_controllers_page(
                 .add(
                     egui::Button::new(RichText::new("Save mapping").strong())
                         .fill(TraktorTheme::ROW_SELECTED())
-                        .min_size(Vec2::new(100.0, 26.0)),
+                        .min_size(Vec2::new(100.0, 24.0)),
                 )
                 .clicked()
             {
@@ -1029,7 +1092,7 @@ pub fn show_other_controllers_page(
                     .add(
                         egui::Button::new("Load FLX4 default")
                             .fill(TraktorTheme::BG_PANEL())
-                            .min_size(Vec2::new(120.0, 26.0)),
+                            .min_size(Vec2::new(120.0, 24.0)),
                     )
                     .clicked()
             {
@@ -1037,31 +1100,34 @@ pub fn show_other_controllers_page(
                 let _ = mgr.active_mapping.save(&active_name);
             }
 
-            // LEARN Button
-            let learn_btn_label = if mgr.learn_mode {
-                "● WAITING FOR INPUT…"
+            // LEARN Button with dot lamp
+            let learn_w = if mgr.learn_mode { 160.0 } else { 90.0 };
+            let (learn_rect, learn_resp) = ui.allocate_exact_size(Vec2::new(learn_w, 24.0), Sense::click());
+            let learn_fill = if mgr.learn_mode { TraktorTheme::ROW_SELECTED() } else { TraktorTheme::BG_PANEL() };
+            ui.painter().rect_filled(learn_rect, 4.0, learn_fill);
+            let learn_border = if mgr.learn_mode {
+                TraktorTheme::METER_RED().gamma_multiply(0.6 + 0.4 * pulse)
+            } else if learn_resp.hovered() {
+                TraktorTheme::TEXT_PRIMARY()
             } else {
-                "● LEARN"
+                TraktorTheme::BORDER_ACCENT()
             };
-            let learn_btn_col = if mgr.learn_mode {
-                TraktorTheme::METER_RED()
-            } else {
-                TraktorTheme::ACCENT()
-            };
-            let learn_btn = egui::Button::new(
-                RichText::new(learn_btn_label)
-                    .color(TraktorTheme::TEXT_PRIMARY())
-                    .strong(),
-            )
-            .fill(if mgr.learn_mode { TraktorTheme::ROW_SELECTED() } else { TraktorTheme::BG_PANEL() })
-            .stroke(Stroke::new(1.2_f32, learn_btn_col))
-            .min_size(Vec2::new(130.0, 26.0));
+            ui.painter().rect_stroke(learn_rect, 4.0, Stroke::new(1.2_f32, learn_border));
 
-            if ui
-                .add(learn_btn)
-                .on_hover_text("Click Learn, then touch or turn any control on your hardware")
-                .clicked()
-            {
+            let lamp_center = Pos2::new(learn_rect.left() + 12.0, learn_rect.center().y);
+            let lamp_col = if mgr.learn_mode { TraktorTheme::METER_RED() } else { TraktorTheme::ACCENT() };
+            ui.painter().circle_filled(lamp_center, 3.5, lamp_col);
+            if mgr.learn_mode {
+                ui.painter().circle_stroke(lamp_center, 5.0 + 2.0 * pulse, Stroke::new(1.0_f32, lamp_col.gamma_multiply(0.5)));
+            }
+            ui.painter().text(
+                Pos2::new(learn_rect.left() + 22.0, learn_rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                if mgr.learn_mode { "WAITING FOR INPUT…" } else { "LEARN" },
+                egui::FontId::proportional(11.5),
+                if mgr.learn_mode { TraktorTheme::TEXT_PRIMARY() } else { TraktorTheme::TEXT_SECONDARY() },
+            );
+            if learn_resp.on_hover_text("Click Learn, then touch or turn any control on your hardware").clicked() {
                 mgr.learn_mode = !mgr.learn_mode;
             }
         });
@@ -1101,18 +1167,22 @@ pub fn show_other_controllers_page(
 
             // Header Row
             ui.horizontal(|ui| {
-                // Same widths as the row cells below.
-                ui.allocate_ui(Vec2::new(195.0, 16.0), |ui| {
+                ui.allocate_ui(Vec2::new(195.0, 18.0), |ui| {
                     ui.set_width(195.0);
                     ui.label(RichText::new("CONTROL ID").size(11.0).color(TraktorTheme::TEXT_MUTED()).monospace());
                 });
-                ui.allocate_ui(Vec2::new(170.0, 16.0), |ui| {
+                ui.allocate_ui(Vec2::new(170.0, 18.0), |ui| {
                     ui.set_width(170.0);
                     ui.label(RichText::new("LABEL").size(11.0).color(TraktorTheme::TEXT_MUTED()));
                 });
-                ui.label(RichText::new("MAPPED ACTION").size(11.0).color(TraktorTheme::TEXT_MUTED()));
+                ui.allocate_ui(Vec2::new(210.0, 18.0), |ui| {
+                    ui.set_width(210.0);
+                    ui.label(RichText::new("MAPPED ACTION").size(11.0).color(TraktorTheme::TEXT_MUTED()));
+                });
             });
+            ui.add_space(2.0);
             ui.separator();
+            ui.add_space(2.0);
 
             egui::ScrollArea::vertical()
                 .id_salt("generic_mapping_table_scroll")
@@ -1127,74 +1197,80 @@ pub fn show_other_controllers_page(
                             let id_text = RichText::new(&entry.control_id)
                                 .font(egui::FontId::monospace(11.0))
                                 .color(if is_selected { TraktorTheme::TEXT_PRIMARY() } else { TraktorTheme::TEXT_SECONDARY() });
-                            ui.allocate_ui(Vec2::new(195.0, 24.0), |ui| {
+                            ui.allocate_ui(Vec2::new(195.0, 28.0), |ui| {
                                 ui.set_width(195.0);
-                                ui.label(id_text);
+                                ui.centered_and_justified(|ui| {
+                                    ui.label(id_text);
+                                });
                             });
 
                             // Editable Friendly Label
-                            ui.allocate_ui(Vec2::new(170.0, 24.0), |ui| {
+                            ui.allocate_ui(Vec2::new(170.0, 28.0), |ui| {
                                 ui.set_width(170.0);
-                                if ui.add(egui::TextEdit::singleline(&mut entry.friendly_name).desired_width(160.0)).changed() {
-                                    changed = true;
-                                }
+                                ui.centered_and_justified(|ui| {
+                                    if ui.add(egui::TextEdit::singleline(&mut entry.friendly_name).desired_width(160.0)).changed() {
+                                        changed = true;
+                                    }
+                                });
                             });
 
                             // Action ComboBox
-                            ui.allocate_ui(Vec2::new(200.0, 24.0), |ui| {
-                                ui.set_width(200.0);
+                            ui.allocate_ui(Vec2::new(210.0, 28.0), |ui| {
+                                ui.set_width(210.0);
                                 let cur_label = action_label(&entry.action);
-                                egui::ComboBox::from_id_salt(("act_combo", idx))
-                                    .selected_text(cur_label)
-                                    .width(190.0)
-                                    .show_ui(ui, |ui| {
-                                        // Standard button actions
-                                        ui.label(RichText::new("Transport & Pad Actions").size(10.5).color(TraktorTheme::TEXT_MUTED()));
-                                        for d in 1..=4 {
-                                            for (id, label, _) in BUTTON_ACTIONS {
-                                                let concrete = id.replace("{d}", &d.to_string());
-                                                if ui.selectable_label(entry.action == concrete, format!("{label} Deck {d}")).clicked() {
-                                                    entry.action = concrete;
+                                ui.centered_and_justified(|ui| {
+                                    egui::ComboBox::from_id_salt(("act_combo", idx))
+                                        .selected_text(cur_label)
+                                        .width(200.0)
+                                        .show_ui(ui, |ui| {
+                                            // Standard button actions
+                                            ui.label(RichText::new("Transport & Pad Actions").size(10.5).color(TraktorTheme::TEXT_MUTED()));
+                                            for d in 1..=4 {
+                                                for (id, label, _) in BUTTON_ACTIONS {
+                                                    let concrete = id.replace("{d}", &d.to_string());
+                                                    if ui.selectable_label(entry.action == concrete, format!("{label} Deck {d}")).clicked() {
+                                                        entry.action = concrete;
+                                                        changed = true;
+                                                    }
+                                                }
+                                            }
+
+                                            ui.separator();
+                                            ui.label(RichText::new("Fader & Knob Actions").size(10.5).color(TraktorTheme::TEXT_MUTED()));
+                                            for d in 1..=4 {
+                                                for (id, label, _) in CONTINUOUS_ACTIONS {
+                                                    let concrete = id.replace("{d}", &d.to_string());
+                                                    if ui.selectable_label(entry.action == concrete, format!("{label} Deck {d}")).clicked() {
+                                                        entry.action = concrete;
+                                                        changed = true;
+                                                    }
+                                                }
+                                            }
+
+                                            ui.separator();
+                                            // Extra Jog & Browse actions
+                                            for d in 1..=2 {
+                                                let jog_act = format!("jog:{d}");
+                                                if ui.selectable_label(entry.action == jog_act, format!("Jogwheel Turn Deck {d}")).clicked() {
+                                                    entry.action = jog_act;
+                                                    changed = true;
+                                                }
+                                                let touch_act = format!("jog_touch:{d}");
+                                                if ui.selectable_label(entry.action == touch_act, format!("Jogwheel Touch Deck {d}")).clicked() {
+                                                    entry.action = touch_act;
                                                     changed = true;
                                                 }
                                             }
-                                        }
-
-                                        ui.separator();
-                                        ui.label(RichText::new("Fader & Knob Actions").size(10.5).color(TraktorTheme::TEXT_MUTED()));
-                                        for d in 1..=4 {
-                                            for (id, label, _) in CONTINUOUS_ACTIONS {
-                                                let concrete = id.replace("{d}", &d.to_string());
-                                                if ui.selectable_label(entry.action == concrete, format!("{label} Deck {d}")).clicked() {
-                                                    entry.action = concrete;
-                                                    changed = true;
-                                                }
-                                            }
-                                        }
-
-                                        ui.separator();
-                                        // Extra Jog & Browse actions
-                                        for d in 1..=2 {
-                                            let jog_act = format!("jog:{d}");
-                                            if ui.selectable_label(entry.action == jog_act, format!("Jogwheel Turn Deck {d}")).clicked() {
-                                                entry.action = jog_act;
+                                            if ui.selectable_label(entry.action == "browse", "Browse Library").clicked() {
+                                                entry.action = "browse".to_string();
                                                 changed = true;
                                             }
-                                            let touch_act = format!("jog_touch:{d}");
-                                            if ui.selectable_label(entry.action == touch_act, format!("Jogwheel Touch Deck {d}")).clicked() {
-                                                entry.action = touch_act;
+                                            if ui.selectable_label(entry.action == "none", "Do nothing").clicked() {
+                                                entry.action = "none".to_string();
                                                 changed = true;
                                             }
-                                        }
-                                        if ui.selectable_label(entry.action == "browse", "Browse Library").clicked() {
-                                            entry.action = "browse".to_string();
-                                            changed = true;
-                                        }
-                                        if ui.selectable_label(entry.action == "none", "Do nothing").clicked() {
-                                            entry.action = "none".to_string();
-                                            changed = true;
-                                        }
-                                    });
+                                        });
+                                });
                             });
 
                             // Per-row Clear Button (hit target >= 24px)

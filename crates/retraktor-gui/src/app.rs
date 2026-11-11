@@ -627,7 +627,33 @@ impl ReTraktorApp {
             "Mix" => self.layout = TraktorLayout::Parallel,
             "FourDeck" => self.layout = TraktorLayout::FourDeck,
             "Browser" => self.layout = TraktorLayout::Browser,
-            "Timeline" => self.layout = TraktorLayout::Timeline,
+            "Timeline" => {
+                self.preferences.is_open = false;
+                self.layout = TraktorLayout::Timeline;
+                if let Ok(mut state) = self.audio.shared.lock() {
+                    for d in 0..2 {
+                        if state.loaded_tracks[d].is_none() {
+                            state.loaded_tracks[d] = Some(crate::audio::LoadedTrackAudio {
+                                title: if d == 0 { "Solaris (Extended Mix)".into() } else { "Midnight Sun (Original)".into() },
+                                artist: if d == 0 { "Articuno".into() } else { "Helios".into() },
+                                bpm: if d == 0 { 124.0 } else { 125.0 },
+                                grid_offset_sec: 0.0,
+                                key: if d == 0 { "8m".into() } else { "9m".into() },
+                                duration_sec: 384.0,
+                                pcm_stereo: vec![0.0; 48000],
+                                sample_rate: 48000,
+                                waveform_peaks: vec![[0.4, 0.5, 0.3]; 300],
+                                stem_peaks: vec![[0.4, 0.5, 0.3, 0.2]; 300],
+                                stems_ready: true,
+                                pcm_drums: None,
+                                pcm_bass: None,
+                                pcm_other: None,
+                                pcm_vocals: None,
+                            });
+                        }
+                    }
+                }
+            }
             "Set" => {
                 self.preferences.is_open = false;
                 self.layout = TraktorLayout::Set;
@@ -1681,6 +1707,28 @@ impl ReTraktorApp {
             self.preferences.is_open = false;
         }
 
+        if self.preferences.is_open {
+            let num_keys = [
+                Key::Num1,
+                Key::Num2,
+                Key::Num3,
+                Key::Num4,
+                Key::Num5,
+                Key::Num6,
+                Key::Num7,
+                Key::Num8,
+            ];
+            for (idx, &k) in num_keys.iter().enumerate() {
+                if ctx.input(|i| (i.modifiers.command || i.modifiers.ctrl) && i.key_pressed(k)) {
+                    if let Some(group) = PreferencesDialog::GROUPS.get(idx) {
+                        if let Some(&first_tab) = group.1.first() {
+                            self.preferences.current_tab = first_tab;
+                        }
+                    }
+                }
+            }
+        }
+
         if ctx.input(|i| i.key_pressed(Key::Escape)) && self.show_next_track_panel {
             self.show_next_track_panel = false;
         }
@@ -2504,8 +2552,12 @@ impl ReTraktorApp {
             row(ui, 48.0, |ui| {
                 deck_badge(ui, deck_letter, accent_color);
                 self.stem_buttons(ui, d);
+                let display_w = 340.0;
+                let avail = (ui.available_width() - display_w - 12.0).max(60.0);
+                ui.allocate_ui_with_layout(Vec2::new(avail, 24.0), Layout::left_to_right(Align::Center), |ui| {
+                    title_label(ui, &deck.title, &deck.artist);
+                });
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let display_w = 340.0;
                     let panel_rect = display(ui, |ui, ink| {
                         ui.set_width(display_w);
                         ui.vertical(|ui| {
@@ -2539,7 +2591,6 @@ impl ReTraktorApp {
                         });
                     });
                     dot::paint_dot_wipe(ui.painter(), panel_rect, (1.0 - loaded_t).max(looping), accent_color);
-                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| title_label(ui, &deck.title, &deck.artist));
                 });
             });
         }

@@ -1,5 +1,5 @@
 use crate::theme::TraktorTheme;
-use eframe::egui::{self, Color32, RichText, Stroke, Ui, Vec2};
+use eframe::egui::{self, Color32, Pos2, RichText, Sense, Stroke, Ui, Vec2};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PrefsTab {
@@ -476,13 +476,14 @@ impl PreferencesDialog {
         description: &str,
         control: impl FnOnce(&mut Ui) -> R,
     ) -> R {
-        // Plain aligned row with a hairline under it; no card per setting.
         let out = egui::Frame::none()
-            .inner_margin(egui::Margin::symmetric(4.0, 8.0))
+            .inner_margin(egui::Margin::symmetric(4.0, 7.0))
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
+                ui.set_min_height(28.0);
                 ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
+                    let label_col_w = (ui.available_width() * 0.52).clamp(340.0, 480.0);
+                    ui.allocate_ui_with_layout(Vec2::new(label_col_w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
                         ui.spacing_mut().item_spacing.y = 2.0;
                         ui.label(
                             RichText::new(label)
@@ -511,11 +512,22 @@ impl PreferencesDialog {
         out.inner
     }
 
-    /// Section heading: sentence case, more space above than below.
+    /// Section heading in dot font with a short dot rule.
     pub fn list_section_header(ui: &mut Ui, title: &str) {
         ui.add_space(18.0);
-        ui.label(RichText::new(sentence_case(title)).size(15.0).strong().color(TraktorTheme::TEXT_PRIMARY()));
-        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            ui.label(
+                RichText::new(title.to_uppercase())
+                    .font(crate::theme::dot_font(13.0))
+                    .color(TraktorTheme::TEXT_PRIMARY()),
+            );
+            let (rect, _) = ui.allocate_exact_size(Vec2::new(32.0, 14.0), Sense::hover());
+            let painter = ui.painter();
+            let cy = rect.center().y;
+            crate::dot::paint_dot_rule(painter, Pos2::new(rect.left() + 2.0, cy), 6, 5.0, 1.2, TraktorTheme::BORDER_ACCENT());
+        });
+        ui.add_space(3.0);
     }
 
     pub fn get_tab_breadcrumb(&self, tab: PrefsTab) -> (&'static str, &'static str) {
@@ -557,27 +569,41 @@ impl PreferencesDialog {
         Self::GROUPS.iter().map(|g| g.1).find(|g| g.contains(&self.current_tab)).unwrap_or(&[PrefsTab::AudioSetup])
     }
 
-    /// Renders the top-level tab strip; the search box filters tabs by any section they contain.
+    /// Renders the top-level tab strip styled like the top bar layout tabs.
     pub fn render_top_section_tabs(&mut self, ui: &mut Ui) {
         let query = self.search_query.trim().to_lowercase();
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
-            for (label, tabs) in Self::GROUPS {
-                let matches = query.is_empty()
-                    || label.to_lowercase().contains(&query)
-                    || tabs.iter().any(|t| self.get_tab_breadcrumb(*t).1.to_lowercase().contains(&query));
-                if !matches {
-                    continue;
+        ui.scope(|ui| {
+            ui.spacing_mut().item_spacing = Vec2::new(3.0, 4.0);
+            ui.horizontal(|ui| {
+                for (idx, (label, tabs)) in Self::GROUPS.iter().enumerate() {
+                    let matches = query.is_empty()
+                        || label.to_lowercase().contains(&query)
+                        || tabs.iter().any(|t| self.get_tab_breadcrumb(*t).1.to_lowercase().contains(&query));
+                    if !matches {
+                        continue;
+                    }
+                    let selected = tabs.contains(&self.current_tab);
+                    let shortcut_tip = format!("{} (Ctrl+{})", label, idx + 1);
+                    let t = crate::theme::fade(ui.ctx(), ui.id().with(("pref_group", idx)), selected);
+                    let idle = TraktorTheme::CONTROL();
+                    let fill = crate::theme::mix(idle, TraktorTheme::ROW_SELECTED(), t);
+                    let fg = if t > 0.5 { on_selected_text() } else { TraktorTheme::TEXT_PRIMARY() };
+                    let button = egui::Button::new(RichText::new(*label).size(11.5).color(fg))
+                        .min_size(Vec2::new(60.0, 24.0));
+                    let mut resp = if t > 0.0 {
+                        ui.add(button.fill(fill))
+                    } else {
+                        ui.add(button)
+                    };
+                    if resp.hovered() || resp.has_focus() {
+                        ui.painter().rect_stroke(resp.rect, 2.0, Stroke::new(1.0_f32, TraktorTheme::TEXT_SECONDARY()));
+                    }
+                    resp = resp.on_hover_text(shortcut_tip);
+                    if resp.clicked() {
+                        self.current_tab = tabs[0];
+                    }
                 }
-                let selected = tabs.contains(&self.current_tab);
-                let button = egui::Button::new(RichText::new(label).size(13.0).color(if selected { on_selected_text() } else { TraktorTheme::TEXT_PRIMARY() }))
-                    .fill(if selected { TraktorTheme::ROW_SELECTED() } else { TraktorTheme::BG_PANEL() })
-                    .rounding(4.0)
-                    .min_size(Vec2::new(110.0, 30.0));
-                if ui.add(button).clicked() {
-                    self.current_tab = tabs[0];
-                }
-            }
+            });
         });
     }
 
@@ -854,7 +880,7 @@ impl PreferencesDialog {
             "Split cue",
             "Put the cued deck in the left headphone ear and the main mix in the right.",
             |ui| {
-                ui.checkbox(&mut self.split_cue, "").on_hover_text("Split cue");
+                crate::dot::dot_toggle(ui, &mut self.split_cue, TraktorTheme::PLAY_ACTIVE(), "Split cue");
             },
         );
     }
@@ -937,7 +963,7 @@ impl PreferencesDialog {
             "Send MIDI clock",
             "Keep external drum machines and synths in time over MIDI.",
             |ui| {
-                ui.checkbox(&mut self.send_midi_clock, "").on_hover_text("Send MIDI clock");
+                crate::dot::dot_toggle(ui, &mut self.send_midi_clock, TraktorTheme::PLAY_ACTIVE(), "Send MIDI clock");
             },
         );
 
@@ -946,7 +972,9 @@ impl PreferencesDialog {
             "MIDI clock offset",
             "Nudge the MIDI clock early or late to line up external gear.",
             |ui| {
-                ui.add(egui::Slider::new(&mut self.midi_clock_offset_ms, -50.0..=50.0).suffix(" ms"));
+                let txt = format!("{:.1} ms", self.midi_clock_offset_ms);
+                crate::dot::dot_slider(ui, &mut self.midi_clock_offset_ms, -50.0, 50.0, 0.0, &txt, TraktorTheme::ACCENT())
+                    .on_hover_text("Compensate for hardware or USB latency in milliseconds");
             },
         );
 
@@ -955,7 +983,7 @@ impl PreferencesDialog {
             "Ableton Link",
             "Share tempo and beat phase with other music apps on your network.",
             |ui| {
-                ui.checkbox(&mut self.ableton_link_enabled, "").on_hover_text("Ableton Link");
+                crate::dot::dot_toggle(ui, &mut self.ableton_link_enabled, TraktorTheme::PLAY_ACTIVE(), "Ableton Link");
             },
         );
     }
@@ -1012,7 +1040,9 @@ impl PreferencesDialog {
             "Filter resonance",
             "How sharp the filter sounds around its cutoff point.",
             |ui| {
-                ui.add(egui::Slider::new(&mut self.filter_resonance, 0.0..=1.0).show_value(true));
+                let txt = format!("{:.2}", self.filter_resonance);
+                crate::dot::dot_slider(ui, &mut self.filter_resonance, 0.0, 1.0, 0.5, &txt, TraktorTheme::ACCENT())
+                    .on_hover_text("How sharp the filter sounds around its cutoff point.");
             },
         );
 
@@ -1042,7 +1072,7 @@ impl PreferencesDialog {
             "Auto gain",
             "Match volume across quiet and loud tracks automatically.",
             |ui| {
-                ui.checkbox(&mut self.autogain, "").on_hover_text("Auto gain");
+                crate::dot::dot_toggle(ui, &mut self.autogain, TraktorTheme::PLAY_ACTIVE(), "Auto gain");
             },
         );
 
@@ -1051,7 +1081,7 @@ impl PreferencesDialog {
             "Master limiter",
             "Keep loud peaks on the main output from clipping.",
             |ui| {
-                ui.checkbox(&mut self.limiter_enabled, "").on_hover_text("Master limiter");
+                crate::dot::dot_toggle(ui, &mut self.limiter_enabled, TraktorTheme::PLAY_ACTIVE(), "Master limiter");
             },
         );
 
@@ -1083,7 +1113,7 @@ impl PreferencesDialog {
             "EQ controls stems",
             "Use the high, mid, and low EQ knobs to adjust vocals, instruments, and drums.",
             |ui| {
-                ui.checkbox(&mut self.neural_mix_eq_mode, "").on_hover_text("EQ controls stems");
+                crate::dot::dot_toggle(ui, &mut self.neural_mix_eq_mode, TraktorTheme::PLAY_ACTIVE(), "EQ controls stems");
             },
         );
     }
@@ -1172,7 +1202,7 @@ impl PreferencesDialog {
             "EQ controls stems",
             "Use the high, mid, and low EQ knobs to adjust vocals, instruments, and drums.",
             |ui| {
-                ui.checkbox(&mut self.neural_mix_eq_mode, "").on_hover_text("EQ controls stems");
+                crate::dot::dot_toggle(ui, &mut self.neural_mix_eq_mode, TraktorTheme::PLAY_ACTIVE(), "EQ controls stems");
             },
         );
     }
@@ -1185,7 +1215,7 @@ impl PreferencesDialog {
             "Four decks",
             "Show Decks C and D alongside Decks A and B.",
             |ui| {
-                ui.checkbox(&mut self.four_deck_mode, "").on_hover_text("Four decks");
+                crate::dot::dot_toggle(ui, &mut self.four_deck_mode, TraktorTheme::PLAY_ACTIVE(), "Four decks");
             },
         );
 
@@ -1215,7 +1245,7 @@ impl PreferencesDialog {
             "Minute markers",
             "Draw a tick every minute along the full-track overview bar.",
             |ui| {
-                ui.checkbox(&mut self.show_minute_markers, "").on_hover_text("Minute markers");
+                crate::dot::dot_toggle(ui, &mut self.show_minute_markers, TraktorTheme::PLAY_ACTIVE(), "Minute markers");
             },
         );
 
@@ -1224,7 +1254,7 @@ impl PreferencesDialog {
             "Beat markers",
             "Draw beat and bar lines on the scrolling waveform.",
             |ui| {
-                ui.checkbox(&mut self.show_beatgrid_ticks, "").on_hover_text("Beat markers");
+                crate::dot::dot_toggle(ui, &mut self.show_beatgrid_ticks, TraktorTheme::PLAY_ACTIVE(), "Beat markers");
             },
         );
 
@@ -1233,7 +1263,7 @@ impl PreferencesDialog {
             "Fit full track in overview",
             "Always fit the entire song into the small overview stripe.",
             |ui| {
-                ui.checkbox(&mut self.stripe_fit_full, "").on_hover_text("Fit full track in overview");
+                crate::dot::dot_toggle(ui, &mut self.stripe_fit_full, TraktorTheme::PLAY_ACTIVE(), "Fit full track in overview");
             },
         );
     }
@@ -1246,7 +1276,7 @@ impl PreferencesDialog {
             "Lock playing decks",
             "Stop a new track from loading onto a deck that is currently playing.",
             |ui| {
-                ui.checkbox(&mut self.lock_playing_decks, "").on_hover_text("Lock playing decks");
+                crate::dot::dot_toggle(ui, &mut self.lock_playing_decks, TraktorTheme::PLAY_ACTIVE(), "Lock playing decks");
             },
         );
 
@@ -1309,10 +1339,10 @@ impl PreferencesDialog {
 
         Self::list_row(
             ui,
-            "Jump to cue on load",
+            "Auto cue on load",
             "Park newly loaded tracks at their first cue point.",
             |ui| {
-                ui.checkbox(&mut self.auto_cue_on_load, "").on_hover_text("Jump to cue on load");
+                crate::dot::dot_toggle(ui, &mut self.auto_cue_on_load, TraktorTheme::PLAY_ACTIVE(), "Jump to cue on load");
             },
         );
 
@@ -1321,7 +1351,9 @@ impl PreferencesDialog {
             "Jog wheel sensitivity",
             "How far the track moves when you spin the jog wheel.",
             |ui| {
-                ui.add(egui::Slider::new(&mut self.jog_scratch_sensitivity, 0.2..=3.0).show_value(true));
+                let txt = format!("{:.1}x", self.jog_scratch_sensitivity);
+                crate::dot::dot_slider(ui, &mut self.jog_scratch_sensitivity, 0.2, 3.0, 1.0, &txt, TraktorTheme::ACCENT())
+                    .on_hover_text("Jog wheel sensitivity when scratching");
             },
         );
 
@@ -1330,7 +1362,7 @@ impl PreferencesDialog {
             "Vinyl mode",
             "Touch the top of the platter to scratch, or use the outer rim to nudge tempo.",
             |ui| {
-                ui.checkbox(&mut self.jog_mode_turntable, "").on_hover_text("Vinyl mode");
+                crate::dot::dot_toggle(ui, &mut self.jog_mode_turntable, TraktorTheme::PLAY_ACTIVE(), "Vinyl mode");
             },
         );
     }
@@ -1523,7 +1555,7 @@ impl PreferencesDialog {
             "Album",
             "",
             |ui| {
-                ui.checkbox(&mut self.library_columns.album, "").on_hover_text("Album");
+                crate::dot::dot_toggle(ui, &mut self.library_columns.album, TraktorTheme::PLAY_ACTIVE(), "Album");
             },
         );
         Self::list_row(
@@ -1531,7 +1563,7 @@ impl PreferencesDialog {
             "BPM",
             "Tempo in beats per minute.",
             |ui| {
-                ui.checkbox(&mut self.library_columns.bpm, "").on_hover_text("BPM");
+                crate::dot::dot_toggle(ui, &mut self.library_columns.bpm, TraktorTheme::PLAY_ACTIVE(), "BPM");
             },
         );
         Self::list_row(
@@ -1539,7 +1571,7 @@ impl PreferencesDialog {
             "Key",
             "Musical key for harmonic mixing.",
             |ui| {
-                ui.checkbox(&mut self.library_columns.key, "").on_hover_text("Key");
+                crate::dot::dot_toggle(ui, &mut self.library_columns.key, TraktorTheme::PLAY_ACTIVE(), "Key");
             },
         );
         Self::list_row(
@@ -1547,7 +1579,7 @@ impl PreferencesDialog {
             "Stems",
             "Shows whether stems are ready and lets you split a track.",
             |ui| {
-                ui.checkbox(&mut self.library_columns.stems, "").on_hover_text("Stems");
+                crate::dot::dot_toggle(ui, &mut self.library_columns.stems, TraktorTheme::PLAY_ACTIVE(), "Stems");
             },
         );
         Self::list_row(
@@ -1555,7 +1587,7 @@ impl PreferencesDialog {
             "Duration",
             "Track length in minutes and seconds.",
             |ui| {
-                ui.checkbox(&mut self.library_columns.duration, "").on_hover_text("Duration");
+                crate::dot::dot_toggle(ui, &mut self.library_columns.duration, TraktorTheme::PLAY_ACTIVE(), "Duration");
             },
         );
         Self::list_row(
@@ -1563,7 +1595,7 @@ impl PreferencesDialog {
             "Genre",
             "",
             |ui| {
-                ui.checkbox(&mut self.library_columns.genre, "").on_hover_text("Genre");
+                crate::dot::dot_toggle(ui, &mut self.library_columns.genre, TraktorTheme::PLAY_ACTIVE(), "Genre");
             },
         );
         Self::list_row(
@@ -1571,7 +1603,7 @@ impl PreferencesDialog {
             "Rating",
             "Star rating from 1 to 5.",
             |ui| {
-                ui.checkbox(&mut self.library_columns.rating, "").on_hover_text("Rating");
+                crate::dot::dot_toggle(ui, &mut self.library_columns.rating, TraktorTheme::PLAY_ACTIVE(), "Rating");
             },
         );
         Self::list_row(
@@ -1579,7 +1611,7 @@ impl PreferencesDialog {
             "Comment",
             "Your notes on the track.",
             |ui| {
-                ui.checkbox(&mut self.library_columns.comment, "").on_hover_text("Comment");
+                crate::dot::dot_toggle(ui, &mut self.library_columns.comment, TraktorTheme::PLAY_ACTIVE(), "Comment");
             },
         );
         Self::list_row(
@@ -1587,7 +1619,7 @@ impl PreferencesDialog {
             "Remixer",
             "",
             |ui| {
-                ui.checkbox(&mut self.library_columns.remixer, "").on_hover_text("Remixer");
+                crate::dot::dot_toggle(ui, &mut self.library_columns.remixer, TraktorTheme::PLAY_ACTIVE(), "Remixer");
             },
         );
         Self::list_row(
@@ -1595,7 +1627,7 @@ impl PreferencesDialog {
             "Label",
             "Record label.",
             |ui| {
-                ui.checkbox(&mut self.library_columns.label, "").on_hover_text("Label");
+                crate::dot::dot_toggle(ui, &mut self.library_columns.label, TraktorTheme::PLAY_ACTIVE(), "Label");
             },
         );
         Self::list_row(
@@ -1603,7 +1635,7 @@ impl PreferencesDialog {
             "Year",
             "",
             |ui| {
-                ui.checkbox(&mut self.library_columns.year, "").on_hover_text("Year");
+                crate::dot::dot_toggle(ui, &mut self.library_columns.year, TraktorTheme::PLAY_ACTIVE(), "Year");
             },
         );
         Self::list_row(
@@ -1611,7 +1643,7 @@ impl PreferencesDialog {
             "Bitrate",
             "Audio quality in kbps.",
             |ui| {
-                ui.checkbox(&mut self.library_columns.bitrate, "").on_hover_text("Bitrate");
+                crate::dot::dot_toggle(ui, &mut self.library_columns.bitrate, TraktorTheme::PLAY_ACTIVE(), "Bitrate");
             },
         );
         Self::list_row(
@@ -1619,7 +1651,7 @@ impl PreferencesDialog {
             "Format",
             "File type such as FLAC, MP3, or WAV.",
             |ui| {
-                ui.checkbox(&mut self.library_columns.format, "").on_hover_text("Format");
+                crate::dot::dot_toggle(ui, &mut self.library_columns.format, TraktorTheme::PLAY_ACTIVE(), "Format");
             },
         );
         Self::list_row(
@@ -1627,7 +1659,7 @@ impl PreferencesDialog {
             "Track number",
             "",
             |ui| {
-                ui.checkbox(&mut self.library_columns.track_number, "").on_hover_text("Track number");
+                crate::dot::dot_toggle(ui, &mut self.library_columns.track_number, TraktorTheme::PLAY_ACTIVE(), "Track number");
             },
         );
         Self::list_row(
@@ -1635,7 +1667,7 @@ impl PreferencesDialog {
             "Energy",
             "Estimated dancefloor intensity from 1 to 10.",
             |ui| {
-                ui.checkbox(&mut self.library_columns.energy, "").on_hover_text("Energy");
+                crate::dot::dot_toggle(ui, &mut self.library_columns.energy, TraktorTheme::PLAY_ACTIVE(), "Energy");
             },
         );
     }
@@ -1691,43 +1723,41 @@ impl PreferencesDialog {
             "Analyse on import",
             "Find BPM, beatgrid, and key automatically when you add files.",
             |ui| {
-                ui.checkbox(&mut self.analyze_new_tracks, "").on_hover_text("Analyse on import");
+                crate::dot::dot_toggle(ui, &mut self.analyze_new_tracks, TraktorTheme::PLAY_ACTIVE(), "Analyse on import");
             },
         );
     }
 
     fn show_controllers_subtabs(&mut self, ui: &mut Ui) {
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing = Vec2::new(8.0, 4.0);
-            let is_mx2 = self.current_tab == PrefsTab::Controllers;
-            let mx2_btn = egui::Button::new(
-                RichText::new("Traktor MX2")
-                    .size(13.0)
-                    .color(if is_mx2 { on_selected_text() } else { TraktorTheme::TEXT_PRIMARY() })
-                    .strong(),
-            )
-            .fill(if is_mx2 { TraktorTheme::ROW_SELECTED() } else { TraktorTheme::BG_PANEL() })
-            .rounding(4.0)
-            .min_size(Vec2::new(130.0, 28.0));
-            if ui.add(mx2_btn).clicked() {
-                self.current_tab = PrefsTab::Controllers;
-            }
-
-            let is_other = self.current_tab == PrefsTab::OtherControllers;
-            let other_btn = egui::Button::new(
-                RichText::new("Other controllers")
-                    .size(13.0)
-                    .color(if is_other { on_selected_text() } else { TraktorTheme::TEXT_PRIMARY() })
-                    .strong(),
-            )
-            .fill(if is_other { TraktorTheme::ROW_SELECTED() } else { TraktorTheme::BG_PANEL() })
-            .rounding(4.0)
-            .min_size(Vec2::new(150.0, 28.0));
-            if ui.add(other_btn).clicked() {
-                self.current_tab = PrefsTab::OtherControllers;
-            }
+        ui.scope(|ui| {
+            ui.spacing_mut().item_spacing = Vec2::new(3.0, 4.0);
+            ui.horizontal(|ui| {
+                for (tab, label) in [
+                    (PrefsTab::Controllers, "Traktor MX2"),
+                    (PrefsTab::OtherControllers, "Other controllers"),
+                ] {
+                    let selected = self.current_tab == tab;
+                    let t = crate::theme::fade(ui.ctx(), ui.id().with(("ctl_subtab", label)), selected);
+                    let idle = TraktorTheme::CONTROL();
+                    let fill = crate::theme::mix(idle, TraktorTheme::ROW_SELECTED(), t);
+                    let fg = if t > 0.5 { on_selected_text() } else { TraktorTheme::TEXT_PRIMARY() };
+                    let button = egui::Button::new(RichText::new(label).size(11.5).color(fg))
+                        .min_size(Vec2::new(90.0, 24.0));
+                    let resp = if t > 0.0 {
+                        ui.add(button.fill(fill))
+                    } else {
+                        ui.add(button)
+                    };
+                    if resp.hovered() || resp.has_focus() {
+                        ui.painter().rect_stroke(resp.rect, 2.0, Stroke::new(1.0_f32, TraktorTheme::TEXT_SECONDARY()));
+                    }
+                    if resp.clicked() {
+                        self.current_tab = tab;
+                    }
+                }
+            });
         });
-        ui.add_space(8.0);
+        ui.add_space(6.0);
     }
 
     fn show_controller_prefs(&mut self, ui: &mut Ui) {
@@ -1935,11 +1965,23 @@ impl PreferencesDialog {
                     });
             });
 
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            ui.label("Under-glow brightness");
-            ui.add(egui::Slider::new(&mut self.mx2_bottom_led_brightness, 0.1..=1.0));
-        });
+        Self::list_row(
+            ui,
+            "Under-glow brightness",
+            "Adjust base LED intensity on Traktor MX2.",
+            |ui| {
+                let disp = format!("{:.0}%", self.mx2_bottom_led_brightness * 100.0);
+                crate::dot::dot_slider(
+                    ui,
+                    &mut self.mx2_bottom_led_brightness,
+                    0.1,
+                    1.0,
+                    0.5,
+                    &disp,
+                    TraktorTheme::ACCENT(),
+                );
+            },
+        );
     }
 
     fn show_file_management(&mut self, ui: &mut Ui) {
@@ -1950,9 +1992,10 @@ impl PreferencesDialog {
             "Your collection saves automatically to ~/.local/share/retraktor/collection.nml.",
             |ui| {
                 let mut m3u = self.collection_save_format == 2;
-                if ui.checkbox(&mut m3u, "Also export collection.m3u8 on exit").changed() {
+                if crate::dot::dot_toggle(ui, &mut m3u, TraktorTheme::PLAY_ACTIVE(), "Export m3u8 on exit").changed() {
                     self.collection_save_format = if m3u { 2 } else { 0 };
                 }
+                ui.label(RichText::new("Also export collection.m3u8 on exit").size(11.0).color(TraktorTheme::TEXT_SECONDARY()));
             },
         );
 
@@ -1997,7 +2040,7 @@ impl PreferencesDialog {
             "Scan on startup",
             "Check your music folders for new tracks when ReTraktor opens.",
             |ui| {
-                ui.checkbox(&mut self.scan_on_startup, "").on_hover_text("Scan on startup");
+                crate::dot::dot_toggle(ui, &mut self.scan_on_startup, TraktorTheme::PLAY_ACTIVE(), "Scan on startup");
             },
         );
 
@@ -2006,7 +2049,7 @@ impl PreferencesDialog {
             "Analyse new tracks",
             "Detect BPM, musical key, and energy for newly added tracks.",
             |ui| {
-                ui.checkbox(&mut self.analyze_new_tracks, "").on_hover_text("Analyse new tracks");
+                crate::dot::dot_toggle(ui, &mut self.analyze_new_tracks, TraktorTheme::PLAY_ACTIVE(), "Analyse new tracks");
             },
         );
 

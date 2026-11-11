@@ -1532,6 +1532,7 @@ pub fn render_shortcuts_hud(ctx: &egui::Context, is_open: &mut bool) {
                     ui.add_space(6.0);
                     key_row(ui, "N", "Suggest Next Track (idle deck)", c);
                     key_row(ui, "Cmd / Ctrl + ,", "Preferences & Setup", c);
+                    key_row(ui, "Ctrl+1..8", "Jump Prefs Group (in dialog)", c);
                     key_row(ui, "?", "Toggle Shortcuts HUD", c);
                     key_row(ui, "Esc", "Dismiss HUD / Modals", c);
                 });
