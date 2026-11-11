@@ -20,6 +20,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::thread;
+use std::sync::{Arc, mpsc};
+type LoadResult = (usize, u64, crate::library_ui::UiTrackEntry, Result<LoadedTrackAudio, String>);
 
 /// Traktor Pro 4 + Next-Gen Workspace Layouts (switchable from Top Header or F1..F6)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -132,6 +134,9 @@ pub struct ReTraktorApp {
     pub deck_auto_cue_status: [Option<String>; 4],
     /// Switched from Browser to Mix after the first track load.
     first_load_done: bool,
+    load_generation: [u64; 4],
+    load_channel: (mpsc::Sender<LoadResult>, mpsc::Receiver<LoadResult>),
+    pending_recording: Option<(Vec<i16>, u32)>,
 
     // Traktor Pro 4 16-Step Pattern Player State
     pub show_pattern_player: bool,
@@ -260,6 +265,9 @@ impl Default for ReTraktorApp {
             deck_auto_cue_status: [None, None, None, None],
             deck_track_ids: [None; 4],
             first_load_done: false,
+            load_generation: [0; 4],
+            load_channel: mpsc::channel(),
+            pending_recording: None,
             show_pattern_player: false,
             pattern_enabled: false,
             pattern_selected_voice: 0,
@@ -323,7 +331,10 @@ impl eframe::App for ReTraktorApp {
         }
 
         // Flush the autosaved collection and preferences on close.
-        if ctx.input(|i| i.viewport().close_requested()) && !self.exit_confirmed {
+        if ctx.input(|i| i.viewport().close_requested()) && self.pending_recording.is_some() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.library.status_message = "Recording has not been saved. Click RETRY SAVE before closing.".into();
+        } else if ctx.input(|i| i.viewport().close_requested()) && !self.exit_confirmed {
             self.save_collection_according_to_prefs();
             let _ = self.preferences.save();
             self.exit_confirmed = true;
@@ -343,6 +354,7 @@ impl eframe::App for ReTraktorApp {
             }
         }
 
+        self.finish_loads();
         self.handle_keyboard_shortcuts(ctx);
         if let Some(ids) = self.library.add_to_set_requested.take() {
             self.set_state.add_tracks(&ids);
@@ -360,7 +372,7 @@ impl eframe::App for ReTraktorApp {
         if let Ok(state) = self.audio.shared.lock() {
             let is_rec = state.is_recording;
             let rec_offset = if is_rec {
-                (state.recorded_samples.len() as f64) / (2.0 * 48_000.0)
+                (state.recorded_samples.len() as f64) / (2.0 * state.recording_sample_rate as f64)
             } else {
                 0.0
             };
@@ -644,8 +656,8 @@ impl ReTraktorApp {
                                 duration_sec: 384.0,
                                 pcm_stereo: vec![0.0; 48000],
                                 sample_rate: 48000,
-                                waveform_peaks: vec![[0.4, 0.5, 0.3]; 300],
-                                stem_peaks: vec![[0.4, 0.5, 0.3, 0.2]; 300],
+                                waveform_peaks: vec![[0.4, 0.5, 0.3]; 300].into(),
+                                stem_peaks: vec![[0.4, 0.5, 0.3, 0.2]; 300].into(),
                                 stems_ready: true,
                                 pcm_drums: None,
                                 pcm_bass: None,
@@ -759,8 +771,8 @@ impl ReTraktorApp {
                             let phase = (i as f32 / 1200.0) * 8.0;
                             let bass = ((phase * 3.14).sin().abs()).clamp(0.1, 0.9);
                             [bass, 0.5, 0.3]
-                        }).collect(),
-                        stem_peaks: Vec::new(),
+                        }).collect::<Vec<_>>().into(),
+                        stem_peaks: Vec::new().into(),
                         pcm_stereo: Vec::new(),
                         stems_ready: false,
                         pcm_drums: None,
@@ -904,7 +916,7 @@ impl ReTraktorApp {
             "cueplay" => {
                 self.jump_to_cue(deck, 1);
                 if let Ok(mut st) = self.audio.shared.lock() {
-                    st.is_playing[d] = true;
+                    st.is_playing[d] = st.loaded_tracks[d].is_some();
                 }
             }
             "sync" => self.sync_deck(deck),
@@ -960,7 +972,7 @@ impl ReTraktorApp {
     }
 
     fn locked_decks(&self) -> [bool; 4] {
-        let playing = self.audio.shared.lock().map(|s| s.is_playing).unwrap_or([false; 4]);
+        let playing = self.audio.shared.lock().map(|s| std::array::from_fn(|d| s.is_playing[d] && s.loaded_tracks[d].is_some())).unwrap_or([false; 4]);
         playing.map(|p| self.preferences.lock_playing_decks && p)
     }
 
@@ -992,23 +1004,16 @@ impl ReTraktorApp {
             }
         }
         for (deck_idx, track) in std::mem::take(&mut self.library.pending_loads) {
-            let d = (deck_idx - 1).min(3);
-            self.deck_track_ids[d] = Some(track.id);
-            self.deck_auto_cue_status[d] = None;
-            let mut hotcues = Vec::new();
-            for cue in &track.cues {
-                if cue.hotcue >= 0 && cue.hotcue < 8 {
-                    hotcues.push(((cue.hotcue + 1) as u8, cue.start_ms / 1000.0));
-                }
-            }
-            if !hotcues.is_empty() {
-                self.deck_hotcues[d] = hotcues;
-            }
-            self.set_state.on_track_loaded(d, track.id);
-            let shared_audio = self.audio.shared.clone();
+            let d = deck_idx.clamp(1, 4) - 1;
+            self.load_generation[d] += 1;
+            let generation = self.load_generation[d];
+            let tx = self.load_channel.0.clone();
             let library_tx = library_tx.clone();
             thread::spawn(move || {
-                let Some(path) = track.file_path.as_ref() else { return };
+                let Some(path) = track.file_path.as_ref() else {
+                    let _ = tx.send((d, generation, track, Err("No file path".into())));
+                    return;
+                };
                 match LoadedTrackAudio::from_file(path, &track.title, &track.artist, track.bpm, &track.musical_key) {
                     Ok(mut loaded) => {
                         // Unanalysed track: analyse the PCM we just decoded and report back to the library.
@@ -1032,14 +1037,43 @@ impl ReTraktorApp {
                         } else if !track.phrases.is_empty() {
                             loaded.phrases = track.phrases.clone();
                         }
-                        if let Ok(mut state) = shared_audio.lock() {
-                            state.loaded_tracks[d] = Some(loaded);
-                            state.playhead_sec[d] = 0.0;
-                        }
+                        let _ = tx.send((d, generation, track, Ok(loaded)));
                     }
-                    Err(e) => eprintln!("retraktor: could not load {}: {e}", path.display()),
+                    Err(e) => { let _ = tx.send((d, generation, track, Err(e))); },
                 }
             });
+        }
+    }
+
+    fn save_pending_recording(&mut self, path: &std::path::Path) -> Result<f64, String> {
+        let (samples, rate) = self.pending_recording.as_ref().ok_or("No recording to save")?;
+        let duration = AudioSystem::write_stereo_wav_file(path, samples, *rate)?;
+        self.pending_recording = None;
+        Ok(duration)
+    }
+
+    fn finish_loads(&mut self) {
+        while let Ok((d, generation, track, result)) = self.load_channel.1.try_recv() {
+            if generation != self.load_generation[d] { continue; }
+            match result {
+                Ok(loaded) => {
+                    let stems_ready = loaded.stems_ready;
+                    if let Ok(mut state) = self.audio.shared.lock() {
+                        state.loaded_tracks[d] = Some(loaded);
+                        state.playhead_sec[d] = 0.0;
+                        state.is_playing[d] = false;
+                    } else { continue; }
+                    self.deck_track_ids[d] = Some(track.id);
+                    self.deck_auto_cue_status[d] = None;
+                    self.deck_hotcues[d] = track.cues.iter().filter(|c| (0..8).contains(&c.hotcue))
+                        .map(|c| ((c.hotcue + 1) as u8, c.start_ms / 1000.0)).collect();
+                    self.deck_loop_active[d] = false;
+                    self.library.finish_deck_load(d, track.id, stems_ready);
+                    self.set_state.on_track_loaded(d, track.id);
+                    self.library.status_message = format!("Loaded '{}' on deck {}", track.title, DECK_LETTERS[d]);
+                }
+                Err(e) => self.library.status_message = format!("Could not load '{}' on deck {}: {e}", track.title, DECK_LETTERS[d]),
+            }
         }
     }
 
@@ -1703,7 +1737,7 @@ impl ReTraktorApp {
     }
 
     fn trigger_performance_pad(&mut self, deck_idx: usize, pad_num: u8) {
-        let d = (deck_idx - 1).min(3);
+        let d = deck_idx.clamp(1, 4) - 1;
         let pad_idx = (pad_num.saturating_sub(1) as usize).min(7);
         match self.deck_pad_mode[d] {
             DeckPadMode::Hotcues => {
@@ -1943,8 +1977,8 @@ impl ReTraktorApp {
                 if i.key_pressed(Key::A) {
                     self.sync_deck(2);
                     if let Ok(mut state) = self.audio.shared.lock() {
-                        state.is_playing[0] = true;
-                        state.is_playing[1] = true;
+                        state.is_playing[0] = state.loaded_tracks[0].is_some();
+                        state.is_playing[1] = state.loaded_tracks[1].is_some();
                     }
                 }
 
@@ -1988,7 +2022,7 @@ impl ReTraktorApp {
     fn toggle_play(&mut self, deck_idx: usize) {
         if let Ok(mut state) = self.audio.shared.lock() {
             let d = deck_idx - 1;
-            state.is_playing[d] = !state.is_playing[d];
+            state.is_playing[d] = state.loaded_tracks[d].is_some() && !state.is_playing[d];
         }
     }
 
@@ -2190,13 +2224,13 @@ impl ReTraktorApp {
                         .audio
                         .shared
                         .lock()
-                        .map(|s| s.recorded_samples.len() as f64 / (48_000.0 * 2.0))
+                        .map(|s| s.recorded_samples.len() as f64 / (s.recording_sample_rate as f64 * 2.0))
                         .unwrap_or(0.0);
-                    if show_rec || is_rec {
+                    if show_rec || is_rec || self.pending_recording.is_some() {
                         let rec_label = if is_rec {
                             format!("REC {:02}:{:02}", (rec_sec / 60.0).floor() as u32, (rec_sec % 60.0).floor() as u32)
                         } else {
-                            "REC".to_string()
+                            if self.pending_recording.is_some() { "RETRY SAVE" } else { "REC" }.to_string()
                         };
                         let (rec_fill, rec_fg) = if is_rec {
                             (TraktorTheme::ACCENT(), on(TraktorTheme::ACCENT()))
@@ -2211,24 +2245,27 @@ impl ReTraktorApp {
                             })
                             .clicked()
                         {
-                            let mut samples_to_save: Option<Vec<i16>> = None;
-                            if let Ok(mut state) = self.audio.shared.lock() {
-                                if state.is_recording {
-                                    state.is_recording = false;
-                                    samples_to_save = Some(std::mem::take(&mut state.recorded_samples));
-                                } else {
-                                    state.recorded_samples = Vec::with_capacity(48_000 * 2 * 1800);
-                                    state.is_recording = true;
-                                    self.set_state.recorded_audible_tracks.clear();
-                                    self.set_state.recording_start = Some(std::time::Instant::now());
+                            let mut samples_to_save = self.pending_recording.take();
+                            if samples_to_save.is_none() {
+                                if let Ok(mut state) = self.audio.shared.lock() {
+                                    if state.is_recording {
+                                        state.is_recording = false;
+                                        samples_to_save = Some((std::mem::take(&mut state.recorded_samples), state.recording_sample_rate));
+                                    } else {
+                                        state.recorded_samples = Vec::with_capacity(48_000 * 2 * 1800);
+                                        state.is_recording = true;
+                                        self.set_state.recorded_audible_tracks.clear();
+                                        self.set_state.recording_start = Some(std::time::Instant::now());
+                                    }
                                 }
                             }
-                            if let Some(samples) = samples_to_save {
+                            if let Some((samples, sample_rate)) = samples_to_save {
                                 let home = env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("."));
                                 let rec_dir = home.join("Music").join("ReTraktor");
                                 let _ = std::fs::create_dir_all(&rec_dir);
                                 let (out_wav, out_cue, out_txt) = crate::setlist::unique_recording_paths(&rec_dir, std::time::SystemTime::now());
-                                match AudioSystem::write_stereo_wav_file(&out_wav, &samples, 48_000) {
+                                self.pending_recording = Some((samples, sample_rate));
+                                match self.save_pending_recording(&out_wav) {
                                     Ok(dur_s) => {
                                         let entries: Vec<(f64, &str, &str)> = self
                                             .set_state
@@ -2248,7 +2285,7 @@ impl ReTraktorApp {
                                         );
                                     }
                                     Err(e) => {
-                                        self.library.status_message = format!("⚠ Failed to save WAV recording: {e}");
+                                        self.library.status_message = format!("Save failed: {e}. Click RETRY SAVE; keep the app open.");
                                     }
                                 }
                             }
@@ -2546,8 +2583,8 @@ impl ReTraktorApp {
                     {
                         self.sync_deck(2);
                         if let Ok(mut state) = self.audio.shared.lock() {
-                            state.is_playing[0] = true;
-                            state.is_playing[1] = true;
+                            state.is_playing[0] = state.loaded_tracks[0].is_some();
+                            state.is_playing[1] = state.loaded_tracks[1].is_some();
                         }
                     }
                 });
@@ -3110,7 +3147,7 @@ impl ReTraktorApp {
                         TransportAction::Cup => {
                             self.jump_to_cue(deck_idx, 1);
                             if let Ok(mut state) = self.audio.shared.lock() {
-                                state.is_playing[d] = true;
+                                state.is_playing[d] = state.loaded_tracks[d].is_some();
                             }
                         }
                         TransportAction::ToggleFlux => {
@@ -3688,8 +3725,8 @@ struct DeckView {
     duration_sec: f64,
     elapsed_sec: f64,
     is_playing: bool,
-    peaks: Vec<[f32; 3]>,
-    stem_peaks: Vec<[f32; 4]>,
+    peaks: Arc<[[f32; 3]]>,
+    stem_peaks: Arc<[[f32; 4]]>,
     phrases: Vec<retraktor_library::Phrase>,
 }
 
@@ -3880,6 +3917,66 @@ fn mix_wave_height(ui: &Ui) -> f32 {
 mod tests {
     use super::*;
     use crate::theme::Palette;
+
+    #[test]
+    fn real_file_loads_and_recording_retries() {
+        let dir = std::env::temp_dir().join(format!("retraktor-load-regression-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("track.wav");
+        AudioSystem::write_stereo_wav_file(&wav, &vec![100; 8820], 44100).unwrap();
+        let mut app = ReTraktorApp::default();
+        app.library = LibraryManager::new(dir.join("collection.nml"));
+        app.preferences.lock_playing_decks = true;
+        app.toggle_play(1);
+        assert!(!app.audio.shared.lock().unwrap().is_playing[0]);
+        assert!(!app.locked_decks()[0]);
+        let track = crate::library_ui::UiTrackEntry {
+            id: 12, title: "Real WAV".into(), file_path: Some(wav.clone()),
+            bpm: 128.0, musical_key: "1d".into(), ..Default::default()
+        };
+        app.deck_hotcues[0] = vec![(1, 42.0)];
+        app.library.pending_loads.push((1, track.clone()));
+        app.drain_pending_loads();
+        let result = app.load_channel.1.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        assert!(result.3.is_ok());
+        app.load_channel.0.send(result).unwrap();
+        app.finish_loads();
+        assert_eq!(app.deck_track_ids[0], Some(12));
+        assert!(app.deck_hotcues[0].is_empty());
+        let view = app.deck_view(0).unwrap();
+        assert!(Arc::ptr_eq(&view.peaks, &app.audio.shared.lock().unwrap().loaded_tracks[0].as_ref().unwrap().waveform_peaks));
+
+        app.load_generation[0] += 1;
+        let stale = LoadedTrackAudio::from_file(&wav, "Stale", "", 128.0, "1d").unwrap();
+        app.load_channel.0.send((0, 1, track.clone(), Ok(stale))).unwrap();
+        app.finish_loads();
+        assert_eq!(app.deck_view(0).unwrap().title, "Real WAV");
+
+        let bad = dir.join("bad.wav");
+        std::fs::write(&bad, b"not audio").unwrap();
+        let bad_track = crate::library_ui::UiTrackEntry { id: 13, file_path: Some(bad), ..track };
+        app.library.pending_loads.push((1, bad_track));
+        app.drain_pending_loads();
+        let result = app.load_channel.1.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        assert!(result.3.is_err());
+        app.load_channel.0.send(result).unwrap();
+        app.finish_loads();
+        assert!(app.library.status_message.contains("Could not load"));
+        assert_eq!(app.deck_track_ids[0], Some(12));
+
+        for rate in [44100, 96000] {
+            app.pending_recording = Some((vec![123; rate as usize * 2], rate));
+            assert!(app.save_pending_recording(&dir).is_err());
+            assert_eq!(app.pending_recording.as_ref().unwrap().0.len(), rate as usize * 2);
+            let out = dir.join("recording.wav");
+            assert_eq!(app.save_pending_recording(&out).unwrap(), 1.0);
+            assert!(app.pending_recording.is_none());
+            let decoded = LoadedTrackAudio::from_file(&out, "", "", 128.0, "1d").unwrap();
+            assert_eq!(decoded.sample_rate, rate);
+            assert_eq!(decoded.duration_sec, 1.0);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn sync_matches_tempo_and_phase() {

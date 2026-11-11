@@ -171,10 +171,25 @@ impl DemucsManager {
         (status, desc)
     }
 
+    fn source_cache_root(audio_path: &Path) -> PathBuf {
+        use std::os::unix::ffi::OsStrExt;
+        let path = fs::canonicalize(audio_path).unwrap_or_else(|_| audio_path.to_path_buf());
+        let mut root = Self::stems_cache_root().join("sources-v1");
+        // Encode the full path in bounded components so equal basenames never share stems.
+        for chunk in path.as_os_str().as_bytes().chunks(64) {
+            root.push(chunk.iter().map(|b| format!("{b:02x}")).collect::<String>());
+        }
+        if let Ok(meta) = fs::metadata(&path) {
+            let modified = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_nanos()).unwrap_or(0);
+            root.push(format!("{}-{modified}", meta.len()));
+        }
+        root
+    }
+
     /// Checks if a given audio file already has pre-rendered stems in the cache.
     pub fn get_cached_stem_dir(audio_path: &Path) -> Option<PathBuf> {
         let file_stem = audio_path.file_stem()?.to_str()?;
-        let cache_root = Self::stems_cache_root();
+        let cache_root = Self::source_cache_root(audio_path);
 
         // Demucs can place stems in cache_root/<file_stem> or cache_root/htdemucs/<file_stem>
         let candidate_dirs = [
@@ -486,7 +501,7 @@ impl DemucsManager {
 
         let status_clone = self.separation_status.clone();
         let audio_path_buf = audio_path.to_path_buf();
-        let cache_root = Self::stems_cache_root();
+        let cache_root = Self::source_cache_root(audio_path);
         let track_title_string = track_title.to_string();
 
         thread::spawn(move || {
@@ -571,6 +586,18 @@ impl DemucsManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_names_include_source_path() {
+        assert_ne!(
+            DemucsManager::source_cache_root(Path::new("/music/one/Track 01.flac")),
+            DemucsManager::source_cache_root(Path::new("/music/two/Track 01.flac"))
+        );
+        assert_ne!(
+            DemucsManager::source_cache_root(Path::new("/music/one/Track 01.flac")),
+            DemucsManager::source_cache_root(Path::new("/music/one/Track 01.wav"))
+        );
+    }
 
     #[test]
     fn test_demucs_paths_and_initial_status() {

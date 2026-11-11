@@ -1,3 +1,4 @@
+#[cfg(not(test))]
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use retraktor_audio::FourDeckAudioEngine;
 use std::f32::consts::PI;
@@ -5,7 +6,9 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+#[cfg(not(test))]
 use std::thread;
+#[cfg(not(test))]
 use std::time::{Duration, Instant};
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::DecoderOptions;
@@ -30,9 +33,9 @@ pub struct LoadedTrackAudio {
     pub pcm_stereo: Vec<f32>, // Interleaved [L, R, L, R, ...]
     pub sample_rate: u32,
     /// Precomputed 3-band `[low, mid, high]` amplitude peaks at `PEAKS_PER_SEC` Hz.
-    pub waveform_peaks: Vec<[f32; 3]>,
+    pub waveform_peaks: Arc<[[f32; 3]]>,
     /// Precomputed 4-stem `[drums, bass, instruments, vocals]` amplitude peaks at `PEAKS_PER_SEC` Hz.
-    pub stem_peaks: Vec<[f32; 4]>,
+    pub stem_peaks: Arc<[[f32; 4]]>,
     pub stems_ready: bool,
     /// True isolated AI stems (from Demucs or synthesis). If Some, played with zero bleed.
     pub pcm_drums: Option<Vec<f32>>,
@@ -260,8 +263,8 @@ impl LoadedTrackAudio {
             duration_sec,
             pcm_stereo,
             sample_rate: sr,
-            waveform_peaks,
-            stem_peaks,
+            waveform_peaks: waveform_peaks.into(),
+            stem_peaks: stem_peaks.into(),
             stems_ready: false,
             pcm_drums: None,
             pcm_bass: None,
@@ -270,19 +273,8 @@ impl LoadedTrackAudio {
             phrases,
         };
 
-        // Check if pre-separated Demucs stems are cached in ~/.cache/retraktor/stems/htdemucs/<file_stem>
-        if let Some(stem_name) = path.file_stem().and_then(|s| s.to_str()) {
-            if let Ok(home) = std::env::var("HOME") {
-                let cache_root = std::path::PathBuf::from(home).join(".cache/retraktor/stems/htdemucs");
-                let candidate_1 = cache_root.join(stem_name);
-                let candidate_2 = cache_root.join("htdemucs").join(stem_name);
-
-                if candidate_1.is_dir() {
-                    let _ = loaded.load_stems_from_dir(&candidate_1);
-                } else if candidate_2.is_dir() {
-                    let _ = loaded.load_stems_from_dir(&candidate_2);
-                }
-            }
+        if let Some(dir) = crate::demucs::DemucsManager::get_cached_stem_dir(path) {
+            loaded.load_stems_from_dir(&dir);
         }
 
         Ok(loaded)
@@ -416,7 +408,7 @@ impl LoadedTrackAudio {
                 self.pcm_bass = Some(b);
                 self.pcm_other = Some(o);
                 self.pcm_vocals = Some(v);
-                self.stem_peaks = real_peaks;
+                self.stem_peaks = real_peaks.into();
                 self.stems_ready = true;
                 return true;
             }
@@ -689,6 +681,16 @@ pub struct AudioSystem {
 }
 
 impl AudioSystem {
+    #[cfg(test)]
+    pub fn new() -> Self {
+        Self {
+            shared: Arc::new(Mutex::new(AudioSharedState::default())),
+            _stream: None,
+            running: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[cfg(not(test))]
     pub fn new() -> Self {
         let initial_state = AudioSharedState::default();
 

@@ -1515,6 +1515,13 @@ impl LibraryManager {
         }
     }
 
+    pub fn finish_deck_load(&mut self, d: usize, id: usize, stems_ready: bool) {
+        self.deck_tracks[d] = Some(id);
+        self.history.push(id);
+        self.last_loaded_deck = Some((d, stems_ready));
+        self.version += 1;
+    }
+
     /// Queues `id` for loading onto deck `deck` (1..=4) after safety checks.
     pub fn load_to_deck(&mut self, deck: usize, id: usize, locked: [bool; 4]) {
         let d = deck.clamp(1, 4) - 1;
@@ -1524,9 +1531,6 @@ impl LibraryManager {
         } else if !t.file_path.as_ref().is_some_and(|p| p.is_file()) {
             self.status_message = format!("File not found for '{}' — use Relocate", t.title);
         } else {
-            self.history.push(id);
-            self.deck_tracks[d] = Some(id);
-            self.last_loaded_deck = Some((d, t.stems_ready));
             self.status_message = format!("Loading '{}' on deck {}", t.title, DECK_NAMES[d]);
             self.pending_loads.push((deck, t));
             self.version += 1;

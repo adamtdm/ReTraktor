@@ -1190,11 +1190,11 @@ impl<'a> ContinuousMixer<'a> {
         let active_channels: &[usize] = if self.two_channel_only { &[0, 1] } else { &[0, 2, 3, 1] };
 
         // Drag target persistence
-        let drag_id = ui.make_persistent_id("continuous_mixer_drag");
-        let active_drag: Option<MixerDragTarget> = ui.ctx().data(|d| d.get_temp(drag_id));
+        let drag_id = response.id.with("drag_target");
+        let mut active_drag: Option<MixerDragTarget> = ui.ctx().data(|d| d.get_temp(drag_id));
 
         if response.drag_started() {
-            if let Some(pos) = response.interact_pointer_pos() {
+            if let Some(pos) = ui.input(|i| i.pointer.press_origin()) {
                 let target = if pos.y >= row_y(4) {
                     Some(MixerDragTarget::Crossfader)
                 } else {
@@ -1223,7 +1223,13 @@ impl<'a> ContinuousMixer<'a> {
                     }
                     found
                 };
-                ui.ctx().data_mut(|d| d.insert_temp(drag_id, target));
+                active_drag = target;
+                ui.ctx().data_mut(|data| {
+                    data.remove_temp::<MixerDragTarget>(drag_id);
+                    if let Some(target) = target {
+                        data.insert_temp(drag_id, target);
+                    }
+                });
             }
         }
 
@@ -2579,6 +2585,92 @@ pub fn dot_slider(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn continuous_mixer_pointer_drags() {
+        use eframe::egui;
+        for two_channel_only in [true, false] {
+            let ctx = egui::Context::default();
+            crate::theme::install_fonts(&ctx);
+            ctx.style_mut(|s| s.interaction.tooltip_delay = 999.0);
+            let mut volume = [0.5; 4];
+            let mut cue = [false; 4];
+            let mut low = [0.5; 4];
+            let mut mid = [0.5; 4];
+            let mut hi = [0.5; 4];
+            let mut kill_low = [false; 4];
+            let mut kill_mid = [false; 4];
+            let mut kill_hi = [false; 4];
+            let mut muted = [[false; 4]; 4];
+            let mut sends = [[false; 4]; 4];
+            let mut xfader = 0.5;
+            let mut cheer = None;
+            let mut mixer = ContinuousMixer {
+                two_channel_only, volume: &mut volume, cue: &mut cue,
+                eq_low: &mut low, eq_mid: &mut mid, eq_hi: &mut hi,
+                eq_kill_low: &mut kill_low, eq_kill_mid: &mut kill_mid,
+                eq_kill_hi: &mut kill_hi, filter: [0.5; 4], filter_on: [false; 4],
+                stem_view: [false; 4], stem_muted: &mut muted, stem_fx_send: &mut sends,
+                crossfader: &mut xfader, channel_peaks: [0.0; 4],
+                band_peaks: [[0.0; 3]; 4], stem_peaks: [[0.0; 4]; 4],
+                main_peaks: (0.0, 0.0), stem_progress: [None; 4],
+                active_cheer: &mut cheer, deck_track_ids: [None; 4],
+                deck_sync_enabled: [false; 4], in_key: false, is_recording: false,
+                size: Vec2::new(500.0, 220.0),
+            };
+            let mut time = 0.0;
+            let mut frame = |mixer: &mut ContinuousMixer<'_>, events| {
+                time += 0.1;
+                let mut rect = egui::Rect::NOTHING;
+                let _ = ctx.run(egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0))),
+                    time: Some(time), events, ..Default::default()
+                }, |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| { rect = mixer.show(ui).rect; });
+                });
+                rect
+            };
+            let rect = frame(&mut mixer, vec![egui::Event::PointerMoved(Pos2::ZERO)]);
+            let cols = 93;
+            let layout = compute_mixer_zone_layout(cols, two_channel_only);
+            let col_x = |c: usize| rect.left() + 9.35 + c as f32 * (500.0 - 18.7) / (cols - 1) as f32;
+            let button = |pos, pressed| egui::Event::PointerButton {
+                pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE,
+            };
+            let channels: &[usize] = if two_channel_only { &[0, 1] } else { &[0, 2, 3, 1] };
+            let mut targets = vec![(Pos2::new(rect.center().x, rect.bottom() - 12.0), Vec2::new(50.0, 0.0), None)];
+            for &d in channels {
+                let zone = layout.fader_meter[d].unwrap();
+                targets.push((Pos2::new(col_x((zone.start + zone.end) / 2), rect.center().y), Vec2::new(0.0, -20.0), Some(d)));
+            }
+            for (start, delta, deck) in targets {
+                frame(&mut mixer, vec![egui::Event::PointerMoved(start), button(start, true)]);
+                frame(&mut mixer, vec![egui::Event::PointerMoved(start + delta)]);
+                frame(&mut mixer, vec![egui::Event::PointerMoved(start + delta * 2.0)]);
+                let value = match deck { Some(d) => mixer.volume[d], None => *mixer.crossfader };
+                assert!(value > 0.5, "drag failed for {deck:?}, two-channel={two_channel_only}");
+                frame(&mut mixer, vec![button(start + delta * 2.0, false)]);
+                frame(&mut mixer, vec![egui::Event::PointerMoved(start)]);
+                assert_eq!(value, match deck { Some(d) => mixer.volume[d], None => *mixer.crossfader });
+            }
+            let zone = layout.eq_stem_zone[0].unwrap();
+            let start = Pos2::new(col_x(zone.start + 1), rect.center().y);
+            frame(&mut mixer, vec![egui::Event::PointerMoved(start), button(start, true)]);
+            frame(&mut mixer, vec![egui::Event::PointerMoved(start - Vec2::new(0.0, 20.0))]);
+            assert!(mixer.eq_low[0] > 0.5);
+            frame(&mut mixer, vec![button(start - Vec2::new(0.0, 20.0), false)]);
+            let center = Pos2::new(rect.center().x, rect.bottom() - 12.0);
+            frame(&mut mixer, vec![egui::Event::PointerMoved(center), button(center, true)]);
+            frame(&mut mixer, vec![button(center, false)]);
+            assert!((*mixer.crossfader - 0.5).abs() < 0.01);
+            // A stationary press/release on a cue lamp must remain a click.
+            let fader = layout.fader_meter[0].unwrap();
+            let cue_pos = Pos2::new(col_x(fader.start), rect.bottom() - 7.35 - 5.0 * (220.0 - 14.7) / 38.0);
+            frame(&mut mixer, vec![egui::Event::PointerMoved(cue_pos), button(cue_pos, true)]);
+            frame(&mut mixer, vec![button(cue_pos, false)]);
+            assert!(mixer.cue[0]);
+        }
+    }
 
     #[test]
     fn ring_dots_follow_bipolar_and_unipolar_values() {
