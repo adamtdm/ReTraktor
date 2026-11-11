@@ -368,12 +368,13 @@ pub fn call_ai_api(settings: &AiSettings, prompt: &str) -> Result<String, String
                 return Err("Gemini API key is required".to_string());
             }
             let url = format!(
-                "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
-                settings.model.trim(),
-                settings.api_key.trim()
+                "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
+                settings.model.trim()
             );
             let body = build_gemini_request(prompt);
+            // Key goes in a header, not the URL, so it can never appear in an error message.
             let resp = agent.post(&url)
+                .set("x-goog-api-key", settings.api_key.trim())
                 .set("Content-Type", "application/json")
                 .send_json(body)
                 .map_err(|e| format!("HTTP request failed: {e}"))?;
@@ -567,8 +568,17 @@ pub fn explain_candidate(candidate: &UiTrackEntry, live_ref: &UiTrackEntry) -> S
 
     // Tempo delta
     if candidate.bpm > 0.0 && live_ref.bpm > 0.0 {
-        let diff = candidate.bpm - live_ref.bpm;
-        if diff.abs() < 0.05 {
+        // Half and double tempo mix as the same tempo, so say that instead of a huge delta.
+        let (mut cand, mut note) = (candidate.bpm, "");
+        if cand < live_ref.bpm * 0.7 {
+            (cand, note) = (cand * 2.0, "half tempo ");
+        } else if cand > live_ref.bpm * 1.4 {
+            (cand, note) = (cand / 2.0, "double tempo ");
+        }
+        let diff = cand - live_ref.bpm;
+        if !note.is_empty() {
+            parts.push(format!("{note}{diff:+.1} BPM"));
+        } else if diff.abs() < 0.05 {
             parts.push(format!("{:.1} BPM", candidate.bpm));
         } else {
             parts.push(format!("{:+.1} BPM", diff));
