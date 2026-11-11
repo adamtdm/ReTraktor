@@ -11,6 +11,7 @@
 
 use eframe::egui::{self, Vec2};
 
+mod ai;
 mod app;
 mod audio;
 mod controller_map;

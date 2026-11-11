@@ -73,6 +73,11 @@ pub struct ReTraktorApp {
     pub bus: PropertyBus,
     pub layout: TraktorLayout,
     pub show_shortcuts_hud: bool,
+    pub show_next_track_panel: bool,
+    pub next_track_picks: Vec<(usize, f32, String)>,
+    pub next_track_target_deck: usize,
+    pub ai_rerank_runner: Option<crate::ai::AiRerankRunner>,
+    pub ai_rerank_status: Option<String>,
 
     // Mixer UI State
     pub channel_gain: [f32; 4],
@@ -190,6 +195,11 @@ impl Default for ReTraktorApp {
             bus,
             layout: TraktorLayout::Browser, // Library first; switches to Mix on the first load
             show_shortcuts_hud: false,
+            show_next_track_panel: false,
+            next_track_picks: Vec::new(),
+            next_track_target_deck: 2,
+            ai_rerank_runner: None,
+            ai_rerank_status: None,
             channel_gain: [0.5, 0.5, 0.5, 0.5],
             channel_eq_hi: [0.5, 0.5, 0.5, 0.5],
             channel_eq_mid: [0.5, 0.5, 0.5, 0.5],
@@ -515,6 +525,17 @@ impl eframe::App for ReTraktorApp {
         // Live Performance Shortcuts HUD Overlay
         render_shortcuts_hud(ctx, &mut self.show_shortcuts_hud);
 
+        // Open Preferences AI tab if requested by library
+        if self.library.open_prefs_ai {
+            self.library.open_prefs_ai = false;
+            self.preferences.is_open = true;
+            self.preferences.current_tab = PrefsTab::Ai;
+        }
+
+        // Suggest Next Track Window
+        if self.show_next_track_panel {
+            self.render_next_track_window(ctx);
+        }
     }
 }
 
@@ -556,6 +577,7 @@ impl ReTraktorApp {
             s if s.starts_with("select:") => self.preferences.mapper.selected = Some(s[7..].to_string()),
             s if s.starts_with("prefs:") => {
                 self.preferences.is_open = true;
+                self.show_next_track_panel = false;
                 if let Some((_, tabs)) = PreferencesDialog::GROUPS.iter().find(|(name, _)| name.replace(' ', "") == s[6..]) {
                     self.preferences.current_tab = tabs[0];
                 }
@@ -582,6 +604,77 @@ impl ReTraktorApp {
             "stemsA" => self.deck_stem_view[0] = true,
             "pattern" => self.show_pattern_player = true,
             "help" => self.show_shortcuts_hud = true,
+            "ai" => {
+                self.preferences.is_open = false;
+                self.show_next_track_panel = false;
+                self.layout = TraktorLayout::Browser;
+                self.library.show_ai_playlist_panel = true;
+            }
+            "next" => {
+                self.preferences.is_open = false;
+                if self.library.tracks.is_empty() {
+                    self.library.tracks = vec![
+                        crate::library_ui::UiTrackEntry {
+                            id: 1,
+                            title: "Pulse Width".into(),
+                            artist: "Aphex Twin".into(),
+                            bpm: 124.0,
+                            musical_key: "8m".into(),
+                            genre: "Techno".into(),
+                            energy: 6,
+                            file_path: Some(std::path::PathBuf::from("/music/pulse_width.flac")),
+                            ..Default::default()
+                        },
+                        crate::library_ui::UiTrackEntry {
+                            id: 2,
+                            title: "Windowlicker".into(),
+                            artist: "Aphex Twin".into(),
+                            bpm: 125.0,
+                            musical_key: "8m".into(),
+                            genre: "Electronic".into(),
+                            energy: 7,
+                            file_path: Some(std::path::PathBuf::from("/music/windowlicker.flac")),
+                            ..Default::default()
+                        },
+                        crate::library_ui::UiTrackEntry {
+                            id: 3,
+                            title: "Blue Monday".into(),
+                            artist: "New Order".into(),
+                            bpm: 126.0,
+                            musical_key: "9m".into(),
+                            genre: "Synthpop".into(),
+                            energy: 7,
+                            file_path: Some(std::path::PathBuf::from("/music/blue_monday.flac")),
+                            ..Default::default()
+                        },
+                        crate::library_ui::UiTrackEntry {
+                            id: 4,
+                            title: "Around The World".into(),
+                            artist: "Daft Punk".into(),
+                            bpm: 121.0,
+                            musical_key: "8m".into(),
+                            genre: "House".into(),
+                            energy: 6,
+                            file_path: Some(std::path::PathBuf::from("/music/around_the_world.flac")),
+                            ..Default::default()
+                        },
+                        crate::library_ui::UiTrackEntry {
+                            id: 5,
+                            title: "Voodoo Ray".into(),
+                            artist: "A Guy Called Gerald".into(),
+                            bpm: 122.0,
+                            musical_key: "7m".into(),
+                            genre: "Acid House".into(),
+                            energy: 6,
+                            file_path: Some(std::path::PathBuf::from("/music/voodoo_ray.flac")),
+                            ..Default::default()
+                        },
+                    ];
+                    self.deck_track_ids[0] = Some(1);
+                }
+                self.show_next_track_panel = true;
+                self.compute_next_track_picks();
+            }
             // Held mid-animation so a still can show it.
             s if s.starts_with("cheer:") => {
                 let cheer_index = s[6..].parse().unwrap_or(0);
@@ -1376,6 +1469,18 @@ impl ReTraktorApp {
             self.preferences.is_open = false;
         }
 
+        if ctx.input(|i| i.key_pressed(Key::Escape)) && self.show_next_track_panel {
+            self.show_next_track_panel = false;
+        }
+
+        if self.show_next_track_panel && ctx.input(|i| i.key_pressed(Key::Enter)) {
+            if let Some(&(id, _, _)) = self.next_track_picks.first() {
+                let locked = self.locked_decks();
+                self.library.load_to_deck(self.next_track_target_deck, id, locked);
+                self.show_next_track_panel = false;
+            }
+        }
+
         // Layout shortcuts F1..F4
         for (key, lay) in [
             (Key::F1, TraktorLayout::Parallel),
@@ -1524,6 +1629,13 @@ impl ReTraktorApp {
                     if let Ok(mut state) = self.audio.shared.lock() {
                         state.is_playing[0] = true;
                         state.is_playing[1] = true;
+                    }
+                }
+
+                if i.key_pressed(Key::N) && !shift {
+                    self.show_next_track_panel = !self.show_next_track_panel;
+                    if self.show_next_track_panel {
+                        self.compute_next_track_picks();
                     }
                 }
             });
@@ -1679,6 +1791,14 @@ impl ReTraktorApp {
                     .clicked()
                 {
                     self.show_pattern_player = !self.show_pattern_player;
+                }
+
+                let next_fill = if self.show_next_track_panel { TraktorTheme::ACCENT() } else { TraktorTheme::ROW_SELECTED() };
+                if pill(ui, "NEXT", self.show_next_track_panel, next_fill, 0.0)
+                    .on_hover_text("Suggest next track for the idle deck (N)")
+                    .clicked()
+                {
+                    self.toggle_next_track_panel();
                 }
 
                 // ---- Right: utilities + mirrored Deck B strip (ON/OFF + FX | FILTER | GAIN | B) ----
@@ -2824,6 +2944,270 @@ impl ReTraktorApp {
                 }
             });
         });
+    }
+
+    fn toggle_next_track_panel(&mut self) {
+        self.show_next_track_panel = !self.show_next_track_panel;
+        if self.show_next_track_panel {
+            self.compute_next_track_picks();
+        }
+    }
+
+    fn compute_next_track_picks(&mut self) {
+        let (live_d, idle_d) = {
+            let (play_a, play_b) = if let Ok(state) = self.audio.shared.lock() {
+                (state.is_playing[0], state.is_playing[1])
+            } else {
+                (false, false)
+            };
+            if play_a && !play_b {
+                (0, 1)
+            } else if play_b && !play_a {
+                (1, 0)
+            } else if self.crossfader_pos < 0.5 {
+                (0, 1)
+            } else {
+                (1, 0)
+            }
+        };
+        self.next_track_target_deck = idle_d + 1;
+
+        let live_ref_opt = self.deck_track_ids[live_d]
+            .and_then(|id| self.library.track(id).cloned())
+            .or_else(|| self.library.history.last().and_then(|&id| self.library.track(id).cloned()))
+            .or_else(|| self.library.tracks.iter().find(|t| !t.missing && t.file_path.is_some()).cloned());
+
+        if let Some(live_ref) = live_ref_opt {
+            let mut scored: Vec<(usize, f32, String)> = self.library.tracks
+                .iter()
+                .filter(|t| !t.missing && t.file_path.is_some())
+                .filter_map(|t| {
+                    let s = crate::ai::score_next_candidate(t, &live_ref, &self.library.history);
+                    if s > 0.0 {
+                        let reason = crate::ai::explain_candidate(t, &live_ref);
+                        Some((t.id, s, reason))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            if scored.is_empty() {
+                scored = self.library.tracks
+                    .iter()
+                    .filter(|t| !t.missing && t.file_path.is_some() && t.id != live_ref.id)
+                    .take(5)
+                    .map(|t| (t.id, 0.5f32, format!("{} BPM · {}", if t.bpm > 0.0 { format!("{:.1}", t.bpm) } else { "-".into() }, if !t.musical_key.is_empty() { &t.musical_key } else { "-" })))
+                    .collect();
+            }
+            self.next_track_picks = scored.into_iter().take(5).collect();
+        }
+    }
+
+    fn render_next_track_window(&mut self, ctx: &egui::Context) {
+        if let Some(runner) = &self.ai_rerank_runner {
+            if let Some(res) = runner.poll() {
+                match res {
+                    Ok(ranked) => {
+                        let mut new_picks = Vec::new();
+                        for (id, reason) in ranked.into_iter().take(5) {
+                            new_picks.push((id, 1.0f32, reason));
+                        }
+                        if !new_picks.is_empty() {
+                            self.next_track_picks = new_picks;
+                        }
+                        self.ai_rerank_status = None;
+                        self.ai_rerank_runner = None;
+                    }
+                    Err(e) => {
+                        self.ai_rerank_status = Some(format!("AI error: {e}"));
+                        self.ai_rerank_runner = None;
+                    }
+                }
+            }
+        }
+
+        if !self.show_next_track_panel || self.preferences.is_open {
+            return;
+        }
+
+        let deck_letter = if self.next_track_target_deck == 1 { "A" } else { "B" };
+        let deck_accent = if self.next_track_target_deck == 1 { TraktorTheme::DECK_A() } else { TraktorTheme::DECK_B() };
+
+        let mut load_id = None;
+
+        egui::Window::new("Suggest next track")
+            .open(&mut self.show_next_track_panel)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::new(0.0, -20.0))
+            .default_width(520.0)
+            .frame(
+                egui::Frame::window(&ctx.style())
+                    .fill(TraktorTheme::BG_PANEL())
+                    .stroke(Stroke::new(1.0_f32, TraktorTheme::BORDER_ACCENT()))
+                    .rounding(6.0)
+                    .inner_margin(14.0),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("NEXT TRACK PICKS")
+                            .color(TraktorTheme::TEXT_PRIMARY())
+                            .font(egui::FontId::monospace(13.0))
+                            .strong(),
+                    );
+                    ui.label(
+                        RichText::new(format!("→ DECK {deck_letter}"))
+                            .color(deck_accent)
+                            .font(egui::FontId::monospace(13.0))
+                            .strong(),
+                    );
+
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let ai_settings = crate::ai::AiSettings::load();
+                        if ai_settings.is_configured() {
+                            let is_busy = self.ai_rerank_runner.is_some();
+                            let ai_btn = egui::Button::new(
+                                RichText::new(if is_busy { "AI THINKING…" } else { "✦ ASK AI" })
+                                    .size(11.0)
+                                    .color(crate::theme::on(TraktorTheme::ROW_SELECTED()))
+                                    .strong(),
+                            )
+                            .fill(TraktorTheme::ROW_SELECTED())
+                            .rounding(3.0)
+                            .min_size(Vec2::new(76.0, 22.0));
+
+                            if ui.add_enabled(!is_busy, ai_btn).on_hover_text("Re-rank candidates using your configured AI model").clicked() {
+                                let (live_d, _) = if self.next_track_target_deck == 1 { (1, 0) } else { (0, 1) };
+                                let live_ref_opt = self.deck_track_ids[live_d]
+                                    .and_then(|id| self.library.track(id).cloned())
+                                    .or_else(|| self.library.history.last().and_then(|&id| self.library.track(id).cloned()))
+                                    .or_else(|| self.library.tracks.first().cloned());
+                                if let Some(live_ref) = live_ref_opt {
+                                    let candidates: Vec<crate::ai::TrackBrief> = self.library.tracks
+                                        .iter()
+                                        .filter(|t| !t.missing && t.file_path.is_some() && t.id != live_ref.id)
+                                        .take(30)
+                                        .map(crate::ai::TrackBrief::from_ui)
+                                        .collect();
+                                    let live_brief = crate::ai::TrackBrief::from_ui(&live_ref);
+                                    let prompt = crate::ai::build_rerank_prompt(&live_brief, &candidates);
+                                    self.ai_rerank_status = Some("Asking AI model to evaluate flow…".to_string());
+                                    self.ai_rerank_runner = Some(crate::ai::AiRerankRunner::start(ai_settings, prompt, candidates));
+                                }
+                            }
+                        }
+                    });
+                });
+
+                ui.add_space(4.0);
+                ui.separator();
+                ui.add_space(6.0);
+
+                if let Some(err) = &self.ai_rerank_status {
+                    ui.label(RichText::new(err).color(TraktorTheme::METER_YELLOW()).size(11.0));
+                    ui.add_space(4.0);
+                }
+
+                if self.next_track_picks.is_empty() {
+                    ui.label(RichText::new("No recommendations available. Load a track onto the live deck first.").color(TraktorTheme::TEXT_MUTED()));
+                } else {
+                    for (rank, &(id, _score, ref reason)) in self.next_track_picks.iter().enumerate() {
+                        if let Some(track) = self.library.track(id).cloned() {
+                            let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 34.0), Sense::click());
+                            let hovered = resp.hovered();
+
+                            let bg = if rank == 0 {
+                                TraktorTheme::ROW_SELECTED().gamma_multiply(0.35)
+                            } else if hovered {
+                                TraktorTheme::BG_PANEL_ALT()
+                            } else {
+                                Color32::TRANSPARENT
+                            };
+                            ui.painter().rect_filled(rect, 4.0, bg);
+
+                            // Left dot indicator & rank
+                            let dot_pos = rect.min + Vec2::new(12.0, 17.0);
+                            ui.painter().circle_filled(dot_pos, 4.0, deck_accent);
+                            ui.painter().text(
+                                rect.min + Vec2::new(22.0, 10.0),
+                                egui::Align2::LEFT_TOP,
+                                format!("{}.", rank + 1),
+                                egui::FontId::monospace(11.0),
+                                TraktorTheme::TEXT_SECONDARY(),
+                            );
+
+                            // Title & Artist
+                            let text_pos = rect.min + Vec2::new(42.0, 4.0);
+                            ui.painter().text(
+                                text_pos,
+                                egui::Align2::LEFT_TOP,
+                                format!("{} – {}", track.title, track.artist),
+                                egui::FontId::proportional(12.5),
+                                TraktorTheme::TEXT_PRIMARY(),
+                            );
+
+                            // Reason line
+                            let reason_pos = rect.min + Vec2::new(42.0, 19.0);
+                            ui.painter().text(
+                                reason_pos,
+                                egui::Align2::LEFT_TOP,
+                                reason,
+                                egui::FontId::proportional(11.0),
+                                TraktorTheme::ACCENT(),
+                            );
+
+                            // Right: BPM & Key badge
+                            let badge_text = format!("{} · {}", if track.bpm > 0.0 { format!("{:.1}", track.bpm) } else { "-".into() }, if !track.musical_key.is_empty() { &track.musical_key } else { "-" });
+                            let badge_pos = egui::pos2(rect.max.x - 10.0, rect.min.y + 10.0);
+                            ui.painter().text(
+                                badge_pos,
+                                egui::Align2::RIGHT_TOP,
+                                badge_text,
+                                egui::FontId::monospace(11.5),
+                                TraktorTheme::TEXT_SECONDARY(),
+                            );
+
+                            if resp.double_clicked() || (resp.clicked() && rank == 0) {
+                                load_id = Some(id);
+                            }
+                        }
+                    }
+                }
+
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Press Enter or double-click to load top pick. Esc to close.")
+                            .color(TraktorTheme::TEXT_MUTED())
+                            .font(egui::FontId::proportional(11.0)),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if let Some(&(top_id, _, _)) = self.next_track_picks.first() {
+                            let btn = egui::Button::new(
+                                RichText::new(format!("LOAD TO DECK {deck_letter} (↵)"))
+                                    .color(crate::theme::on(TraktorTheme::ROW_SELECTED()))
+                                    .strong(),
+                            )
+                            .fill(TraktorTheme::ROW_SELECTED())
+                            .rounding(4.0)
+                            .min_size(Vec2::new(140.0, 24.0));
+                            if ui.add(btn).clicked() {
+                                load_id = Some(top_id);
+                            }
+                        }
+                    });
+                });
+            });
+
+        if let Some(id) = load_id {
+            let locked = self.locked_decks();
+            self.library.load_to_deck(self.next_track_target_deck, id, locked);
+            self.show_next_track_panel = false;
+        }
     }
 }
 

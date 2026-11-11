@@ -636,6 +636,13 @@ pub struct LibraryManager {
     pub open_prefs_requested: bool,
     pub open_prefs_file_management: bool,
     pub open_prefs_browser_columns: bool,
+    pub open_prefs_ai: bool,
+    pub show_ai_playlist_panel: bool,
+    pub ai_prompt_input: String,
+    pub ai_target_duration_mins: u32,
+    pub ai_playlist_runner: Option<crate::ai::AiPlaylistRunner>,
+    pub ai_playlist_status: Option<String>,
+    pub ai_playlist_sent_info: Option<(usize, usize)>,
 }
 
 impl Default for LibraryManager {
@@ -693,6 +700,13 @@ impl LibraryManager {
             open_prefs_requested: false,
             open_prefs_file_management: false,
             open_prefs_browser_columns: false,
+            open_prefs_ai: false,
+            show_ai_playlist_panel: false,
+            ai_prompt_input: String::new(),
+            ai_target_duration_mins: 45,
+            ai_playlist_runner: None,
+            ai_playlist_status: None,
+            ai_playlist_sent_info: None,
         };
         let path = mgr.collection_path.clone();
         if path.is_file() {
@@ -1477,6 +1491,20 @@ impl LibraryManager {
                 });
             });
 
+            // Entry point for AI playlist generator
+            let ai_sel = self.show_ai_playlist_panel;
+            let ai_btn = egui::Button::new(
+                RichText::new("✦ AI playlist")
+                    .size(11.5)
+                    .color(if ai_sel { crate::theme::on(TraktorTheme::ROW_SELECTED()) } else { TraktorTheme::ACCENT() }),
+            )
+            .fill(if ai_sel { TraktorTheme::ROW_SELECTED() } else { Color32::TRANSPARENT })
+            .rounding(3.0)
+            .min_size(egui::vec2(ui.available_width(), 22.0));
+            if ui.add(ai_btn).on_hover_text("Build a playlist from a sentence with AI").clicked() {
+                self.show_ai_playlist_panel = !self.show_ai_playlist_panel;
+            }
+
             let mut delete = None;
             let mut export = None;
             for i in 0..self.playlists.len() {
@@ -1566,6 +1594,10 @@ impl LibraryManager {
         });
 
         ui.vertical(|ui| {
+            if self.show_ai_playlist_panel {
+                self.show_ai_playlist_panel_ui(ui);
+                ui.add_space(6.0);
+            }
             if self.selected_nav == NavItem::Explorer {
                 self.show_explorer(ui, locked, deck_count, music_folders);
             } else if self.tracks.is_empty() {
@@ -1590,6 +1622,123 @@ impl LibraryManager {
                 ui.label(if n == 1 { "1 track".to_string() } else { format!("{n} tracks") });
             });
         }
+    }
+
+    fn show_ai_playlist_panel_ui(&mut self, ui: &mut Ui) {
+        // Poll background AI playlist job if active
+        if let Some(runner) = &self.ai_playlist_runner {
+            if let Some(res) = runner.poll() {
+                match res {
+                    Ok(ids) => {
+                        let name = if self.ai_prompt_input.trim().is_empty() {
+                            "AI Playlist".to_string()
+                        } else {
+                            self.ai_prompt_input.trim().to_string()
+                        };
+                        self.remember_for_undo(format!("created AI playlist '{name}'"));
+                        self.playlists.push(UserPlaylist { name: name.clone(), track_ids: ids.clone() });
+                        let new_idx = self.playlists.len() - 1;
+                        self.selected_nav = NavItem::Playlist(new_idx);
+                        self.status_message = format!("Created playlist '{name}' with {} tracks", ids.len());
+                        self.touch();
+                        self.ai_playlist_runner = None;
+                        self.ai_playlist_status = None;
+                        self.show_ai_playlist_panel = false;
+                    }
+                    Err(e) => {
+                        self.ai_playlist_status = Some(format!("Error: {e}"));
+                        self.ai_playlist_runner = None;
+                    }
+                }
+            }
+        }
+
+        let ai_settings = crate::ai::AiSettings::load();
+
+        egui::Frame::none()
+            .fill(TraktorTheme::BG_PANEL_ALT())
+            .stroke(Stroke::new(1.0_f32, TraktorTheme::BORDER_ACCENT()))
+            .rounding(4.0)
+            .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("✦ AI Playlist").color(TraktorTheme::TEXT_PRIMARY()).strong());
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.small_button("✕").on_hover_text("Close").clicked() {
+                            self.show_ai_playlist_panel = false;
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+
+                if !ai_settings.is_configured() {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("To build playlists with AI, configure your API key in Settings.")
+                                .color(TraktorTheme::TEXT_SECONDARY())
+                                .font(egui::FontId::proportional(12.0)),
+                        );
+                        if ui
+                            .add(egui::Button::new(RichText::new("Open AI Settings").color(TraktorTheme::ACCENT()).underline()).frame(false))
+                            .clicked()
+                        {
+                            self.open_prefs_ai = true;
+                        }
+                    });
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        ui.label(RichText::new("Prompt:").color(TraktorTheme::TEXT_SECONDARY()).size(12.0));
+                        let w = (ui.available_width() - 200.0).max(140.0);
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.ai_prompt_input)
+                                .hint_text("e.g. 45 minutes of warm-up house, 118 to 124, ending bright")
+                                .desired_width(w),
+                        );
+
+                        ui.add(egui::DragValue::new(&mut self.ai_target_duration_mins).range(5..=300).suffix(" min"));
+
+                        let is_busy = self.ai_playlist_runner.is_some();
+                        let btn = egui::Button::new(
+                            RichText::new(if is_busy { "BUILDING…" } else { "BUILD" })
+                                .color(crate::theme::on(TraktorTheme::ROW_SELECTED()))
+                                .strong(),
+                        )
+                        .fill(TraktorTheme::ROW_SELECTED())
+                        .rounding(3.0)
+                        .min_size(egui::vec2(75.0, 24.0));
+
+                        if ui.add_enabled(!is_busy && !self.ai_prompt_input.trim().is_empty(), btn).clicked() {
+                            let max_tracks = ((self.ai_target_duration_mins as f64 * 60.0) / 210.0).round().max(3.0) as usize;
+                            let (briefs, total) = crate::ai::prefilter_tracks(&self.tracks, &self.ai_prompt_input, 1500);
+                            self.ai_playlist_sent_info = Some((briefs.len(), total));
+                            let valid_ids: Vec<usize> = briefs.iter().map(|b| b.id).collect();
+                            let prompt = crate::ai::build_playlist_prompt(&self.ai_prompt_input, &briefs, max_tracks);
+                            let status_text = if total > 1500 {
+                                format!("Sent {} of {} tracks to AI (pre-filtered by request)…", briefs.len(), total)
+                            } else {
+                                format!("Analyzing {} tracks with {}…", briefs.len(), ai_settings.provider.label())
+                            };
+                            self.ai_playlist_status = Some(status_text);
+                            self.ai_playlist_runner = Some(crate::ai::AiPlaylistRunner::start(ai_settings, prompt, valid_ids));
+                        }
+                    });
+
+                    if let Some(status) = &self.ai_playlist_status {
+                        ui.add_space(3.0);
+                        ui.horizontal(|ui| {
+                            if self.ai_playlist_runner.is_some() {
+                                ui.spinner();
+                                ui.label(RichText::new(status).color(TraktorTheme::METER_YELLOW()).size(11.5));
+                            } else if status.starts_with("Error") {
+                                ui.label(RichText::new(status).color(TraktorTheme::CUE_ACTIVE()).size(11.5));
+                            } else {
+                                ui.label(RichText::new(status).color(TraktorTheme::PLAY_ACTIVE()).size(11.5));
+                            }
+                        });
+                    }
+                }
+            });
     }
 
     fn show_missing_banner(&mut self, ui: &mut Ui, music_folders: &[PathBuf]) {
