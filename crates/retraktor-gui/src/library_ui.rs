@@ -1711,7 +1711,10 @@ impl LibraryManager {
                 if let Some((ri, buf)) = &mut self.renaming {
                     if *ri == i {
                         let r = ui.add(egui::TextEdit::singleline(buf).desired_width(f32::INFINITY));
-                        r.request_focus();
+                        // Re-requesting focus every frame swallowed Enter, so the name could never be committed.
+                        if !r.has_focus() && !r.lost_focus() {
+                            r.request_focus();
+                        }
                         if r.lost_focus() {
                             let name = buf.trim().to_string();
                             if !name.is_empty() && !ui.input(|i| i.key_pressed(egui::Key::Escape)) {

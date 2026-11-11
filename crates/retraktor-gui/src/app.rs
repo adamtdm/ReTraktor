@@ -2099,6 +2099,14 @@ impl ReTraktorApp {
         }
     }
 
+    /// Back to the track's own tempo. Sync has to let go too, or it would pull the pitch straight back.
+    fn reset_tempo(&mut self, d: usize) {
+        if self.deck_sync_enabled[d] {
+            self.sync_deck(d + 1);
+        }
+        self.deck_pitch_fader[d] = 0.0;
+    }
+
     /// Shifts a loaded track's beatgrid and/or scales its tempo, on the deck and in the library entry.
     fn adjust_deck_grid(&mut self, d: usize, shift_sec: f64, bpm_factor: f64) {
         let Ok(mut state) = self.audio.shared.lock() else { return };
@@ -2713,7 +2721,9 @@ impl ReTraktorApp {
                                 let pitch_pct = self.deck_pitch_fader[d];
                                 let bpm_txt = format!("{:.2}", deck.bpm * (1.0 + pitch_pct as f64 / 100.0));
                                 ui.allocate_ui_with_layout(Vec2::new(95.0, 24.0), Layout::left_to_right(Align::Center), |ui| {
-                                    readout(ui, "BPM", &bpm_txt, size, ink);
+                                    if bpm_reset_clicked(readout(ui, "BPM", &bpm_txt, size, ink)) {
+                                        self.reset_tempo(d);
+                                    }
                                 });
                                 ui.allocate_ui_with_layout(Vec2::new(85.0, 24.0), Layout::left_to_right(Align::Center), |ui| {
                                     readout(ui, if in_key { "IN KEY" } else { "KEY" }, &deck.key, size, ink);
@@ -2863,7 +2873,9 @@ impl ReTraktorApp {
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             display(ui, |ui, ink| {
                 ui.spacing_mut().item_spacing.x = 14.0;
-                readout(ui, "BPM", &format!("{:.2}", deck.bpm * (1.0 + self.deck_pitch_fader[d] as f64 / 100.0)), 20.0, ink);
+                if bpm_reset_clicked(readout(ui, "BPM", &format!("{:.2}", deck.bpm * (1.0 + self.deck_pitch_fader[d] as f64 / 100.0)), 20.0, ink)) {
+                    self.reset_tempo(d);
+                }
                 readout(ui, "REMAIN", &deck.remaining(), 20.0, ink);
             });
             ui.with_layout(Layout::left_to_right(Align::Center), |ui| title_label(ui, &deck.title, &deck.artist));
@@ -3012,7 +3024,9 @@ impl ReTraktorApp {
                         let advance = ui.fonts(|f| f.glyph_width(&crate::theme::dot_font(100.0), '0')) / 100.0;
                         let size = ((ui.available_width() - 3.0 * 14.0) / (20.0 * advance)).floor().clamp(16.0, 30.0);
                         let pitch_pct = self.deck_pitch_fader[d];
-                        readout(ui, "BPM", &format!("{:.2}", bpm * (1.0 + pitch_pct as f64 / 100.0)), size, ink);
+                        if bpm_reset_clicked(readout(ui, "BPM", &format!("{:.2}", bpm * (1.0 + pitch_pct as f64 / 100.0)), size, ink)) {
+                            self.reset_tempo(d);
+                        }
                         readout(ui, "PITCH", &format!("{pitch_pct:+.1}%"), size, ink);
                         // A compatible key says so in words, not just in brightness.
                         readout(ui, if in_key { "IN KEY" } else { "KEY" }, &deck.key, size, ink);
@@ -3858,7 +3872,12 @@ fn display(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui, Color32)) -> egui::Re
 }
 
 /// A number glanced at mid-mix: small caps label over the value in the dot-matrix face.
-fn readout(ui: &mut Ui, label: &str, value: &str, size: f32, ink: Color32) {
+/// True when a BPM readout was double-clicked (back to the track's own tempo).
+fn bpm_reset_clicked(resp: egui::Response) -> bool {
+    resp.interact(Sense::click()).on_hover_text("Double-click to return to the track's original BPM").double_clicked()
+}
+
+fn readout(ui: &mut Ui, label: &str, value: &str, size: f32, ink: Color32) -> egui::Response {
     let label_galley = ui.painter().layout_no_wrap(label.to_owned(), egui::FontId::proportional(10.0), ink.gamma_multiply(0.65));
     let value_galley = ui.painter().layout_no_wrap(value.to_owned(), crate::theme::dot_font(size), ink);
     let size = Vec2::new(label_galley.size().x.max(value_galley.size().x), label_galley.size().y + value_galley.size().y);
@@ -3867,6 +3886,7 @@ fn readout(ui: &mut Ui, label: &str, value: &str, size: f32, ink: Color32) {
     ui.painter().galley(rect.left_top(), label_galley, ink);
     ui.painter().galley(value_pos, value_galley, ink);
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, format!("{label} {value}")));
+    resp
 }
 
 /// Status lamp with a label; clicking opens the matching settings. Filled = OK, hollow = not,

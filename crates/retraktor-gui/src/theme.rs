@@ -282,6 +282,23 @@ impl Palette {
         (c.r() as u32 + c.g() as u32 + c.b() as u32) < 384
     }
 
+    /// Re-tints the whole palette from one colour: `primary` becomes ACCENT and every other
+    /// coloured token turns by the same hue angle. Greys stay grey; meters keep their warning colours.
+    pub fn set_primary(&mut self, primary: Color32) {
+        use egui::ecolor::Hsva;
+        let hsv = |c: Color32| Hsva::from_srgb([c.r(), c.g(), c.b()]);
+        let shift = hsv(primary).h - hsv(self.ACCENT).h;
+        for (name, c) in self.tokens_mut() {
+            let mut x = hsv(*c);
+            if x.s > 0.0 && !name.starts_with("METER_") {
+                x.h = (x.h + shift).rem_euclid(1.0);
+                let [r, g, b] = x.to_srgb();
+                *c = rgb(r, g, b);
+            }
+        }
+        self.ACCENT = primary;
+    }
+
     /// `NAME=#rrggbb` lines.
     pub fn to_text(&self) -> String {
         let mut copy = self.clone();
@@ -585,6 +602,15 @@ pub fn editor(ui: &mut egui::Ui) {
             .size(12.0)
             .color(if ratio >= 4.5 { p.TEXT_SECONDARY } else { p.METER_RED }),
     );
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        let mut primary = p.ACCENT;
+        if egui::color_picker::color_edit_button_srgba(ui, &mut primary, egui::color_picker::Alpha::Opaque).changed() {
+            p.set_primary(primary);
+            changed = true;
+        }
+        ui.label("Primary colour").on_hover_text("Re-tints every colour in the theme from this one. Fine-tune single colours in the groups below.");
+    });
     ui.add_space(14.0);
     ui.label(egui::RichText::new("Waveform style").size(15.0).strong());
     ui.add_space(6.0);
@@ -823,6 +849,22 @@ mod tests {
             assert!(contrast(p.TEXT_PRIMARY, p.BG_WINDOW) >= 7.0, "{name} body text");
             assert!(contrast(p.TEXT_SECONDARY, p.BG_PANEL) >= 4.5, "{name} secondary text");
         }
+    }
+
+    #[test]
+    fn primary_colour_retints_hues_but_not_greys_or_meters() {
+        let mut p = Palette::NIGHT;
+        let blue = rgb(40, 90, 230);
+        p.set_primary(blue);
+        assert_eq!(p.ACCENT, blue);
+        assert_eq!(p.TEXT_PRIMARY, Palette::NIGHT.TEXT_PRIMARY);
+        assert_eq!(p.METER_RED, Palette::NIGHT.METER_RED);
+        // DECK_B shared the accent red, so it lands on the new hue (blue dominant).
+        assert!(p.DECK_B.b() > p.DECK_B.r() && p.DECK_B.b() > p.DECK_B.g(), "{:?}", p.DECK_B);
+        // Same colour again is a no-op.
+        let once = p.clone();
+        p.set_primary(blue);
+        assert_eq!(p.CUE_ACTIVE, once.CUE_ACTIVE);
     }
 
     #[test]

@@ -1288,7 +1288,7 @@ impl<'a> ContinuousMixer<'a> {
                                     let s = if mirrored { 3 - slot.min(3) } else { slot.min(3) };
                                     self.stem_muted[d][s] = !self.stem_muted[d][s];
                                     response.mark_changed();
-                                } else if pos.y < row_y(body_top_row) + 6.0 {
+                                } else if pos.y > row_y(body_bot_row + 5) {
                                     let mirrored = d == 1 || d == 3;
                                     let frac = ((pos.x - zx1) / (zx2 - zx1).max(1.0)).clamp(0.0, 0.999);
                                     let slot = (frac * 3.0).floor() as usize;
@@ -1409,7 +1409,7 @@ impl<'a> ContinuousMixer<'a> {
                                     if self.stem_view[d] {
                                         tooltip = Some("Stems: click one to turn it on or off".to_string());
                                     } else {
-                                        tooltip = Some("Equaliser: drag a band up or down, right-click to cut it".to_string());
+                                        tooltip = Some("Equaliser: drag a band up or down; click its bottom (or right-click) to cut it".to_string());
                                     }
                                     break;
                                 }
@@ -1452,11 +1452,12 @@ impl<'a> ContinuousMixer<'a> {
                 if c == handle_c || c == handle_c + 1 {
                     set_cell!(c, r, DotCell::Filled(handle_fg));
                 } else {
-                    let is_left = c < handle_c;
-                    let lv = if is_left { lv_a } else { lv_b };
+                    // Handle hard left = all A, so the ribbon right of the handle is A's.
+                    let is_a = c > handle_c;
+                    let lv = if is_a { lv_a } else { lv_b };
                     let on = r == 0 || (r as f32 / 4.0) < lv;
                     if on {
-                        let base = if is_left { col_a } else { col_b };
+                        let base = if is_a { col_a } else { col_b };
                         let fade = 0.45 + 0.55 * (1.0 - r as f32 / 5.0);
                         set_cell!(c, r, DotCell::Filled(base.gamma_multiply(fade)));
                     }
@@ -1575,6 +1576,7 @@ impl<'a> ContinuousMixer<'a> {
         }
 
         // 4. EQ or Stems zone for each active channel
+        let mut kill_icons: Vec<(Pos2, &Sprite, i32, SpriteMode, Color32)> = Vec::new();
         for &d in active_channels {
             let Some(zone) = layout.eq_stem_zone[d] else { continue };
             let accent = TraktorTheme::deck_color(d + 1);
@@ -1730,23 +1732,23 @@ impl<'a> ContinuousMixer<'a> {
                         ui.ctx().request_repaint();
                     }
 
-                    // Top readout
-                    painter.text(
-                        Pos2::new(slot_cx, header_y),
-                        Align2::CENTER_CENTER,
-                        format_eq_db(val, killed),
-                        theme::dot_font(10.5),
-                        if killed { TraktorTheme::METER_RED() } else { ink },
-                    );
-
-                    // Bottom label
+                    // Top label
                     let lbl = if is_compact { &labels[b][..1] } else { labels[b] };
                     painter.text(
-                        Pos2::new(slot_cx, footer_label_y),
+                        Pos2::new(slot_cx, header_y),
                         Align2::CENTER_CENTER,
                         lbl,
                         FontId::proportional(8.0),
                         ink.gamma_multiply(0.68),
+                    );
+
+                    // Bottom readout
+                    painter.text(
+                        Pos2::new(slot_cx, footer_label_y),
+                        Align2::CENTER_CENTER,
+                        format_eq_db(val, killed),
+                        theme::dot_font(10.5),
+                        if killed { TraktorTheme::METER_RED() } else { ink },
                     );
 
                     let lit_rows = value_to_lit_rows(val, track_rows);
@@ -1768,40 +1770,27 @@ impl<'a> ContinuousMixer<'a> {
                     }
 
                     if anim && !is_compact && band_w >= 4 {
-                        let top_dot_y = row_y(body_top_row);
-                        let icon_cy = top_dot_y + 2.0 * step_y;
-                        if is_animating {
+                        // Kill icon sits at the foot of the band, in a blanked window, painted after the lattice.
+                        let icon_pos = Pos2::new(slot_cx, row_y(body_bot_row + 2));
+                        let icon = if is_animating {
                             let bounce = bounce_dot_offset(elapsed, 0.6, 5);
-                            let pop_down = ((1.0 - (elapsed / 0.25).min(1.0)) * 6.0).round() as i32;
+                            let drop_in = ((1.0 - (elapsed / 0.25).min(1.0)) * 6.0).round() as i32;
                             let sprite = if killed { &SPRITE_KILL_X } else { &SPRITE_TICK };
                             let col = if killed { TraktorTheme::METER_RED() } else { TraktorTheme::PLAY_ACTIVE() };
-                            paint_sprite(
-                                painter,
-                                Pos2::new(slot_cx, icon_cy),
-                                Vec2::new(step_x, step_y),
-                                dot_radius,
-                                sprite,
-                                0,
-                                bounce - pop_down,
-                                SpriteMode::Filled,
-                                col,
-                                unlit,
-                                false,
-                            );
+                            Some((icon_pos, sprite, bounce + drop_in, SpriteMode::Filled, col))
                         } else if killed {
-                            paint_sprite(
-                                painter,
-                                Pos2::new(slot_cx, icon_cy),
-                                Vec2::new(step_x, step_y),
-                                dot_radius,
-                                &SPRITE_KILL_X,
-                                0,
-                                0,
-                                SpriteMode::Hollow,
-                                TraktorTheme::METER_RED(),
-                                unlit,
-                                false,
-                            );
+                            Some((icon_pos, &SPRITE_KILL_X, 0, SpriteMode::Hollow, TraktorTheme::METER_RED()))
+                        } else {
+                            None
+                        };
+                        if let Some(icon) = icon {
+                            let mid_c = (slot_start_c + slot_end_c) / 2;
+                            for c in mid_c.saturating_sub(3).max(slot_start_c)..=(mid_c + 3).min(slot_end_c) {
+                                for r in body_bot_row..=body_bot_row + 5 {
+                                    set_cell!(c, r, DotCell::Unlit);
+                                }
+                            }
+                            kill_icons.push(icon);
                         }
                     }
 
@@ -1840,6 +1829,7 @@ impl<'a> ContinuousMixer<'a> {
 
         // 5. Whole-canvas choreography:
         // A. Crossfade cheers wave across full canvas width
+        let mut cheer_overlay = None;
         if let Some(cheer) = self.active_cheer {
             if anim {
                 let elapsed = (now_sec - cheer.start_sec) as f32;
@@ -1860,19 +1850,6 @@ impl<'a> ContinuousMixer<'a> {
                     };
 
                     let cheer_accent = TraktorTheme::deck_color(cheer.deck + 1);
-                    paint_sprite(
-                        painter,
-                        Pos2::new(col_x(target_cx.round() as usize), row_y(cheer_cy_row)),
-                        Vec2::new(step_x, step_y),
-                        dot_radius,
-                        sprite,
-                        frame_idx,
-                        bounce,
-                        SpriteMode::Filled,
-                        cheer_accent,
-                        unlit,
-                        false,
-                    );
 
                     // Wave ripple outwards across the other zones
                     for c in 0..cols {
@@ -1887,13 +1864,15 @@ impl<'a> ContinuousMixer<'a> {
                         }
                     }
 
-                    painter.text(
-                        Pos2::new(col_x(target_cx.round() as usize), inner_rect.top() + 6.0),
-                        Align2::CENTER_CENTER,
-                        "★ NICE MIX ★",
-                        theme::dot_font(9.5),
-                        cheer_accent,
-                    );
+                    // Blank the dots under the sprite so it reads in front of the EQ / stem bars.
+                    let (sw, sh) = sprite.dimensions(frame_idx);
+                    let cc = target_cx.round() as usize;
+                    for c in cc.saturating_sub(sw / 2 + 1)..=(cc + sw / 2 + 1).min(cols - 1) {
+                        for r in cheer_cy_row.saturating_sub(sh / 2 + 1)..=(cheer_cy_row + sh / 2 + 1 + bounce.max(0) as usize).min(rows - 1) {
+                            cells[r * cols + c] = DotCell::Unlit;
+                        }
+                    }
+                    cheer_overlay = Some((sprite, frame_idx, bounce, cheer_accent, col_x(cc), row_y(cheer_cy_row)));
                     ui.ctx().request_repaint();
                 }
             }
@@ -2015,6 +1994,18 @@ impl<'a> ContinuousMixer<'a> {
         paint_dot_grid(painter, inner_rect, cols, rows, dot_radius, unlit, |c, r| {
             cells[r * cols + c]
         });
+
+        for (pos, sprite, bounce, mode, col) in kill_icons {
+            paint_sprite(painter, pos, Vec2::new(step_x, step_y), dot_radius, sprite, 0, bounce, mode, col, unlit, false);
+        }
+        // Cheer sprite and caption go on last, over the lattice.
+        if let Some((sprite, frame_idx, bounce, col, x, y)) = cheer_overlay {
+            paint_sprite(painter, Pos2::new(x, y), Vec2::new(step_x, step_y), dot_radius, sprite, frame_idx, bounce, SpriteMode::Filled, col, unlit, false);
+            let caption = painter.layout_no_wrap("★ NICE MIX ★".to_owned(), theme::dot_font(9.5), col);
+            let cap_rect = Align2::CENTER_CENTER.anchor_size(Pos2::new(x, inner_rect.top() + 6.0), caption.size());
+            painter.rect_filled(cap_rect.expand(2.0), 2.0, bg);
+            painter.galley(cap_rect.min, caption, col);
+        }
 
         response
     }
