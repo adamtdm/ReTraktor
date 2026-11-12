@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Deploy a test build: run the tests, push the current branch, build the .deb and publish it
+# Deploy a test build: run the tests, push the current branch and main, build the .deb and publish it
 # to the local page (http://retraktor.local, also reachable over Tailscale).
 # Usage: scripts/deploy.sh ["what to test in this build" ...]   (default: the last commit subject)
 set -euo pipefail
@@ -11,14 +11,20 @@ LAN="http://192.168.68.105/pages/retraktor"
 TAILNET="https://pop-os-1.tailafd5c7.ts.net/pages/retraktor"
 
 [ -z "$(git status --porcelain)" ] || { echo "Uncommitted changes: commit first, so the build matches git." >&2; exit 1; }
-[ -f "$PAGE/install.sh" ] || { echo "No installer at $PAGE/install.sh" >&2; exit 1; }
+mkdir -p "$PAGE"
 
 cargo test --workspace -q
-git push origin HEAD
+# main tracks every deploy; a non-fast-forward is refused here, before anything is built.
+git push --atomic origin HEAD HEAD:main
+git update-ref refs/heads/main HEAD
 
 VERSION="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)+$(date +%Y%m%d.%H%M)"
 RETRAKTOR_VERSION="$VERSION" scripts/build-packages.sh
 install -m 644 "dist/retraktor_${VERSION}_amd64.deb" "$PAGE/retraktor_latest_amd64.deb"
+install -m 755 scripts/page-install.sh "$PAGE/install.sh"
+# Keep the last 3 builds for rollback.
+ls -t dist/retraktor_*.deb | tail -n +4 | xargs -r rm -f
+ls -t dist/retraktor-*.tar.gz | tail -n +4 | xargs -r rm -f
 
 esc() { sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'; }
 [ $# -gt 0 ] || set -- "$(git log -1 --format=%s)"

@@ -2653,6 +2653,26 @@ mod tests {
     }
 
     #[test]
+    fn new_playlist_name_commits_on_enter() {
+        let (mut lib, _) = temp_lib("rename");
+        lib.add_to_playlist(&[], None);
+        let ctx = egui::Context::default();
+        let mut frame = |lib: &mut LibraryManager, events: Vec<egui::Event>| {
+            let _ = ctx.run(egui::RawInput { events, ..Default::default() }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| lib.show_nav_tree(ui));
+            });
+        };
+        frame(&mut lib, vec![]);
+        frame(&mut lib, vec![]);
+        let key = |key, pressed| egui::Event::Key { key, physical_key: None, pressed, repeat: false, modifiers: egui::Modifiers::NONE };
+        frame(&mut lib, vec![key(egui::Key::A, true), egui::Event::Text(" Friday".into())]);
+        frame(&mut lib, vec![key(egui::Key::Enter, true), key(egui::Key::Enter, false)]);
+        frame(&mut lib, vec![]);
+        assert!(lib.renaming.is_none(), "still editing after Enter");
+        assert!(lib.playlists[0].name.ends_with("Friday"), "{}", lib.playlists[0].name);
+    }
+
+    #[test]
     fn untagged_file_gets_no_invented_metadata() {
         let (_, dir) = temp_lib("untagged");
         let p = dir.join("Some Artist - Some Title.mp3");

@@ -2654,6 +2654,15 @@ mod tests {
             frame(&mut mixer, vec![egui::Event::PointerMoved(center), button(center, true)]);
             frame(&mut mixer, vec![button(center, false)]);
             assert!((*mixer.crossfader - 0.5).abs() < 0.01);
+            // A single click at the foot of deck A's LOW band cuts it; another restores it.
+            let rows = ((208.0_f32 - 2.7) / 5.2).round() as usize;
+            let foot = Pos2::new(col_x(zone.start + 1), rect.bottom() - 7.35 - 9.0 * (205.3 / (rows - 1) as f32));
+            for want in [true, false] {
+                for _ in 0..5 { frame(&mut mixer, vec![egui::Event::PointerMoved(foot)]); }
+                frame(&mut mixer, vec![button(foot, true)]);
+                frame(&mut mixer, vec![button(foot, false)]);
+                assert_eq!(mixer.eq_kill_low[0], want, "two-channel={two_channel_only}");
+            }
             // A stationary press/release on a cue lamp must remain a click.
             let fader = layout.fader_meter[0].unwrap();
             let cue_pos = Pos2::new(col_x(fader.start), rect.bottom() - 7.35 - 5.0 * (220.0 - 14.7) / 38.0);

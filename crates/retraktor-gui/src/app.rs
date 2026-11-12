@@ -3939,6 +3939,41 @@ mod tests {
     use crate::theme::Palette;
 
     #[test]
+    fn bpm_double_click_resets_tempo() {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let mut time = 0.0;
+        let mut frame = |events: Vec<egui::Event>| {
+            time += 0.05;
+            let (mut rect, mut hit) = (egui::Rect::NOTHING, false);
+            let _ = ctx.run(egui::RawInput { time: Some(time), events, ..Default::default() }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let r = readout(ui, "BPM", "128.00", 18.0, Color32::WHITE);
+                    rect = r.rect;
+                    hit = bpm_reset_clicked(r);
+                });
+            });
+            (rect, hit)
+        };
+        let p = frame(vec![]).0.center();
+        let mut hits = Vec::new();
+        let click = |pressed| egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+        frame(vec![egui::Event::PointerMoved(p)]);
+        for _ in 0..2 {
+            hits.push(frame(vec![click(true)]).1);
+            hits.push(frame(vec![click(false)]).1);
+        }
+        assert!(hits.iter().any(|&h| h), "double-click on the BPM readout was not seen");
+
+        let mut app = ReTraktorApp::default();
+        app.deck_pitch_fader[0] = 3.5;
+        app.deck_sync_enabled[0] = true;
+        app.reset_tempo(0);
+        assert_eq!(app.deck_pitch_fader[0], 0.0);
+        assert!(!app.deck_sync_enabled[0], "sync would pull the pitch straight back");
+    }
+
+    #[test]
     fn real_file_loads_and_recording_retries() {
         let dir = std::env::temp_dir().join(format!("retraktor-load-regression-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

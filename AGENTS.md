@@ -33,8 +33,4 @@ Never cut: validation at trust boundaries, error handling that prevents data los
 
 ## Deploying
 
-A change is shipped when it is committed and `scripts/deploy.sh "what to test" ...` has run: it tests, pushes the branch, builds the .deb and updates the local page (`~/pages/retraktor`, http://retraktor.local).
-
-## Deploying
-
-A change is shipped when it is committed and `scripts/deploy.sh "what to test" ...` has run: it tests, pushes the branch, builds the .deb and updates the local page (`~/pages/retraktor`, http://retraktor.local).
+A change is shipped when it is committed and `scripts/deploy.sh "what to test" ...` has run: it tests, pushes the branch and fast-forwards `main`, builds the .deb, and updates the local page (`~/pages/retraktor`, http://retraktor.local) including its installer from `scripts/page-install.sh`.
