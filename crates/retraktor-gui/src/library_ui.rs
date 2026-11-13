@@ -1540,7 +1540,8 @@ impl LibraryManager {
     fn add_to_playlist(&mut self, ids: &[usize], playlist: Option<usize>) {
         let idx = playlist.unwrap_or_else(|| {
             self.playlists.push(UserPlaylist { name: format!("New playlist {}", self.playlists.len() + 1), track_ids: Vec::new(), missing: Vec::new() });
-            self.renaming = Some((self.playlists.len() - 1, self.playlists.last().unwrap().name.clone()));
+            // Empty box with the default as a hint, so typing replaces it rather than appending.
+            self.renaming = Some((self.playlists.len() - 1, String::new()));
             self.playlists.len() - 1
         });
         let Some(pl) = self.playlists.get_mut(idx) else { return };
@@ -1550,7 +1551,11 @@ impl LibraryManager {
                 pl.track_ids.push(id);
             }
         }
-        self.status_message = format!("Added {} tracks to '{}'", pl.track_ids.len() - before, pl.name);
+        self.status_message = if ids.is_empty() {
+            "New playlist: type a name and press Enter".into()
+        } else {
+            format!("Added {} tracks to '{}'", pl.track_ids.len() - before, pl.name)
+        };
         self.touch();
     }
 
@@ -1710,7 +1715,7 @@ impl LibraryManager {
             for i in 0..self.playlists.len() {
                 if let Some((ri, buf)) = &mut self.renaming {
                     if *ri == i {
-                        let r = ui.add(egui::TextEdit::singleline(buf).desired_width(f32::INFINITY));
+                        let r = ui.add(egui::TextEdit::singleline(buf).hint_text(self.playlists[i].name.as_str()).desired_width(f32::INFINITY));
                         // Re-requesting focus every frame swallowed Enter, so the name could never be committed.
                         if !r.has_focus() && !r.lost_focus() {
                             r.request_focus();
@@ -2665,11 +2670,18 @@ mod tests {
         frame(&mut lib, vec![]);
         frame(&mut lib, vec![]);
         let key = |key, pressed| egui::Event::Key { key, physical_key: None, pressed, repeat: false, modifiers: egui::Modifiers::NONE };
-        frame(&mut lib, vec![key(egui::Key::A, true), egui::Event::Text(" Friday".into())]);
+        frame(&mut lib, vec![key(egui::Key::A, true), egui::Event::Text("Friday".into())]);
         frame(&mut lib, vec![key(egui::Key::Enter, true), key(egui::Key::Enter, false)]);
         frame(&mut lib, vec![]);
         assert!(lib.renaming.is_none(), "still editing after Enter");
-        assert!(lib.playlists[0].name.ends_with("Friday"), "{}", lib.playlists[0].name);
+        assert_eq!(lib.playlists[0].name, "Friday");
+        // Enter on an empty box keeps the default name.
+        lib.add_to_playlist(&[], None);
+        frame(&mut lib, vec![]);
+        frame(&mut lib, vec![]);
+        frame(&mut lib, vec![key(egui::Key::Enter, true), key(egui::Key::Enter, false)]);
+        frame(&mut lib, vec![]);
+        assert_eq!(lib.playlists[1].name, "New playlist 2");
     }
 
     #[test]
