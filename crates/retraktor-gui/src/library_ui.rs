@@ -638,7 +638,8 @@ pub struct LibraryManager {
     pub pending_loads: Vec<(usize, UiTrackEntry)>,
     pub status_message: String,
     pub stem_job_progress: Option<(usize, f32)>,
-    pub request_stem_separation: Option<usize>,
+    /// Tracks waiting for Demucs, run one at a time (two at once would exhaust RAM on a laptop).
+    pub stem_queue: std::collections::VecDeque<usize>,
     pub last_stemmed_track_id: Option<usize>,
     pub last_loaded_deck: Option<(usize, bool)>,
     pub open_prefs_requested: bool,
@@ -703,7 +704,7 @@ impl LibraryManager {
             pending_loads: Vec::new(),
             status_message: String::new(),
             stem_job_progress: None,
-            request_stem_separation: None,
+            stem_queue: Default::default(),
             last_stemmed_track_id: None,
             last_loaded_deck: None,
             open_prefs_requested: false,
@@ -1537,6 +1538,18 @@ impl LibraryManager {
         }
     }
 
+    /// Queues tracks for Demucs, skipping ones already queued or already separated. Returns how many were added.
+    pub fn queue_stems(&mut self, ids: &[usize]) -> usize {
+        let before = self.stem_queue.len();
+        for &id in ids {
+            let ready = self.tracks.iter().find(|t| t.id == id).map_or(true, |t| t.stems_ready || t.file_path.is_none());
+            if !ready && !self.stem_queue.contains(&id) {
+                self.stem_queue.push_back(id);
+            }
+        }
+        self.stem_queue.len() - before
+    }
+
     fn add_to_playlist(&mut self, ids: &[usize], playlist: Option<usize>) {
         let idx = playlist.unwrap_or_else(|| {
             self.playlists.push(UserPlaylist { name: format!("New playlist {}", self.playlists.len() + 1), track_ids: Vec::new(), missing: Vec::new() });
@@ -1608,7 +1621,9 @@ impl LibraryManager {
             Action::Edit(id) => self.editing = self.track(id).cloned(),
             Action::FillTags(ids) => self.start_tag_fill(&ids),
             Action::Analyze(ids) => self.start_analysis(ids, true),
-            Action::Stems(id) => self.request_stem_separation = Some(id),
+            Action::Stems(id) => {
+                self.queue_stems(&[id]);
+            }
             Action::Reveal(p) => {
                 let dir = p.parent().unwrap_or(&p).to_path_buf();
                 if let Err(e) = std::process::Command::new("xdg-open").arg(&dir).spawn() {
@@ -1745,6 +1760,12 @@ impl LibraryManager {
                     }
                     if ui.button("Export as M3U8").clicked() {
                         export = Some(i);
+                        ui.close_menu();
+                    }
+                    if ui.button("Prepare stems").on_hover_text("Separate every track in this playlist with Demucs, one after another").clicked() {
+                        let ids = self.playlists[i].track_ids.clone();
+                        let n = self.queue_stems(&ids);
+                        self.status_message = format!("Queued {n} tracks for stems ({} waiting). Leave ReTraktor open; it runs in the background.", self.stem_queue.len());
                         ui.close_menu();
                     }
                     if ui.button("Delete playlist").clicked() {
@@ -2658,11 +2679,28 @@ mod tests {
     }
 
     #[test]
+    fn stem_queue_skips_ready_queued_and_fileless_tracks() {
+        let (mut lib, dir) = temp_lib("stemq");
+        let mut ready = track("Ready", &dir.join("r.wav"));
+        ready.id = 1;
+        ready.stems_ready = true;
+        let mut a = track("A", &dir.join("a.wav"));
+        a.id = 2;
+        let mut nofile = track("No file", &dir.join("n.wav"));
+        nofile.id = 3;
+        nofile.file_path = None;
+        lib.tracks = vec![ready, a, nofile];
+        assert_eq!(lib.queue_stems(&[1, 2, 3, 2, 99]), 1);
+        assert_eq!(lib.queue_stems(&[2]), 0);
+        assert_eq!(lib.stem_queue, [2]);
+    }
+
+    #[test]
     fn new_playlist_name_commits_on_enter() {
         let (mut lib, _) = temp_lib("rename");
         lib.add_to_playlist(&[], None);
         let ctx = egui::Context::default();
-        let mut frame = |lib: &mut LibraryManager, events: Vec<egui::Event>| {
+        let frame = |lib: &mut LibraryManager, events: Vec<egui::Event>| {
             let _ = ctx.run(egui::RawInput { events, ..Default::default() }, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| lib.show_nav_tree(ui));
             });

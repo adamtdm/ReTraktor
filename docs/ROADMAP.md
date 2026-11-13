@@ -11,6 +11,23 @@ beat strip and phase meter; four waveform styles; sync that follows tempo and ph
 stems from a button or key; pattern player; MX2 mapper; theme editor; headless screenshot and
 recording scripts.
 
+## Status at 2026-11-13
+
+Built and merged since this roadmap was written: set Build / Perform / Record (section 3), AI
+assistant with your own key (4), track-list playlist import with a missing-tracks list (5, "Now"),
+MIDI / HID learn mapper with a DDJ-FLX4 preset (6), rekordbox XML export, phrase detection and
+auto cues (7). Every build ships through `scripts/deploy.sh` (git + the local install page).
+
+Still open:
+
+- **Needs the user's ears and hardware**: grid nudge, tempo ×½ / ×2, sync by ear, MX2 end to end,
+  DDJ-FLX4 preset.
+- **Real-time stems**: researched in `docs/design/REALTIME-STEMS.md`. Live neural separation is not
+  possible on the dev laptop (htdemucs runs 2.8× slower than real time), so for now playlists can
+  queue "Prepare stems" in the background. Next step: try StemgenRT's small model through `ort` on a faster machine.
+- **Library portability**: Serato and Engine DJ export, USB export for CDJs.
+- **Streaming "Next"**: public Spotify playlists by link (metadata only).
+
 ## 1. Fix first (reported, or known and unverified)
 
 | Item | State |

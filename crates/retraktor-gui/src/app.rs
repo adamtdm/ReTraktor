@@ -571,14 +571,25 @@ impl eframe::App for ReTraktorApp {
             crate::demucs::DemucsSeparationStatus::Idle => {}
         }
 
-        // Handle user request to separate stems for a track
-        if let Some(track_id) = self.library.request_stem_separation.take() {
+        // Start the next queued separation once Demucs is free.
+        let demucs_idle = matches!(*self.demucs.separation_status.lock().unwrap(), crate::demucs::DemucsSeparationStatus::Idle);
+        if demucs_idle && !self.demucs.is_installed() && !self.library.stem_queue.is_empty() {
+            self.library.stem_queue.clear();
+            self.library.status_message =
+                "Install Demucs in Preferences > Stems & AI to separate stems (live crossover stems work without it).".to_string();
+        }
+        if let Some(track_id) = demucs_idle.then(|| self.library.stem_queue.pop_front()).flatten() {
             if let Some(track) = self.library.tracks.iter().find(|t| t.id == track_id).cloned() {
                 if let Some(ref file_path) = track.file_path {
                     if self.demucs.is_installed() {
                         let started = self.demucs.start_separation(track.id, &track.title, file_path);
                         if started {
-                            self.library.status_message = format!("Queued Meta Demucs AI 4-stem separation for '{}'...", track.title);
+                            let more = self.library.stem_queue.len();
+                            self.library.status_message = if more > 0 {
+                                format!("Separating stems for '{}' ({more} more queued)...", track.title)
+                            } else {
+                                format!("Separating stems for '{}'...", track.title)
+                            };
                         } else {
                             self.library.status_message = format!("Could not start Demucs separation for '{}'.", track.title);
                         }
@@ -2012,7 +2023,7 @@ impl ReTraktorApp {
                 .map(|t| t.id)
         });
         if let Some(id) = track_id {
-            self.library.request_stem_separation = Some(id);
+            self.library.queue_stems(&[id]);
             self.deck_stem_view[d] = true;
         } else {
             self.library.status_message = format!("Load a track onto Deck {} first to create stems.", DECK_LETTERS[d]);
