@@ -677,15 +677,22 @@ impl AudioSharedState {
 pub struct AudioSystem {
     pub shared: Arc<Mutex<AudioSharedState>>,
     _stream: Option<cpal::Stream>,
+    /// What the open stream actually runs at, for the Audio status line.
+    pub output_info: Option<String>,
     pub running: Arc<AtomicBool>,
 }
 
 impl AudioSystem {
+    pub fn output_info(&self) -> Option<&str> {
+        self.output_info.as_deref()
+    }
+
     #[cfg(test)]
     pub fn new() -> Self {
         Self {
             shared: Arc::new(Mutex::new(AudioSharedState::default())),
             _stream: None,
+            output_info: None,
             running: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -699,6 +706,7 @@ impl AudioSystem {
 
         let host = cpal::default_host();
         let has_hw_stream;
+        let mut output_info = None;
         let stream = match host.default_output_device() {
             Some(device) => {
                 let config_res = device.default_output_config();
@@ -707,6 +715,7 @@ impl AudioSystem {
                         let sample_format = config.sample_format();
                         let channels = config.channels() as usize;
                         let sr = config.sample_rate();
+                        let device_name = device.description().map(|d| d.name().to_string()).unwrap_or_else(|_| "default device".into());
 
                         let shared_clone = Arc::clone(&shared);
                         let err_fn = |err| eprintln!("Audio stream error: {err}");
@@ -736,11 +745,18 @@ impl AudioSystem {
                         };
 
                         match stream_opt {
-                            Some(s) => {
-                                let _ = s.play();
-                                has_hw_stream = true;
-                                Some(s)
-                            }
+                            Some(s) => match s.play() {
+                                Ok(()) => {
+                                    output_info = Some(format!("{device_name} · {} Hz", sr));
+                                    has_hw_stream = true;
+                                    Some(s)
+                                }
+                                Err(e) => {
+                                    eprintln!("Audio stream would not start: {e}");
+                                    has_hw_stream = false;
+                                    None
+                                }
+                            },
                             None => {
                                 has_hw_stream = false;
                                 None
@@ -808,6 +824,7 @@ impl AudioSystem {
         Self {
             shared,
             _stream: stream,
+            output_info,
             running,
         }
     }

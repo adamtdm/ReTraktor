@@ -101,6 +101,8 @@ pub struct ReTraktorApp {
 
     pub master_volume: f32,
     pub master_tempo: f64,
+    /// The deck whose tempo the MASTER button made the clock, if any.
+    tempo_master_deck: Option<usize>,
     pub crossfader_pos: f32,
     pub xfader_cheer_sm: dot::CrossfadeCheerStateMachine,
     pub active_cheer: Option<dot::ActiveCheer>,
@@ -135,6 +137,10 @@ pub struct ReTraktorApp {
     /// Switched from Browser to Mix after the first track load.
     first_load_done: bool,
     load_generation: [u64; 4],
+    /// From worker dispatch until that generation's result arrives.
+    deck_loading: [bool; 4],
+    /// When the last load on a deck failed, shown on the deck for a few seconds.
+    deck_load_failed: [Option<std::time::Instant>; 4],
     load_channel: (mpsc::Sender<LoadResult>, mpsc::Receiver<LoadResult>),
     pending_recording: Option<(Vec<i16>, u32)>,
 
@@ -230,6 +236,7 @@ impl Default for ReTraktorApp {
             channel_xfader_assign: [0, 2, 1, 1], // Deck A: Left, Deck B: Right, C/D: Thru
             master_volume: 0.8,
             master_tempo: 128.00,
+            tempo_master_deck: None,
             crossfader_pos: 0.5,
             xfader_cheer_sm: dot::CrossfadeCheerStateMachine::new(),
             active_cheer: None,
@@ -266,6 +273,8 @@ impl Default for ReTraktorApp {
             deck_track_ids: [None; 4],
             first_load_done: false,
             load_generation: [0; 4],
+            deck_loading: [false; 4],
+            deck_load_failed: [None; 4],
             load_channel: mpsc::channel(),
             pending_recording: None,
             show_pattern_player: false,
@@ -355,17 +364,13 @@ impl eframe::App for ReTraktorApp {
         }
 
         self.finish_loads();
-        self.handle_keyboard_shortcuts(ctx);
+        if self.deck_loading.iter().any(|&l| l) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+        // Keys belong to the topmost layer: decide once, before any handler can close an overlay.
+        self.dispatch_keys(ctx);
         if let Some(ids) = self.library.add_to_set_requested.take() {
             self.set_state.add_tracks(&ids);
-        }
-
-        if self.layout == TraktorLayout::Set {
-            let idle = self.idle_deck();
-            if let Some((deck, id)) = self.set_state.handle_keys(ctx, &self.library, idle) {
-                self.library.load_to_deck(deck, id, [false; 4]);
-                self.drain_pending_loads();
-            }
         }
 
         let dt = ctx.input(|i| i.stable_dt);
@@ -448,6 +453,8 @@ impl eframe::App for ReTraktorApp {
                         self.show_browser_panel(ui);
                     }
                     TraktorLayout::Timeline => {
+                        // Planning views keep play, cue and time on screen.
+                        self.show_mini_decks_bar(ui);
                         self.show_timeline_studio_layout(ui);
                         self.show_browser_panel(ui);
                     }
@@ -457,7 +464,9 @@ impl eframe::App for ReTraktorApp {
                     }
                     TraktorLayout::Set => {
                         let idle = self.idle_deck();
-                        self.set_state.show_set_view(ui, &mut self.library, idle);
+                        let locks = self.locked_decks();
+                        self.show_mini_decks_bar(ui);
+                        self.set_state.show_set_view(ui, &mut self.library, idle, locks);
                         self.show_browser_panel(ui);
                     }
                 }
@@ -602,6 +611,7 @@ impl eframe::App for ReTraktorApp {
         }
 
         // Preferences Dialog
+        self.preferences.audio_output = self.audio.output_info().map(str::to_string);
         self.preferences.show(ctx);
 
         // Live Performance Shortcuts HUD Overlay
@@ -740,6 +750,10 @@ impl ReTraktorApp {
             "prefs" => self.preferences.is_open = true,
             "noprefs" => self.preferences.is_open = false,
             "expandA" => self.deck_expanded[0] = true,
+            "pick" => self.library.selected_track_id = self.library.tracks.first().map(|t| t.id),
+            "master" => self.tempo_master_deck = Some(0),
+            "setpick" => self.set_state.selected_index = Some(1),
+            s if s.starts_with("faderB:") => self.channel_volume[1] = s[7..].parse().unwrap_or(0.85),
             s if s.starts_with("select:") => self.preferences.mapper.selected = Some(s[7..].to_string()),
             "prefs:other" | "prefs:OtherControllers" | "prefs:Other" => {
                 self.preferences.is_open = true;
@@ -1008,15 +1022,12 @@ impl ReTraktorApp {
     /// Decodes queued library loads on worker threads; real files only, never synthetic audio.
     fn drain_pending_loads(&mut self) {
         let library_tx = self.library.sender();
-        if !self.library.pending_loads.is_empty() && !self.first_load_done {
-            self.first_load_done = true;
-            if self.layout == TraktorLayout::Browser {
-                self.layout = TraktorLayout::Parallel;
-            }
-        }
         for (deck_idx, track) in std::mem::take(&mut self.library.pending_loads) {
             let d = deck_idx.clamp(1, 4) - 1;
             self.load_generation[d] += 1;
+            self.deck_loading[d] = true;
+            self.deck_load_failed[d] = None;
+            self.library.deck_refused[d] = None;
             let generation = self.load_generation[d];
             let tx = self.load_channel.0.clone();
             let library_tx = library_tx.clone();
@@ -1066,8 +1077,18 @@ impl ReTraktorApp {
     fn finish_loads(&mut self) {
         while let Ok((d, generation, track, result)) = self.load_channel.1.try_recv() {
             if generation != self.load_generation[d] { continue; }
+            self.deck_loading[d] = false;
             match result {
                 Ok(loaded) => {
+                    // The first successful load opens the decks; after that the view is the DJ's choice.
+                    let mut switched = false;
+                    if !self.first_load_done {
+                        self.first_load_done = true;
+                        if self.layout == TraktorLayout::Browser {
+                            self.layout = TraktorLayout::Parallel;
+                            switched = true;
+                        }
+                    }
                     let stems_ready = loaded.stems_ready;
                     if let Ok(mut state) = self.audio.shared.lock() {
                         state.loaded_tracks[d] = Some(loaded);
@@ -1082,8 +1103,14 @@ impl ReTraktorApp {
                     self.library.finish_deck_load(d, track.id, stems_ready);
                     self.set_state.on_track_loaded(d, track.id);
                     self.library.status_message = format!("Loaded '{}' on deck {}", track.title, DECK_LETTERS[d]);
+                    if switched {
+                        self.library.status_message += " · opened the Mix view (F3 returns to the Browser)";
+                    }
                 }
-                Err(e) => self.library.status_message = format!("Could not load '{}' on deck {}: {e}", track.title, DECK_LETTERS[d]),
+                Err(e) => {
+                    self.deck_load_failed[d] = Some(std::time::Instant::now());
+                    self.library.status_message = format!("Could not load '{}' on deck {}: {e}", track.title, DECK_LETTERS[d]);
+                }
             }
         }
     }
@@ -1130,9 +1157,9 @@ impl ReTraktorApp {
 
                 let mut nudge = 0.0;
                 // Sync holds the tempo to the other deck (or the master tempo) and eases the beats together.
-                if self.deck_sync_enabled[d] {
+                let leader = sync_leader(self.tempo_master_deck, d);
+                if let (true, Some(other)) = (self.deck_sync_enabled[d], leader) {
                     if let Some((bpm, offset)) = grids[d] {
-                        let other = if d == 0 { 1 } else { 0 };
                         let target = grids[other]
                             .map(|(b, _)| b * (1.0 + self.deck_pitch_fader[other] as f64 / 100.0))
                             .unwrap_or(self.master_tempo);
@@ -1159,6 +1186,13 @@ impl ReTraktorApp {
             }
 
             state.engine.master_volume = self.master_volume;
+            // A master deck drives the clock at its live tempo; an ejected deck releases it.
+            if let Some(m) = self.tempo_master_deck {
+                match grids[m] {
+                    Some((bpm, _)) => self.master_tempo = bpm * (1.0 + self.deck_pitch_fader[m] as f64 / 100.0),
+                    None => self.tempo_master_deck = None,
+                }
+            }
             state.engine.clock.bpm = self.master_tempo;
 
             // Sync telemetry into PropertyBus for MX2 105-LED & 9-segment VU meter feedback
@@ -1784,22 +1818,52 @@ impl ReTraktorApp {
         }
     }
 
+    /// Every keyboard handler, in order. Overlay state is taken once, before any handler can close an overlay,
+    /// so one key press never reaches both an overlay and what lies under it.
+    fn dispatch_keys(&mut self, ctx: &egui::Context) {
+        let overlay = self.show_shortcuts_hud || self.show_next_track_panel || self.preferences.is_open;
+        self.library.keys_blocked = overlay;
+        self.handle_keyboard_shortcuts(ctx);
+        self.set_keys(ctx, overlay);
+    }
+
+    /// Set view keys (arrows, Enter, Delete, O); inert while help, the picker or Preferences is on top.
+    fn set_keys(&mut self, ctx: &egui::Context, overlay: bool) {
+        if self.layout != TraktorLayout::Set || overlay {
+            return;
+        }
+        let idle = self.idle_deck();
+        if let Some((deck, id)) = self.set_state.handle_keys(ctx, &self.library, idle) {
+            let locks = self.locked_decks();
+            self.library.load_to_deck(deck, id, locks);
+            self.drain_pending_loads();
+        }
+    }
+
     fn handle_keyboard_shortcuts(&mut self, ctx: &egui::Context) {
+        let typing = ctx.wants_keyboard_input();
+        let overlay = self.show_shortcuts_hud || self.show_next_track_panel || self.preferences.is_open;
         if ctx.input(|i| i.modifiers.command && i.key_pressed(Key::Comma)) {
             self.preferences.is_open = !self.preferences.is_open;
         }
-
-        if ctx.input(|i| (i.modifiers.shift && i.key_pressed(Key::Slash)) || i.key_pressed(Key::Questionmark)) {
+        if !typing && ctx.input(|i| (i.modifiers.shift && i.key_pressed(Key::Slash)) || i.key_pressed(Key::Questionmark)) {
             self.show_shortcuts_hud = !self.show_shortcuts_hud;
         }
-
-        if ctx.input(|i| i.key_pressed(Key::Escape)) && self.show_shortcuts_hud {
-            self.show_shortcuts_hud = false;
+        // Escape closes only the topmost layer.
+        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+            if self.show_shortcuts_hud {
+                self.show_shortcuts_hud = false;
+            } else if self.show_next_track_panel {
+                self.show_next_track_panel = false;
+            } else if self.preferences.is_open {
+                self.preferences.save();
+                self.preferences.is_open = false;
+            }
         }
-
-        if ctx.input(|i| i.key_pressed(Key::Escape)) && self.preferences.is_open {
-            self.preferences.save();
-            self.preferences.is_open = false;
+        // Settings take the screen: no help sheet or picker floating over them.
+        if self.preferences.is_open {
+            self.show_next_track_panel = false;
+            self.show_shortcuts_hud = false;
         }
 
         if self.preferences.is_open {
@@ -1824,11 +1888,7 @@ impl ReTraktorApp {
             }
         }
 
-        if ctx.input(|i| i.key_pressed(Key::Escape)) && self.show_next_track_panel {
-            self.show_next_track_panel = false;
-        }
-
-        if self.show_next_track_panel && ctx.input(|i| i.key_pressed(Key::Enter)) {
+        if self.show_next_track_panel && !self.show_shortcuts_hud && ctx.input(|i| i.key_pressed(Key::Enter)) {
             if let Some(&(id, _, _)) = self.next_track_picks.first() {
                 let locked = self.locked_decks();
                 self.library.load_to_deck(self.next_track_target_deck, id, locked);
@@ -1851,7 +1911,8 @@ impl ReTraktorApp {
         }
 
         // Only process single-key deck and mixer shortcuts when not typing in a text field or in Preferences
-        if !ctx.wants_keyboard_input() && !self.preferences.is_open {
+        // Deck keys only act on the decks: never while typing, in Preferences, or with the help sheet or picker open.
+        if !typing && !overlay {
             ctx.input(|i| {
                 if i.modifiers.command || i.modifiers.ctrl || i.modifiers.alt {
                     return;
@@ -1997,7 +2058,8 @@ impl ReTraktorApp {
                 if shift && i.key_pressed(Key::N) {
                     if let Some((_, _, track)) = self.set_state.next_unplayed_track(&self.library) {
                         let target_deck = self.idle_deck();
-                        self.library.load_to_deck(target_deck, track.id, [false; 4]);
+                        let locks = self.locked_decks();
+                        self.library.load_to_deck(target_deck, track.id, locks);
                         self.drain_pending_loads();
                     }
                 }
@@ -2097,8 +2159,8 @@ impl ReTraktorApp {
         }
 
         // Tempo follows in sync_audio_state; here the deck jumps straight onto the other deck's beat.
+        let Some(other) = sync_leader(self.tempo_master_deck, d) else { return };
         if let Ok(mut state) = self.audio.shared.lock() {
-            let other = if d == 0 { 1 } else { 0 };
             let grid = |i: usize| state.loaded_tracks[i].as_ref().map(|t| (t.bpm.max(20.0), t.grid_offset_sec));
             if let (Some((bpm, offset)), Some((other_bpm, other_offset)), true) = (grid(d), grid(other), state.is_playing[other]) {
                 let behind = beat_phase_diff(
@@ -2187,12 +2249,14 @@ impl ReTraktorApp {
                         .on_hover_text("Master tempo down 0.5 BPM")
                         .clicked()
                     {
+                        self.tempo_master_deck = None;
                         self.master_tempo = (self.master_tempo - 0.5).max(40.0);
                     }
                     if pill(ui, "+", false, Color32::TRANSPARENT, HIT)
                         .on_hover_text("Master tempo up 0.5 BPM")
                         .clicked()
                     {
+                        self.tempo_master_deck = None;
                         self.master_tempo = (self.master_tempo + 0.5).min(240.0);
                     }
                 });
@@ -2395,28 +2459,45 @@ impl ReTraktorApp {
                 }
                 ui.separator();
 
-                for (v, (label, name)) in
-                    [("KICK", "808 kick"), ("CLAP", "909 clap"), ("HAT", "909 hat"), ("PERC", "rave percussion")].into_iter().enumerate()
-                {
-                    if pill(ui, label, self.pattern_selected_voice == v, TraktorTheme::ROW_SELECTED(), 44.0)
-                        .on_hover_text(format!("Edit the {name} steps"))
-                        .clicked()
-                    {
-                        self.pattern_selected_voice = v;
-                    }
-                }
-                ui.separator();
-
                 // All four voices at once as a 4 x 16 dot grid; the playing step sweeps across as a bright column.
                 let v = self.pattern_selected_voice.min(3);
+                // Each row is named on its left; clicking a name picks the voice the 4X4 / ROLL / CLEAR buttons edit.
+                const NAMES: [&str; 4] = ["KICK", "CLAP", "HAT", "PERC"];
+                let label_w = 40.0;
                 let grid_w = (ui.available_width() - 250.0).clamp(16.0 * 14.0, 16.0 * 34.0);
-                let (grid, resp) = ui.allocate_exact_size(Vec2::new(grid_w, 4.0 * 18.0), Sense::click());
+                let (area, resp) = ui.allocate_exact_size(Vec2::new(label_w + grid_w, 4.0 * 18.0 + 11.0), Sense::click());
+                // A row of beat numbers on top, then the four voice rows.
+                let grid = egui::Rect::from_min_max(area.min + Vec2::new(label_w, 11.0), area.max);
                 let cell = Vec2::new(grid_w / 16.0, 18.0);
-                if let (true, Some(pos)) = (resp.clicked(), resp.interact_pointer_pos()) {
-                    let step = (((pos.x - grid.left()) / cell.x) as usize).min(15);
+                if let (true, Some(pos)) = (resp.clicked(), resp.interact_pointer_pos().filter(|p| p.y >= grid.top())) {
                     let voice = (((pos.y - grid.top()) / cell.y) as usize).min(3);
-                    self.pattern_steps[voice][step] ^= true;
+                    if pos.x >= grid.left() {
+                        let step = (((pos.x - grid.left()) / cell.x) as usize).min(15);
+                        self.pattern_steps[voice][step] ^= true;
+                    }
                     self.pattern_selected_voice = voice;
+                }
+                for (step, n) in [(0, "1"), (4, "5"), (8, "9"), (12, "13")] {
+                    ui.painter().text(egui::pos2(grid.left() + (step as f32 + 0.5) * cell.x, area.top()), egui::Align2::CENTER_TOP, n, egui::FontId::proportional(9.0), TraktorTheme::TEXT_SECONDARY());
+                }
+                for (voice, name) in NAMES.iter().enumerate() {
+                    let selected = voice == self.pattern_selected_voice;
+                    if selected {
+                        let y = grid.top() + (voice as f32 + 0.5) * cell.y;
+                        ui.painter().circle_filled(egui::pos2(area.left() - 5.0, y), 2.5, TraktorTheme::ACCENT());
+                    }
+                    ui.painter().text(
+                        egui::pos2(area.left(), grid.top() + (voice as f32 + 0.5) * cell.y),
+                        egui::Align2::LEFT_CENTER,
+                        *name,
+                        egui::FontId::proportional(10.5),
+                        if selected { TraktorTheme::TEXT_PRIMARY() } else { TraktorTheme::TEXT_SECONDARY() },
+                    );
+                }
+                // Faint lines between the four beats.
+                for beat in 1..4 {
+                    let x = grid.left() + beat as f32 * 4.0 * cell.x;
+                    ui.painter().line_segment([egui::pos2(x, grid.top()), egui::pos2(x, grid.bottom())], Stroke::new(1.0_f32, TraktorTheme::BORDER_COLOR()));
                 }
                 let sweep = crate::theme::animations() && running;
                 for voice in 0..4 {
@@ -2437,7 +2518,7 @@ impl ReTraktorApp {
                         ui.painter().circle_filled(centre, if on_step { radius + 1.0 } else { radius }, colour);
                     }
                 }
-                resp.on_hover_text("Rows are kick, clap, hat and percussion; click a dot to switch that step on or off");
+                resp.on_hover_text("Click a dot to switch that step on or off; click a name to pick the voice the buttons on the right edit");
                 ui.separator();
 
                 if pill(ui, "4X4", false, Color32::TRANSPARENT, 0.0).on_hover_text("Fill with a four-on-the-floor pattern").clicked() {
@@ -2596,8 +2677,8 @@ impl ReTraktorApp {
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let (fill, fg) = (TraktorTheme::CONTROL(), TraktorTheme::TEXT_PRIMARY());
-                    if icon_pill(ui, Icon::Play, "AUDITION", fill, fg, Vec2::new(0.0, HIT))
-                        .on_hover_text("Sync deck B to deck A and play both (A)")
+                    if icon_pill(ui, Icon::Play, "SYNC + PLAY BOTH", fill, fg, Vec2::new(0.0, HIT))
+                        .on_hover_text("Sync deck B to deck A and play both through the main output (A)")
                         .clicked()
                     {
                         self.sync_deck(2);
@@ -2636,7 +2717,8 @@ impl ReTraktorApp {
         }
 
         let idle = self.idle_deck();
-        self.set_state.show_next_up_strip(ui, &mut self.library, idle);
+        let locks = self.locked_decks();
+        self.set_state.show_next_up_strip(ui, &mut self.library, idle, locks);
 
         ui.horizontal_top(|ui| {
             let mixer_w = (ui.available_width() * 0.38).clamp(380.0, 560.0);
@@ -2806,9 +2888,15 @@ impl ReTraktorApp {
             // Shorter waveforms on short windows keep the browser on screen.
             let wave_h = (36.0 + (ui.ctx().screen_rect().height() - 640.0) * 0.1).clamp(36.0, 80.0);
 
+            // A and B differ in height when one shows tools or stems; pad the shorter one so C and D line up.
+            let heights_id = ui.id().with("four_deck_top_heights");
+            let prev: [f32; 2] = ui.ctx().data(|d| d.get_temp(heights_id)).unwrap_or([0.0; 2]);
+            let row_h = prev[0].max(prev[1]);
+            let mut now = [0.0f32; 2];
             ui.allocate_ui_with_layout(Vec2::new(deck_w, 340.0), Layout::top_down(Align::Min), |ui| {
                 ui.set_width(deck_w);
-                self.show_single_deck(ui, 1, TraktorTheme::DECK_A(), true, wave_h, 0.0);
+                now[0] = self.show_single_deck(ui, 1, TraktorTheme::DECK_A(), true, wave_h, 0.0);
+                ui.add_space((row_h - now[0]).max(0.0));
                 self.show_single_deck(ui, 3, TraktorTheme::DECK_C(), true, wave_h, 0.0);
             });
             ui.allocate_ui_with_layout(Vec2::new(mixer_w, 340.0), Layout::top_down(Align::Min), |ui| {
@@ -2817,9 +2905,14 @@ impl ReTraktorApp {
             });
             ui.allocate_ui_with_layout(Vec2::new(deck_w, 340.0), Layout::top_down(Align::Min), |ui| {
                 ui.set_width(deck_w);
-                self.show_single_deck(ui, 2, TraktorTheme::DECK_B(), true, wave_h, 0.0);
+                now[1] = self.show_single_deck(ui, 2, TraktorTheme::DECK_B(), true, wave_h, 0.0);
+                ui.add_space((row_h - now[1]).max(0.0));
                 self.show_single_deck(ui, 4, TraktorTheme::DECK_D(), true, wave_h, 0.0);
             });
+            if now != prev {
+                ui.ctx().data_mut(|d| d.insert_temp(heights_id, now));
+                ui.ctx().request_repaint();
+            }
         });
     }
 
@@ -2863,7 +2956,12 @@ impl ReTraktorApp {
         let d = deck_idx - 1;
         let letter = DECK_LETTERS[d.min(3)];
         let Some(deck) = self.deck_view(d) else {
-            empty_deck_hint(ui, letter, accent, "Empty. Drop a track here");
+            let loading = self.deck_loading[d] || self.library.pending_loads.iter().any(|(deck, _)| *deck == deck_idx);
+            deck_badge(ui, letter, accent);
+            self.deck_notice(ui, d);
+            if !loading {
+                ui.add(egui::Label::new(RichText::new("Drop a track here, or double-click one in the library").size(12.0).color(TraktorTheme::TEXT_SECONDARY())).truncate().selectable(false));
+            }
             return;
         };
 
@@ -2881,6 +2979,11 @@ impl ReTraktorApp {
         {
             self.toggle_play(deck_idx);
         }
+        let cue_key = ["(C)", "(Shift+C)", "", ""][d.min(3)];
+        if pill(ui, "CUE", false, TraktorTheme::CUE_ACTIVE(), 40.0).on_hover_text(format!("Jump to cue 1 on deck {letter} {cue_key}")).clicked() {
+            self.jump_to_cue(deck_idx, 1);
+        }
+        self.deck_notice(ui, d);
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             display(ui, |ui, ink| {
                 ui.spacing_mut().item_spacing.x = 14.0;
@@ -2902,12 +3005,13 @@ impl ReTraktorApp {
         include_scrolling_waveform: bool,
         waveform_height: f32,
         min_height: f32,
-    ) {
+    ) -> f32 {
         let rect = ui
             .scope(|ui| self.show_single_deck_inner(ui, deck_idx, accent_color, include_scrolling_waveform, waveform_height, min_height))
             .response
             .rect;
         self.deck_drop(ui, rect, deck_idx);
+        rect.height()
     }
 
     /// Snapshot of what a deck needs to draw itself; `None` while the deck is empty.
@@ -2933,7 +3037,7 @@ impl ReTraktorApp {
     fn stem_buttons(&mut self, ui: &mut Ui, d: usize) {
         let view_on = self.deck_stem_view[d];
         if pill(ui, "STEMS", view_on, TraktorTheme::ROW_SELECTED(), 0.0)
-            .on_hover_text("Show the track as four stem lanes: drums, bass, other, vocals")
+            .on_hover_text("Stem mode: four lanes (drums, bass, other, vocals) on the deck, and the mixer's EQ becomes four stem controls")
             .clicked()
         {
             self.deck_stem_view[d] = !view_on;
@@ -2941,6 +3045,15 @@ impl ReTraktorApp {
         if !view_on {
             return;
         }
+        // Say which separation is playing: clean Demucs stems, or the instant frequency split.
+        let saved = self.audio.shared.lock().is_ok_and(|st| st.loaded_tracks[d].as_ref().is_some_and(|t| t.stems_ready));
+        let (src, src_tip) = if saved {
+            ("SAVED STEMS", "Stems separated by Demucs and saved with the track; quality depends on the track")
+        } else {
+            ("LIVE SPLIT · BANDS", "Instant frequency split: ACAPELLA and VOCALS keep the vocal frequencies, not an isolated voice, so expect bleed. Use CREATE STEMS under TOOLS for separated stems")
+        };
+        ui.label(RichText::new(src).font(egui::FontId::proportional(10.5)).color(if saved { TraktorTheme::PLAY_ACTIVE() } else { TraktorTheme::METER_YELLOW() }))
+            .on_hover_text(src_tip);
         for (label, mutes, tip) in [
             ("ACAPELLA", [true, true, true, false], "Vocals only: mute drums, bass and other"),
             ("INST", [false, false, false, true], "Instrumental: mute the vocals"),
@@ -2958,9 +3071,35 @@ impl ReTraktorApp {
             ui.set_width(ui.available_width());
             ui.set_min_height((min_height - 12.0).max(HIT));
             ui.horizontal(|ui| {
-                empty_deck_hint(ui, DECK_LETTERS[(deck_idx - 1).min(3)], accent, "Drop a track here, or double-click one in the library");
+                // LOADING / LOAD FAILED / LOCKED sit beside the letter, as on a loaded deck.
+                deck_badge(ui, DECK_LETTERS[(deck_idx - 1).min(3)], accent);
+                self.deck_notice(ui, deck_idx - 1);
+                if !(self.deck_loading[deck_idx - 1] || self.library.pending_loads.iter().any(|(deck, _)| *deck == deck_idx)) {
+                    ui.add(egui::Label::new(RichText::new("Drop a track here, or double-click one in the library").size(12.0).color(TraktorTheme::TEXT_SECONDARY())).truncate().selectable(false));
+                }
             });
         });
+    }
+
+    /// LOADING or LOCKED beside the deck letter, so the answer to a load shows where the DJ is looking.
+    fn deck_notice(&self, ui: &mut Ui, d: usize) {
+        let loading = self.deck_loading[d] || self.library.pending_loads.iter().any(|(deck, _)| *deck == d + 1);
+        let refused = self.library.deck_refused[d].is_some_and(|t| t.elapsed().as_secs_f32() < 3.0);
+        let failed = self.deck_load_failed[d].is_some_and(|t| t.elapsed().as_secs_f32() < 5.0);
+        let (text, colour, tip) = if loading {
+            ("LOADING", TraktorTheme::TEXT_PRIMARY(), "A new track is loading on this deck; the current one keeps playing until it is ready")
+        } else if failed {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+            ("LOAD FAILED", TraktorTheme::METER_RED(), "The file could not be decoded; see the status line under the library")
+        } else if refused {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+            ("LOCKED", TraktorTheme::METER_RED(), "This deck is playing, so the load was refused (Preferences → Decks: lock playing decks)")
+        } else if self.locked_decks()[d] {
+            ("LOCK", TraktorTheme::TEXT_SECONDARY(), "Playing and protected: new tracks won't load here until it stops (Preferences → Decks)")
+        } else {
+            return;
+        };
+        ui.label(RichText::new(text).font(egui::FontId::proportional(10.5)).strong().color(colour)).on_hover_text(tip);
     }
 
     fn show_single_deck_inner(
@@ -2995,6 +3134,7 @@ impl ReTraktorApp {
             // 1. Which deck, which track.
             ui.horizontal(|ui| {
                 deck_badge(ui, deck_letter, accent_color);
+                self.deck_notice(ui, d);
                 title_label(ui, &deck.title, &deck.artist);
             });
 
@@ -3059,17 +3199,22 @@ impl ReTraktorApp {
                 {
                     self.sync_deck(deck_idx);
                 }
-                if pill(ui, "MASTER", (self.master_tempo - bpm).abs() < 0.05, TraktorTheme::ROW_SELECTED(), 0.0)
-                    .on_hover_text("Use this track's tempo as the master tempo")
+                if pill(ui, "MASTER", self.tempo_master_deck == Some(d), TraktorTheme::ROW_SELECTED(), 0.0)
+                    .on_hover_text("Make this deck's tempo the master clock; click again to release")
                     .clicked()
                 {
-                    self.master_tempo = bpm;
+                    if self.tempo_master_deck == Some(d) {
+                        self.tempo_master_deck = None;
+                    } else {
+                        self.tempo_master_deck = Some(d);
+                        self.master_tempo = bpm;
+                    }
                 }
                 self.stem_buttons(ui, d);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let expanded = self.deck_expanded[d];
                     if pill(ui, "TOOLS", expanded, TraktorTheme::ROW_SELECTED(), 0.0)
-                        .on_hover_text("Track tools: create stems, fix the beatgrid or tempo, and the hotcue pads")
+                        .on_hover_text("Track tools: create stems, fix the beatgrid or tempo, auto cues")
                         .clicked()
                     {
                         self.deck_expanded[d] = !expanded;
@@ -3120,16 +3265,21 @@ impl ReTraktorApp {
             // 5. Stem mutes, while the stems view is on.
             if self.deck_stem_view[d] {
                 ui.horizontal(|ui| {
-                    let w = (ui.available_width() - 3.0 * ui.spacing().item_spacing.x) / 4.0;
+                    let gap = ui.spacing().item_spacing.x;
+                    let w = (ui.available_width() - 10.0 * gap) / 4.0;
                     for (s, name) in ["DRUMS", "BASS", "OTHER", "VOCALS"].into_iter().enumerate() {
-                        let label = if self.deck_stem_fx_send[d][s] { format!("{name} · FX") } else { name.to_string() };
-                        let resp = pill(ui, &label, !self.deck_stem_muted[d][s], accent_color, w)
-                            .on_hover_text("Click to mute or unmute this stem. Right-click to send it to the FX");
-                        if resp.clicked() {
-                            self.deck_stem_muted[d][s] = !self.deck_stem_muted[d][s];
+                        if s > 0 {
+                            ui.add_space(gap);
                         }
-                        if resp.secondary_clicked() {
-                            self.deck_stem_fx_send[d][s] = !self.deck_stem_fx_send[d][s];
+                        let muted = self.deck_stem_muted[d][s];
+                        // The word carries the state too, not just the fill.
+                        let label = if muted { format!("{name} OFF") } else { name.to_string() };
+                        if pill(ui, &label, !muted, accent_color, w * 0.72).on_hover_text("Click to mute or unmute this stem").clicked() {
+                            self.deck_stem_muted[d][s] = !muted;
+                        }
+                        let fx = self.deck_stem_fx_send[d][s];
+                        if pill(ui, "FX", fx, TraktorTheme::ACCENT(), w * 0.28).on_hover_text(format!("Send {} to the deck FX", name.to_lowercase())).clicked() {
+                            self.deck_stem_fx_send[d][s] = !fx;
                         }
                     }
                 });
@@ -3157,7 +3307,7 @@ impl ReTraktorApp {
 
             // 7. Transport and loop; the pitch fader shares the row when there is room for it.
             let mut pitch_inline = false;
-            row(ui, HIT, |ui| {
+            row(ui, 30.0, |ui| {
                 if let Some(action) = deck_transport_bar(
                     ui,
                     deck.is_playing,
@@ -3165,6 +3315,7 @@ impl ReTraktorApp {
                     self.deck_loop_active[d],
                     self.deck_loop_size_beats[d],
                     !self.deck_expanded[d],
+                    [Some(""), Some("Shift+"), None, None][d],
                 ) {
                     match action {
                         TransportAction::TogglePlay => self.toggle_play(deck_idx),
@@ -3208,12 +3359,45 @@ impl ReTraktorApp {
                 });
             }
 
-            // 8. Track tools and the hotcue pads, behind "TOOLS".
+            // 8. Hotcue pads: always on screen, they are played, not configured.
+            let gap = ui.spacing().item_spacing.x;
+            ui.horizontal(|ui| {
+                let w = (ui.available_width() - 7.0 * gap) / 8.0;
+                // Always hotcues on screen; the other pad modes belong to the hardware pads.
+                let mode = DeckPadMode::Hotcues;
+                for i in 1..=8usize {
+                    let (lit, fill, tip) = match mode {
+                        DeckPadMode::Hotcues => (
+                            self.deck_hotcues[d].iter().any(|(c, _)| *c == i as u8),
+                            TraktorTheme::hotcue_color(i),
+                            "Jump to this hotcue, or set it here if empty. Right-click to clear",
+                        ),
+                        DeckPadMode::Stems if i <= 4 => (!self.deck_stem_muted[d][i - 1], TraktorTheme::ACCENT(), "Mute or unmute a stem"),
+                        DeckPadMode::Stems => (self.deck_stem_fx_send[d][i - 5], TraktorTheme::ACCENT(), "Send a stem to the FX"),
+                        DeckPadMode::Pattern => {
+                            let v = self.pattern_selected_voice.min(3);
+                            let step_offset = if deck_idx == 2 { 8 } else { 0 };
+                            (self.pattern_steps[v][(step_offset + i - 1).min(15)], TraktorTheme::ACCENT(), "Toggle a pattern step")
+                        }
+                        DeckPadMode::FluxLoop => (self.deck_loop_active[d], TraktorTheme::ACCENT(), "Loop roll"),
+                    };
+                    let pad = pill(ui, &i.to_string(), lit, fill, w).on_hover_text(tip);
+                    if pad.clicked() {
+                        self.trigger_performance_pad(deck_idx, i as u8);
+                    }
+                    if pad.secondary_clicked() && mode == DeckPadMode::Hotcues {
+                        self.deck_hotcues[d].retain(|(c, _)| *c != i as u8);
+                        if let Some(track_id) = self.deck_track_ids[d] {
+                            self.library.set_hotcues(track_id, &self.deck_hotcues[d]);
+                        }
+                    }
+                }
+            });
+            // 9. Track tools, behind "TOOLS".
             if !self.deck_expanded[d] {
                 return;
             }
             ui.multiply_opacity(pads_t);
-            let gap = ui.spacing().item_spacing.x;
             ui.horizontal(|ui| {
                 let shift = if d == 1 { "Shift+" } else { "" };
                 let progress = self.library.stem_job_progress.filter(|(id, _)| self.deck_track_ids[d] == Some(*id));
@@ -3250,38 +3434,6 @@ impl ReTraktorApp {
                 }
                 if let Some(status) = &self.deck_auto_cue_status[d] {
                     ui.label(RichText::new(status).color(TraktorTheme::ACCENT()).font(egui::FontId::proportional(11.0)));
-                }
-            });
-            ui.horizontal(|ui| {
-                let w = (ui.available_width() - 7.0 * gap) / 8.0;
-                // Always hotcues on screen; the other pad modes belong to the hardware pads.
-                let mode = DeckPadMode::Hotcues;
-                for i in 1..=8usize {
-                    let (lit, fill, tip) = match mode {
-                        DeckPadMode::Hotcues => (
-                            self.deck_hotcues[d].iter().any(|(c, _)| *c == i as u8),
-                            TraktorTheme::hotcue_color(i),
-                            "Jump to this hotcue, or set it here if empty. Right-click to clear",
-                        ),
-                        DeckPadMode::Stems if i <= 4 => (!self.deck_stem_muted[d][i - 1], TraktorTheme::ACCENT(), "Mute or unmute a stem"),
-                        DeckPadMode::Stems => (self.deck_stem_fx_send[d][i - 5], TraktorTheme::ACCENT(), "Send a stem to the FX"),
-                        DeckPadMode::Pattern => {
-                            let v = self.pattern_selected_voice.min(3);
-                            let step_offset = if deck_idx == 2 { 8 } else { 0 };
-                            (self.pattern_steps[v][(step_offset + i - 1).min(15)], TraktorTheme::ACCENT(), "Toggle a pattern step")
-                        }
-                        DeckPadMode::FluxLoop => (self.deck_loop_active[d], TraktorTheme::ACCENT(), "Loop roll"),
-                    };
-                    let pad = pill(ui, &i.to_string(), lit, fill, w).on_hover_text(tip);
-                    if pad.clicked() {
-                        self.trigger_performance_pad(deck_idx, i as u8);
-                    }
-                    if pad.secondary_clicked() && mode == DeckPadMode::Hotcues {
-                        self.deck_hotcues[d].retain(|(c, _)| *c != i as u8);
-                        if let Some(track_id) = self.deck_track_ids[d] {
-                            self.library.set_hotcues(track_id, &self.deck_hotcues[d]);
-                        }
-                    }
                 }
             });
         });
@@ -3642,8 +3794,8 @@ impl ReTraktorApp {
                                 reason_pos,
                                 egui::Align2::LEFT_TOP,
                                 reason,
-                                egui::FontId::proportional(11.0),
-                                TraktorTheme::ACCENT(),
+                                egui::FontId::proportional(11.5),
+                                TraktorTheme::TEXT_SECONDARY(),
                             );
 
                             // Right: BPM & Key badge
@@ -3657,7 +3809,7 @@ impl ReTraktorApp {
                                 TraktorTheme::TEXT_SECONDARY(),
                             );
 
-                            if resp.double_clicked() || (resp.clicked() && rank == 0) {
+                            if resp.double_clicked() {
                                 load_id = Some(id);
                             }
                         }
@@ -3669,8 +3821,8 @@ impl ReTraktorApp {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new("Press Enter or double-click to load top pick. Esc to close.")
-                            .color(TraktorTheme::TEXT_MUTED())
+                        RichText::new("Enter loads the top pick · double-click loads any row · Esc closes")
+                            .color(TraktorTheme::TEXT_SECONDARY())
                             .font(egui::FontId::proportional(11.0)),
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -3856,6 +4008,16 @@ fn deck_badge(ui: &mut Ui, letter: &str, color: Color32) {
 }
 
 /// "Title  Artist" on one line, cut with an ellipsis rather than pushing the layout wider.
+/// The deck a syncing deck follows: the MASTER deck when one is set (the master itself follows no one),
+/// otherwise its partner (B for A, A for every other deck).
+fn sync_leader(master: Option<usize>, d: usize) -> Option<usize> {
+    match master {
+        Some(m) if m == d => None,
+        Some(m) => Some(m),
+        None => Some(if d == 0 { 1 } else { 0 }),
+    }
+}
+
 fn title_label(ui: &mut Ui, title: &str, artist: &str) {
     let mut job = egui::text::LayoutJob::default();
     job.append(title, 0.0, egui::TextFormat::simple(egui::FontId::proportional(13.0), TraktorTheme::TEXT_PRIMARY()));
@@ -3982,6 +4144,123 @@ mod tests {
         app.reset_tempo(0);
         assert_eq!(app.deck_pitch_fader[0], 0.0);
         assert!(!app.deck_sync_enabled[0], "sync would pull the pitch straight back");
+    }
+
+    #[test]
+    fn set_keys_and_locked_loads_never_replace_a_protected_deck() {
+        let ctx = egui::Context::default();
+        let mut app = ReTraktorApp::default();
+        app.library.tracks.push(crate::library_ui::UiTrackEntry { id: 77, title: "x".into(), file_path: Some("/nonexistent.wav".into()), ..Default::default() });
+        app.library.rebuild_index();
+        // A locked destination is refused with a visible deck notice, through the shared load path.
+        app.library.load_to_deck(1, 77, [true, false, false, false]);
+        assert!(app.library.pending_loads.is_empty());
+        assert!(app.library.deck_refused[0].is_some());
+
+        // Through the real dispatch order: Enter, Delete and O under help or Preferences leave the set alone
+        // and load nothing (the set is never changed here, so nothing is saved).
+        app.library.tracks.push(crate::library_ui::UiTrackEntry { id: 78, title: "y".into(), file_path: Some("/nonexistent2.wav".into()), ..Default::default() });
+        app.library.rebuild_index();
+        app.layout = TraktorLayout::Set;
+        app.set_state.set_list.track_ids = vec![77, 78];
+        app.set_state.selected_index = Some(0);
+        let key = |k| egui::Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
+        for (help, prefs) in [(true, false), (false, true)] {
+            app.show_shortcuts_hud = help;
+            app.preferences.is_open = prefs;
+            let _ = ctx.run(egui::RawInput { events: vec![key(Key::Enter), key(Key::Delete), key(Key::O)], ..Default::default() }, |ctx| app.dispatch_keys(ctx));
+            assert_eq!(app.set_state.set_list.track_ids, vec![77, 78], "the set changed under an overlay");
+            assert!(app.library.pending_loads.is_empty() && !app.deck_loading.iter().any(|&l| l), "Set Enter loaded under an overlay");
+        }
+
+        // Picker Enter loads the pick (78) onto its deck, and the same Enter never also loads the Set selection (77).
+        app.show_shortcuts_hud = false;
+        app.preferences.is_open = false;
+        app.show_next_track_panel = true;
+        app.next_track_picks = vec![(78, 1.0, String::new())];
+        app.next_track_target_deck = 2;
+        let _ = ctx.run(egui::RawInput { events: vec![key(Key::Enter)], ..Default::default() }, |ctx| app.dispatch_keys(ctx));
+        let queued: Vec<usize> = app.library.pending_loads.iter().map(|(_, t)| t.id).collect();
+        assert!(!queued.contains(&77), "the Set selection loaded along with the pick");
+    }
+
+    #[test]
+    fn deck_loading_lasts_until_its_own_result() {
+        let mut app = ReTraktorApp::default();
+        let t = crate::library_ui::UiTrackEntry { id: 5, title: "gone".into(), ..Default::default() };
+        // Two dispatches to deck A (no file path, so the workers fail at once); generation 2 is current.
+        app.library.pending_loads.push((1, t.clone()));
+        app.library.pending_loads.push((1, t.clone()));
+        app.drain_pending_loads();
+        assert!(app.deck_loading[0], "loading starts at dispatch");
+        // Drain the real worker results, then replay them one at a time in a known order.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let results: Vec<_> = app.load_channel.1.try_iter().collect();
+        assert_eq!(results.len(), 2);
+        let (stale, current): (Vec<_>, Vec<_>) = results.into_iter().partition(|r| r.1 == 1);
+        app.load_channel.0.send(stale.into_iter().next().unwrap()).unwrap();
+        app.finish_loads();
+        assert!(app.deck_loading[0], "a stale result ended loading");
+        app.load_channel.0.send(current.into_iter().next().unwrap()).unwrap();
+        app.finish_loads();
+        assert!(!app.deck_loading[0], "the matching result did not end loading");
+        assert!(app.deck_load_failed[0].is_some(), "the failure is not shown on the deck");
+    }
+
+    #[test]
+    fn sync_follows_the_master_deck() {
+        assert_eq!(sync_leader(None, 0), Some(1));
+        assert_eq!(sync_leader(None, 2), Some(0));
+        assert_eq!(sync_leader(Some(0), 0), None, "the master never follows another deck");
+        assert_eq!(sync_leader(Some(2), 0), Some(2), "a C master leads A");
+        assert_eq!(sync_leader(Some(2), 1), Some(2));
+    }
+
+    #[test]
+    fn deck_keys_ignored_while_help_or_picker_is_open() {
+        let ctx = egui::Context::default();
+        let mut app = ReTraktorApp::default();
+        app.audio.shared.lock().unwrap().loaded_tracks[0] = Some(crate::audio::LoadedTrackAudio {
+            title: "t".into(),
+            artist: String::new(),
+            duration_sec: 10.0,
+            bpm: 120.0,
+            grid_offset_sec: 0.0,
+            key: String::new(),
+            sample_rate: 44100,
+            waveform_peaks: Vec::new().into(),
+            stem_peaks: Vec::new().into(),
+            pcm_stereo: Vec::new(),
+            stems_ready: false,
+            pcm_drums: None,
+            pcm_bass: None,
+            pcm_other: None,
+            pcm_vocals: None,
+            phrases: Vec::new(),
+        });
+        let space = || vec![egui::Event::Key { key: Key::Space, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }];
+        let press = |app: &mut ReTraktorApp, events| {
+            let _ = ctx.run(egui::RawInput { events, ..Default::default() }, |ctx| app.handle_keyboard_shortcuts(ctx));
+        };
+        let playing = |app: &ReTraktorApp| app.audio.shared.lock().unwrap().is_playing[0];
+
+        app.show_shortcuts_hud = true;
+        press(&mut app, space());
+        assert!(!playing(&app), "Space played deck A under the help sheet");
+        app.show_shortcuts_hud = false;
+        app.show_next_track_panel = true;
+        press(&mut app, space());
+        assert!(!playing(&app), "Space played deck A under the next-track picker");
+        app.show_next_track_panel = false;
+        press(&mut app, space());
+        assert!(playing(&app), "Space no longer plays deck A");
+
+        // Escape closes only the topmost layer.
+        app.show_shortcuts_hud = true;
+        app.preferences.is_open = false;
+        app.show_next_track_panel = true;
+        press(&mut app, vec![egui::Event::Key { key: Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }]);
+        assert!(!app.show_shortcuts_hud && app.show_next_track_panel);
     }
 
     #[test]

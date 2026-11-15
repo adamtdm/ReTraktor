@@ -636,6 +636,10 @@ pub struct LibraryManager {
 
     // App integration
     pub pending_loads: Vec<(usize, UiTrackEntry)>,
+    /// Set by the app while help, the picker or Preferences is on top: browser keys stay inert.
+    pub keys_blocked: bool,
+    /// A refused load, shown on the deck itself for a few seconds.
+    pub deck_refused: [Option<std::time::Instant>; 4],
     pub status_message: String,
     pub stem_job_progress: Option<(usize, f32)>,
     /// Tracks waiting for Demucs, run one at a time (two at once would exhaust RAM on a laptop).
@@ -702,6 +706,8 @@ impl LibraryManager {
             explorer_dir: home,
             explorer_entries: Vec::new(),
             pending_loads: Vec::new(),
+            keys_blocked: false,
+            deck_refused: [None; 4],
             status_message: String::new(),
             stem_job_progress: None,
             stem_queue: Default::default(),
@@ -845,7 +851,7 @@ impl LibraryManager {
         self.dirty_since = Some(Instant::now());
     }
 
-    fn rebuild_index(&mut self) {
+    pub(crate) fn rebuild_index(&mut self) {
         self.id_index = self.tracks.iter().enumerate().map(|(i, t)| (t.id, i)).collect();
     }
 
@@ -1529,6 +1535,7 @@ impl LibraryManager {
         let Some(t) = self.track(id).cloned() else { return };
         if locked[d] {
             self.status_message = format!("Deck {} is playing and locked — not loaded", DECK_NAMES[d]);
+            self.deck_refused[d] = Some(std::time::Instant::now());
         } else if !t.file_path.as_ref().is_some_and(|p| p.is_file()) {
             self.status_message = format!("File not found for '{}' — use Relocate", t.title);
         } else {
@@ -1660,14 +1667,19 @@ impl LibraryManager {
         let resp = ui
             .with_layout(Layout::top_down(Align::Min), |ui| {
                 ui.add(
-                    egui::Button::new(RichText::new(label).size(12.0).color(if selected { Color32::WHITE } else { TraktorTheme::TEXT_PRIMARY() }))
-                        .fill(if selected { TraktorTheme::ROW_SELECTED() } else { Color32::TRANSPARENT })
+                    egui::Button::new(RichText::new(label).size(12.0).color(TraktorTheme::TEXT_PRIMARY()))
+                        .fill(if selected { TraktorTheme::CONTROL_HOVER() } else { Color32::TRANSPARENT })
                         .stroke(Stroke::NONE)
                         .wrap_mode(egui::TextWrapMode::Truncate)
                         .min_size(egui::vec2(ui.available_width(), 22.0)),
                 )
             })
             .inner;
+        // Selection is a neutral fill plus a bar, so red stays for deck B and actions.
+        if selected {
+            let r = resp.rect;
+            ui.painter().rect_filled(egui::Rect::from_min_size(r.min, egui::vec2(3.0, r.height())), 1.0, TraktorTheme::ACCENT());
+        }
         if resp.clicked() {
             self.selected_nav = item;
             self.selection.clear();
@@ -1716,9 +1728,9 @@ impl LibraryManager {
             let ai_btn = egui::Button::new(
                 RichText::new("AI playlist")
                     .size(11.5)
-                    .color(if ai_sel { crate::theme::on(TraktorTheme::ROW_SELECTED()) } else { TraktorTheme::ACCENT() }),
+                    .color(TraktorTheme::ACCENT()),
             )
-            .fill(if ai_sel { TraktorTheme::ROW_SELECTED() } else { Color32::TRANSPARENT })
+            .fill(if ai_sel { TraktorTheme::CONTROL_HOVER() } else { Color32::TRANSPARENT })
             .rounding(3.0)
             .min_size(egui::vec2(ui.available_width(), 22.0));
             if ui.add(ai_btn).on_hover_text("Build a playlist from a sentence with AI").clicked() {
@@ -1848,7 +1860,7 @@ impl LibraryManager {
             } else if self.tracks.is_empty() {
                 self.show_empty_state(ui, music_folders);
             } else {
-                self.show_toolbar(ui, music_folders, columns);
+                self.show_toolbar(ui, music_folders, columns, locked, deck_count);
                 if self.selected_nav == NavItem::Missing {
                     self.show_missing_banner(ui, music_folders);
                 }
@@ -2058,16 +2070,26 @@ impl LibraryManager {
             });
     }
 
-    fn show_toolbar(&mut self, ui: &mut Ui, music_folders: &[PathBuf], columns: &mut LibraryColumnsConfig) {
+    fn show_toolbar(&mut self, ui: &mut Ui, music_folders: &[PathBuf], columns: &mut LibraryColumnsConfig, locked: [bool; 4], deck_count: usize) {
         ui.horizontal(|ui| {
-            let r = ui.add(egui::TextEdit::singleline(&mut self.search_query).hint_text("Search… try bpm:120-128 key:~8m energy:>6").desired_width((ui.available_width() * 0.28).clamp(150.0, 320.0)));
+            let r = ui.add(egui::TextEdit::singleline(&mut self.search_query).hint_text("Search title, artist, genre…").desired_width((ui.available_width() * 0.28).clamp(150.0, 320.0)));
             if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F)) {
                 r.request_focus();
             }
             if !self.search_query.is_empty() && ui.small_button("Clear").clicked() {
                 self.search_query.clear();
             }
+            ui.menu_button("Filters", |ui| {
+                ui.label(RichText::new("Add these to the search; click one to try it").color(TraktorTheme::TEXT_SECONDARY()));
+                for (q, what) in [("bpm:120-128", "tempo range"), ("key:~8m", "keys that mix with 8m"), ("energy:>6", "energy above 6")] {
+                    if ui.button(format!("{q}   {what}")).clicked() {
+                        self.search_query = format!("{} {q}", self.search_query.trim()).trim().to_string();
+                        ui.close_menu();
+                    }
+                }
+            });
             ui.separator();
+
             let busy = self.is_busy();
             if ui.add_enabled(!busy, egui::Button::new("Rescan")).on_hover_text("Add new files from your music folders").clicked() {
                 self.start_scan(music_folders.to_vec());
@@ -2086,20 +2108,69 @@ impl LibraryManager {
                 self.selected_nav = NavItem::Missing;
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.small_button("rekordbox XML").on_hover_text("Export collection + playlists to ~/Music/ReTraktor-rekordbox.xml").clicked() {
+                ui.menu_button("Export", |ui| if ui.button("rekordbox XML").on_hover_text("Export collection + playlists to ~/Music/ReTraktor-rekordbox.xml").clicked() {
+                    ui.close_menu();
                     let path = env::var("HOME").map(PathBuf::from).unwrap_or_default().join("Music/ReTraktor-rekordbox.xml");
                     let xml = retraktor_formats::to_rekordbox_xml(&self.snapshot());
                     self.status_message = match fs::create_dir_all(path.parent().unwrap()).and_then(|_| fs::write(&path, xml)) {
                         Ok(()) => format!("Exported rekordbox XML to {}", path.display()),
                         Err(e) => format!("rekordbox export failed: {e}"),
                     };
-                }
+                });
                 ui.menu_button("Columns", |ui| column_menu(ui, columns));
                 if ui.small_button("Folders").clicked() {
                     self.open_prefs_requested = true;
                     self.open_prefs_file_management = true;
                 }
             });
+        });
+
+        // Second row: what to do with the selection, always in the same place.
+        ui.horizontal_wrapped(|ui| {
+            let sel = self.selected_track_id;
+            ui.label(RichText::new("Load").color(TraktorTheme::TEXT_SECONDARY()));
+            for (d, name) in DECK_NAMES.iter().enumerate().take(deck_count) {
+                let enabled = sel.is_some() && !locked[d];
+                let why = if sel.is_none() { "Select a track first".to_string() } else { format!("Deck {name} is playing and locked") };
+                if ui.add_enabled(enabled, egui::Button::new(*name)).on_hover_text(format!("Load the selected track on deck {name}")).on_disabled_hover_text(why).clicked() {
+                    if let Some(id) = sel {
+                        self.load_to_deck(d + 1, id, locked);
+                    }
+                }
+            }
+            let ids = sel.map(|id| self.selected_or(id)).unwrap_or_default();
+            let n = ids.len();
+            ui.add_enabled_ui(n > 0, |ui| {
+                ui.menu_button("Prepare", |ui| {
+                    ui.label(RichText::new(format!("For {}", plural(n))).color(TraktorTheme::TEXT_SECONDARY()));
+                    if ui.button("Analyse BPM, key and energy").clicked() {
+                        self.start_analysis(ids.clone(), true);
+                        ui.close_menu();
+                    }
+                    if ui.button("Prepare stems").on_hover_text("Separate with Demucs, one after another").clicked() {
+                        let added = self.queue_stems(&ids);
+                        self.status_message = format!("Queued stems for {}", plural(added));
+                        ui.close_menu();
+                    }
+                    if ui.button("Add to set").clicked() {
+                        self.add_to_set_requested = Some(ids.clone());
+                        self.status_message = format!("Added {} to set list", plural(n));
+                        ui.close_menu();
+                    }
+                    if n == 1 && ui.button("Edit track info…").clicked() {
+                        self.editing = self.track(ids[0]).cloned();
+                        ui.close_menu();
+                    }
+                })
+                .response
+                .on_disabled_hover_text("Select a track first");
+            });
+            ui.separator();
+            ui.label(
+                RichText::new(if sel.is_some() { "Double-click: first unlocked deck · Shift+double-click: B · right-click for more" } else { "Select a track to load or prepare it · double-click loads the first unlocked deck" })
+                    .size(11.0)
+                    .color(TraktorTheme::TEXT_SECONDARY()),
+            );
         });
     }
 
@@ -2272,10 +2343,11 @@ impl LibraryManager {
         let mut actions: Vec<Action> = Vec::new();
 
         // Keyboard: arrows browse, Enter loads A / Shift+Enter loads B, Delete removes from playlist.
-        if !ui.ctx().wants_keyboard_input() && ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Z)) {
+        let keys = !ui.ctx().wants_keyboard_input() && !self.keys_blocked;
+        if keys && ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Z)) {
             self.undo();
         }
-        if !ui.ctx().wants_keyboard_input() {
+        if keys {
             let (down, up, enter, shift, del, all, add_set) = ui.input(|i| {
                 (
                     i.key_pressed(egui::Key::ArrowDown),

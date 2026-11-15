@@ -418,6 +418,10 @@ pub struct MapperState {
     pub selected: Option<String>,
     /// Select whatever is touched on the hardware.
     pub learn: bool,
+    /// "Reset all" asks once before it discards every remap.
+    pub confirm_reset: bool,
+    /// Set by Preferences when saving the mapping failed.
+    pub save_error: Option<String>,
 }
 
 fn board_rect(ui: &Ui) -> (Rect, f32) {
@@ -515,16 +519,60 @@ pub fn show(ui: &mut Ui, map: &mut Mapping, state: &mut MapperState, last_touche
         ui.add_enabled(connected, egui::Checkbox::new(&mut state.learn, "Press a control on the MX2 to select it"));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if !map.action.is_empty() || !map.colour.is_empty() {
-                if ui.button("Reset all to default").clicked() {
-                    *map = Mapping::default();
-                    changed = true;
+                if state.confirm_reset {
+                    if ui.button("Cancel").clicked() {
+                        state.confirm_reset = false;
+                    }
+                    if ui.button(RichText::new(format!("Reset {} changed controls", remapped_count(map))).color(TraktorTheme::METER_RED())).clicked() {
+                        *map = Mapping::default();
+                        state.confirm_reset = false;
+                        changed = true;
+                    }
+                } else if ui.button("Reset all to default").clicked() {
+                    state.confirm_reset = true;
                 }
             }
-            ui.label(RichText::new(format!("{} remapped", map.action.len())).size(12.0).color(TraktorTheme::TEXT_SECONDARY()));
+            if let Some(e) = state.save_error.clone() {
+                // Reporting a change makes Preferences save again.
+                if ui.button("Retry").clicked() {
+                    changed = true;
+                }
+                ui.label(RichText::new(format!("Mapping not saved: {e}")).size(12.0).color(TraktorTheme::METER_RED()));
+            }
+            ui.label(RichText::new(format!("{} changed", remapped_count(map))).size(12.0).color(TraktorTheme::TEXT_SECONDARY()))
+                .on_hover_text("Controls with a different action or LED colour from the default");
         });
     });
     ui.add_space(6.0);
 
+    // Wide windows put the editor beside the drawing, so selecting a control never scrolls it away.
+    if ui.available_width() >= 1100.0 {
+        let editor_w = 330.0;
+        let board_w = ui.available_width() - editor_w - 12.0;
+        ui.horizontal_top(|ui| {
+            ui.allocate_ui_with_layout(Vec2::new(board_w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                ui.set_width(board_w);
+                board_panel(ui, map, state, &controls, last_touched);
+            });
+            ui.allocate_ui_with_layout(Vec2::new(editor_w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                ui.set_width(editor_w);
+                changed |= detail_panel(ui, map, state, &controls);
+            });
+        });
+    } else {
+        board_panel(ui, map, state, &controls, last_touched);
+        changed |= detail_panel(ui, map, state, &controls);
+    }
+    changed
+}
+
+/// Controls whose action or LED colour differs from the default (a control with both counts once).
+fn remapped_count(map: &Mapping) -> usize {
+    map.action.keys().chain(map.colour.keys()).collect::<std::collections::BTreeSet<_>>().len()
+}
+
+/// The drawn MX2 and its status line.
+fn board_panel(ui: &mut Ui, map: &Mapping, state: &mut MapperState, controls: &[Ctl], last_touched: Option<&str>) {
     let (board, s) = board_rect(ui);
     let response = ui.allocate_rect(board, Sense::hover());
     let painter = ui.painter_at(board.expand(4.0));
@@ -548,7 +596,7 @@ pub fn show(ui: &mut Ui, map: &mut Mapping, state: &mut MapperState, last_touche
     let mut clicked: Option<String> = None;
     let mut hovered_ctl: Option<&Ctl> = None;
     let mut dropped_labels = false;
-    for c in &controls {
+    for c in controls {
         let hit = hit_rect(c, board.min, s);
         let r = ui.interact(hit, ui.id().with(&c.id), Sense::click());
         if r.hovered() {
@@ -792,12 +840,17 @@ pub fn show(ui: &mut Ui, map: &mut Mapping, state: &mut MapperState, last_touche
             ui.label(
                 RichText::new("· Legend: Fav/Add/Prev/View (library) · TT/Jog/Rev/Flux (jog) · Sync/Mst (tempo) · Cues/Stems/Pat/Roll (pads)")
                     .size(11.0)
-                    .color(TraktorTheme::TEXT_MUTED()),
+                    .color(TraktorTheme::TEXT_SECONDARY()),
             );
         }
     });
     ui.add_space(4.0);
 
+}
+
+/// The selected control's editor; returns true when the mapping changed.
+fn detail_panel(ui: &mut Ui, map: &mut Mapping, state: &mut MapperState, controls: &[Ctl]) -> bool {
+    let mut changed = false;
     // Detail panel for the selected control.
     let Some(sel) = state.selected.clone() else {
         ui.label(RichText::new("Click any control to see or change what it does.").color(TraktorTheme::TEXT_SECONDARY()));

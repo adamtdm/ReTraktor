@@ -87,6 +87,8 @@ impl LibraryColumnsConfig {
 pub struct PreferencesDialog {
     /// Set when the user asks for the folder chooser; the app opens it via the library.
     pub request_folder_pick: bool,
+    /// The running output stream (device and rate), if any; set by the app each frame.
+    pub audio_output: Option<String>,
     pub is_open: bool,
     pub current_tab: PrefsTab,
     pub search_query: String,
@@ -216,6 +218,7 @@ impl Default for PreferencesDialog {
         let default_music = Some(home.join("Music")).filter(|m| m.is_dir());
 
         Self {
+            audio_output: None,
             is_open: false,
             current_tab: PrefsTab::Controllers,
             search_query: String::new(),
@@ -675,7 +678,7 @@ impl PreferencesDialog {
                             ui.horizontal(|ui| {
                                 ui.add(
                                     egui::TextEdit::singleline(&mut self.search_query)
-                                        .hint_text("Search settings…")
+                                        .hint_text("Find a section…")
                                         .desired_width(220.0),
                                 );
                                 if !self.search_query.is_empty() && ui.small_button("Clear").clicked() {
@@ -694,6 +697,17 @@ impl PreferencesDialog {
                 .show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
                     self.render_top_section_tabs(ui);
+                    let q = self.search_query.trim().to_lowercase();
+                    let any = q.is_empty()
+                        || Self::GROUPS.iter().any(|(label, tabs)| label.to_lowercase().contains(&q) || tabs.iter().any(|t| self.get_tab_breadcrumb(*t).1.to_lowercase().contains(&q)));
+                    if !any {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("No section matches. Try audio, mixer, library, stems, controllers, look or AI.").color(TraktorTheme::TEXT_SECONDARY()));
+                            if ui.small_button("Clear").clicked() {
+                                self.search_query.clear();
+                            }
+                        });
+                    }
                 });
 
             // 3. Full-Width Scrollable List-Type Options View
@@ -709,17 +723,23 @@ impl PreferencesDialog {
                         .id_salt("prefs_main_scroll")
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
-                            ui.vertical(|ui| {
-                                ui.set_min_width(avail_w - 16.0);
-                                ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
-
-                                for tab in self.current_group() {
-                                    if self.current_group() == &[PrefsTab::Controllers, PrefsTab::OtherControllers] && *tab != self.current_tab {
-                                        continue;
+                            // Settings rows stay in a readable column; the controller drawing gets the full width.
+                            let controllers = self.current_group() == &[PrefsTab::Controllers, PrefsTab::OtherControllers];
+                            let full = avail_w - 16.0;
+                            let w = if controllers { full } else { full.min(1000.0) };
+                            ui.horizontal_top(|ui| {
+                                ui.add_space(((full - w) * 0.5).max(0.0));
+                                ui.vertical(|ui| {
+                                    ui.set_width(w);
+                                    ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+                                    for tab in self.current_group() {
+                                        if controllers && *tab != self.current_tab {
+                                            continue;
+                                        }
+                                        self.show_section(ui, *tab);
+                                        ui.add_space(12.0);
                                     }
-                                    self.show_section(ui, *tab);
-                                    ui.add_space(12.0);
-                                }
+                                });
                             });
                         });
                 });
@@ -742,7 +762,7 @@ impl PreferencesDialog {
         Self::list_row(
             ui,
             "Audio device",
-            "Which sound card or audio output ReTraktor plays through.",
+            "Which sound card or audio output to use. Not applied yet: ReTraktor plays through the system default output (see Audio status).",
             |ui| {
                 egui::ComboBox::from_id_salt("audio_device_combo")
                     .selected_text(device_label)
@@ -770,7 +790,7 @@ impl PreferencesDialog {
         Self::list_row(
             ui,
             "Sample rate",
-            "Audio rate in Hz; 48000 Hz matches most DJ controllers.",
+            "Audio rate in Hz; 48000 Hz matches most DJ controllers. Not applied yet: ReTraktor plays through the system default output (see Audio status).",
             |ui| {
                 egui::ComboBox::from_id_salt("sr_combo")
                     .selected_text(format!("{} Hz", self.sample_rate))
@@ -788,7 +808,7 @@ impl PreferencesDialog {
         Self::list_row(
             ui,
             "Buffer size",
-            "Smaller values feel more responsive when scratching; larger values prevent crackles.",
+            "Smaller values feel more responsive when scratching; larger values prevent crackles. Not applied yet: ReTraktor plays through the system default output (see Audio status).",
             |ui| {
                 egui::ComboBox::from_id_salt("buf_combo")
                     .selected_text(format!("{} samples ({:.1} ms)", self.buffer_size, latency_ms))
@@ -805,11 +825,16 @@ impl PreferencesDialog {
         Self::list_row(
             ui,
             "Audio status",
-            "Live round-trip latency and audio dropouts.",
+            "The output ReTraktor is actually playing through, as reported by the sound system.",
             |ui| {
+                let (text, colour) = if let Some(info) = &self.audio_output {
+                    (format!("Output stream opened · {info}"), TraktorTheme::PLAY_ACTIVE())
+                } else {
+                    ("No audio output: check the system default output".to_string(), TraktorTheme::ACCENT())
+                };
                 ui.label(
-                    RichText::new(format!("Running · {:.1} ms latency · 0 dropouts", latency_ms))
-                        .color(TraktorTheme::PLAY_ACTIVE())
+                    RichText::new(text)
+                        .color(colour)
                         .font(egui::FontId::monospace(11.5))
                         .strong(),
                 );
@@ -1111,7 +1136,7 @@ impl PreferencesDialog {
         Self::list_row(
             ui,
             "EQ controls stems",
-            "Use the high, mid, and low EQ knobs to adjust vocals, instruments, and drums.",
+            "Hardware EQ knobs (MX2 or MIDI) set vocal, instrument and drum levels instead of EQ. On screen, the deck STEMS button turns the mixer into stem controls either way.",
             |ui| {
                 crate::dot::dot_toggle(ui, &mut self.neural_mix_eq_mode, TraktorTheme::PLAY_ACTIVE(), "EQ controls stems");
             },
@@ -1200,7 +1225,7 @@ impl PreferencesDialog {
         Self::list_row(
             ui,
             "EQ controls stems",
-            "Use the high, mid, and low EQ knobs to adjust vocals, instruments, and drums.",
+            "Hardware EQ knobs (MX2 or MIDI) set vocal, instrument and drum levels instead of EQ. On screen, the deck STEMS button turns the mixer into stem controls either way.",
             |ui| {
                 crate::dot::dot_toggle(ui, &mut self.neural_mix_eq_mode, TraktorTheme::PLAY_ACTIVE(), "EQ controls stems");
             },
@@ -1767,9 +1792,7 @@ impl PreferencesDialog {
         let connected = self.mx2_connected_node.is_some();
         let touched = self.last_surface_control.clone();
         if crate::controller_map::show(ui, &mut self.mapping, &mut self.mapper, touched.as_deref(), connected) {
-            if let Err(e) = self.mapping.save() {
-                eprintln!("retraktor: could not save MX2 mapping: {e}");
-            }
+            self.mapper.save_error = self.mapping.save().err().map(|e| e.to_string());
             self.trigger_led_test = true;
         }
         ui.add_space(14.0);

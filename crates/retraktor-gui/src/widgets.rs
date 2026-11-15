@@ -649,6 +649,15 @@ pub fn scrolling_waveform(
             Stroke::new(0.6_f32, TraktorTheme::WAVEFORM_GRID().gamma_multiply(0.2))
         };
         painter.line_segment([Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())], stroke);
+        // Bar numbers along the bottom edge; every 4th bar when bars are too close to label.
+        let bar_px = 4.0 * beat_len_sec as f32 * pixels_per_sec;
+        let every = if bar_px < 30.0 { 16 } else { 4 };
+        if b >= 0 && b % every == 0 && rect.height() > 30.0 {
+            painter.text(Pos2::new(x + 2.0, rect.bottom() - 1.0), egui::Align2::LEFT_BOTTOM, format!("{}", b / 4 + 1), egui::FontId::proportional(9.0), TraktorTheme::TEXT_SECONDARY());
+        }
+    }
+    if rect.height() > 30.0 {
+        painter.text(rect.right_bottom() - Vec2::new(3.0, 1.0), egui::Align2::RIGHT_BOTTOM, format!("{:.0} s", 2.0 * visible_sec_half), egui::FontId::proportional(9.0), TraktorTheme::TEXT_MUTED());
     }
 
     // 4. Hotcue Markers
@@ -1078,7 +1087,7 @@ pub fn stripe_overview(
     _accent: Color32,
 ) -> Response {
     let width = ui.available_width().max(160.0);
-    let height = 22.0;
+    let height = 28.0;
     let (rect, mut response) =
         ui.allocate_exact_size(Vec2::new(width, height), Sense::click_and_drag());
 
@@ -1332,7 +1341,11 @@ pub fn deck_transport_bar(
     loop_active: bool,
     current_loop_beats: u32,
     compact: bool,
+    // Keyboard prefix for this deck's shortcuts: "" (A), "Shift+" (B), None (no keys).
+    keys: Option<&str>,
 ) -> Option<TransportAction> {
+    let key = |k: &str| keys.map(|p| format!(" ({p}{k})")).unwrap_or_default();
+    const H: f32 = 30.0;
     let mut action = None;
     let active_fg = if crate::theme::palette().is_dark() {
         TraktorTheme::BG_WINDOW()
@@ -1353,8 +1366,8 @@ pub fn deck_transport_bar(
             TraktorTheme::TEXT_PRIMARY()
         };
         let play_icon = if is_playing { Icon::Pause } else { Icon::Play };
-        if icon_button(ui, play_icon, "", play_color, play_text_color, Vec2::new(34.0, 22.0))
-            .on_hover_text(if is_playing { "Pause (Space)" } else { "Play (Space)" })
+        if icon_button(ui, play_icon, "", play_color, play_text_color, Vec2::new(46.0, H))
+            .on_hover_text(format!("{}{}", if is_playing { "Pause" } else { "Play" }, key("Space")))
             .clicked()
         {
             action = Some(TransportAction::TogglePlay);
@@ -1365,14 +1378,14 @@ pub fn deck_transport_bar(
                 egui::Button::new(
                     RichText::new("CUE")
                         .color(TraktorTheme::TEXT_PRIMARY())
-                        .font(egui::FontId::monospace(9.5))
+                        .font(egui::FontId::monospace(12.0))
                         .strong(),
                 )
                 .fill(TraktorTheme::CUE_INACTIVE())
                 .stroke(Stroke::new(0.5_f32, TraktorTheme::BORDER_COLOR()))
-                .min_size(Vec2::new(34.0, 22.0)),
+                .min_size(Vec2::new(46.0, H)),
             )
-            .on_hover_text("Jump to Cue 1")
+            .on_hover_text(format!("Jump to cue 1{}", key("C")))
             .clicked()
         {
             action = Some(TransportAction::Cue);
@@ -1383,11 +1396,11 @@ pub fn deck_transport_bar(
                 egui::Button::new(
                     RichText::new("CUP")
                         .color(TraktorTheme::TEXT_SECONDARY())
-                        .font(egui::FontId::monospace(9.0)),
+                        .font(egui::FontId::monospace(10.5)),
                 )
                 .fill(TraktorTheme::CUE_INACTIVE())
                 .stroke(Stroke::new(0.5_f32, TraktorTheme::BORDER_COLOR()))
-                .min_size(Vec2::new(32.0, 22.0)),
+                .min_size(Vec2::new(34.0, H)),
             )
             .on_hover_text("Cue Play (Jump to Cue 1 & Play)")
             .clicked()
@@ -1404,7 +1417,7 @@ pub fn deck_transport_bar(
                         } else {
                             TraktorTheme::TEXT_SECONDARY()
                         })
-                        .font(egui::FontId::monospace(9.0))
+                        .font(egui::FontId::monospace(10.5))
                         .strong(),
                 )
                 .fill(if flux_active {
@@ -1413,7 +1426,7 @@ pub fn deck_transport_bar(
                     TraktorTheme::CUE_INACTIVE()
                 })
                 .stroke(Stroke::new(0.5_f32, TraktorTheme::BORDER_COLOR()))
-                .min_size(Vec2::new(30.0, 22.0)),
+                .min_size(Vec2::new(34.0, H)),
             )
             .on_hover_text("Toggle Flux / Slip Mode")
             .clicked()
@@ -1423,8 +1436,11 @@ pub fn deck_transport_bar(
 
         ui.separator();
 
+        if !compact {
+            ui.label(RichText::new("LOOP").font(egui::FontId::proportional(10.5)).color(if loop_active { TraktorTheme::LOOP_ACTIVE() } else { TraktorTheme::TEXT_SECONDARY() }));
+        }
         let chevron_fill = TraktorTheme::CONTROL();
-        if icon_button(ui, Icon::Prev, "", chevron_fill, TraktorTheme::TEXT_SECONDARY(), Vec2::new(18.0, 22.0))
+        if icon_button(ui, Icon::Prev, "", chevron_fill, TraktorTheme::TEXT_SECONDARY(), Vec2::new(22.0, H))
             .on_hover_text("Halve loop length")
             .clicked()
         {
@@ -1453,22 +1469,22 @@ pub fn deck_transport_bar(
             if ui
                 .add(
                     egui::Button::new(
-                        RichText::new(format!("{beats}"))
+                        RichText::new(if compact { format!("LOOP {beats}") } else { format!("{beats}") })
                             .color(fg)
-                            .font(egui::FontId::monospace(9.0))
+                            .font(egui::FontId::monospace(10.5))
                             .strong(),
                     )
                     .fill(fill)
-                    .min_size(Vec2::new(20.0, 22.0)),
+                    .min_size(Vec2::new(24.0, H)),
                 )
-                .on_hover_text(format!("Loop {beats} beats (L)"))
+                .on_hover_text(format!("Loop {beats} beats: click to set and toggle the loop{}", key("L")))
                 .clicked()
             {
                 action = Some(TransportAction::SelectLoop(beats));
             }
         }
 
-        if icon_button(ui, Icon::Next, "", chevron_fill, TraktorTheme::TEXT_SECONDARY(), Vec2::new(18.0, 22.0))
+        if icon_button(ui, Icon::Next, "", chevron_fill, TraktorTheme::TEXT_SECONDARY(), Vec2::new(22.0, H))
             .on_hover_text("Double loop length")
             .clicked()
         {
@@ -1508,7 +1524,7 @@ pub fn render_shortcuts_hud(ctx: &egui::Context, is_open: &mut bool) {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
                         RichText::new("Press Esc or ? to close")
-                            .color(TraktorTheme::TEXT_MUTED())
+                            .color(TraktorTheme::TEXT_SECONDARY())
                             .font(egui::FontId::proportional(11.0)),
                     );
                 });
@@ -1584,7 +1600,7 @@ pub fn render_shortcuts_hud(ctx: &egui::Context, is_open: &mut bool) {
                     ui.add_space(4.0);
                     key_row(ui, "U", "Cycle Transition Curve", c);
                     key_row(ui, "B", "Cycle Bar Length (8/16/32)", c);
-                    key_row(ui, "A", "Audition Transition", c);
+                    key_row(ui, "A", "Sync + play both", c);
                     ui.add_space(6.0);
                     key_row(ui, "N", "Suggest Next Track (idle deck)", c);
                     key_row(ui, "Cmd / Ctrl + ,", "Preferences & Setup", c);
@@ -1599,8 +1615,8 @@ pub fn render_shortcuts_hud(ctx: &egui::Context, is_open: &mut bool) {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.label(
-                    RichText::new("💡 Pro Tip: Hardware USB DJ controllers (Traktor Kontrol / MX2) operate at 1000 Hz alongside keyboard shortcuts.")
-                        .color(TraktorTheme::TEXT_MUTED())
+                    RichText::new("The MX2 and MIDI controllers work alongside these keys; Shift picks deck B.")
+                        .color(TraktorTheme::TEXT_SECONDARY())
                         .font(egui::FontId::proportional(11.0)),
                 );
             });

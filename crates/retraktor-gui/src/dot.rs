@@ -976,6 +976,9 @@ pub struct MixerZoneLayout {
     pub xfader_end: usize,
 }
 
+/// Columns between the right MAIN meter column and the scale captions.
+const MAIN_SCALE_GAP_COLS: f32 = 0.8;
+
 pub fn compute_mixer_zone_layout(cols: usize, two_channel_only: bool) -> MixerZoneLayout {
     let mid = cols / 2;
     let margin = 2usize;
@@ -990,14 +993,15 @@ pub fn compute_mixer_zone_layout(cols: usize, two_channel_only: bool) -> MixerZo
     let mut is_compact = [false; 4];
 
     if two_channel_only {
-        let a_fader_e = mid.saturating_sub(4);
-        let a_fader_s = mid.saturating_sub(5);
-        let b_fader_s = mid + 4;
-        let b_fader_e = mid + 5;
+        // Faders sit far enough out that the MAIN scale (0 / -6 / -12) has its own lane beside the meter.
+        let a_fader_e = mid.saturating_sub(9);
+        let a_fader_s = mid.saturating_sub(10);
+        let b_fader_s = mid + 9;
+        let b_fader_e = mid + 10;
 
         let a_eq_s = mid.saturating_sub(max_span);
-        let a_eq_e = mid.saturating_sub(8);
-        let b_eq_s = mid + 8;
+        let a_eq_e = mid.saturating_sub(13);
+        let b_eq_s = mid + 13;
         let b_eq_e = mid + max_span;
 
         fader_meter[0] = Some(ColRange::new(a_fader_s, a_fader_e));
@@ -1105,7 +1109,7 @@ enum MixerDragTarget {
 
 /// Unified centre mixer continuous dot-matrix canvas.
 /// Integrates EQ/stems, fader-on-meters, MAIN meter, and crossfader ribbon into ONE
-/// continuous dot-matrix lattice, mirrored around the centre.
+/// continuous dot-matrix lattice; every channel reads LOW → HI left to right.
 pub struct ContinuousMixer<'a> {
     pub two_channel_only: bool,
     pub volume: &'a mut [f32; 4],
@@ -1143,6 +1147,8 @@ impl<'a> ContinuousMixer<'a> {
         }
 
         let painter = ui.painter();
+        // Labels and handles are drawn after the lattice so dots never cover them.
+        let mut post: Vec<eframe::egui::Shape> = Vec::new();
         let bg = TraktorTheme::WAVEFORM_BG();
         let ink = theme::on(bg);
         let unlit = unlit_on_inset();
@@ -1175,12 +1181,13 @@ impl<'a> ContinuousMixer<'a> {
         let layout = compute_mixer_zone_layout(cols, self.two_channel_only);
         let mid = layout.mid;
 
-        let body_bot_row = 7usize;
+        // Rows 0-3 crossfader, 4-9 the footer band (CUE, readouts), 10 up the channel bodies.
+        let body_bot_row = 10usize;
         let body_top_row = rows.saturating_sub(4);
         let track_rows = body_top_row.saturating_sub(body_bot_row) + 1;
         let track_h = (row_y(body_bot_row) - row_y(body_top_row)).max(20.0);
         let header_y = row_y(rows.saturating_sub(2));
-        let footer_label_y = row_y(5);
+        let footer_label_y = (row_y(3) + row_y(body_bot_row)) * 0.5;
         let cue_lamp_y = footer_label_y;
 
         let ribbon_left_x = col_x(layout.xfader_start);
@@ -1212,10 +1219,9 @@ impl<'a> ContinuousMixer<'a> {
                             let zx1 = col_x(eq_rng.start) - step_x * 0.5;
                             let zx2 = col_x(eq_rng.end) + step_x * 0.5;
                             if pos.x >= zx1 && pos.x <= zx2 && !self.stem_view[d] {
-                                let mirrored = d == 1 || d == 3;
                                 let frac = ((pos.x - zx1) / (zx2 - zx1).max(1.0)).clamp(0.0, 0.999);
                                 let slot = (frac * 3.0).floor() as usize;
-                                let b = if mirrored { 2 - slot.min(2) } else { slot.min(2) };
+                                let b = slot.min(2);
                                 found = Some(MixerDragTarget::EqBand(d, b));
                                 break;
                             }
@@ -1270,9 +1276,8 @@ impl<'a> ContinuousMixer<'a> {
                 } else {
                     for &d in active_channels {
                         if let Some(f_rng) = layout.fader_meter[d] {
-                            let fx1 = col_x(f_rng.start) - step_x * 1.5;
-                            let fx2 = col_x(f_rng.end) + step_x * 1.5;
-                            if pos.x >= fx1 && pos.x <= fx2 && pos.y >= row_y(body_bot_row) + 2.0 {
+                            let cue_hit = cue_button((col_x(f_rng.start) + col_x(f_rng.end)) * 0.5, cue_lamp_y).expand(2.0);
+                            if cue_hit.contains(pos) {
                                 self.cue[d] = !self.cue[d];
                                 response.mark_changed();
                             }
@@ -1282,17 +1287,15 @@ impl<'a> ContinuousMixer<'a> {
                             let zx2 = col_x(eq_rng.end) + step_x * 0.5;
                             if pos.x >= zx1 && pos.x <= zx2 {
                                 if self.stem_view[d] {
-                                    let mirrored = d == 1 || d == 3;
                                     let frac = ((pos.x - zx1) / (zx2 - zx1).max(1.0)).clamp(0.0, 0.999);
                                     let slot = (frac * 4.0).floor() as usize;
-                                    let s = if mirrored { 3 - slot.min(3) } else { slot.min(3) };
+                                    let s = slot.min(3);
                                     self.stem_muted[d][s] = !self.stem_muted[d][s];
                                     response.mark_changed();
                                 } else if pos.y > row_y(body_bot_row + 5) {
-                                    let mirrored = d == 1 || d == 3;
                                     let frac = ((pos.x - zx1) / (zx2 - zx1).max(1.0)).clamp(0.0, 0.999);
                                     let slot = (frac * 3.0).floor() as usize;
-                                    let b = if mirrored { 2 - slot.min(2) } else { slot.min(2) };
+                                    let b = slot.min(2);
                                     let kill = match b {
                                         0 => &mut self.eq_kill_low[d],
                                         1 => &mut self.eq_kill_mid[d],
@@ -1313,17 +1316,15 @@ impl<'a> ContinuousMixer<'a> {
                         let zx2 = col_x(eq_rng.end) + step_x * 0.5;
                         if pos.x >= zx1 && pos.x <= zx2 {
                             if self.stem_view[d] {
-                                let mirrored = d == 1 || d == 3;
                                 let frac = ((pos.x - zx1) / (zx2 - zx1).max(1.0)).clamp(0.0, 0.999);
                                 let slot = (frac * 4.0).floor() as usize;
-                                let s = if mirrored { 3 - slot.min(3) } else { slot.min(3) };
+                                let s = slot.min(3);
                                 self.stem_fx_send[d][s] = !self.stem_fx_send[d][s];
                                 response.mark_changed();
                             } else {
-                                let mirrored = d == 1 || d == 3;
                                 let frac = ((pos.x - zx1) / (zx2 - zx1).max(1.0)).clamp(0.0, 0.999);
                                 let slot = (frac * 3.0).floor() as usize;
-                                let b = if mirrored { 2 - slot.min(2) } else { slot.min(2) };
+                                let b = slot.min(2);
                                 let kill = match b {
                                     0 => &mut self.eq_kill_low[d],
                                     1 => &mut self.eq_kill_mid[d],
@@ -1354,10 +1355,9 @@ impl<'a> ContinuousMixer<'a> {
                             let zx1 = col_x(eq_rng.start) - step_x * 0.5;
                             let zx2 = col_x(eq_rng.end) + step_x * 0.5;
                             if pos.x >= zx1 && pos.x <= zx2 && !self.stem_view[d] {
-                                let mirrored = d == 1 || d == 3;
                                 let frac = ((pos.x - zx1) / (zx2 - zx1).max(1.0)).clamp(0.0, 0.999);
                                 let slot = (frac * 3.0).floor() as usize;
-                                let b = if mirrored { 2 - slot.min(2) } else { slot.min(2) };
+                                let b = slot.min(2);
                                 match b {
                                     0 => self.eq_low[d] = 0.5,
                                     1 => self.eq_mid[d] = 0.5,
@@ -1465,20 +1465,8 @@ impl<'a> ContinuousMixer<'a> {
             }
         }
 
-        painter.text(
-            Pos2::new(inner_rect.left() + 6.0, row_y(1)),
-            Align2::CENTER_CENTER,
-            "A",
-            theme::dot_font(12.0),
-            col_a,
-        );
-        painter.text(
-            Pos2::new(inner_rect.right() - 6.0, row_y(1)),
-            Align2::CENTER_CENTER,
-            "B",
-            theme::dot_font(12.0),
-            col_b,
-        );
+        overlay_text(painter, &mut post, Pos2::new(inner_rect.left() + 6.0, row_y(1)), "A", theme::dot_font(12.0), col_a, bg);
+        overlay_text(painter, &mut post, Pos2::new(inner_rect.right() - 6.0, row_y(1)), "B", theme::dot_font(12.0), col_b, bg);
 
         // 2. MAIN Stereo Meter (centre)
         let main_l = layout.main_meter_l;
@@ -1501,13 +1489,24 @@ impl<'a> ContinuousMixer<'a> {
                 }
             }
         }
-        painter.text(
-            Pos2::new(col_x(mid), footer_label_y),
-            Align2::CENTER_CENTER,
-            "MAIN",
-            FontId::proportional(8.0),
-            TraktorTheme::TEXT_SECONDARY(),
-        );
+        // The meter is linear in peak level, so -6 dB sits at half height and -12 dB at a quarter.
+        // A warning word, so it shows with animations off too.
+        let clipping = self.main_peaks.0.max(self.main_peaks.1) >= 0.99;
+        if clipping {
+            overlay_text(painter, &mut post, Pos2::new(col_x(mid), header_y), "CLIP", FontId::proportional(11.0), TraktorTheme::METER_RED(), bg);
+        } else if self.two_channel_only {
+            overlay_text(painter, &mut post, Pos2::new(col_x(mid), header_y), "MAIN", FontId::proportional(11.0), TraktorTheme::TEXT_SECONDARY(), bg);
+        }
+        if self.two_channel_only {
+            for (level, db) in [(1.0_f32, "0"), (0.5, "-6"), (0.25, "-12")] {
+                let y = row_y(body_bot_row) - level * track_h;
+                let x = col_x(main_r) + step_x * MAIN_SCALE_GAP_COLS;
+                let g = painter.layout_no_wrap(db.to_owned(), FontId::proportional(11.0), TraktorTheme::TEXT_SECONDARY());
+                let r = Align2::LEFT_CENTER.anchor_size(Pos2::new(x, y), g.size());
+                post.push(eframe::egui::Shape::rect_filled(r.expand(1.0), 2.0, bg));
+                post.push(eframe::egui::Shape::galley(r.min, g, TraktorTheme::TEXT_SECONDARY()));
+            }
+        }
 
         // 3. Faders-on-Meter for each active channel
         for &d in active_channels {
@@ -1545,34 +1544,32 @@ impl<'a> ContinuousMixer<'a> {
             let bh = 12.0_f32;
             let bracket = Rect::from_center_size(Pos2::new(fader_cx, hy), Vec2::new(bw, bh));
             let stroke = Stroke::new(1.8_f32, TraktorTheme::TEXT_PRIMARY());
-            painter.rect_stroke(bracket, 3.5, stroke);
-            painter.line_segment([Pos2::new(bracket.left() - 4.0, hy), bracket.left_center()], stroke);
-            painter.line_segment([bracket.right_center(), Pos2::new(bracket.right() + 4.0, hy)], stroke);
+            // Rail and unity mark, so the column reads as a fader before it reads as a meter.
+            let rail = Stroke::new(1.0_f32, TraktorTheme::TEXT_SECONDARY());
+            post.push(eframe::egui::Shape::line_segment([Pos2::new(fader_cx, row_y(body_top_row)), Pos2::new(fader_cx, row_y(body_bot_row))], Stroke::new(4.0_f32, bg)));
+            post.push(eframe::egui::Shape::line_segment([Pos2::new(fader_cx, row_y(body_top_row)), Pos2::new(fader_cx, row_y(body_bot_row))], rail));
+            let unity_y = row_y(body_bot_row) - 0.85 * track_h;
+            post.push(eframe::egui::Shape::line_segment([Pos2::new(fader_cx - bw * 0.5 - 5.0, unity_y), Pos2::new(fader_cx + bw * 0.5 + 5.0, unity_y)], Stroke::new(1.0_f32, TraktorTheme::TEXT_SECONDARY().gamma_multiply(0.7))));
+            post.push(eframe::egui::Shape::rect_filled(bracket, 3.5, bg));
+            post.push(eframe::egui::Shape::rect_stroke(bracket, 3.5, stroke));
+            post.push(eframe::egui::Shape::line_segment([Pos2::new(bracket.left() - 4.0, hy), bracket.left_center()], stroke));
+            post.push(eframe::egui::Shape::line_segment([bracket.right_center(), Pos2::new(bracket.right() + 4.0, hy)], stroke));
+            overlay_text(painter, &mut post, bracket.center(), DECK_LETTERS[d], FontId::proportional(9.5), accent, bg);
 
             // dB readout at header
-            painter.text(
-                Pos2::new(fader_cx, header_y),
-                Align2::CENTER_CENTER,
-                format_db(vol, 0.85),
-                theme::dot_font(10.5),
-                TraktorTheme::TEXT_PRIMARY(),
-            );
-
-            // Headphone cue lamp along footer row
-            let is_cue = self.cue[d];
-            let cue_col = if is_cue { TraktorTheme::CUE_ACTIVE() } else { TraktorTheme::TEXT_MUTED() };
-            if is_cue {
-                painter.circle_filled(Pos2::new(fader_cx - 7.0, cue_lamp_y), 2.6, cue_col);
-            } else {
-                painter.circle_stroke(Pos2::new(fader_cx - 7.0, cue_lamp_y), 2.2, Stroke::new(1.1_f32, cue_col));
+            // Four-channel mode gives the header to the C/D band letters; the lettered handle still marks each fader.
+            if self.two_channel_only || !layout.is_compact[d] {
+                overlay_text(painter, &mut post, Pos2::new(fader_cx, header_y), &format_db(vol, 0.85), theme::dot_font(10.5), TraktorTheme::TEXT_PRIMARY(), bg);
             }
-            painter.text(
-                Pos2::new(fader_cx + 4.5, cue_lamp_y),
-                Align2::CENTER_CENTER,
-                "CUE",
-                FontId::proportional(7.5),
-                if is_cue { TraktorTheme::TEXT_PRIMARY() } else { TraktorTheme::TEXT_MUTED() },
-            );
+
+            // Headphone cue: a labelled button on the footer row, filled when on.
+            let is_cue = self.cue[d];
+            let cue_rect = cue_button(fader_cx, cue_lamp_y);
+            post.push(eframe::egui::Shape::rect_filled(cue_rect, 3.0, if is_cue { TraktorTheme::CUE_ACTIVE() } else { bg }));
+            post.push(eframe::egui::Shape::rect_stroke(cue_rect, 3.0, Stroke::new(1.0_f32, if is_cue { TraktorTheme::CUE_ACTIVE() } else { TraktorTheme::TEXT_SECONDARY() })));
+            let cue_fg = if is_cue { theme::on(TraktorTheme::CUE_ACTIVE()) } else { TraktorTheme::TEXT_SECONDARY() };
+            let g = painter.layout_no_wrap("CUE".to_owned(), FontId::proportional(11.0), cue_fg);
+            post.push(eframe::egui::Shape::galley(Align2::CENTER_CENTER.anchor_size(cue_rect.center(), g.size()).min, g, cue_fg));
         }
 
         // 4. EQ or Stems zone for each active channel
@@ -1581,7 +1578,6 @@ impl<'a> ContinuousMixer<'a> {
             let Some(zone) = layout.eq_stem_zone[d] else { continue };
             let accent = TraktorTheme::deck_color(d + 1);
             let accent_vis = visible_on_inset(accent);
-            let mirrored = d == 1 || d == 3;
             let is_compact = layout.is_compact[d];
 
             if self.stem_view[d] {
@@ -1593,7 +1589,7 @@ impl<'a> ContinuousMixer<'a> {
                 let names = ["DRM", "BAS", "OTH", "VOC"];
 
                 for slot in 0..stem_count {
-                    let s = if mirrored { 3 - slot } else { slot };
+                    let s = slot;
                     let slot_start_c = zone.start + slot * (stem_w + 1);
                     let slot_end_c = (slot_start_c + stem_w - 1).min(zone.end);
                     let slot_cx = (col_x(slot_start_c) + col_x(slot_end_c)) * 0.5;
@@ -1618,22 +1614,16 @@ impl<'a> ContinuousMixer<'a> {
 
                     // Top state
                     let top_txt = if muted { "OFF" } else if fx { "FX" } else { "ON" };
-                    painter.text(
-                        Pos2::new(slot_cx, header_y),
-                        Align2::CENTER_CENTER,
-                        top_txt,
-                        theme::dot_font(9.5),
-                        if muted { ink.gamma_multiply(0.4) } else if fx { TraktorTheme::ACCENT() } else { ink },
-                    );
+                    if is_compact {
+                        overlay_text(painter, &mut post, Pos2::new(slot_cx, header_y), &names[s][..1], FontId::proportional(11.0), if muted { ink.gamma_multiply(0.55) } else { ink }, bg);
+                    } else {
+                        overlay_text(painter, &mut post, Pos2::new(slot_cx, header_y), top_txt, theme::dot_font(9.5), if muted { ink.gamma_multiply(0.55) } else if fx { TraktorTheme::ACCENT() } else { ink }, bg);
+                    }
 
                     // Bottom label
-                    painter.text(
-                        Pos2::new(slot_cx, footer_label_y),
-                        Align2::CENTER_CENTER,
-                        names[s],
-                        FontId::proportional(7.5),
-                        if muted { ink.gamma_multiply(0.4) } else { ink.gamma_multiply(0.75) },
-                    );
+                    if !is_compact {
+                        overlay_text(painter, &mut post, Pos2::new(slot_cx, footer_label_y), names[s], FontId::proportional(11.0), if muted { ink.gamma_multiply(0.55) } else { ink }, bg);
+                    }
 
                     let live = if anim { self.stem_peaks[d][s].clamp(0.0, 1.0) } else { 0.45 };
                     let active_frac = (0.35 + 0.65 * live) * open_t;
@@ -1711,7 +1701,7 @@ impl<'a> ContinuousMixer<'a> {
                 let mut node_centers = [Pos2::ZERO; 3];
 
                 for slot in 0..band_count {
-                    let b = if mirrored { 2 - slot } else { slot };
+                    let b = slot;
                     let slot_start_c = zone.start + slot * (band_w + 1);
                     let slot_end_c = (slot_start_c + band_w - 1).min(zone.end);
                     let slot_cx = (col_x(slot_start_c) + col_x(slot_end_c)) * 0.5;
@@ -1733,28 +1723,19 @@ impl<'a> ContinuousMixer<'a> {
                     }
 
                     // Top label
+                    // Compact C/D zones keep a one-letter band name; the header is theirs in four-channel mode.
                     let lbl = if is_compact { &labels[b][..1] } else { labels[b] };
-                    painter.text(
-                        Pos2::new(slot_cx, header_y),
-                        Align2::CENTER_CENTER,
-                        lbl,
-                        FontId::proportional(8.0),
-                        ink.gamma_multiply(0.68),
-                    );
+                    overlay_text(painter, &mut post, Pos2::new(slot_cx, header_y), lbl, FontId::proportional(11.0), ink, bg);
 
                     // Bottom readout
-                    painter.text(
-                        Pos2::new(slot_cx, footer_label_y),
-                        Align2::CENTER_CENTER,
-                        format_eq_db(val, killed),
-                        theme::dot_font(10.5),
-                        if killed { TraktorTheme::METER_RED() } else { ink },
-                    );
+                    if !is_compact {
+                        overlay_text(painter, &mut post, Pos2::new(slot_cx, footer_label_y), &format_eq_db(val, killed), theme::dot_font(10.5), if killed { TraktorTheme::METER_RED() } else { ink }, bg);
+                    }
 
                     let lit_rows = value_to_lit_rows(val, track_rows);
                     for c in slot_start_c..=slot_end_c {
                         let sub = if band_w > 1 { (c - slot_start_c) as f32 / (band_w - 1) as f32 } else { 0.5 };
-                        let sub_freq = if mirrored { 1.0 - sub } else { sub };
+                        let sub_freq = sub;
                         let freq_pos = (b as f32 + (sub_freq - 0.5) * 0.8) / 2.0;
                         let flt_gain = filter_band_gain(self.filter[d], self.filter_on[d], freq_pos);
 
@@ -1815,7 +1796,7 @@ impl<'a> ContinuousMixer<'a> {
                     }
                 }
                 for (slot, &center) in node_centers.iter().enumerate() {
-                    let b = if mirrored { 2 - slot } else { slot };
+                    let b = slot;
                     let killed = kills[b];
                     painter.circle_filled(center, 4.5, bg);
                     painter.circle_stroke(
@@ -1995,6 +1976,7 @@ impl<'a> ContinuousMixer<'a> {
             cells[r * cols + c]
         });
 
+        painter.extend(post);
         for (pos, sprite, bounce, mode, col) in kill_icons {
             paint_sprite(painter, pos, Vec2::new(step_x, step_y), dot_radius, sprite, 0, bounce, mode, col, unlit, false);
         }
@@ -2011,6 +1993,19 @@ impl<'a> ContinuousMixer<'a> {
     }
 }
 
+
+/// The headphone CUE button under a channel fader; drawing and clicking share this rectangle.
+fn cue_button(fader_cx: f32, y: f32) -> Rect {
+    Rect::from_center_size(Pos2::new(fader_cx, y), Vec2::new(30.0, 24.0))
+}
+
+/// Queues text on a backing of `bg`, so it reads over the dot lattice.
+fn overlay_text(painter: &Painter, post: &mut Vec<eframe::egui::Shape>, pos: Pos2, text: &str, font: FontId, color: Color32, bg: Color32) {
+    let g = painter.layout_no_wrap(text.to_owned(), font, color);
+    let r = Align2::CENTER_CENTER.anchor_size(pos, g.size());
+    post.push(eframe::egui::Shape::rect_filled(r.expand(1.5), 2.0, bg));
+    post.push(eframe::egui::Shape::galley(r.min, g, color));
+}
 
 /// Pure helper: maps a phase difference in beats (`-0.5..=0.5`) to a column offset (`-half_cols..=half_cols`).
 pub fn phase_col_offset(phase_diff: f64, half_cols: isize) -> isize {
@@ -2330,8 +2325,8 @@ pub fn set_arc_display(
     );
 
     let grid_rect = Rect::from_min_max(
-        Pos2::new(rect.left() + 16.0, rect.top() + 24.0),
-        Pos2::new(rect.right() - 16.0, rect.bottom() - 18.0),
+        Pos2::new(rect.left() + 22.0, rect.top() + 24.0),
+        Pos2::new(rect.right() - 28.0, rect.bottom() - 18.0),
     );
 
     // Each track is two dots wide with a one-dot gap.
@@ -2390,6 +2385,18 @@ pub fn set_arc_display(
         }
     });
 
+    // Axis captions: energy 1-10 on the left (accent), the BPM range on the right (green).
+    let cap = FontId::proportional(8.5);
+    let row_y = |r: f32| grid_rect.bottom() - dot_radius - r * (grid_rect.height() - dot_radius * 2.0) / (rows - 1) as f32;
+    for (r, label) in [(9.0, "10"), (4.0, "5"), (0.0, "1")] {
+        painter.text(Pos2::new(grid_rect.left() - 4.0, row_y(r)), Align2::RIGHT_CENTER, label, cap.clone(), visible_on_inset(TraktorTheme::ACCENT()));
+    }
+    if !bpms.is_empty() {
+        for (r, bpm) in [(9.0, max_bpm), (0.0, min_bpm)] {
+            painter.text(Pos2::new(grid_rect.right() + 3.0, row_y(r)), Align2::LEFT_CENTER, format!("{bpm:.0}"), cap.clone(), TraktorTheme::PLAY_ACTIVE());
+        }
+    }
+
     // Musical keys under each column
     for (c, t) in tracks.iter().enumerate() {
         let col_x = if cols > 1 {
@@ -2406,7 +2413,7 @@ pub fn set_arc_display(
         painter.text(
             Pos2::new(col_x, grid_rect.bottom() + 3.0),
             Align2::CENTER_TOP,
-            &t.key,
+            format!("{} {}", c + 1, t.key),
             FontId::monospace(9.0),
             key_col,
         );
@@ -2893,6 +2900,12 @@ mod tests {
             assert_eq!(a_fad.len(), b_fad.len(), "Fader zones must be symmetric in length");
             assert_eq!(l2.mid - a_eq.start, b_eq.end - l2.mid, "EQ outer ends must be equidistant from mid");
             assert_eq!(l2.mid - a_fad.start, b_fad.end - l2.mid, "Faders must be equidistant from mid");
+            // The MAIN scale lane ("-12" at 11 px is about 18 px; the lattice pitch is about 5.2 px) must end
+            // before B's fader handle and its side ticks (up to about 19 px left of the fader centre).
+            let pitch = 5.2_f32;
+            let lane_end = l2.main_meter_r as f32 + MAIN_SCALE_GAP_COLS + 18.0 / pitch;
+            let handle_left = b_fad.center() - 19.0 / pitch;
+            assert!(lane_end < handle_left, "MAIN scale would run under deck B's fader ({lane_end} >= {handle_left})");
 
             // 4-channel mode
             let l4 = compute_mixer_zone_layout(cols, false);

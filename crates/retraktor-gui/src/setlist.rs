@@ -141,6 +141,14 @@ impl FlowWarning {
             Self::EnergyDrop => "Energy drop (≥3)",
         }
     }
+
+    pub fn short(self) -> &'static str {
+        match self {
+            Self::KeyClash => "KEY",
+            Self::TempoJump => "BPM",
+            Self::EnergyDrop => "ENERGY",
+        }
+    }
 }
 
 /// Pure helper: relative tempo difference after folding half/double tempo (e.g. 70 bpm ≈ 140 bpm).
@@ -413,11 +421,14 @@ pub struct SetUiState {
     pub recorded_audible_tracks: Vec<(f64, String, String)>,
     pub recording_start: Option<std::time::Instant>,
     pub recording_samples_start_len: usize,
+    /// Clear asks once before it empties the set.
+    confirm_clear: bool,
 }
 
 impl Default for SetUiState {
     fn default() -> Self {
         Self {
+            confirm_clear: false,
             set_list: SetList::load(),
             selected_index: None,
             undo_order: None,
@@ -607,7 +618,7 @@ impl SetUiState {
     }
 
     /// Renders the PERFORM "NEXT UP" slim strip on the Mix view.
-    pub fn show_next_up_strip(&mut self, ui: &mut Ui, library: &mut LibraryManager, idle_deck: usize) {
+    pub fn show_next_up_strip(&mut self, ui: &mut Ui, library: &mut LibraryManager, idle_deck: usize, locks: [bool; 4]) {
         if self.set_list.track_ids.is_empty() {
             return;
         }
@@ -665,7 +676,7 @@ impl SetUiState {
                         .on_hover_text(format!("Load {} to Deck {} (Shift+N)", t.title, deck_letter))
                         .clicked()
                         {
-                            library.load_to_deck(idle_deck, t.id, [false; 4]);
+                            library.load_to_deck(idle_deck, t.id, locks);
                         }
                     });
                 } else {
@@ -680,7 +691,7 @@ impl SetUiState {
     }
 
     /// Renders the complete BUILD workspace view (Set list + Arc display + Running time).
-    pub fn show_set_view(&mut self, ui: &mut Ui, library: &mut LibraryManager, idle_deck: usize) {
+    pub fn show_set_view(&mut self, ui: &mut Ui, library: &mut LibraryManager, idle_deck: usize, locks: [bool; 4]) {
         let avail_h = ui.available_height().max(240.0);
         let top_h = (avail_h * 0.48).clamp(180.0, 260.0);
 
@@ -709,26 +720,29 @@ impl SetUiState {
                         );
                         ui.label(
                             RichText::new(format!("({} tracks)", self.set_list.track_ids.len()))
-                                .color(TraktorTheme::TEXT_MUTED())
+                                .color(TraktorTheme::TEXT_SECONDARY())
                                 .font(egui::FontId::proportional(11.0)),
                         );
 
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ui.add(
-                                egui::Button::new(
-                                    RichText::new("Clear")
-                                        .color(TraktorTheme::TEXT_MUTED())
-                                        .size(11.0),
-                                )
-                                .fill(TraktorTheme::CONTROL())
-                                .min_size(Vec2::new(0.0, HIT)),
-                            )
-                            .on_hover_text("Clear entire set list")
-                            .clicked()
+                            let n = self.set_list.track_ids.len();
+                            if self.confirm_clear {
+                                if ui.button("Cancel").clicked() {
+                                    self.confirm_clear = false;
+                                }
+                                if ui.add(egui::Button::new(RichText::new(format!("Clear {n} tracks")).color(TraktorTheme::METER_RED()).size(11.0)).min_size(Vec2::new(0.0, HIT))).clicked() {
+                                    self.set_list.track_ids.clear();
+                                    self.selected_index = None;
+                                    self.confirm_clear = false;
+                                    let _ = self.set_list.save();
+                                }
+                            } else if n > 0
+                                && ui
+                                    .add(egui::Button::new(RichText::new("Clear").color(TraktorTheme::TEXT_SECONDARY()).size(11.0)).fill(TraktorTheme::CONTROL()).min_size(Vec2::new(0.0, HIT)))
+                                    .on_hover_text("Empty the set list (asks first)")
+                                    .clicked()
                             {
-                                self.set_list.track_ids.clear();
-                                self.selected_index = None;
-                                let _ = self.set_list.save();
+                                self.confirm_clear = true;
                             }
 
                             let order_label = if self.undo_order.is_some() { "Undo Order (O)" } else { "Order Flow (O)" };
@@ -833,12 +847,12 @@ impl SetUiState {
                                     painter.text(Pos2::new(artist_rect.right() + 84.0, y), Align2::LEFT_CENTER, &energy_str, FontId::monospace(10.0), TraktorTheme::ACCENT());
 
                                     let dur_str = format_duration(track.duration_sec);
-                                    painter.text(Pos2::new(rect.right() - 28.0, y), Align2::RIGHT_CENTER, &dur_str, FontId::monospace(10.0), TraktorTheme::TEXT_MUTED());
+                                    painter.text(Pos2::new(rect.right() - 8.0, y), Align2::RIGHT_CENTER, &dur_str, FontId::monospace(10.0), TraktorTheme::TEXT_SECONDARY());
 
-                                    // Warning icon indicator if join to next track has issues
-                                    let row_warnings: Vec<_> = warnings.iter().filter(|(idx, _)| *idx == i).map(|(_, w)| *w).collect();
+                                    // The join into the next track, named in words: hover gives the detail.
+                                    let row_warnings: Vec<_> = warnings.iter().filter(|(idx, _)| *idx == i).map(|(_, w)| w.short()).collect();
                                     if !row_warnings.is_empty() {
-                                        painter.text(Pos2::new(rect.right() - 8.0, y), Align2::CENTER_CENTER, "⚠", egui::FontId::proportional(12.0), TraktorTheme::METER_RED());
+                                        painter.text(Pos2::new(rect.right() - 52.0, y), Align2::RIGHT_CENTER, format!("⚠ {}", row_warnings.join(" ")), egui::FontId::proportional(10.5), TraktorTheme::METER_YELLOW());
                                     }
                                 }
 
@@ -846,7 +860,7 @@ impl SetUiState {
                                     self.selected_index = Some(i);
                                 }
                                 if resp.double_clicked() {
-                                    library.load_to_deck(idle_deck, track.id, [false; 4]);
+                                    library.load_to_deck(idle_deck, track.id, locks);
                                 }
 
                                 // Warning tooltip
@@ -878,10 +892,29 @@ impl SetUiState {
                         })
                         .collect();
 
-                    let arc_h = top_h - 48.0;
+                    let arc_h = top_h - 66.0;
                     let (_, clicked) = dot::set_arc_display(ui, &arc_tracks, self.selected_index, Vec2::new(arc_w - 8.0, arc_h));
                     if let Some(c) = clicked {
                         self.selected_index = Some(c);
+                    }
+                    // Name the highlighted column, so the plot reads without the list.
+                    if let Some(t) = self.selected_index.and_then(|i| resolved.get(i).map(|t| (i, t))) {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(format!(
+                                    "{:02} · {}{} · {:.1} BPM · {} · E{}",
+                                    t.0 + 1,
+                                    if t.1.artist.is_empty() { String::new() } else { format!("{} – ", t.1.artist) },
+                                    t.1.title,
+                                    t.1.bpm,
+                                    t.1.musical_key,
+                                    t.1.energy
+                                ))
+                                    .color(TraktorTheme::TEXT_PRIMARY())
+                                    .font(egui::FontId::proportional(11.0)),
+                            )
+                            .truncate(),
+                        );
                     }
 
                     ui.add_space(4.0);
@@ -905,7 +938,7 @@ impl SetUiState {
                         if !warnings.is_empty() {
                             ui.label(
                                 RichText::new(format!("⚠ {} flow warnings", warnings.len()))
-                                    .color(TraktorTheme::METER_RED())
+                                    .color(TraktorTheme::METER_YELLOW())
                                     .font(egui::FontId::proportional(11.0)),
                             );
                         } else if !resolved.is_empty() {
@@ -916,6 +949,21 @@ impl SetUiState {
                             );
                         }
                     });
+                    // The selected track's join into the next one, spelled out.
+                    if let Some(i) = self.selected_index.filter(|&i| i + 1 < resolved.len()) {
+                        let here: Vec<_> = warnings.iter().filter(|(idx, _)| *idx == i).map(|(_, w)| w.label()).collect();
+                        if !here.is_empty() {
+                            let (a, b) = (&resolved[i], &resolved[i + 1]);
+                            ui.label(
+                                RichText::new(format!(
+                                    "{:02} → {:02}: {} · {:.1} → {:.1} BPM · {} → {} · energy {} → {}",
+                                    i + 1, i + 2, here.join(", "), a.bpm, b.bpm, a.musical_key, b.musical_key, a.energy, b.energy
+                                ))
+                                .color(TraktorTheme::METER_YELLOW())
+                                .font(egui::FontId::proportional(11.0)),
+                            );
+                        }
+                    }
                 });
             });
         });
