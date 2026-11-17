@@ -17,6 +17,7 @@ mod audio;
 mod controller_map;
 mod demucs;
 mod dot;
+mod keylock;
 mod library_ui;
 mod playlist_import;
 pub mod midi;

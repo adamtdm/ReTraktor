@@ -89,6 +89,10 @@ pub struct PreferencesDialog {
     pub request_folder_pick: bool,
     /// The running output stream (device and rate), if any; set by the app each frame.
     pub audio_output: Option<String>,
+    /// Channels of the running output; set by the app each frame.
+    pub audio_output_channels: u16,
+    /// Outputs found on this computer; `None` until the Audio page first shows.
+    pub audio_devices: Option<Vec<crate::audio::OutputChoice>>,
     pub is_open: bool,
     pub current_tab: PrefsTab,
     pub search_query: String,
@@ -219,6 +223,8 @@ impl Default for PreferencesDialog {
 
         Self {
             audio_output: None,
+            audio_output_channels: 0,
+            audio_devices: None,
             is_open: false,
             current_tab: PrefsTab::Controllers,
             search_query: String::new(),
@@ -227,7 +233,7 @@ impl Default for PreferencesDialog {
             ai_test_status: None,
             sample_rate: 48000,
             buffer_size: 128,
-            audio_device_name: "PipeWire pro-audio / ALSA Default".to_string(),
+            audio_device_name: String::new(),
             mixing_mode: 0,
             monitor_out_l: "Channel 3 (Headphones L)".to_string(),
             monitor_out_r: "Channel 4 (Headphones R)".to_string(),
@@ -351,10 +357,12 @@ impl PreferencesDialog {
             .join(", ");
         let c = &self.library_columns;
         format!(
-            "{{\n  \"sample_rate\": {},\n  \"buffer_size\": {},\n  \"audio_device_name\": \"{}\",\n  \"four_deck_mode\": {},\n  \"waveform_color_mode\": {},\n  \"eq_model_idx\": {},\n  \"filter_model_idx\": {},\n  \"filter_resonance\": {},\n  \"xfader_curve_idx\": {},\n  \"autogain\": {},\n  \"limiter_enabled\": {},\n  \"lock_playing_decks\": {},\n  \"scan_on_startup\": {},\n  \"analyze_new_tracks\": {},\n  \"key_notation_idx\": {},\n  \"collection_save_format\": {},\n  \"prompt_save_on_exit\": {},\n  \"col_album\": {},\n  \"col_bpm\": {},\n  \"col_key\": {},\n  \"col_stems\": {},\n  \"col_duration\": {},\n  \"col_genre\": {},\n  \"col_rating\": {},\n  \"col_comment\": {},\n  \"col_remixer\": {},\n  \"col_label\": {},\n  \"col_year\": {},\n  \"col_bitrate\": {},\n  \"col_format\": {},\n  \"col_track_number\": {},\n  \"col_energy\": {},\n  \"music_folders\": [{}]\n}}",
+            "{{\n  \"sample_rate\": {},\n  \"buffer_size\": {},\n  \"audio_device_name\": \"{}\",\n  \"split_cue\": {},\n  \"keylock_quality\": {},\n  \"four_deck_mode\": {},\n  \"waveform_color_mode\": {},\n  \"eq_model_idx\": {},\n  \"filter_model_idx\": {},\n  \"filter_resonance\": {},\n  \"xfader_curve_idx\": {},\n  \"autogain\": {},\n  \"limiter_enabled\": {},\n  \"lock_playing_decks\": {},\n  \"scan_on_startup\": {},\n  \"analyze_new_tracks\": {},\n  \"key_notation_idx\": {},\n  \"collection_save_format\": {},\n  \"prompt_save_on_exit\": {},\n  \"col_album\": {},\n  \"col_bpm\": {},\n  \"col_key\": {},\n  \"col_stems\": {},\n  \"col_duration\": {},\n  \"col_genre\": {},\n  \"col_rating\": {},\n  \"col_comment\": {},\n  \"col_remixer\": {},\n  \"col_label\": {},\n  \"col_year\": {},\n  \"col_bitrate\": {},\n  \"col_format\": {},\n  \"col_track_number\": {},\n  \"col_energy\": {},\n  \"music_folders\": [{}]\n}}",
             self.sample_rate,
             self.buffer_size,
             self.audio_device_name.replace('"', "\\\""),
+            self.split_cue,
+            self.keylock_quality,
             self.four_deck_mode,
             self.waveform_color_mode,
             self.eq_model_idx,
@@ -398,6 +406,8 @@ impl PreferencesDialog {
                     "sample_rate" => if let Ok(n) = val.parse() { self.sample_rate = n; },
                     "buffer_size" => if let Ok(n) = val.parse() { self.buffer_size = n; },
                     "audio_device_name" => self.audio_device_name = val.to_string(),
+                    "split_cue" => self.split_cue = val == "true",
+                    "keylock_quality" => if let Ok(n) = val.parse() { self.keylock_quality = n; },
                     "four_deck_mode" => self.four_deck_mode = val == "true",
                     "waveform_color_mode" => if let Ok(n) = val.parse() { self.waveform_color_mode = n; },
                     "eq_model_idx" => if let Ok(n) = val.parse() { self.eq_model_idx = n; },
@@ -746,43 +756,38 @@ impl PreferencesDialog {
         });
     }
 
+    pub fn headphone_out(&self) -> crate::audio::HeadphoneOut {
+        if self.split_cue { crate::audio::HeadphoneOut::Split } else { crate::audio::HeadphoneOut::Channels34 }
+    }
+
     /// Backwards compatibility shim
     pub fn show(&mut self, _ctx: &egui::Context) {}
 
     fn show_audio_setup(&mut self, ui: &mut Ui) {
         Self::list_section_header(ui, "Sound card");
 
-        let device_label = match self.audio_device_name.as_str() {
-            "PipeWire pro-audio / ALSA Default" => "System default (PipeWire / ALSA)",
-            "Traktor Kontrol / MX2 USB Audio (hw:MX2,0)" => "Traktor MX2 USB audio",
-            "USB Audio Class 2.0 Interface (hw:UAC2,0)" => "USB audio interface",
-            other => other,
-        }
-        .to_string();
+        let devices = self.audio_devices.get_or_insert_with(crate::audio::list_outputs).clone();
+        let label_of = |c: &crate::audio::OutputChoice| format!("{} ({} ch)", c.label, c.channels);
+        let device_label = devices
+            .iter()
+            .find(|c| c.id == self.audio_device_name)
+            .map_or_else(|| "System default".to_string(), label_of);
         Self::list_row(
             ui,
             "Audio device",
-            "Which sound card or audio output to use. Not applied yet: ReTraktor plays through the system default output (see Audio status).",
+            "Pick your controller's sound card to use its headphone socket. Changes apply straight away.",
             |ui| {
+                if ui.button("Rescan").on_hover_text("Look again for sound cards (after plugging one in)").clicked() {
+                    self.audio_devices = None;
+                }
                 egui::ComboBox::from_id_salt("audio_device_combo")
                     .selected_text(device_label)
-                    .width(240.0)
+                    .width(300.0)
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut self.audio_device_name,
-                            "PipeWire pro-audio / ALSA Default".to_string(),
-                            "System default (PipeWire / ALSA)",
-                        );
-                        ui.selectable_value(
-                            &mut self.audio_device_name,
-                            "Traktor Kontrol / MX2 USB Audio (hw:MX2,0)".to_string(),
-                            "Traktor MX2 USB audio",
-                        );
-                        ui.selectable_value(
-                            &mut self.audio_device_name,
-                            "USB Audio Class 2.0 Interface (hw:UAC2,0)".to_string(),
-                            "USB audio interface",
-                        );
+                        ui.selectable_value(&mut self.audio_device_name, String::new(), "System default");
+                        for c in &devices {
+                            ui.selectable_value(&mut self.audio_device_name, c.id.clone(), label_of(c));
+                        }
                     });
             },
         );
@@ -790,7 +795,7 @@ impl PreferencesDialog {
         Self::list_row(
             ui,
             "Sample rate",
-            "Audio rate in Hz; 48000 Hz matches most DJ controllers. Not applied yet: ReTraktor plays through the system default output (see Audio status).",
+            "Audio rate in Hz; 48000 Hz matches most DJ controllers.",
             |ui| {
                 egui::ComboBox::from_id_salt("sr_combo")
                     .selected_text(format!("{} Hz", self.sample_rate))
@@ -808,7 +813,7 @@ impl PreferencesDialog {
         Self::list_row(
             ui,
             "Buffer size",
-            "Smaller values feel more responsive when scratching; larger values prevent crackles. Not applied yet: ReTraktor plays through the system default output (see Audio status).",
+            "Smaller values feel more responsive when scratching; larger values prevent crackles.",
             |ui| {
                 egui::ComboBox::from_id_salt("buf_combo")
                     .selected_text(format!("{} samples ({:.1} ms)", self.buffer_size, latency_ms))
@@ -830,7 +835,7 @@ impl PreferencesDialog {
                 let (text, colour) = if let Some(info) = &self.audio_output {
                     (format!("Output stream opened · {info}"), TraktorTheme::PLAY_ACTIVE())
                 } else {
-                    ("No audio output: check the system default output".to_string(), TraktorTheme::ACCENT())
+                    ("No audio output: pick another device above".to_string(), TraktorTheme::ACCENT())
                 };
                 ui.label(
                     RichText::new(text)
@@ -848,7 +853,7 @@ impl PreferencesDialog {
         Self::list_row(
             ui,
             "Mixing mode",
-            "Mix inside ReTraktor or send each deck to an external hardware mixer.",
+            "Mix inside ReTraktor or send each deck to an external hardware mixer. Not applied yet: ReTraktor always mixes internally.",
             |ui| {
                 let modes = [
                     "Internal mixer",
@@ -864,34 +869,26 @@ impl PreferencesDialog {
             },
         );
 
-        Self::list_row(
-            ui,
-            "Main output",
-            "Stereo channels sent to your main speakers.",
-            |ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.master_out_r).desired_width(170.0));
-                ui.label("R:");
-                ui.add(egui::TextEdit::singleline(&mut self.master_out_l).desired_width(170.0));
-                ui.label("L:");
-            },
-        );
+        Self::list_row(ui, "Main output", "Your speakers or the controller's main output.", |ui| {
+            ui.label(RichText::new("Channels 1–2").color(TraktorTheme::TEXT_SECONDARY()));
+        });
 
-        Self::list_row(
-            ui,
-            "Headphones",
-            "Stereo channels used for headphone cueing.",
-            |ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.monitor_out_r).desired_width(170.0));
-                ui.label("R:");
-                ui.add(egui::TextEdit::singleline(&mut self.monitor_out_l).desired_width(170.0));
-                ui.label("L:");
-            },
-        );
+        let split = self.split_cue;
+        let (hp_text, hp_ok) = if split {
+            ("Channels 1–2, split: left ear = cue, right ear = main (mono)".to_string(), true)
+        } else if self.audio_output_channels >= 4 {
+            ("Channels 3–4".to_string(), true)
+        } else {
+            ("Not available: this output has 2 channels. Choose your controller's sound card, or turn on Split cue.".to_string(), false)
+        };
+        Self::list_row(ui, "Headphones", "Where the cue mix goes. Use the mixer's PHONES knobs for level and cue/main blend.", |ui| {
+            ui.label(RichText::new(hp_text).color(if hp_ok { TraktorTheme::PLAY_ACTIVE() } else { TraktorTheme::ACCENT() }));
+        });
 
         Self::list_row(
             ui,
             "Booth output",
-            "Second stereo output for booth speakers with its own volume.",
+            "Second stereo output for booth speakers with its own volume. Not applied yet.",
             |ui| {
                 ui.add(egui::TextEdit::singleline(&mut self.booth_out_r).desired_width(170.0));
                 ui.label("R:");
@@ -903,7 +900,7 @@ impl PreferencesDialog {
         Self::list_row(
             ui,
             "Split cue",
-            "Put the cued deck in the left headphone ear and the main mix in the right.",
+            "For a stereo-only output with a splitter cable: cue in the left ear, main mix in the right, both mono.",
             |ui| {
                 crate::dot::dot_toggle(ui, &mut self.split_cue, TraktorTheme::PLAY_ACTIVE(), "Split cue");
             },
@@ -916,7 +913,7 @@ impl PreferencesDialog {
         Self::list_row(
             ui,
             "Deck A input",
-            "Stereo input channels for a turntable or CDJ on Deck A.",
+            "Stereo input channels for a turntable or CDJ on Deck A. Not applied yet.",
             |ui| {
                 ui.add(egui::TextEdit::singleline(&mut self.deck_a_in_r).desired_width(170.0));
                 ui.label("R:");
@@ -928,7 +925,7 @@ impl PreferencesDialog {
         Self::list_row(
             ui,
             "Deck B input",
-            "Stereo input channels for a turntable or CDJ on Deck B.",
+            "Stereo input channels for a turntable or CDJ on Deck B. Not applied yet.",
             |ui| {
                 ui.add(egui::TextEdit::singleline(&mut self.deck_b_in_r).desired_width(170.0));
                 ui.label("R:");
@@ -940,7 +937,7 @@ impl PreferencesDialog {
         Self::list_row(
             ui,
             "Aux or microphone",
-            "Extra stereo or mic input sent straight to the main mix.",
+            "Extra stereo or mic input sent straight to the main mix. Not applied yet.",
             |ui| {
                 ui.add(egui::TextEdit::singleline(&mut self.aux_in_r).desired_width(170.0));
                 ui.label("R:");
@@ -955,8 +952,8 @@ impl PreferencesDialog {
             "Control playback speed and position with timecode records or CDs.",
             |ui| {
                 ui.label(
-                    RichText::new("Ready")
-                        .color(TraktorTheme::DECK_A())
+                    RichText::new("Not available yet")
+                        .color(TraktorTheme::TEXT_SECONDARY())
                         .font(egui::FontId::monospace(11.0))
                         .strong(),
                 );

@@ -103,6 +103,83 @@ impl MixerFxKind {
     }
 }
 
+/// Trapezoidal state-variable filter (Simper), Butterworth Q.
+#[derive(Debug, Clone, Copy, Default)]
+struct Svf {
+    ic1: f32,
+    ic2: f32,
+}
+
+const SVF_K: f32 = std::f32::consts::SQRT_2; // Q = 0.707
+
+impl Svf {
+    /// Returns `(low, band, high)` for coefficient `g = tan(pi * fc / sr)`.
+    fn tick(&mut self, x: f32, g: f32) -> (f32, f32, f32) {
+        let a1 = 1.0 / (1.0 + g * (g + SVF_K));
+        let v3 = x - self.ic2;
+        let v1 = a1 * self.ic1 + g * a1 * v3;
+        let v2 = self.ic2 + g * v1;
+        self.ic1 = 2.0 * v1 - self.ic1;
+        self.ic2 = 2.0 * v2 - self.ic2;
+        (v2, v1, x - SVF_K * v1 - v2)
+    }
+}
+
+/// One channel of a 3-way Linkwitz-Riley (24 dB/oct) crossover.
+#[derive(Debug, Clone, Copy, Default)]
+struct Lr4Bands {
+    lo: [Svf; 2],
+    lo_hp: [Svf; 2],
+    hi_lp: [Svf; 2],
+    hi: [Svf; 2],
+    lo_ap: Svf,
+}
+
+impl Lr4Bands {
+    fn split(&mut self, x: f32, g_lo: f32, g_hi: f32) -> (f32, f32, f32) {
+        let lp4 = |[a, b]: &mut [Svf; 2], x: f32, g: f32| { let y = a.tick(x, g).0; b.tick(y, g).0 };
+        let hp4 = |[a, b]: &mut [Svf; 2], x: f32, g: f32| { let y = a.tick(x, g).2; b.tick(y, g).2 };
+        let low = lp4(&mut self.lo, x, g_lo);
+        let rest = hp4(&mut self.lo_hp, x, g_lo);
+        let mid = lp4(&mut self.hi_lp, rest, g_hi);
+        let high = hp4(&mut self.hi, rest, g_hi);
+        // The upper crossover shifts mid+high by an allpass; give the low band the same shift.
+        let (l, b, h) = self.lo_ap.tick(low, g_hi);
+        (l + h - SVF_K * b, mid, high)
+    }
+}
+
+/// DJ-style 3-band isolator: low below 300 Hz, high above 2.5 kHz, 24 dB/oct slopes.
+/// At unity the bands sum to a flat (allpass) response.
+#[derive(Debug, Clone, Default)]
+pub struct ThreeBandIsolator {
+    ch: [Lr4Bands; 2],
+    g: (f32, f32),
+    sr: u32,
+}
+
+impl ThreeBandIsolator {
+    pub const LOW_HZ: f32 = 300.0;
+    pub const HIGH_HZ: f32 = 2500.0;
+
+    /// Applies linear band gains (`1.0` = unity, `0.0` = kill) to one stereo frame.
+    pub fn process_stereo(&mut self, sr: u32, l: f32, r: f32, g_low: f32, g_mid: f32, g_high: f32) -> (f32, f32) {
+        if sr != self.sr {
+            let fs = sr.max(1) as f32;
+            let tan = |f: f32| (std::f32::consts::PI * f.min(fs * 0.45) / fs).tan();
+            self.g = (tan(Self::LOW_HZ), tan(Self::HIGH_HZ));
+            self.sr = sr;
+        }
+        let (glo, ghi) = self.g;
+        let mix = |c: &mut Lr4Bands, x: f32| {
+            let (lo, mid, hi) = c.split(x, glo, ghi);
+            lo * g_low + mid * g_mid + hi * g_high
+        };
+        let [a, b] = &mut self.ch;
+        (mix(a, l), mix(b, r))
+    }
+}
+
 /// Bipolar DJ Channel Mixer FX processor (`0.0..0.5` Low/Left, `0.5` center neutral, `0.5..1.0` High/Right).
 #[derive(Debug, Clone)]
 pub struct BipolarFilter {
@@ -392,6 +469,33 @@ impl OzoneMaximizerDsp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RMS of a sine at `hz` after the isolator settles.
+    fn isolator_rms(hz: f32, g: (f32, f32, f32)) -> f32 {
+        let mut eq = ThreeBandIsolator::default();
+        let sr = 48_000;
+        let (mut acc, mut n) = (0.0, 0);
+        for i in 0..sr {
+            let x = (i as f32 * hz * std::f32::consts::TAU / sr as f32).sin();
+            let (l, _) = eq.process_stereo(sr as u32, x, x, g.0, g.1, g.2);
+            if i > sr / 2 {
+                acc += l * l;
+                n += 1;
+            }
+        }
+        (acc / n as f32).sqrt() / std::f32::consts::FRAC_1_SQRT_2
+    }
+
+    #[test]
+    fn isolator_is_transparent_at_unity_and_kills_its_band() {
+        for hz in [60.0, 1000.0, 8000.0] {
+            assert!((isolator_rms(hz, (1.0, 1.0, 1.0)) - 1.0).abs() < 0.01, "{hz} Hz not transparent");
+        }
+        assert!(isolator_rms(50.0, (0.0, 1.0, 1.0)) < 0.1, "low kill leaves bass");
+        assert!(isolator_rms(10_000.0, (1.0, 1.0, 0.0)) < 0.15, "high kill leaves treble");
+        assert!(isolator_rms(1000.0, (0.0, 1.0, 0.0)) > 0.6, "mid survives low+high kill");
+        assert!(isolator_rms(10_000.0, (0.0, 1.0, 1.0)) > 0.9, "low kill keeps treble");
+    }
 
     #[test]
     fn test_eq_flux_transport_and_ozone_maximizer() {

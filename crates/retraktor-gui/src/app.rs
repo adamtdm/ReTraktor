@@ -100,6 +100,12 @@ pub struct ReTraktorApp {
     pub channel_xfader_assign: [usize; 4], // 0: Left, 1: Thru, 2: Right
 
     pub master_volume: f32,
+    /// Headphone blend (0 = cue, 1 = main) and level.
+    pub cue_mix: f32,
+    pub cue_volume: f32,
+    pub deck_keylock: [bool; 4],
+    /// Sound-card settings the open stream was built with.
+    audio_applied: Option<(String, u32, u32, bool)>,
     pub master_tempo: f64,
     /// The deck whose tempo the MASTER button made the clock, if any.
     tempo_master_deck: Option<usize>,
@@ -235,6 +241,10 @@ impl Default for ReTraktorApp {
             channel_cue: [false, false, false, false],
             channel_xfader_assign: [0, 2, 1, 1], // Deck A: Left, Deck B: Right, C/D: Thru
             master_volume: 0.8,
+            cue_mix: 0.0,
+            cue_volume: 0.8,
+            deck_keylock: [false; 4],
+            audio_applied: None,
             master_tempo: 128.00,
             tempo_master_deck: None,
             crossfader_pos: 0.5,
@@ -337,6 +347,14 @@ impl eframe::App for ReTraktorApp {
         ctx.request_repaint();
         if self.shot.is_some() {
             self.screenshot_step(ctx);
+        }
+
+        // Open (or reopen) the sound card whenever its settings change.
+        let p = &self.preferences;
+        let want = (p.audio_device_name.clone(), p.sample_rate, p.buffer_size, !p.split_cue);
+        if self.audio_applied.as_ref() != Some(&want) {
+            self.audio.open(&want.0, want.1, want.2, want.3);
+            self.audio_applied = Some(want);
         }
 
         // Flush the autosaved collection and preferences on close.
@@ -612,6 +630,7 @@ impl eframe::App for ReTraktorApp {
 
         // Preferences Dialog
         self.preferences.audio_output = self.audio.output_info().map(str::to_string);
+        self.preferences.audio_output_channels = self.audio.output_channels;
         self.preferences.show(ctx);
 
         // Live Performance Shortcuts HUD Overlay
@@ -971,6 +990,7 @@ impl ReTraktorApp {
             "browse_up" => self.library.select_prev_track(),
             "filter_on" => self.channel_filter_on[d] ^= true,
             "headphone" => self.channel_cue[d] ^= true,
+            "keylock" => self.deck_keylock[d] ^= true,
             "fx_on" if deck == 2 => self.fx2_on ^= true,
             "fx_on" => self.fx1_on ^= true,
             _ => {}
@@ -990,6 +1010,8 @@ impl ReTraktorApp {
             "pitch" => self.deck_pitch_fader[d] = v * 16.0 - 8.0,
             "xfader" => self.crossfader_pos = v,
             "master_volume" => self.master_volume = v,
+            "cue_mix" => self.cue_mix = v,
+            "cue_vol" => self.cue_volume = v,
             "fx_mix" if deck == 2 => self.fx2_dry_wet = v,
             "fx_mix" => self.fx1_dry_wet = v,
             _ => {}
@@ -1145,12 +1167,11 @@ impl ReTraktorApp {
                 state.engine.strips[d].filter.knob = self.channel_filter[d];
                 state.engine.strips[d].filter.enabled = self.channel_filter_on[d];
                 state.engine.strips[d].filter.kind = self.channel_fx_kind[d];
-                state.engine.strips[d].eq.high = self.channel_eq_hi[d];
-                state.engine.strips[d].eq.mid = self.channel_eq_mid[d];
-                state.engine.strips[d].eq.low = self.channel_eq_low[d];
-                state.eq_kill_hi[d] = self.eq_kill_hi[d];
-                state.eq_kill_mid[d] = self.eq_kill_mid[d];
-                state.eq_kill_low[d] = self.eq_kill_low[d];
+                let knob = |kill: bool, v: f32| if kill { 0.0 } else { v };
+                state.engine.strips[d].eq.high = knob(self.eq_kill_hi[d], self.channel_eq_hi[d]);
+                state.engine.strips[d].eq.mid = knob(self.eq_kill_mid[d], self.channel_eq_mid[d]);
+                state.engine.strips[d].eq.low = knob(self.eq_kill_low[d], self.channel_eq_low[d]);
+                state.keylock[d] = self.deck_keylock[d];
 
                 state.engine.strips[d].xfader_left = self.channel_xfader_assign[d] == 0;
                 state.engine.strips[d].xfader_right = self.channel_xfader_assign[d] == 2;
@@ -1186,6 +1207,10 @@ impl ReTraktorApp {
             }
 
             state.engine.master_volume = self.master_volume;
+            state.cue_mix = self.cue_mix;
+            state.cue_volume = self.cue_volume;
+            state.keylock_hq = self.preferences.keylock_quality == 0;
+            state.headphone_out = self.preferences.headphone_out();
             // A master deck drives the clock at its live tempo; an ejected deck releases it.
             if let Some(m) = self.tempo_master_deck {
                 match grids[m] {
@@ -1547,6 +1572,8 @@ impl ReTraktorApp {
                     "surface.mixer.channels.1.channel_fx.amount" => self.channel_filter[0] = v,
                     "surface.mixer.channels.2.channel_fx.amount" => self.channel_filter[1] = v,
                     "surface.mixer.main.volume" => self.master_volume = v,
+                    "surface.mixer.cue_mix" => self.cue_mix = v,
+                    "surface.mixer.cue_vol" => self.cue_volume = v,
                     "surface.left.pitch.fader" => self.deck_pitch_fader[0] = (v * 16.0) - 8.0,
                     "surface.right.pitch.fader" => self.deck_pitch_fader[1] = (v * 16.0) - 8.0,
                     "surface.left.fx.knobs.1" => self.fx1_dry_wet = v,
@@ -1603,6 +1630,8 @@ impl ReTraktorApp {
                     "surface.right.cue" => self.jump_to_cue(2, 1),
                     "surface.left.sync" => self.sync_deck(1),
                     "surface.right.sync" => self.sync_deck(2),
+                    "surface.left.key_lock" => self.deck_keylock[0] ^= true,
+                    "surface.right.key_lock" => self.deck_keylock[1] ^= true,
                     "surface.left.flux" => self.deck_flux_active[0] = !self.deck_flux_active[0],
                     "surface.right.flux" => self.deck_flux_active[1] = !self.deck_flux_active[1],
                     "surface.left.loop_size.push" => self.toggle_loop(1),
@@ -2301,6 +2330,16 @@ impl ReTraktorApp {
                     let main_txt = format!("{}", (self.master_volume * 100.0).round() as i32);
                     dot::dot_ring(ui, &mut self.master_volume, 0.0, 1.0, 0.8, &main_txt, "MAIN", TraktorTheme::TEXT_PRIMARY(), true)
                         .on_hover_text(format!("Main output level ({main_txt}%). {KNOB_TIP}"));
+                    let phones_txt = format!("{}", (self.cue_volume * 100.0).round() as i32);
+                    dot::dot_ring(ui, &mut self.cue_volume, 0.0, 1.0, 0.8, &phones_txt, "PHONES", TraktorTheme::TEXT_PRIMARY(), true)
+                        .on_hover_text(format!("Headphone level ({phones_txt}%). {KNOB_TIP}"));
+                    let mix_txt = match self.cue_mix {
+                        m if m < 0.05 => "CUE".to_string(),
+                        m if m > 0.95 => "MAIN".to_string(),
+                        m => format!("{}", (m * 100.0).round() as i32),
+                    };
+                    dot::dot_ring(ui, &mut self.cue_mix, 0.0, 1.0, 0.0, &mix_txt, "CUE/MIX", TraktorTheme::TEXT_PRIMARY(), true)
+                        .on_hover_text(format!("Headphones hear the cued decks (left) or the main mix (right). {KNOB_TIP}"));
 
                     let is_rec = self.audio.shared.lock().map(|s| s.is_recording).unwrap_or(false);
                     let rec_sec = self
@@ -3198,6 +3237,12 @@ impl ReTraktorApp {
                     .clicked()
                 {
                     self.sync_deck(deck_idx);
+                }
+                if pill(ui, "KEY", self.deck_keylock[d], TraktorTheme::KEYLOCK_ACTIVE(), 0.0)
+                    .on_hover_text("Key lock: change tempo without changing the musical key")
+                    .clicked()
+                {
+                    self.deck_keylock[d] ^= true;
                 }
                 if pill(ui, "MASTER", self.tempo_master_deck == Some(d), TraktorTheme::ROW_SELECTED(), 0.0)
                     .on_hover_text("Make this deck's tempo the master clock; click again to release")

@@ -1,6 +1,8 @@
+use cpal::traits::{DeviceTrait, HostTrait};
 #[cfg(not(test))]
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::traits::StreamTrait;
 use retraktor_audio::FourDeckAudioEngine;
+use crate::keylock::KeyLock;
 use std::f32::consts::PI;
 use std::fs::File;
 use std::path::Path;
@@ -510,6 +512,16 @@ pub fn sample_stereo_hermite(pcm: &[f32], sample_pos: f64) -> (f32, f32) {
     }
 }
 
+/// Where the headphone (cue) mix goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeadphoneOut {
+    /// Output channels 3 and 4 (a controller's headphone socket).
+    Channels34,
+    /// One stereo output split in mono: left = headphones, right = main.
+    Split,
+    Off,
+}
+
 /// Thread-safe shared state for UI <-> Audio Engine communication.
 pub struct AudioSharedState {
     pub engine: FourDeckAudioEngine,
@@ -519,15 +531,20 @@ pub struct AudioSharedState {
     pub loop_active: [bool; 4],
     pub loop_start_sec: [f64; 4],
     pub loop_len_sec: [f64; 4],
-    pub eq_kill_hi: [bool; 4],
-    pub eq_kill_mid: [bool; 4],
-    pub eq_kill_low: [bool; 4],
     pub channel_gain: [f32; 4],
     pub loaded_tracks: [Option<LoadedTrackAudio>; 4],
     pub channel_peaks: [f32; 4],
     pub master_peak_l: f32,
     pub master_peak_r: f32,
     pub cue_enabled: [bool; 4],
+    /// Headphone blend: 0 = cue only, 1 = main only.
+    pub cue_mix: f32,
+    pub cue_volume: f32,
+    pub headphone_out: HeadphoneOut,
+    pub keylock: [bool; 4],
+    pub keylock_hq: bool,
+    keylocks: [KeyLock; 4],
+    keylock_engaged: [bool; 4],
     pub crossfader: f32,
     pub crossfader_curve: f32,
 
@@ -595,15 +612,19 @@ impl Default for AudioSharedState {
             loop_active: [false, false, false, false],
             loop_start_sec: [0.0, 0.0, 0.0, 0.0],
             loop_len_sec: [8.0, 8.0, 8.0, 8.0],
-            eq_kill_hi: [false, false, false, false],
-            eq_kill_mid: [false, false, false, false],
-            eq_kill_low: [false, false, false, false],
             channel_gain: [0.5, 0.5, 0.5, 0.5],
             loaded_tracks: [None, None, None, None],
             channel_peaks: [0.0, 0.0, 0.0, 0.0],
             master_peak_l: 0.0,
             master_peak_r: 0.0,
             cue_enabled: [false, false, false, false],
+            cue_mix: 0.0,
+            cue_volume: 0.8,
+            headphone_out: HeadphoneOut::Channels34,
+            keylock: [false; 4],
+            keylock_hq: true,
+            keylocks: Default::default(),
+            keylock_engaged: [false; 4],
             crossfader: 0.5,
             crossfader_curve: 0.5,
             scratch_active: [false; 4],
@@ -674,12 +695,70 @@ impl AudioSharedState {
     }
 }
 
+/// Headphone signal: the cue bus blended toward the main mix, then the headphone level.
+fn headphone_mix(cue: (f32, f32), main: (f32, f32), mix: f32, volume: f32) -> (f32, f32) {
+    let m = mix.clamp(0.0, 1.0);
+    let v = volume.clamp(0.0, 1.0);
+    let ch = |c: f32, o: f32| ((c * (1.0 - m) + o * m) * v).clamp(-1.0, 1.0);
+    (ch(cue.0, main.0), ch(cue.1, main.1))
+}
+
 pub struct AudioSystem {
     pub shared: Arc<Mutex<AudioSharedState>>,
     _stream: Option<cpal::Stream>,
     /// What the open stream actually runs at, for the Audio status line.
     pub output_info: Option<String>,
+    /// Channels of the open stream (0 when none is open).
+    pub output_channels: u16,
     pub running: Arc<AtomicBool>,
+    /// True while a sound card drives the playheads; otherwise a timer thread does.
+    hw_active: Arc<AtomicBool>,
+}
+
+/// An output the user can pick; `id` is what Preferences stores ("" = system default).
+#[derive(Clone, Debug, PartialEq)]
+pub struct OutputChoice {
+    pub id: String,
+    pub label: String,
+    pub channels: u16,
+}
+
+/// Outputs to offer: PipeWire/Pulse sinks when a sound server runs, otherwise raw ALSA devices.
+pub fn list_outputs() -> Vec<OutputChoice> {
+    let sinks = std::process::Command::new("pactl")
+        .args(["-f", "json", "list", "sinks"])
+        .output()
+        .ok()
+        .and_then(|o| serde_json::from_slice::<serde_json::Value>(&o.stdout).ok());
+    if let Some(serde_json::Value::Array(sinks)) = sinks {
+        let found: Vec<OutputChoice> = sinks
+            .iter()
+            .filter_map(|v| {
+                let name = v["name"].as_str()?;
+                Some(OutputChoice {
+                    id: format!("pw:{name}"),
+                    label: v["description"].as_str().unwrap_or(name).to_string(),
+                    channels: v["channel_map"].as_str().map_or(2, |m| m.split(',').count() as u16),
+                })
+            })
+            .collect();
+        if !found.is_empty() {
+            return found;
+        }
+    }
+    let host = cpal::default_host();
+    host.output_devices()
+        .map(|devs| {
+            devs.filter_map(|d| {
+                Some(OutputChoice {
+                    id: d.id().ok()?.to_string(),
+                    label: d.description().map(|x| x.name().to_string()).unwrap_or_else(|_| d.to_string()),
+                    channels: d.supported_output_configs().ok()?.map(|c| c.channels()).max()?,
+                })
+            })
+            .collect()
+        })
+        .unwrap_or_default()
 }
 
 impl AudioSystem {
@@ -687,146 +766,155 @@ impl AudioSystem {
         self.output_info.as_deref()
     }
 
-    #[cfg(test)]
     pub fn new() -> Self {
-        Self {
-            shared: Arc::new(Mutex::new(AudioSharedState::default())),
-            _stream: None,
-            output_info: None,
-            running: Arc::new(AtomicBool::new(false)),
+        let shared = Arc::new(Mutex::new(AudioSharedState::default()));
+        let running = Arc::new(AtomicBool::new(true));
+        let hw_active = Arc::new(AtomicBool::new(false));
+        #[cfg(not(test))]
+        Self::spawn_fallback_clock(Arc::clone(&shared), Arc::clone(&running), Arc::clone(&hw_active));
+        Self { shared, _stream: None, output_info: None, output_channels: 0, running, hw_active }
+    }
+
+    /// (Re)opens the output. `device_id` comes from [`list_outputs`] ("" = system default).
+    /// `headphones_34` asks for four channels so the cue mix can use outputs 3–4.
+    /// Falls back to the system default, then to the device's own rate and buffer.
+    #[cfg(not(test))]
+    pub fn open(&mut self, device_id: &str, sample_rate: u32, buffer: u32, headphones_34: bool) {
+        self._stream = None;
+        self.hw_active.store(false, Ordering::Relaxed);
+        self.output_info = None;
+        self.output_channels = 0;
+
+        let host = cpal::default_host();
+        let choices = if device_id.is_empty() { Vec::new() } else { list_outputs() };
+        let choice = choices.iter().find(|c| c.id == device_id);
+        // A PipeWire sink is reached through ALSA's "pipewire" device, which reads PIPEWIRE_NODE.
+        let (device, label, max_ch) = match (choice, device_id.strip_prefix("pw:")) {
+            (Some(c), Some(node)) => {
+                std::env::set_var("PIPEWIRE_NODE", node);
+                let pw = host.output_devices().ok().and_then(|mut d| d.find(|d| d.id().is_ok_and(|i| i.id() == "pipewire")));
+                (pw.or_else(|| host.default_output_device()), c.label.clone(), c.channels)
+            }
+            (Some(c), None) => {
+                std::env::remove_var("PIPEWIRE_NODE");
+                let dev = device_id.parse().ok().and_then(|id| host.device_by_id(&id));
+                (dev, c.label.clone(), c.channels)
+            }
+            _ => {
+                std::env::remove_var("PIPEWIRE_NODE");
+                (host.default_output_device(), "System default output".to_string(), 2)
+            }
+        };
+        let Some(device) = device else { return };
+        let Ok(default) = device.default_output_config() else { return };
+
+        // The system default is stereo speakers; only a chosen 4-channel device gets the cue on 3–4.
+        let want_ch = if headphones_34 && !device_id.is_empty() && max_ch >= 4 { 4 } else { 2 };
+        let ranges: Vec<_> = device.supported_output_configs().map(|r| r.collect()).unwrap_or_default();
+        let usable = |r: &&cpal::SupportedStreamConfigRange| matches!(r.sample_format(), cpal::SampleFormat::F32 | cpal::SampleFormat::I16);
+        let pick = ranges
+            .iter()
+            .filter(usable)
+            .filter(|r| r.channels() == want_ch)
+            .find(|r| r.contains_rate(sample_rate))
+            .or_else(|| ranges.iter().filter(usable).find(|r| r.channels() == want_ch))
+            .or_else(|| ranges.iter().filter(usable).find(|r| r.channels() == 2 && r.contains_rate(sample_rate)));
+        let config = match pick {
+            Some(r) => {
+                let rate = if r.contains_rate(sample_rate) { sample_rate } else { default.sample_rate().clamp(r.min_sample_rate(), r.max_sample_rate()) };
+                r.clone().with_sample_rate(rate)
+            }
+            None => default,
+        };
+        let format = config.sample_format();
+        let channels = config.channels() as usize;
+        let sr = config.sample_rate();
+        let fixed_ok = match config.buffer_size() {
+            cpal::SupportedBufferSize::Range { min, max } => (*min..=*max).contains(&buffer),
+            cpal::SupportedBufferSize::Unknown => true,
+        };
+
+        let build = |buffer_size: cpal::BufferSize| {
+            let stream_config = cpal::StreamConfig { channels: channels as u16, sample_rate: sr, buffer_size };
+            let shared = Arc::clone(&self.shared);
+            let err_fn = |err| eprintln!("Audio stream error: {err}");
+            match format {
+                cpal::SampleFormat::F32 => device.build_output_stream(
+                    stream_config,
+                    move |data: &mut [f32], _: &cpal::OutputCallbackInfo| Self::render_audio_f32(&shared, data, channels, sr),
+                    err_fn,
+                    None,
+                ),
+                _ => device.build_output_stream(
+                    stream_config,
+                    move |data: &mut [i16], _: &cpal::OutputCallbackInfo| Self::render_audio_i16(&shared, data, channels, sr),
+                    err_fn,
+                    None,
+                ),
+            }
+            .ok()
+        };
+        let (stream, buffer_text) = match fixed_ok.then(|| build(cpal::BufferSize::Fixed(buffer))).flatten() {
+            Some(s) => (Some(s), format!("{buffer}-sample buffer")),
+            None => (build(cpal::BufferSize::Default), "device's own buffer".to_string()),
+        };
+        match stream.map(|s| s.play().map(|()| s)) {
+            Some(Ok(s)) => {
+                self.output_info = Some(format!("{label} · {sr} Hz · {channels} ch · {buffer_text}"));
+                self.output_channels = channels as u16;
+                self.hw_active.store(true, Ordering::Relaxed);
+                self._stream = Some(s);
+            }
+            Some(Err(e)) => eprintln!("Audio stream would not start: {e}"),
+            None => eprintln!("Could not open audio output {label}"),
         }
     }
 
+    #[cfg(test)]
+    pub fn open(&mut self, _device_id: &str, _sample_rate: u32, _buffer: u32, _headphones_34: bool) {}
+
+    /// Advances the playheads on a timer while no sound card is running.
     #[cfg(not(test))]
-    pub fn new() -> Self {
-        let initial_state = AudioSharedState::default();
-
-        let shared = Arc::new(Mutex::new(initial_state));
-        let running = Arc::new(AtomicBool::new(true));
-
-        let host = cpal::default_host();
-        let has_hw_stream;
-        let mut output_info = None;
-        let stream = match host.default_output_device() {
-            Some(device) => {
-                let config_res = device.default_output_config();
-                match config_res {
-                    Ok(config) => {
-                        let sample_format = config.sample_format();
-                        let channels = config.channels() as usize;
-                        let sr = config.sample_rate();
-                        let device_name = device.description().map(|d| d.name().to_string()).unwrap_or_else(|_| "default device".into());
-
-                        let shared_clone = Arc::clone(&shared);
-                        let err_fn = |err| eprintln!("Audio stream error: {err}");
-
-                        let stream_opt = match sample_format {
-                            cpal::SampleFormat::F32 => device
-                                .build_output_stream(
-                                    config.into(),
-                                    move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                                        Self::render_audio_f32(&shared_clone, data, channels, sr);
-                                    },
-                                    err_fn,
-                                    None,
-                                )
-                                .ok(),
-                            cpal::SampleFormat::I16 => device
-                                .build_output_stream(
-                                    config.into(),
-                                    move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
-                                        Self::render_audio_i16(&shared_clone, data, channels, sr);
-                                    },
-                                    err_fn,
-                                    None,
-                                )
-                                .ok(),
-                            _ => None,
-                        };
-
-                        match stream_opt {
-                            Some(s) => match s.play() {
-                                Ok(()) => {
-                                    output_info = Some(format!("{device_name} · {} Hz", sr));
-                                    has_hw_stream = true;
-                                    Some(s)
-                                }
-                                Err(e) => {
-                                    eprintln!("Audio stream would not start: {e}");
-                                    has_hw_stream = false;
-                                    None
-                                }
-                            },
-                            None => {
-                                has_hw_stream = false;
-                                None
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        has_hw_stream = false;
-                        None
-                    }
+    fn spawn_fallback_clock(shared: Arc<Mutex<AudioSharedState>>, running: Arc<AtomicBool>, hw_active: Arc<AtomicBool>) {
+        thread::spawn(move || {
+            let mut last_tick = Instant::now();
+            while running.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(16));
+                let dt = last_tick.elapsed().as_secs_f64();
+                last_tick = Instant::now();
+                if hw_active.load(Ordering::Relaxed) {
+                    continue;
                 }
-            }
-            None => {
-                has_hw_stream = false;
-                None
-            }
-        };
-
-        // Only run software fallback clock if no hardware audio stream is advancing the playhead
-        if !has_hw_stream {
-            let shared_companion = Arc::clone(&shared);
-            let running_companion = Arc::clone(&running);
-            thread::spawn(move || {
-                let mut last_tick = Instant::now();
-                while running_companion.load(Ordering::Relaxed) {
-                    thread::sleep(Duration::from_millis(16));
-                    let dt = last_tick.elapsed().as_secs_f64();
-                    last_tick = Instant::now();
-
-                    if let Ok(mut state) = shared_companion.try_lock() {
-                        if state.pattern_enabled {
-                            let bpm = state.engine.clock.bpm.max(40.0);
-                            let step_dur = (60.0 / bpm) / 4.0;
-                            state.pattern_phase_sec += dt;
-                            state.pattern_current_step =
-                                ((state.pattern_phase_sec / step_dur).floor() as usize) % 16;
-                        }
-                        for d in 0..4 {
-                            if state.is_playing[d] || state.scratch_active[d] || state.scratch_ramping[d] {
-                                let ratio = if state.scratch_active[d] || state.scratch_ramping[d] {
-                                    state.scratch_rate[d]
-                                } else {
-                                    state.pitch_ratio[d]
-                                };
-                                state.playhead_sec[d] += dt * ratio;
-                                if state.loop_active[d] && state.loop_len_sec[d] > 0.05 {
-                                    let end = state.loop_start_sec[d] + state.loop_len_sec[d];
-                                    if state.playhead_sec[d] >= end {
-                                        state.playhead_sec[d] = state.loop_start_sec[d];
-                                    }
-                                } else if let Some(track) = &state.loaded_tracks[d] {
-                                    if state.playhead_sec[d] >= track.duration_sec {
-                                        state.playhead_sec[d] = 0.0;
-                                    } else if state.playhead_sec[d] < 0.0 {
-                                        state.playhead_sec[d] = 0.0;
-                                    }
+                if let Ok(mut state) = shared.try_lock() {
+                    if state.pattern_enabled {
+                        let bpm = state.engine.clock.bpm.max(40.0);
+                        let step_dur = (60.0 / bpm) / 4.0;
+                        state.pattern_phase_sec += dt;
+                        state.pattern_current_step = ((state.pattern_phase_sec / step_dur).floor() as usize) % 16;
+                    }
+                    for d in 0..4 {
+                        if state.is_playing[d] || state.scratch_active[d] || state.scratch_ramping[d] {
+                            let ratio = if state.scratch_active[d] || state.scratch_ramping[d] {
+                                state.scratch_rate[d]
+                            } else {
+                                state.pitch_ratio[d]
+                            };
+                            state.playhead_sec[d] += dt * ratio;
+                            if state.loop_active[d] && state.loop_len_sec[d] > 0.05 {
+                                let end = state.loop_start_sec[d] + state.loop_len_sec[d];
+                                if state.playhead_sec[d] >= end {
+                                    state.playhead_sec[d] = state.loop_start_sec[d];
+                                }
+                            } else if let Some(track) = &state.loaded_tracks[d] {
+                                if state.playhead_sec[d] >= track.duration_sec || state.playhead_sec[d] < 0.0 {
+                                    state.playhead_sec[d] = 0.0;
                                 }
                             }
                         }
                     }
                 }
-            });
-        }
-
-        Self {
-            shared,
-            _stream: stream,
-            output_info,
-            running,
-        }
+            }
+        });
     }
 
     /// Writes a slice of interleaved stereo `i16` PCM samples to a standard RIFF `.wav` file on disk.
@@ -888,14 +976,17 @@ impl AudioSystem {
                 }
             }
         }
-        let mut state = match state_opt {
+        let mut guard = match state_opt {
             Some(s) => s,
             None => {
                 output.fill(0.0);
                 return;
             }
         };
+        let state = &mut *guard;
+        output.fill(0.0);
         state.recording_sample_rate = sr;
+        state.engine.routing.sample_rate = sr;
 
         // Block-level scratch filter observation and release inertia ramping
         for d in 0..4 {
@@ -940,11 +1031,33 @@ impl AudioSystem {
                 };
 
                 let mut true_stems = None;
+                let scratching = state.scratch_active[d] || state.scratch_ramping[d];
+                let keylock_on = state.keylock[d] && !scratching;
+                if keylock_on && !state.keylock_engaged[d] {
+                    state.keylocks[d].reset();
+                }
+                state.keylock_engaged[d] = keylock_on;
 
                 if let Some(track) = &state.loaded_tracks[d] {
                     track_dur = track.duration_sec.max(0.1);
-                    let sample_pos = state.playhead_sec[d] * (track.sample_rate as f64);
-                    let (mut s_l, mut s_r) = sample_stereo_hermite(&track.pcm_stereo, sample_pos);
+                    let tsr = track.sample_rate as f64;
+                    let sample_pos = state.playhead_sec[d] * tsr;
+                    let stems = [&track.pcm_drums, &track.pcm_bass, &track.pcm_other, &track.pcm_vocals];
+                    let has_stems = stems.iter().all(|s| s.is_some());
+                    let locked = keylock_on.then(|| {
+                        let mut srcs: [&[f32]; 5] = [&track.pcm_stereo, &[], &[], &[], &[]];
+                        for (i, s) in stems.iter().enumerate() {
+                            srcs[i + 1] = s.as_deref().unwrap_or(&[]);
+                        }
+                        let n = if has_stems { 5 } else { 1 };
+                        let lp = (state.loop_active[d] && state.loop_len_sec[d] > 0.05)
+                            .then(|| (state.loop_start_sec[d] * tsr, state.loop_len_sec[d] * tsr));
+                        state.keylocks[d].next(&srcs[..n], sample_pos, tsr / sr as f64, lp, state.keylock_hq)
+                    });
+                    let (mut s_l, mut s_r) = match locked {
+                        Some(k) => k[0],
+                        None => sample_stereo_hermite(&track.pcm_stereo, sample_pos),
+                    };
 
                     // Phono cartridge magnetic induction scaling (output proportional to needle velocity)
                     // Attenuates frozen sample buzz/clicks when platter is stopped
@@ -965,10 +1078,14 @@ impl AudioSystem {
                         &track.pcm_other,
                         &track.pcm_vocals,
                     ) {
-                        let (mut d_l, mut d_r) = sample_stereo_hermite(dp, sample_pos);
-                        let (mut b_l, mut b_r) = sample_stereo_hermite(bp, sample_pos);
-                        let (mut o_l, mut o_r) = sample_stereo_hermite(op, sample_pos);
-                        let (mut v_l, mut v_r) = sample_stereo_hermite(vp, sample_pos);
+                        let read = |i: usize, pcm: &[f32]| match locked {
+                            Some(k) => k[i],
+                            None => sample_stereo_hermite(pcm, sample_pos),
+                        };
+                        let (mut d_l, mut d_r) = read(1, dp);
+                        let (mut b_l, mut b_r) = read(2, bp);
+                        let (mut o_l, mut o_r) = read(3, op);
+                        let (mut v_l, mut v_r) = read(4, vp);
                         if phono_gain < 1.0 {
                             d_l *= phono_gain; d_r *= phono_gain;
                             b_l *= phono_gain; b_r *= phono_gain;
@@ -1052,26 +1169,9 @@ impl AudioSystem {
                         )
                     };
 
-                    // 2. Channel Gain & 3-Band EQ
+                    // 2. Channel gain (the 3-band EQ runs in the mixer engine).
                     let gain = (state.channel_gain[d] * 2.0).clamp(0.0, 2.0);
-                    let l_g = if state.eq_kill_low[d] {
-                        0.0
-                    } else {
-                        state.engine.strips[d].eq.low * 2.0
-                    };
-                    let m_g = if state.eq_kill_mid[d] {
-                        0.0
-                    } else {
-                        state.engine.strips[d].eq.mid * 2.0
-                    };
-                    let h_g = if state.eq_kill_hi[d] {
-                        0.0
-                    } else {
-                        state.engine.strips[d].eq.high * 2.0
-                    };
-                    let eq_scalar = ((l_g + m_g + h_g) / 3.0).clamp(0.0, 2.0);
-
-                    deck_samples[d] = (stem_l * gain * eq_scalar, stem_r * gain * eq_scalar);
+                    deck_samples[d] = (stem_l * gain, stem_r * gain);
                 }
 
                 state.playhead_sec[d] += advance_dt;
@@ -1133,7 +1233,7 @@ impl AudioSystem {
 
             state.engine.crossfader = state.crossfader;
             state.engine.crossfader_curve = state.crossfader_curve;
-            let (mut ml, mut mr, _cl, _cr) = state.engine.process_frame(deck_samples);
+            let (mut ml, mut mr, cl, cr) = state.engine.process_frame(deck_samples);
             ml = (ml + pat_sample).clamp(-1.0, 1.0);
             mr = (mr + pat_sample).clamp(-1.0, 1.0);
 
@@ -1146,11 +1246,18 @@ impl AudioSystem {
                     .push((mr.clamp(-1.0, 1.0) * 32767.0) as i16);
             }
 
-            if channels >= 2 {
-                output[f * channels] = ml;
-                output[f * channels + 1] = mr;
-            } else if channels == 1 {
-                output[f] = (ml + mr) * 0.5;
+            let out = &mut output[f * channels..(f + 1) * channels];
+            let (hl, hr) = headphone_mix((cl, cr), (ml, mr), state.cue_mix, state.cue_volume);
+            match (state.headphone_out, channels) {
+                (_, 1) => out[0] = (ml + mr) * 0.5,
+                (HeadphoneOut::Split, _) => {
+                    out[0] = (hl + hr) * 0.5;
+                    out[1] = (ml + mr) * 0.5;
+                }
+                (HeadphoneOut::Channels34, 4..) => {
+                    out[..4].copy_from_slice(&[ml, mr, hl, hr]);
+                }
+                _ => out[..2].copy_from_slice(&[ml, mr]),
             }
         }
 
@@ -1193,6 +1300,112 @@ impl Drop for AudioSystem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tone_track(hz: f32, sr: u32, secs: f32) -> LoadedTrackAudio {
+        let pcm_stereo = (0..(sr as f32 * secs) as usize)
+            .flat_map(|i| {
+                let v = (i as f32 * hz * std::f32::consts::TAU / sr as f32).sin() * 0.5;
+                [v, v]
+            })
+            .collect();
+        LoadedTrackAudio {
+            title: "tone".into(),
+            artist: String::new(),
+            duration_sec: secs as f64,
+            bpm: 120.0,
+            grid_offset_sec: 0.0,
+            key: String::new(),
+            sample_rate: sr,
+            waveform_peaks: Vec::new().into(),
+            stem_peaks: Vec::new().into(),
+            pcm_stereo,
+            stems_ready: false,
+            pcm_drums: None,
+            pcm_bass: None,
+            pcm_other: None,
+            pcm_vocals: None,
+            phrases: Vec::new(),
+        }
+    }
+
+    /// Peak of each output channel over half a second of the real callback.
+    fn render_peaks(setup: impl FnOnce(&mut AudioSharedState), channels: usize) -> Vec<f32> {
+        let shared = Arc::new(Mutex::new(AudioSharedState::default()));
+        {
+            let mut st = shared.lock().unwrap();
+            st.loaded_tracks[0] = Some(tone_track(1000.0, 48_000, 2.0));
+            st.is_playing[0] = true;
+            setup(&mut st);
+        }
+        let mut peaks = vec![0.0f32; channels];
+        let mut buf = vec![0.0f32; 512 * channels];
+        for block in 0..47 {
+            AudioSystem::render_audio_f32(&shared, &mut buf, channels, 48_000);
+            if block > 4 {
+                for (i, x) in buf.iter().enumerate() {
+                    peaks[i % channels] = peaks[i % channels].max(x.abs());
+                }
+            }
+        }
+        peaks
+    }
+
+    /// `cargo test --release -p retraktor-gui keylock_cpu -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn keylock_cpu() {
+        let shared = Arc::new(Mutex::new(AudioSharedState::default()));
+        {
+            let mut st = shared.lock().unwrap();
+            for d in 0..4 {
+                let mut t = tone_track(440.0, 44_100, 30.0);
+                for s in [&mut t.pcm_drums, &mut t.pcm_bass, &mut t.pcm_other, &mut t.pcm_vocals] {
+                    *s = Some(t.pcm_stereo.clone());
+                }
+                st.loaded_tracks[d] = Some(t);
+                st.is_playing[d] = true;
+                st.keylock[d] = true;
+                st.pitch_ratio[d] = 1.04;
+            }
+        }
+        let mut buf = vec![0.0f32; 256 * 2];
+        for locked in [false, true] {
+            shared.lock().unwrap().keylock = [locked; 4];
+            let t0 = std::time::Instant::now();
+            for _ in 0..(48_000 * 10 / 256) {
+                AudioSystem::render_audio_f32(&shared, &mut buf, 2, 48_000);
+            }
+            println!("10 s of 4 decks with stems, key lock {locked}: {:?}", t0.elapsed());
+        }
+    }
+
+    #[test]
+    fn cue_reaches_headphones_on_3_4_and_split() {
+        // Fader down, CUE on: silent on the speakers, audible in the headphones.
+        let cue_only = |st: &mut AudioSharedState| {
+            st.engine.strips[0].volume = 0.0;
+            st.engine.strips[0].cue_enabled = true;
+        };
+        let p = render_peaks(cue_only, 4);
+        assert!(p[0] < 0.01 && p[1] < 0.01, "main should be silent: {p:?}");
+        assert!(p[2] > 0.1 && p[3] > 0.1, "headphones should hear the cue: {p:?}");
+
+        let p = render_peaks(|st| { cue_only(st); st.headphone_out = HeadphoneOut::Split; }, 2);
+        assert!(p[0] > 0.1 && p[1] < 0.01, "split: left = cue, right = main: {p:?}");
+
+        // CUE off: nothing in the headphones at the CUE end of the blend.
+        let p = render_peaks(|st| st.engine.strips[0].volume = 0.0, 4);
+        assert!(p[2] < 0.01, "no cue pressed, headphones silent: {p:?}");
+    }
+
+    #[test]
+    fn mid_kill_removes_a_1khz_tone_and_key_lock_keeps_playing() {
+        let open = render_peaks(|_| {}, 2);
+        let killed = render_peaks(|st| st.engine.strips[0].eq.mid = 0.0, 2);
+        assert!(killed[0] < open[0] * 0.2, "mid kill: {killed:?} vs {open:?}");
+        let locked = render_peaks(|st| { st.keylock[0] = true; st.pitch_ratio[0] = 1.06; }, 2);
+        assert!(locked[0] > open[0] * 0.7, "key lock output: {locked:?} vs {open:?}");
+    }
 
     #[test]
     fn test_alpha_beta_filter_scratch_physics() {

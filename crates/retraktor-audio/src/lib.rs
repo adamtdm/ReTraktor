@@ -5,7 +5,7 @@
 //! UAC2 multi-channel routing profiles.
 
 use retraktor_core::{PropValue, PropertyBus};
-use retraktor_dsp::{
+use retraktor_dsp::{ThreeBandIsolator, 
     BipolarFilter, DeckTransportDsp, MasterClock, MixerEqModel, MixerFxKind, OzoneMaximizerDsp,
 };
 use std::collections::VecDeque;
@@ -98,6 +98,7 @@ pub struct ChannelStrip {
     pub last_prefader_peak: f32,
     pub transport: DeckTransportDsp,
     pub eq: MixerEqModel,
+    pub isolator: ThreeBandIsolator,
     pub filter: BipolarFilter,
 }
 
@@ -128,6 +129,7 @@ impl Default for FourDeckAudioEngine {
                 last_prefader_peak: 0.0,
                 transport: DeckTransportDsp::default(),
                 eq: MixerEqModel::default(),
+                isolator: ThreeBandIsolator::default(),
                 filter: BipolarFilter::default(),
             }),
             crossfader: 0.5,
@@ -268,9 +270,9 @@ impl FourDeckAudioEngine {
             }
             strip.transport.advance(dt_sec);
             let (fl, fr) = strip.filter.process_stereo(in_l, in_r);
-            let eq_gain = strip.eq.knob_to_linear(strip.eq.mid);
-            let pre_l = fl * eq_gain;
-            let pre_r = fr * eq_gain;
+            let eq = &strip.eq;
+            let (g_lo, g_mid, g_hi) = (eq.knob_to_linear(eq.low), eq.knob_to_linear(eq.mid), eq.knob_to_linear(eq.high));
+            let (pre_l, pre_r) = strip.isolator.process_stereo(self.routing.sample_rate, fl, fr, g_lo, g_mid, g_hi);
             strip.last_prefader_peak = pre_l.abs().max(pre_r.abs()).clamp(0.0, 1.0);
 
             if strip.cue_enabled {
