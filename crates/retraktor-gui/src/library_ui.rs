@@ -167,6 +167,26 @@ impl UiTrackEntry {
     }
 
     /// Copies values from `tags` into fields that are still empty; never overwrites.
+    /// Takes another library's data for this track without overwriting anything already here:
+    /// empty tags, rating, and each kind of cue (beatgrid, hotcues, memory cues) only if this track has none.
+    fn adopt_from(&mut self, other: UiTrackEntry) {
+        use retraktor_core::CueType;
+        let kinds: [fn(&NmlCue) -> bool; 3] = [
+            |c| c.cue_type == CueType::Grid,
+            |c| c.cue_type != CueType::Grid && c.hotcue >= 0,
+            |c| c.cue_type != CueType::Grid && c.hotcue < 0,
+        ];
+        for is_kind in kinds {
+            if !self.cues.iter().any(is_kind) {
+                self.cues.extend(other.cues.iter().filter(|c| is_kind(c)).cloned());
+            }
+        }
+        if self.rating == 0 {
+            self.rating = other.rating;
+        }
+        self.fill_empty_from(other);
+    }
+
     fn fill_empty_from(&mut self, tags: UiTrackEntry) {
         for (dst, src) in [
             (&mut self.title, tags.title),
@@ -488,6 +508,40 @@ pub enum NavItem {
     History,
     Explorer,
     Playlist(usize),
+    /// Tracks from a linked library (index into `libraries`).
+    Library(usize),
+}
+
+/// Another DJ app's library that ReTraktor reads and keeps in step with.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LibKind {
+    Traktor,
+    Rekordbox,
+}
+
+impl LibKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            LibKind::Traktor => "Traktor",
+            LibKind::Rekordbox => "rekordbox",
+        }
+    }
+
+    fn parse(self, text: &str) -> Result<NmlCollection, String> {
+        match self {
+            LibKind::Traktor => NmlCollection::parse_xml(text),
+            LibKind::Rekordbox => retraktor_formats::from_rekordbox_xml(text),
+        }
+    }
+}
+
+pub struct LinkedLibrary {
+    pub kind: LibKind,
+    pub path: PathBuf,
+    /// Collection tracks this library holds, from the last read.
+    pub track_ids: Vec<usize>,
+    /// Last read result in words.
+    pub note: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
@@ -554,6 +608,7 @@ impl SortColumn {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Pick {
     Collection,
+    Rekordbox,
     MusicFolder,
     RelocateFolder,
     TrackList,
@@ -570,6 +625,7 @@ pub enum Msg {
     /// (track id, analysis, overwrite existing values)
     Analyzed(usize, TrackAnalysis, bool),
     Saved(Result<usize, String>),
+    LibraryRead(PathBuf, Result<NmlCollection, String>),
     Done(String),
 }
 
@@ -592,6 +648,9 @@ enum Action {
 pub struct LibraryManager {
     pub tracks: Vec<UiTrackEntry>,
     pub playlists: Vec<UserPlaylist>,
+    pub libraries: Vec<LinkedLibrary>,
+    /// A library read added tracks: look for moved files in the music folders.
+    relocate_linked: bool,
     pub history: Vec<usize>,
     pub search_query: String,
     pub selected_nav: NavItem,
@@ -671,6 +730,8 @@ impl LibraryManager {
         let mut mgr = Self {
             tracks: Vec::new(),
             playlists: Vec::new(),
+            libraries: Vec::new(),
+            relocate_linked: false,
             history: Vec::new(),
             search_query: String::new(),
             selected_nav: NavItem::Collection,
@@ -733,7 +794,83 @@ impl LibraryManager {
             mgr.dirty_since = None;
         }
         mgr.load_missing_sidecar();
+        // Linked libraries are re-read on every start so their playlists stay current.
+        for line in fs::read_to_string(mgr.libraries_file()).unwrap_or_default().lines() {
+            let kind = match line.split_once('\t') {
+                Some(("traktor", p)) => Some((LibKind::Traktor, p)),
+                Some(("rekordbox", p)) => Some((LibKind::Rekordbox, p)),
+                _ => None,
+            };
+            if let Some((kind, p)) = kind {
+                mgr.libraries.push(LinkedLibrary { kind, path: PathBuf::from(p), track_ids: Vec::new(), note: "Reading…".into() });
+            }
+        }
+        for i in 0..mgr.libraries.len() {
+            mgr.read_library(i);
+        }
         mgr
+    }
+
+    fn libraries_file(&self) -> PathBuf {
+        self.collection_path.with_file_name("libraries.tsv")
+    }
+
+    fn save_libraries(&mut self) {
+        let text: String = self
+            .libraries
+            .iter()
+            .map(|l| format!("{}\t{}\n", if l.kind == LibKind::Traktor { "traktor" } else { "rekordbox" }, l.path.display()))
+            .collect();
+        if let Err(e) = write_atomic(&self.libraries_file(), &text) {
+            self.status_message = format!("Could not save the list of linked libraries: {e}");
+        }
+    }
+
+    /// "rekordbox", or "rekordbox 2" for a second library of the same kind; also its playlist folder.
+    pub fn library_name(&self, i: usize) -> String {
+        let kind = self.libraries[i].kind;
+        let n = self.libraries[..i].iter().filter(|l| l.kind == kind).count();
+        if n == 0 { kind.label().to_string() } else { format!("{} {}", kind.label(), n + 1) }
+    }
+
+    /// Links (or re-reads) another app's library and merges it in the background.
+    pub fn link_library(&mut self, kind: LibKind, path: PathBuf) {
+        let i = match self.libraries.iter().position(|l| l.path == path) {
+            Some(i) => i,
+            None => {
+                self.libraries.push(LinkedLibrary { kind, path, track_ids: Vec::new(), note: "Reading…".into() });
+                self.save_libraries();
+                self.libraries.len() - 1
+            }
+        };
+        self.selected_nav = NavItem::Library(i);
+        self.read_library(i);
+    }
+
+    pub fn read_library(&mut self, i: usize) {
+        let Some(lib) = self.libraries.get_mut(i) else { return };
+        lib.note = "Reading…".into();
+        let (kind, path) = (lib.kind, lib.path.clone());
+        self.spawn_job(move |tx| {
+            let read = fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|t| kind.parse(&t));
+            let _ = tx.send(Msg::LibraryRead(path, read));
+            String::new()
+        });
+    }
+
+    /// Stops following a library: its playlist folder goes, its tracks stay in the collection.
+    pub fn unlink_library(&mut self, i: usize) {
+        if i >= self.libraries.len() {
+            return;
+        }
+        let prefix = format!("{} / ", self.library_name(i));
+        self.playlists.retain(|p| !p.name.starts_with(&prefix));
+        let lib = self.libraries.remove(i);
+        self.selected_nav = NavItem::Collection;
+        self.save_libraries();
+        self.save_missing_sidecar();
+        self.touch();
+        self.status_message = format!("Unlinked {}. Its tracks stay in your collection.", lib.path.display());
     }
 
     pub fn default_nml_path() -> PathBuf {
@@ -770,6 +907,10 @@ impl LibraryManager {
             let dialog = rfd::FileDialog::new().set_directory(&home);
             let picked = match kind {
                 Pick::Collection => dialog.set_title("Choose your Traktor collection.nml").add_filter("Traktor collection", &["nml"]).pick_file(),
+                Pick::Rekordbox => dialog
+                    .set_title("Choose a rekordbox XML export (rekordbox: File > Export Collection in xml format)")
+                    .add_filter("rekordbox XML", &["xml"])
+                    .pick_file(),
                 Pick::MusicFolder => dialog.set_title("Choose a music folder").pick_folder(),
                 Pick::RelocateFolder => dialog.set_title("Choose the folder your missing tracks moved to").pick_folder(),
                 Pick::TrackList => dialog
@@ -786,6 +927,9 @@ impl LibraryManager {
     /// Processes background results and chosen files; call every frame, even while preferences are open.
     pub fn apply_picks(&mut self, music_folders: &mut Vec<PathBuf>) {
         self.poll();
+        if std::mem::take(&mut self.relocate_linked) && !music_folders.is_empty() {
+            self.relocate_after_check = Some(music_folders.clone());
+        }
         for (kind, path) in std::mem::take(&mut self.picked) {
             self.handle_pick(kind, path, music_folders);
         }
@@ -794,10 +938,8 @@ impl LibraryManager {
     /// Acts on a chosen file or folder.
     fn handle_pick(&mut self, kind: Pick, path: PathBuf, music_folders: &mut Vec<PathBuf>) {
         match kind {
-            Pick::Collection => match self.import_nml_file(&path) {
-                Ok(_) => self.relocate_after_check = Some(music_folders.clone()),
-                Err(e) => self.status_message = format!("Couldn't read {}: {e}", path.display()),
-            },
+            Pick::Collection => self.link_library(LibKind::Traktor, path),
+            Pick::Rekordbox => self.link_library(LibKind::Rekordbox, path),
             Pick::TrackList => {
                 self.import_track_list_file(&path);
             }
@@ -961,18 +1103,45 @@ impl LibraryManager {
     pub fn import_nml_file(&mut self, path: &Path) -> Result<usize, String> {
         let content = fs::read_to_string(path).map_err(|e| e.to_string())?;
         let col = NmlCollection::parse_xml(&content)?;
+        let (added, _) = self.merge_collection(&col, None);
+        self.status_message = format!("Imported {added} new tracks and {} playlists from {}", self.playlists.len(), path.display());
+        Ok(col.entries.len())
+    }
+
+    /// Merges tracks and playlists into the collection; returns (new tracks, ids of every merged track).
+    /// With `library`, its playlists live in a "<library> / …" folder that mirrors the source,
+    /// files from another computer match yours by file name, and your tracks only gain what they lack.
+    fn merge_collection(&mut self, col: &NmlCollection, library: Option<&str>) -> (usize, Vec<usize>) {
         let mut by_path: HashMap<PathBuf, usize> = self
             .tracks
             .iter()
             .filter_map(|t| Some((t.file_path.clone()?, t.id)))
             .collect();
+        let file_key = |p: &Path| p.file_name().map(|n| n.to_string_lossy().to_lowercase());
+        let mut by_name: HashMap<String, Vec<usize>> = HashMap::new();
+        if library.is_some() {
+            for t in &self.tracks {
+                if let Some(k) = t.file_path.as_deref().and_then(file_key) {
+                    by_name.entry(k).or_default().push(t.id);
+                }
+            }
+        }
         let mut by_key: HashMap<String, usize> = HashMap::new();
+        let mut ids = Vec::with_capacity(col.entries.len());
         let mut added = 0;
         for e in &col.entries {
             let t = UiTrackEntry::from_nml(e);
             let p = t.file_path.clone().unwrap_or_default();
-            let id = match by_path.get(&p) {
-                Some(&id) => id,
+            let moved = || if p.is_file() { None } else { file_key(&p).and_then(|k| by_name.get(&k)).filter(|v| v.len() == 1).map(|v| v[0]) };
+            let id = match by_path.get(&p).copied().or_else(|| library.and_then(|_| moved())) {
+                Some(id) => {
+                    if library.is_some() {
+                        if let Some(mine) = self.track_mut(id) {
+                            mine.adopt_from(t);
+                        }
+                    }
+                    id
+                }
                 None => {
                     added += 1;
                     let id = self.push_track(t);
@@ -980,6 +1149,7 @@ impl LibraryManager {
                     id
                 }
             };
+            ids.push(id);
             by_key.insert(e.location.primary_key(), id);
         }
         fn walk(node: &NmlPlaylistNode, prefix: &str, by_key: &HashMap<String, usize>, out: &mut Vec<UserPlaylist>) {
@@ -1004,6 +1174,31 @@ impl LibraryManager {
         }
         let mut imported = Vec::new();
         col.playlists.iter().for_each(|n| walk(n, "", &by_key, &mut imported));
+        if let Some(lib) = library {
+            let prefix = format!("{lib} / ");
+            let names: HashSet<String> = imported.iter().map(|p| format!("{prefix}{}", p.name)).collect();
+            let before = self.playlists.len();
+            let selected = match self.selected_nav {
+                NavItem::Playlist(i) => self.playlists.get(i).map(|p| p.name.clone()),
+                _ => None,
+            };
+            self.playlists.retain(|p| !p.name.starts_with(&prefix) || names.contains(&p.name));
+            for mut pl in imported {
+                pl.name = format!("{prefix}{}", pl.name);
+                match self.playlists.iter_mut().find(|p| p.name == pl.name) {
+                    Some(existing) => existing.track_ids = pl.track_ids,
+                    None => self.playlists.push(pl),
+                }
+            }
+            if self.playlists.len() != before || selected.is_some() {
+                self.selected_nav = selected
+                    .and_then(|n| self.playlists.iter().position(|p| p.name == n))
+                    .map_or(if matches!(self.selected_nav, NavItem::Playlist(_)) { NavItem::Collection } else { self.selected_nav }, NavItem::Playlist);
+            }
+            self.touch();
+            self.start_check();
+            return (added, ids);
+        }
         for pl in imported {
             match self.playlists.iter_mut().find(|p| p.name == pl.name) {
                 Some(existing) => {
@@ -1018,8 +1213,7 @@ impl LibraryManager {
         }
         self.touch();
         self.start_check();
-        self.status_message = format!("Imported {added} new tracks and {} playlists from {}", self.playlists.len(), path.display());
-        Ok(col.entries.len())
+        (added, ids)
     }
 
     /// Imports a playlist from a track list file (.csv, .txt, .m3u, .m3u8).
@@ -1378,9 +1572,31 @@ impl LibraryManager {
                     self.status_message = format!("Could not save collection: {e}");
                 }
                 Msg::Saved(Ok(_)) => self.saving = false,
+                Msg::LibraryRead(path, read) => {
+                    let Some(i) = self.libraries.iter().position(|l| l.path == path) else { continue };
+                    let name = self.library_name(i);
+                    match read {
+                        Ok(col) => {
+                            let (added, ids) = self.merge_collection(&col, Some(&name));
+                            let prefix = format!("{name} / ");
+                            let lists = self.playlists.iter().filter(|p| p.name.starts_with(&prefix)).count();
+                            let lib = &mut self.libraries[i];
+                            lib.note = format!("{} tracks, {lists} playlists ({added} new to your collection)", ids.len());
+                            lib.track_ids = ids;
+                            self.status_message = format!("{name}: {}", lib.note);
+                            self.relocate_linked |= added > 0;
+                        }
+                        Err(e) => {
+                            self.libraries[i].note = format!("Couldn't read it: {e}");
+                            self.status_message = format!("{name}: couldn't read {}: {e}", path.display());
+                        }
+                    }
+                }
                 Msg::Done(s) => {
                     self.jobs = self.jobs.saturating_sub(1);
-                    self.status_message = s;
+                    if !s.is_empty() {
+                        self.status_message = s;
+                    }
                     if self.jobs == 0 {
                         self.job_status.clear();
                         let scanned = std::mem::take(&mut self.scanned_ids);
@@ -1418,6 +1634,7 @@ impl LibraryManager {
         }
         let ids: Vec<usize> = match self.selected_nav {
             NavItem::Playlist(i) => self.playlists.get(i).map(|p| p.track_ids.clone()).unwrap_or_default(),
+            NavItem::Library(i) => self.libraries.get(i).map(|l| l.track_ids.clone()).unwrap_or_default(),
             NavItem::History => self.history.iter().rev().copied().collect(),
             NavItem::Missing => self.tracks.iter().filter(|t| t.missing).map(|t| t.id).collect(),
             NavItem::Stems => self.tracks.iter().filter(|t| t.stems_ready).map(|t| t.id).collect(),
@@ -1708,6 +1925,59 @@ impl LibraryManager {
             self.nav_button(ui, format!("Stems  {stems}"), NavItem::Stems, None);
             self.nav_button(ui, format!("History  {}", self.history.len()), NavItem::History, None);
             self.nav_button(ui, "Files".to_string(), NavItem::Explorer, None);
+
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("LIBRARIES").size(10.5).color(TraktorTheme::TEXT_MUTED()));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.menu_button("Link…", |ui| {
+                        if ui.button("Traktor collection (.nml)…").clicked() {
+                            self.pick(Pick::Collection);
+                            ui.close_menu();
+                        }
+                        if ui.button("rekordbox XML…").on_hover_text("In rekordbox: File > Export Collection in xml format, then pick that file").clicked() {
+                            self.pick(Pick::Rekordbox);
+                            ui.close_menu();
+                        }
+                        let found: Vec<PathBuf> = self.detected.clone().unwrap_or_default().into_iter().filter(|p| !self.libraries.iter().any(|l| &l.path == p)).collect();
+                        for p in found {
+                            if ui.button(format!("Traktor: {}", p.display())).clicked() {
+                                self.link_library(LibKind::Traktor, p);
+                                ui.close_menu();
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text("Show another DJ app's library here. ReTraktor reads it and never changes it.");
+                });
+            });
+            if self.libraries.is_empty() {
+                ui.label(RichText::new("Link Traktor or rekordbox to use their playlists here.").size(11.0).color(TraktorTheme::TEXT_SECONDARY()));
+            }
+            let mut unlink = None;
+            let mut reread = None;
+            for i in 0..self.libraries.len() {
+                let label = format!("{}  {}", self.library_name(i), self.libraries[i].track_ids.len());
+                let lib = &self.libraries[i];
+                let tip = format!("{}\n{}", lib.note, lib.path.display());
+                let resp = self.nav_button(ui, label, NavItem::Library(i), None).on_hover_text(tip);
+                resp.context_menu(|ui| {
+                    if ui.button("Read again").on_hover_text("Pick up changes made in the other app").clicked() {
+                        reread = Some(i);
+                        ui.close_menu();
+                    }
+                    if ui.button("Unlink").on_hover_text("Remove its playlist folder; its tracks stay in your collection").clicked() {
+                        unlink = Some(i);
+                        ui.close_menu();
+                    }
+                });
+            }
+            if let Some(i) = reread {
+                self.read_library(i);
+            }
+            if let Some(i) = unlink {
+                self.unlink_library(i);
+            }
 
             ui.add_space(8.0);
             ui.horizontal(|ui| {
@@ -2738,6 +3008,69 @@ pub fn deck_drop_target(ui: &Ui, rect: egui::Rect) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn wait_for_library(lib: &mut LibraryManager) {
+        for _ in 0..500 {
+            lib.poll();
+            if lib.libraries.iter().all(|l| l.note != "Reading…") && lib.jobs == 0 {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("library read did not finish");
+    }
+
+    #[test]
+    fn linked_rekordbox_library_merges_without_overwriting_and_mirrors_playlists() {
+        let (mut lib, dir) = temp_lib("rbx-link");
+        // My copy of a track rekordbox knows from a Mac, with my own BPM and no hotcues.
+        let mine = dir.join("Deep Low.mp3");
+        fs::write(&mine, b"x").unwrap();
+        let my_id = lib.push_track(UiTrackEntry { title: "Deep Low (mine)".into(), bpm: 125.0, file_path: Some(mine.clone()), ..Default::default() });
+        lib.playlists.push(UserPlaylist { name: "My set".into(), track_ids: vec![my_id], missing: Vec::new() });
+
+        let xml = |with_friday: bool| format!(r#"<DJ_PLAYLISTS Version="1.0.0"><COLLECTION Entries="2">
+<TRACK TrackID="1" Name="Deep Low" Artist="A" AverageBpm="126.00" Genre="Techno" Rating="204" Location="file://localhost/Users/dj/Music/Deep%20Low.mp3">
+  <TEMPO Inizio="0.1" Bpm="126.00" Metro="4/4" Battito="1"/><POSITION_MARK Name="Drop" Type="0" Start="64.0" Num="0"/></TRACK>
+<TRACK TrackID="2" Name="Only In Rekordbox" Artist="B" Location="file://localhost/Users/dj/Music/new.mp3"/>
+</COLLECTION><PLAYLISTS><NODE Type="0" Name="ROOT" Count="2">
+  <NODE Name="Warmup" Type="1" KeyType="0" Entries="1"><TRACK Key="2"/></NODE>
+  {}
+</NODE></PLAYLISTS></DJ_PLAYLISTS>"#, if with_friday { r#"<NODE Name="Friday" Type="1" KeyType="0" Entries="2"><TRACK Key="1"/><TRACK Key="2"/></NODE>"# } else { "" });
+        let xml_path = dir.join("rekordbox.xml");
+        fs::write(&xml_path, xml(true)).unwrap();
+        lib.link_library(LibKind::Rekordbox, xml_path.clone());
+        wait_for_library(&mut lib);
+
+        assert_eq!(lib.tracks.len(), 2, "the moved file matched my copy; one new track");
+        let t = lib.tracks.iter().find(|t| t.id == my_id).unwrap();
+        assert_eq!(t.title, "Deep Low (mine)");
+        assert_eq!(t.bpm, 125.0, "my BPM is kept");
+        assert_eq!(t.genre, "Techno", "empty tags are filled");
+        assert_eq!(t.rating, 4);
+        assert!(t.cues.iter().any(|c| c.hotcue == 0 && c.name == "Drop"), "missing hotcues are adopted");
+        assert_eq!(t.file_path.as_deref(), Some(mine.as_path()), "my file path is kept");
+        let friday = lib.playlists.iter().find(|p| p.name == "rekordbox / Friday").expect("library playlist");
+        assert_eq!(friday.track_ids[0], my_id);
+        assert_eq!(lib.libraries[0].track_ids.len(), 2);
+
+        // Deleting a playlist in rekordbox removes it here on the next read; mine stay.
+        fs::write(&xml_path, xml(false)).unwrap();
+        lib.read_library(0);
+        wait_for_library(&mut lib);
+        let names: Vec<&str> = lib.playlists.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["My set", "rekordbox / Warmup"]);
+        assert_eq!(lib.tracks.len(), 2, "re-reading adds nothing twice");
+
+        // The link survives a restart.
+        assert!(fs::read_to_string(lib.libraries_file()).unwrap().contains("rekordbox\t"));
+
+        lib.unlink_library(0);
+        assert!(lib.libraries.is_empty());
+        assert_eq!(lib.playlists.len(), 1);
+        assert_eq!(lib.tracks.len(), 2, "unlinking keeps the tracks");
+        let _ = fs::remove_dir_all(dir);
+    }
 
     fn temp_lib(name: &str) -> (LibraryManager, PathBuf) {
         let dir = env::temp_dir().join(format!("retraktor-test-{name}-{}", std::process::id()));

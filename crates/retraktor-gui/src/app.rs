@@ -772,6 +772,10 @@ impl ReTraktorApp {
             "pick" => self.library.selected_track_id = self.library.tracks.first().map(|t| t.id),
             "master" => self.tempo_master_deck = Some(0),
             "setpick" => self.set_state.selected_index = Some(1),
+            s if s.starts_with("lib:") => {
+                self.layout = TraktorLayout::Browser;
+                self.library.selected_nav = crate::library_ui::NavItem::Library(s[4..].parse().unwrap_or(0));
+            }
             s if s.starts_with("faderB:") => self.channel_volume[1] = s[7..].parse().unwrap_or(0.85),
             s if s.starts_with("select:") => self.preferences.mapper.selected = Some(s[7..].to_string()),
             "prefs:other" | "prefs:OtherControllers" | "prefs:Other" => {

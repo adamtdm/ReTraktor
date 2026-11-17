@@ -333,6 +333,169 @@ fn file_kind(filename: &str) -> &'static str {
     }
 }
 
+/// Reads a rekordbox XML export (File > Export Collection in xml format) as a collection:
+/// tracks, first beatgrid marker, hotcues, memory cues, loops and playlists.
+/// Track locations keep rekordbox's paths; the caller relocates files from another computer.
+pub fn from_rekordbox_xml(xml: &str) -> Result<NmlCollection, String> {
+    use crate::nml::{NmlLocation, NmlTempo};
+    let doc = crate::xml::XmlDocument::parse(xml)?;
+    if doc.root.name != "DJ_PLAYLISTS" {
+        return Err(format!("Not a rekordbox XML file (found <{}>)", doc.root.name));
+    }
+    let mut col = NmlCollection::new(20);
+    col.program = "rekordbox".to_string();
+    let mut key_by_id: HashMap<String, String> = HashMap::new();
+    let mut key_by_location: HashMap<String, String> = HashMap::new();
+    let num = |n: &crate::xml::XmlNode, k: &str| n.attr(k).and_then(|v| v.trim().parse::<f64>().ok());
+    let text = |n: &crate::xml::XmlNode, k: &str| n.attr(k).map(str::trim).filter(|v| !v.is_empty()).map(str::to_string);
+
+    for t in doc.root.child("COLLECTION").into_iter().flat_map(|c| c.children_named("TRACK")) {
+        let Some(raw_location) = t.attr("Location") else { continue };
+        let path = decode_rekordbox_location(raw_location);
+        let location = NmlLocation::from_posix_path(&path, "linux-root");
+        let key = location.primary_key();
+        if let Some(id) = t.attr("TrackID") {
+            key_by_id.insert(id.to_string(), key.clone());
+        }
+        key_by_location.insert(raw_location.to_string(), key);
+
+        let tonality = text(t, "Tonality");
+        let mut cues = Vec::new();
+        // shortcut: only the first TEMPO marker is kept, so tempo-changing (dynamic) grids flatten to one bpm.
+        if let Some(tempo) = t.children_named("TEMPO").next() {
+            cues.push(NmlCue {
+                name: "AutoGrid".into(),
+                displ_order: 0,
+                cue_type: CueType::Grid,
+                start_ms: num(tempo, "Inizio").unwrap_or(0.0) * 1000.0,
+                len_ms: 0.0,
+                repeats: -1,
+                hotcue: -1,
+                grid_bpm: num(tempo, "Bpm"),
+            });
+        }
+        for m in t.children_named("POSITION_MARK") {
+            let start = num(m, "Start").unwrap_or(0.0);
+            let cue_type = match num(m, "Type").unwrap_or(0.0) as i64 {
+                1 => CueType::FadeIn,
+                2 => CueType::FadeOut,
+                3 => CueType::Load,
+                4 => CueType::Loop,
+                _ => CueType::Cue,
+            };
+            let len = match (cue_type, num(m, "End")) {
+                (CueType::Loop, Some(end)) => (end - start).max(0.0),
+                _ => 0.0,
+            };
+            cues.push(NmlCue {
+                name: m.attr("Name").unwrap_or("").to_string(),
+                displ_order: 0,
+                cue_type,
+                start_ms: start * 1000.0,
+                len_ms: len * 1000.0,
+                repeats: -1,
+                hotcue: num(m, "Num").map_or(-1, |n| n as i64),
+                grid_bpm: None,
+            });
+        }
+        col.entries.push(NmlEntry {
+            title: t.attr("Name").unwrap_or("").to_string(),
+            artist: t.attr("Artist").unwrap_or("").to_string(),
+            location,
+            album_title: text(t, "Album"),
+            album_track: num(t, "TrackNumber").map(|n| n as u32).filter(|n| *n > 0),
+            genre: text(t, "Genre"),
+            comment: text(t, "Comments"),
+            musical_key_value: tonality.as_deref().and_then(tonality_to_value),
+            key_text: tonality,
+            playtime_sec: num(t, "TotalTime").filter(|s| *s > 0.0),
+            bitrate: num(t, "BitRate").map(|b| b as u32).filter(|b| *b > 0),
+            tempo: num(t, "AverageBpm").filter(|b| *b > 0.0).map(|bpm| NmlTempo { bpm, bpm_quality: 100.0 }),
+            cues,
+            ranking: num(t, "Rating").map(|r| r.clamp(0.0, 255.0) as u8).filter(|r| *r > 0),
+            label: text(t, "Label"),
+            remixer: text(t, "Remixer"),
+            release_date: text(t, "Year").filter(|y| y != "0"),
+            play_count: num(t, "PlayCount").map(|n| n as u32).filter(|n| *n > 0),
+            ..Default::default()
+        });
+    }
+
+    fn node(n: &crate::xml::XmlNode, by_id: &HashMap<String, String>, by_loc: &HashMap<String, String>) -> Option<NmlPlaylistNode> {
+        let name = n.attr("Name").unwrap_or("").to_string();
+        match n.attr("Type") {
+            Some("0") => Some(NmlPlaylistNode::Folder {
+                name: if name == "ROOT" { "$ROOT".into() } else { name },
+                subnodes: n.children_named("NODE").filter_map(|c| node(c, by_id, by_loc)).collect(),
+            }),
+            Some("1") => {
+                let by = if n.attr("KeyType") == Some("1") { by_loc } else { by_id };
+                Some(NmlPlaylistNode::Playlist {
+                    name,
+                    uuid: String::new(),
+                    track_keys: n.children_named("TRACK").filter_map(|t| by.get(t.attr("Key")?).cloned()).collect(),
+                })
+            }
+            _ => None,
+        }
+    }
+    if let Some(pl) = doc.root.child("PLAYLISTS") {
+        col.playlists = pl.children_named("NODE").filter_map(|n| node(n, &key_by_id, &key_by_location)).collect();
+    }
+    Ok(col)
+}
+
+/// `file://localhost/Users/me/My%20Track.mp3` → `/Users/me/My Track.mp3`; Windows paths keep their drive (`C:/…`).
+fn decode_rekordbox_location(uri: &str) -> String {
+    let rest = uri.strip_prefix("file://localhost").or_else(|| uri.strip_prefix("file://")).unwrap_or(uri);
+    let bytes = rest.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = bytes.get(i + 1..i + 3).and_then(|h| std::str::from_utf8(h).ok()).and_then(|h| u8::from_str_radix(h, 16).ok());
+        match (bytes[i], hex) {
+            (b'%', Some(b)) => {
+                out.push(b);
+                i += 3;
+            }
+            (b, _) => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    let path = String::from_utf8_lossy(&out).into_owned();
+    match path.as_bytes() {
+        [b'/', d, b':', ..] if d.is_ascii_alphabetic() => path[1..].to_string(),
+        _ => path,
+    }
+}
+
+/// rekordbox "Am" / "C#m" / "F" (any enharmonic spelling) → Traktor key value 0..=23.
+fn tonality_to_value(t: &str) -> Option<u8> {
+    let t = t.trim();
+    let (root, minor) = match t.strip_suffix('m') {
+        Some(r) => (r, true),
+        None => (t, false),
+    };
+    let pc = match root {
+        "C" | "B#" => 0,
+        "C#" | "Db" => 1,
+        "D" => 2,
+        "D#" | "Eb" => 3,
+        "E" | "Fb" => 4,
+        "F" | "E#" => 5,
+        "F#" | "Gb" => 6,
+        "G" => 7,
+        "G#" | "Ab" => 8,
+        "A" => 9,
+        "A#" | "Bb" => 10,
+        "B" | "Cb" => 11,
+        _ => return None,
+    };
+    Some(if minor { 12 + pc } else { pc })
+}
+
 /// XML-escapes `&`, `<`, `>`, `"`, and `'`.
 fn xml_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -498,6 +661,59 @@ mod tests {
 
         // 8. Playlist & Folder structure under ROOT
         assert!(xml.contains("<PLAYLISTS>\n    <NODE Type=\"0\" Name=\"ROOT\" Count=\"1\">\n      <NODE Type=\"0\" Name=\"Club Sets\" Count=\"1\">\n        <NODE Type=\"1\" Name=\"Main Room\" Entries=\"2\" KeyType=\"0\">\n          <TRACK Key=\"1\"/>\n          <TRACK Key=\"2\"/>\n        </NODE>\n      </NODE>\n    </NODE>\n  </PLAYLISTS>"));
+    }
+
+    #[test]
+    fn rekordbox_xml_reads_back_what_we_export() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<DJ_PLAYLISTS Version="1.0.0">
+  <COLLECTION Entries="2">
+    <TRACK TrackID="7" Name="Deep &amp; Low" Artist="A" Album="LP" Genre="Techno" TotalTime="301" AverageBpm="126.00"
+           Tonality="Abm" Rating="153" Location="file://localhost/Users/dj/Music/Deep%20Low%C3%A9.mp3">
+      <TEMPO Inizio="0.120" Bpm="126.00" Metro="4/4" Battito="1"/>
+      <TEMPO Inizio="60.120" Bpm="126.00" Metro="4/4" Battito="1"/>
+      <POSITION_MARK Name="Drop" Type="0" Start="64.120" Num="2"/>
+      <POSITION_MARK Name="" Type="0" Start="32.000" Num="-1"/>
+      <POSITION_MARK Name="Roll" Type="4" Start="96.0" End="100.0" Num="3"/>
+    </TRACK>
+    <TRACK TrackID="8" Name="Win" Artist="B" Location="file://localhost/C:/Users/dj/Music/win.flac"/>
+  </COLLECTION>
+  <PLAYLISTS>
+    <NODE Type="0" Name="ROOT" Count="1">
+      <NODE Type="0" Name="Gigs" Count="1">
+        <NODE Name="Friday" Type="1" KeyType="0" Entries="2"><TRACK Key="8"/><TRACK Key="7"/></NODE>
+      </NODE>
+    </NODE>
+  </PLAYLISTS>
+</DJ_PLAYLISTS>"#;
+        let col = from_rekordbox_xml(xml).unwrap();
+        assert_eq!(col.entries.len(), 2);
+        let t = &col.entries[0];
+        assert_eq!(t.title, "Deep & Low");
+        assert_eq!(t.location.to_posix_path(), "/Users/dj/Music/Deep Lowé.mp3");
+        assert_eq!(t.musical_key_value, Some(20)); // G#m
+        assert_eq!(t.ranking, Some(153)); // 3 stars
+        assert_eq!(t.tempo.as_ref().map(|t| t.bpm), Some(126.0));
+        let grids: Vec<_> = t.cues.iter().filter(|c| c.cue_type == CueType::Grid).collect();
+        assert_eq!(grids.len(), 1);
+        assert!((grids[0].start_ms - 120.0).abs() < 1e-6);
+        let hot: Vec<_> = t.cues.iter().filter(|c| c.hotcue >= 0).map(|c| (c.hotcue, c.cue_type)).collect();
+        assert_eq!(hot, vec![(2, CueType::Cue), (3, CueType::Loop)]);
+        assert!(t.cues.iter().any(|c| c.hotcue == -1 && c.cue_type == CueType::Cue && (c.start_ms - 32_000.0).abs() < 1e-6));
+        assert_eq!(col.entries[1].location.to_posix_path(), "/C:/Users/dj/Music/win.flac");
+
+        let NmlPlaylistNode::Folder { name, subnodes } = &col.playlists[0] else { panic!() };
+        assert_eq!(name, "$ROOT");
+        let NmlPlaylistNode::Folder { subnodes, .. } = &subnodes[0] else { panic!() };
+        let NmlPlaylistNode::Playlist { name, track_keys, .. } = &subnodes[0] else { panic!() };
+        assert_eq!(name, "Friday");
+        assert_eq!(track_keys, &vec![col.entries[1].location.primary_key(), col.entries[0].location.primary_key()]);
+
+        // And our own export reads back with the same tracks and cues.
+        let again = from_rekordbox_xml(&to_rekordbox_xml(&col)).unwrap();
+        assert_eq!(again.entries.len(), 2);
+        assert_eq!(again.entries[0].cues.iter().filter(|c| c.hotcue >= 0).count(), 2);
+        assert_eq!(again.entries[0].musical_key_value, Some(20));
     }
 
     #[test]

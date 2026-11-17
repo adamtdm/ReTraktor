@@ -20,7 +20,7 @@ pub mod xml;
 pub use nml::{
     NmlCollection, NmlCue, NmlEntry, NmlLocation, NmlLoudness, NmlPlaylistNode, NmlTempo,
 };
-pub use rekordbox::to_rekordbox_xml;
+pub use rekordbox::{from_rekordbox_xml, to_rekordbox_xml};
 pub use stripes::{StripeColumn, TransientFile, TransientRecord, WaveformStripe};
 pub use trak::{StemCompressorDsp, StemLimiterDsp, StemMasteringDsp, StemMetadata, StemSlotMeta};
 pub use tsi::{TsiChunk, TsiControlMapping, TsiDevice, TsiFile};

@@ -7,7 +7,9 @@ VirtualDJ 2026, Engine DJ, djay Pro 5.6 and Mixxx 2.6 (the open-source benchmark
 
 | Feature | Competitors | ReTraktor |
 |---|---|---|
-| Key lock (tempo change without pitch change) | all | **Missing.** A "Keylock quality" setting exists in Preferences but nothing in the audio path reads it, so pitch moves with tempo |
+| Key lock (tempo change without pitch change) | all | Yes (Nov 2026): per-deck KEY, WSOLA time-stretch, stems included |
+| Headphone cue on a second output | all | Yes (Nov 2026): outputs 3–4 or split mono; PHONES level and CUE/MIX blend |
+| Real 3-band EQ / kills | all | Yes (Nov 2026): 24 dB/oct isolator (was a volume average) |
 | Beat jump / quantised cues and loops | all | **Missing** beat jump; loops exist |
 | Frequency-coloured waveforms with beat and bar markers | all | Single-colour waveform with beat ticks |
 | Channel and master level meters | all | No visible per-channel meter in the 2-deck mixer |
@@ -15,7 +17,7 @@ VirtualDJ 2026, Engine DJ, djay Pro 5.6 and Mixxx 2.6 (the open-source benchmark
 | Stems | all (real time) | Offline Demucs plus instant DSP split; live neural stems not possible on the dev laptop ([REALTIME-STEMS.md](REALTIME-STEMS.md)) |
 | Recording | all | Yes |
 | MIDI/HID controller mapping | all | Yes: MX2 replica, learn mapper, FLX4 preset |
-| Library import/export | rekordbox XML, Serato tags, Engine DB, USB for CDJs | rekordbox XML export only |
+| Library import/export | rekordbox XML, Serato tags, Engine DB, USB for CDJs | Linked Traktor and rekordbox (XML) libraries side by side, re-read on start; rekordbox XML export. Missing: Serato, Engine, rekordbox master.db, USB |
 | Sampler / remix decks | Traktor, Serato, rekordbox, VirtualDJ | Pattern player only |
 
 ## Where the field is heading in 2026
@@ -39,13 +41,14 @@ VirtualDJ 2026, Engine DJ, djay Pro 5.6 and Mixxx 2.6 (the open-source benchmark
 
 ## Order to close the gaps
 
-1. Key lock (time-stretch in the audio path), then make the existing setting real.
-2. Beat jump and quantise.
-3. Channel and master meters; frequency-coloured waveform.
-4. Browser pre-listen.
-5. Serato / Engine export and USB export.
-6. Real-time stems on capable machines (StemgenRT via `ort`).
-7. Streaming, once credentials are available.
+1. ~~Key lock, headphone cue, real EQ, device selection~~ (done Nov 2026; needs hardware testing).
+2. ~~Linked libraries: Traktor + rekordbox XML~~ (done); next Engine DJ (SQLite) and Serato (crates + tags).
+3. Beat jump and quantise.
+4. Channel and master meters; frequency-coloured waveform.
+5. Browser pre-listen (headphone cue makes it cheap).
+6. Serato / Engine export and USB export.
+7. Real-time stems on capable machines (StemgenRT via `ort`).
+8. Streaming, once credentials are available.
 
 ## Sources
 
