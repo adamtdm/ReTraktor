@@ -668,6 +668,8 @@ pub struct LibraryManager {
     scroll_to_selected: bool,
 
     collection_path: PathBuf,
+    /// Files the user removed from the collection; linked libraries must not bring them back on the next read.
+    removed: HashSet<PathBuf>,
     dirty_since: Option<Instant>,
     saving: bool,
     tx: Sender<Msg>,
@@ -746,6 +748,7 @@ impl LibraryManager {
             view_stamp: None,
             id_index: HashMap::new(),
             scroll_to_selected: false,
+            removed: HashSet::new(),
             collection_path,
             dirty_since: None,
             saving: false,
@@ -794,6 +797,7 @@ impl LibraryManager {
             mgr.dirty_since = None;
         }
         mgr.load_missing_sidecar();
+        mgr.removed = fs::read_to_string(mgr.removed_file()).unwrap_or_default().lines().map(PathBuf::from).collect();
         // Linked libraries are re-read on every start so their playlists stay current.
         for line in fs::read_to_string(mgr.libraries_file()).unwrap_or_default().lines() {
             let kind = match line.split_once('\t') {
@@ -813,6 +817,23 @@ impl LibraryManager {
 
     fn libraries_file(&self) -> PathBuf {
         self.collection_path.with_file_name("libraries.tsv")
+    }
+
+    fn removed_file(&self) -> PathBuf {
+        self.collection_path.with_file_name("removed.txt")
+    }
+
+    fn save_removed(&mut self) {
+        let text: String = self.removed.iter().map(|p| format!("{}\n", p.display())).collect();
+        if let Err(e) = write_atomic(&self.removed_file(), &text) {
+            self.status_message = format!("Could not save the list of removed tracks: {e}");
+        }
+    }
+
+    /// Whether a linked library's entry is a track the user removed (also when the library knows it by another folder).
+    fn was_removed(&self, p: &Path) -> bool {
+        self.removed.contains(p)
+            || !p.is_file() && p.file_name().is_some_and(|n| self.removed.iter().any(|r| r.file_name().is_some_and(|m| m.eq_ignore_ascii_case(n))))
     }
 
     fn save_libraries(&mut self) {
@@ -1010,6 +1031,10 @@ impl LibraryManager {
     }
 
     fn push_track(&mut self, mut t: UiTrackEntry) -> usize {
+        // Adding a file again, any way, undoes an earlier removal.
+        if t.file_path.as_ref().is_some_and(|p| self.removed.remove(p)) {
+            self.save_removed();
+        }
         t.id = self.next_id();
         let id = t.id;
         self.id_index.insert(id, self.tracks.len());
@@ -1132,6 +1157,9 @@ impl LibraryManager {
         for e in &col.entries {
             let t = UiTrackEntry::from_nml(e);
             let p = t.file_path.clone().unwrap_or_default();
+            if library.is_some() && self.was_removed(&p) {
+                continue;
+            }
             let moved = || if p.is_file() { None } else { file_key(&p).and_then(|k| by_name.get(&k)).filter(|v| v.len() == 1).map(|v| v[0]) };
             let id = match by_path.get(&p).copied().or_else(|| library.and_then(|_| moved())) {
                 Some(id) => {
@@ -1732,6 +1760,10 @@ impl LibraryManager {
         if let Some((what, tracks, playlists)) = self.undo.take() {
             self.tracks = tracks;
             self.playlists = playlists;
+            let back: Vec<PathBuf> = self.tracks.iter().filter_map(|t| t.file_path.clone()).collect();
+            if back.iter().fold(false, |any, p| self.removed.remove(p) || any) {
+                self.save_removed();
+            }
             self.selection.clear();
             self.rebuild_index();
             self.status_message = format!("Undid: {what}");
@@ -1856,6 +1888,9 @@ impl LibraryManager {
             }
             Action::RemoveFromCollection(ids) => {
                 self.remember_for_undo(format!("removed {} from the collection", plural(ids.len())));
+                let paths: Vec<PathBuf> = ids.iter().filter_map(|&id| self.track(id)?.file_path.clone()).collect();
+                self.removed.extend(paths);
+                self.save_removed();
                 self.tracks.retain(|t| !ids.contains(&t.id));
                 for pl in &mut self.playlists {
                     pl.track_ids.retain(|id| !ids.contains(id));
@@ -3062,6 +3097,7 @@ mod tests {
         assert_eq!(names, vec!["My set", "rekordbox / Warmup"]);
         assert_eq!(lib.tracks.len(), 2, "re-reading adds nothing twice");
 
+
         // The link survives a restart.
         assert!(fs::read_to_string(lib.libraries_file()).unwrap().contains("rekordbox\t"));
 
@@ -3069,6 +3105,21 @@ mod tests {
         assert!(lib.libraries.is_empty());
         assert_eq!(lib.playlists.len(), 1);
         assert_eq!(lib.tracks.len(), 2, "unlinking keeps the tracks");
+        lib.link_library(LibKind::Rekordbox, xml_path.clone());
+        wait_for_library(&mut lib);
+        // Removed tracks stay removed after a restart, though the library still lists them.
+        let all: Vec<usize> = lib.tracks.iter().map(|t| t.id).collect();
+        lib.apply(Action::RemoveFromCollection(all), [false; 4], 2);
+        lib.save_collection_nml(&dir.join("collection.nml")).unwrap();
+        let mut reopened = LibraryManager::new(dir.join("collection.nml"));
+        wait_for_library(&mut reopened);
+        assert!(reopened.tracks.is_empty(), "removed tracks came back: {:?}", reopened.tracks.iter().map(|t| &t.title).collect::<Vec<_>>());
+        // Adding the file myself brings it back for good.
+        reopened.add_file(&mine);
+        reopened.read_library(0);
+        wait_for_library(&mut reopened);
+        assert_eq!(reopened.tracks.len(), 1, "only the re-added track, merged once");
+        assert!(!fs::read_to_string(reopened.removed_file()).unwrap().contains("Deep Low"));
         let _ = fs::remove_dir_all(dir);
     }
 
