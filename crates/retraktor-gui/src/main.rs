@@ -50,6 +50,8 @@ fn main() -> eframe::Result<()> {
         native_options,
         Box::new(|cc| {
             theme::install_fonts(&cc.egui_ctx);
+            // egui moves 40 pt per wheel notch (under 2 library rows); desktop apps move about 3 lines.
+            cc.egui_ctx.options_mut(|o| o.line_scroll_speed = 3.0 * 22.0);
             Ok(Box::new(ReTraktorApp::default()))
         }),
     )
