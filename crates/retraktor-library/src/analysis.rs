@@ -218,28 +218,27 @@ fn estimate_rhythm_and_cues(ds: &[f32], ds_sr: f64) -> (f64, f64, f32, Vec<f64>,
     let mut rms_frames = Vec::with_capacity(n_frames);
     let mut lp1 = 0.0_f32;
     let mut lp2 = 0.0_f32;
+    // Band power through two ~5 ms smoothers: a 5.8 ms frame alone ripples with a held bass note
+    // and that ripple's alias reads as a false tempo.
+    let a = (1.0 / (0.005 * ds_sr)) as f32;
+    let mut power = [[0.0_f32; 2]; 3];
 
     for f in 0..n_frames {
         let slice = &ds[f * hop..(f + 1) * hop];
-        let mut e_low = 0.0_f32;
-        let mut e_mid = 0.0_f32;
-        let mut e_high = 0.0_f32;
         let mut e_full = 0.0_f32;
         for &x in slice {
             lp1 += 0.08 * (x - lp1);
             lp2 += 0.55 * (x - lp2);
-            let low = lp1;
-            let mid = lp2 - lp1;
-            let high = x - lp2;
-            e_low += low * low;
-            e_mid += mid * mid;
-            e_high += high * high;
+            for (p, band) in power.iter_mut().zip([lp1, lp2 - lp1, x - lp2]) {
+                p[0] += a * (band * band - p[0]);
+                p[1] += a * (p[0] - p[1]);
+            }
             e_full += x * x;
         }
         let inv = 1.0 / (hop as f32);
-        low_env.push((e_low * inv).sqrt());
-        mid_env.push((e_mid * inv).sqrt());
-        high_env.push((e_high * inv).sqrt());
+        low_env.push(power[0][1].sqrt());
+        mid_env.push(power[1][1].sqrt());
+        high_env.push(power[2][1].sqrt());
         rms_frames.push((e_full * inv).sqrt());
     }
 
@@ -1165,6 +1164,42 @@ mod tests {
         assert_eq!(cues_some[4].0, 8);
         for &(slot, _, _) in &cues_some {
             assert!(slot != 1 && slot != 2 && slot != 4, "Must not overwrite existing cues");
+        }
+    }
+}
+
+#[cfg(test)]
+mod bpm_regression {
+    use super::*;
+    const BASS: f64 = 0.4;
+    fn beat(bpm: f64, offset: f64, sr: u32, secs: f64) -> Vec<f32> {
+        let n = (sr as f64 * secs) as usize;
+        let mut v = vec![0.0f32; n];
+        let mut seed = 1u32;
+        for i in 0..n {
+            let t = i as f64 / sr as f64 - offset;
+            if t < 0.0 { continue; }
+            let pb = 60.0 / bpm;
+            let tb = t % pb;
+            let kick = (-(tb * 30.0)).exp() * (std::f64::consts::TAU * (50.0 + 80.0 * (-(tb * 40.0)).exp()) * tb).sin();
+            let th = (t + pb / 2.0) % pb;
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            let noise = (seed >> 9) as f64 / (1u32 << 23) as f64 - 0.5;
+            let hat = (-(th * 200.0)).exp() * noise;
+            let note = [55.0, 55.0, 65.4, 49.0][((t / (pb * 8.0)) as usize) % 4];
+            let bass = BASS * (std::f64::consts::TAU * note * t).sin();
+            v[i] = (0.7 * kick + 0.3 * hat + bass) as f32;
+        }
+        v
+    }
+    /// A held bass note under a four-on-the-floor kick used to lock the tempo onto its own alias (124.52 for 122, 128 and 140).
+    #[test]
+    fn tempo_survives_a_heavy_held_bassline() {
+        for (bpm, off) in [(122.0, 0.3), (128.0, 0.0), (132.5, 0.4), (140.0, 0.2), (87.0, 0.1)] {
+            let a = analyze_mono(&beat(bpm, off, 44100, 120.0), 44100);
+            let phase = ((a.beatgrid_offset_sec - off) / (60.0 / bpm)).rem_euclid(1.0);
+            assert!((a.bpm - bpm).abs() < 0.1, "{bpm} BPM read as {}", a.bpm);
+            assert!(phase.min(1.0 - phase) < 0.05, "{bpm} BPM grid off by {phase} beats");
         }
     }
 }

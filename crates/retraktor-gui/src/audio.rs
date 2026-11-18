@@ -956,7 +956,7 @@ impl AudioSystem {
         Ok(dur_sec)
     }
 
-    fn render_audio_f32(
+    pub(crate) fn render_audio_f32(
         shared: &Arc<Mutex<AudioSharedState>>,
         output: &mut [f32],
         channels: usize,

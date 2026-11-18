@@ -4469,3 +4469,41 @@ mod tests {
         assert_eq!(cycle_bars(32), 8);
     }
 }
+
+#[cfg(test)]
+mod sync_audio {
+    use super::*;
+
+    fn track(bpm: f64) -> crate::audio::LoadedTrackAudio {
+        crate::audio::LoadedTrackAudio {
+            title: "t".into(), artist: String::new(), duration_sec: 100.0, bpm, grid_offset_sec: 0.0, key: String::new(),
+            sample_rate: 44100, waveform_peaks: Vec::new().into(), stem_peaks: Vec::new().into(), pcm_stereo: vec![0.0; 44100 * 200],
+            stems_ready: false, pcm_drums: None, pcm_bass: None, pcm_other: None, pcm_vocals: None, phrases: Vec::new(),
+        }
+    }
+
+    /// SYNC on B (130) under A (120): the audio callback really plays B at 120/130, with key lock off and on.
+    #[test]
+    fn synced_deck_plays_at_the_leaders_tempo() {
+        let mut app = ReTraktorApp::default();
+        {
+            let mut s = app.audio.shared.lock().unwrap();
+            s.loaded_tracks[0] = Some(track(120.0));
+            s.loaded_tracks[1] = Some(track(130.0));
+            s.is_playing = [true, true, false, false];
+        }
+        app.sync_deck(2);
+        app.sync_audio_state();
+        for keylock in [false, true] {
+            let shared = app.audio.shared.clone();
+            let before = { let mut s = shared.lock().unwrap(); s.keylock = [keylock; 4]; s.playhead_sec };
+            let mut buf = vec![0.0f32; 512 * 2];
+            for _ in 0..(48_000 * 2 / 512) {
+                crate::audio::AudioSystem::render_audio_f32(&shared, &mut buf, 2, 48_000);
+            }
+            let after = shared.lock().unwrap().playhead_sec;
+            let ratio = (after[1] - before[1]) / (after[0] - before[0]);
+            assert!((ratio - 120.0 / 130.0).abs() < 1e-3, "key lock {keylock}: B ran at {ratio}");
+        }
+    }
+}
