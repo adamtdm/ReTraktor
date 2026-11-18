@@ -130,6 +130,8 @@ pub struct ReTraktorApp {
     pub deck_hotcues: [Vec<(u8, f64)>; 4],
     pub deck_pad_mode: [DeckPadMode; 4],
     pub deck_sync_enabled: [bool; 4],
+    /// Play state last frame, so a synced deck can snap onto the bar when either deck starts.
+    sync_was_playing: [bool; 4],
 
     // Hybrid 4-Stem Separation State ([Drums, Bass, Instruments, Vocals])
     pub deck_stem_volumes: [[f32; 4]; 4],
@@ -274,6 +276,7 @@ impl Default for ReTraktorApp {
                 DeckPadMode::Hotcues,
             ],
             deck_sync_enabled: [false; 4],
+            sync_was_playing: [false; 4],
             deck_stem_volumes: [[1.0; 4]; 4],
             deck_stem_muted: [[false; 4]; 4],
             deck_stem_fx_send: [[false; 4]; 4],
@@ -1190,9 +1193,14 @@ impl ReTraktorApp {
                             .unwrap_or(self.master_tempo);
                         self.deck_pitch_fader[d] = ((sync_ratio(bpm, target) - 1.0) * 100.0) as f32;
                         if let (Some((other_bpm, other_offset)), true, true) = (grids[other], state.is_playing[d], state.is_playing[other]) {
+                            // Either deck just started: jump onto the bar like SYNC does; after that only drift is nudged.
+                            if !self.sync_was_playing[d] || !self.sync_was_playing[other] {
+                                snap_bars(&mut state, d, other);
+                            }
                             let behind = beat_phase_diff(
                                 (state.playhead_sec[other] - other_offset) * other_bpm / 60.0,
                                 (state.playhead_sec[d] - offset) * bpm / 60.0,
+                                1.0,
                             );
                             nudge = (behind * 0.2).clamp(-0.03, 0.03);
                         }
@@ -1210,6 +1218,7 @@ impl ReTraktorApp {
                 state.loop_len_sec[d] = self.deck_loop_size_beats[d] as f64 * (60.0 / bpm.max(30.0));
             }
 
+            self.sync_was_playing = state.is_playing;
             state.engine.master_volume = self.master_volume;
             state.cue_mix = self.cue_mix;
             state.cue_volume = self.cue_volume;
@@ -2194,13 +2203,8 @@ impl ReTraktorApp {
         // Tempo follows in sync_audio_state; here the deck jumps straight onto the other deck's beat.
         let Some(other) = sync_leader(self.tempo_master_deck, d) else { return };
         if let Ok(mut state) = self.audio.shared.lock() {
-            let grid = |i: usize| state.loaded_tracks[i].as_ref().map(|t| (t.bpm.max(20.0), t.grid_offset_sec));
-            if let (Some((bpm, offset)), Some((other_bpm, other_offset)), true) = (grid(d), grid(other), state.is_playing[other]) {
-                let behind = beat_phase_diff(
-                    (state.playhead_sec[other] - other_offset) * other_bpm / 60.0,
-                    (state.playhead_sec[d] - offset) * bpm / 60.0,
-                );
-                state.playhead_sec[d] = (state.playhead_sec[d] + behind * 60.0 / bpm).max(0.0);
+            if state.is_playing[other] {
+                snap_bars(&mut state, d, other);
             }
         }
     }
@@ -2810,7 +2814,7 @@ impl ReTraktorApp {
                     let t = state.loaded_tracks[i].as_ref().filter(|_| state.is_playing[i])?;
                     Some((state.playhead_sec[i] - t.grid_offset_sec) * t.bpm.max(20.0) / 60.0)
                 };
-                Some(beat_phase_diff(beats(other)?, beats(d)?))
+                Some(beat_phase_diff(beats(other)?, beats(d)?, 1.0))
             });
             let in_key = deck_idx != 1
                 && self.audio.shared.lock().is_ok_and(|s| {
@@ -2881,6 +2885,7 @@ impl ReTraktorApp {
             scrolling_stem_waveforms(
                 ui,
                 deck.elapsed_sec,
+                1.0 + self.deck_pitch_fader[d] as f64 / 100.0,
                 deck.bpm,
                 deck.grid_offset_sec,
                 &cues,
@@ -2898,6 +2903,7 @@ impl ReTraktorApp {
             scrolling_waveform(
                 ui,
                 deck.elapsed_sec,
+                1.0 + self.deck_pitch_fader[d] as f64 / 100.0,
                 deck.bpm,
                 deck.grid_offset_sec,
                 &cues,
@@ -3189,7 +3195,7 @@ impl ReTraktorApp {
                     let t = state.loaded_tracks[i].as_ref().filter(|_| state.is_playing[i])?;
                     Some((state.playhead_sec[i] - t.grid_offset_sec) * t.bpm.max(20.0) / 60.0)
                 };
-                Some(beat_phase_diff(beats(other)?, beats(d)?))
+                Some(beat_phase_diff(beats(other)?, beats(d)?, 1.0))
             });
             let looping = crate::theme::fade(ui.ctx(), ("deck_loop", d), self.deck_loop_active[d]);
             let panel_rect = display(ui, |ui, ink| {
@@ -3279,6 +3285,7 @@ impl ReTraktorApp {
                     scrolling_stem_waveforms(
                         ui,
                         deck.elapsed_sec,
+                        1.0 + self.deck_pitch_fader[d] as f64 / 100.0,
                         bpm,
                         deck.grid_offset_sec,
                         &cues,
@@ -3296,6 +3303,7 @@ impl ReTraktorApp {
                     scrolling_waveform(
                         ui,
                         deck.elapsed_sec,
+                        1.0 + self.deck_pitch_fader[d] as f64 / 100.0,
                         bpm,
                         deck.grid_offset_sec,
                         &cues,
@@ -3912,10 +3920,26 @@ fn sync_ratio(bpm: f64, target: f64) -> f64 {
     ratio
 }
 
-/// How far (in beats, -0.5..=0.5) a deck at `beats` must move forward to land on the master's beat.
-fn beat_phase_diff(master_beats: f64, beats: f64) -> f64 {
-    let diff = (master_beats - beats).rem_euclid(1.0);
-    if diff > 0.5 { diff - 1.0 } else { diff }
+/// How far (in beats, within ±period/2) a deck at `beats` must move forward to line up with the master
+/// every `period` beats: 1 for the beat, 4 for the bar.
+fn beat_phase_diff(master_beats: f64, beats: f64, period: f64) -> f64 {
+    let diff = (master_beats - beats).rem_euclid(period);
+    if diff > period / 2.0 { diff - period } else { diff }
+}
+
+/// Moves deck `d` so its bar lines meet `other`'s (at most two beats either way).
+/// shortcut: counts bars in each track's own beats, so a half-time pairing (70 under 140) lines up every other bar.
+fn snap_bars(state: &mut crate::audio::AudioSharedState, d: usize, other: usize) {
+    let grid = |i: usize| state.loaded_tracks[i].as_ref().map(|t| (t.bpm.max(20.0), t.grid_offset_sec));
+    if let (Some((bpm, offset)), Some((other_bpm, other_offset))) = (grid(d), grid(other)) {
+        let behind = beat_phase_diff(
+            (state.playhead_sec[other] - other_offset) * other_bpm / 60.0,
+            (state.playhead_sec[d] - offset) * bpm / 60.0,
+            4.0,
+        );
+        let len = state.loaded_tracks[d].as_ref().map_or(0.0, |t| t.duration_sec);
+        state.playhead_sec[d] = (state.playhead_sec[d] + behind * 60.0 / bpm).clamp(0.0, len);
+    }
 }
 
 /// Helper to determine the current phrase and bars remaining until the next phrase boundary.
@@ -4377,9 +4401,11 @@ mod tests {
         assert!((sync_ratio(91.0, 68.5) - 68.5 / 91.0).abs() < 1e-9);
         assert!((sync_ratio(68.5, 137.0) - 1.0).abs() < 1e-9); // half time, not +100%
         assert!((sync_ratio(140.0, 128.0) * 140.0 - 128.0).abs() < 1e-9);
-        assert!((beat_phase_diff(10.25, 3.0) - 0.25).abs() < 1e-9);
-        assert!((beat_phase_diff(10.0, 3.9) - 0.1).abs() < 1e-9);
-        assert!((beat_phase_diff(10.0, 3.2) + 0.2).abs() < 1e-9);
+        assert!((beat_phase_diff(10.25, 3.0, 1.0) - 0.25).abs() < 1e-9);
+        assert!((beat_phase_diff(10.0, 3.9, 1.0) - 0.1).abs() < 1e-9);
+        assert!((beat_phase_diff(10.0, 3.2, 1.0) + 0.2).abs() < 1e-9);
+        assert!((beat_phase_diff(8.0, 5.0, 4.0) + 1.0).abs() < 1e-9, "bar 3 of 4 moves back a beat to the downbeat");
+        assert!((beat_phase_diff(8.0, 6.5, 4.0) - 1.5).abs() < 1e-9);
     }
 
     fn contrast(a: Color32, b: Color32) -> f32 {
@@ -4505,5 +4531,37 @@ mod sync_audio {
             let ratio = (after[1] - before[1]) / (after[0] - before[0]);
             assert!((ratio - 120.0 / 130.0).abs() < 1e-3, "key lock {keylock}: B ran at {ratio}");
         }
+    }
+
+    /// SYNC and starting a synced deck both land it on the leader's bar, not just its beat.
+    #[test]
+    fn sync_lines_up_bars_on_press_and_on_play() {
+        let bar_gap = |app: &ReTraktorApp| {
+            let s = app.audio.shared.lock().unwrap();
+            beat_phase_diff(s.playhead_sec[0] * 120.0 / 60.0, s.playhead_sec[1] * 130.0 / 60.0, 4.0)
+        };
+        let mut app = ReTraktorApp::default();
+        {
+            let mut s = app.audio.shared.lock().unwrap();
+            s.loaded_tracks[0] = Some(track(120.0));
+            s.loaded_tracks[1] = Some(track(130.0));
+            s.is_playing = [true, true, false, false];
+            s.playhead_sec[0] = 10.0; // beat 20: a downbeat
+            s.playhead_sec[1] = 30.0 + 2.6 * 60.0 / 130.0; // beat 67.6: late in bar 17
+        }
+        app.sync_audio_state();
+        app.sync_deck(2);
+        assert!(bar_gap(&app).abs() < 1e-6, "SYNC left the bars {} beats apart", bar_gap(&app));
+
+        // Stopped, moved, started again with SYNC still on: it snaps back onto the bar.
+        app.audio.shared.lock().unwrap().is_playing[1] = false;
+        app.sync_audio_state();
+        {
+            let mut s = app.audio.shared.lock().unwrap();
+            s.playhead_sec[1] += 1.3 * 60.0 / 130.0;
+            s.is_playing[1] = true;
+        }
+        app.sync_audio_state();
+        assert!(bar_gap(&app).abs() < 1e-6, "starting play left the bars {} beats apart", bar_gap(&app));
     }
 }

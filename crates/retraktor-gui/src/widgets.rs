@@ -567,6 +567,7 @@ pub fn paint_waveform_style_preview(
 pub fn scrolling_waveform(
     ui: &mut Ui,
     elapsed_sec: f64,
+    tempo: f64,
     bpm: f64,
     grid_offset_sec: f64,
     cues: &[(u8, f64)],
@@ -592,7 +593,8 @@ pub fn scrolling_waveform(
 
     let center_y = rect.center().y;
     let center_x = rect.center().x;
-    let pixels_per_sec = 92.0_f32;
+    // Drawn in heard time, so synced decks' beat lines scroll at the same speed and spacing.
+    let pixels_per_sec = 92.0 / tempo.clamp(0.25, 4.0) as f32;
 
     // Subtle horizontal zero-crossing baseline
     painter.line_segment(
@@ -722,6 +724,7 @@ pub fn scrolling_waveform(
 pub fn scrolling_stem_waveforms(
     ui: &mut Ui,
     elapsed_sec: f64,
+    tempo: f64,
     bpm: f64,
     grid_offset_sec: f64,
     cues: &[(u8, f64)],
@@ -765,7 +768,8 @@ pub fn scrolling_stem_waveforms(
     painter.rect_stroke(rect, 1.0, Stroke::new(1.0_f32, TraktorTheme::BORDER_COLOR()));
 
     let center_x = wave_rect.center().x;
-    let pixels_per_sec = 92.0_f32;
+    // Drawn in heard time, so synced decks' beat lines scroll at the same speed and spacing.
+    let pixels_per_sec = 92.0 / tempo.clamp(0.25, 4.0) as f32;
 
     // Stem lane colours derived from theme tokens
     let stem_core_colors = [
