@@ -122,25 +122,28 @@ retraktor-gui
 
 #### 1. Install System Development Libraries
 
+ReTraktor plays through PipeWire directly when it runs, and asks RealtimeKit (`rtkit`) for real-time scheduling of its audio thread. It needs PipeWire 0.3.53 or newer; building it needs the PipeWire and SPA headers, `libclang` and the D-Bus headers. Without a PipeWire server it plays through ALSA, including PulseAudio's ALSA plugin. **Preferences > Audio** shows which route opened, any fallback, and any underruns.
+
 * **Ubuntu / Pop!_OS / Debian / Mint**:
   ```bash
   sudo apt update
   sudo apt install -y build-essential pkg-config curl git \
       libudev-dev libusb-1.0-0-dev libhidapi-dev libasound2-dev \
-      libpipewire-0.3-dev libx11-dev libxkbcommon-dev libgl1-mesa-dev
+      libpipewire-0.3-dev libspa-0.2-dev libclang-dev libdbus-1-dev \
+      libx11-dev libxkbcommon-dev libgl1-mesa-dev
   ```
 
 * **Fedora / RHEL**:
   ```bash
   sudo dnf install -y gcc gcc-c++ pkgconfig git \
       systemd-devel libusb1-devel hidapi-devel alsa-lib-devel \
-      pipewire-devel libX11-devel libxkbcommon-devel mesa-libGL-devel
+      pipewire-devel clang-devel dbus-devel libX11-devel libxkbcommon-devel mesa-libGL-devel
   ```
 
 * **Arch Linux / Manjaro**:
   ```bash
   sudo pacman -S --needed base-devel pkgconf git \
-      systemd libusb hidapi alsa-lib pipewire libx11 libxkbcommon mesa
+      systemd libusb hidapi alsa-lib pipewire clang dbus libx11 libxkbcommon mesa
   ```
 
 #### 2. Install Rust Toolchain (if not already installed)

@@ -23,6 +23,11 @@ ureq = { version = "2.10", features = ["json"] }
 serde_json = "1.0"
 concurrent-queue = "2.5"
 
+# Native PipeWire output, with real-time scheduling for its audio thread through the desktop's RealtimeKit.
+# Builds need libpipewire-0.3 and libspa-0.2 headers, libclang and libdbus-1 headers (see README).
+[target.'cfg(target_os = "linux")'.dependencies]
+cpal = { version = "0.18.2", features = ["pipewire", "realtime-dbus"] }
+
 [[bin]]
 name = "retraktor-gui"
 path = "src/main.rs"

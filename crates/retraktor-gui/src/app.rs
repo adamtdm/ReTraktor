@@ -580,29 +580,18 @@ impl eframe::App for ReTraktorApp {
                     t.stems_ready = true;
                     self.library.status_message = format!("✔ AI Demucs separated 4 stems for '{}'!", t.title);
                 }
-                // Reload stems asynchronously without stalling audio or UI
-                if let Some(track) = self.library.tracks.iter().find(|t| t.id == track_id) {
-                    let track_title = track.title.clone();
-                    let track_artist = track.artist.clone();
-                    let shared_audio = self.audio.shared.clone();
-                    let stem_dir_buf = stem_dir.clone();
-                    thread::spawn(move || {
-                        if let Ok(mut state) = shared_audio.lock() {
-                            for d in 0..4 {
-                                if let Some(ref mut loaded) = state.loaded_tracks[d] {
-                                    if loaded.title == track_title && loaded.artist == track_artist {
-                                        let _ = loaded.load_stems_from_dir(&stem_dir_buf);
-                                    }
-                                }
-                            }
-                        }
-                    });
-                    for d in 0..4 {
-                        if self.deck_track_ids[d] == Some(track_id) {
-                            self.deck_stem_view[d] = true;
-                        }
-                    }
+                // The decks holding this library track now: their stems decode on a worker and install only where that same audio still plays.
+                let decks: Vec<(usize, LoadedTrackAudio)> = match self.audio.shared.lock() {
+                    Ok(state) => (0..4)
+                        .filter(|&d| self.deck_track_ids[d] == Some(track_id))
+                        .filter_map(|d| Some((d, state.loaded_tracks[d].clone()?)))
+                        .collect(),
+                    Err(_) => Vec::new(),
+                };
+                for &(d, _) in &decks {
+                    self.deck_stem_view[d] = true;
                 }
+                install_stems(self.audio.shared.clone(), decks, stem_dir.clone());
                 *self.demucs.separation_status.lock().unwrap() = crate::demucs::DemucsSeparationStatus::Idle;
             }
             crate::demucs::DemucsSeparationStatus::Failed { track_id: _, error } => {
@@ -644,7 +633,8 @@ impl eframe::App for ReTraktorApp {
         }
 
         // Preferences Dialog
-        self.preferences.audio_output = self.audio.output_info().map(str::to_string);
+        self.preferences.audio_output = self.audio.status_line();
+        self.audio.log_stream_trouble();
         self.preferences.audio_output_channels = self.audio.output_channels;
         self.preferences.show(ctx);
 
@@ -709,7 +699,7 @@ impl ReTraktorApp {
                                 grid_offset_sec: 0.0,
                                 key: if d == 0 { "8m".into() } else { "9m".into() },
                                 duration_sec: 384.0,
-                                pcm_stereo: vec![0.0; 48000],
+                                pcm_stereo: Arc::new(vec![0.0; 48000]),
                                 sample_rate: 48000,
                                 waveform_peaks: vec![[0.4, 0.5, 0.3]; 300].into(),
                                 stem_peaks: vec![[0.4, 0.5, 0.3, 0.2]; 300].into(),
@@ -837,7 +827,7 @@ impl ReTraktorApp {
                             [bass, 0.5, 0.3]
                         }).collect::<Vec<_>>().into(),
                         stem_peaks: Vec::new().into(),
-                        pcm_stereo: Vec::new(),
+                        pcm_stereo: Arc::default(),
                         stems_ready: false,
                         pcm_drums: None,
                         pcm_bass: None,
@@ -852,7 +842,7 @@ impl ReTraktorApp {
                             retraktor_library::Phrase { start_sec: 210.0, kind: retraktor_library::PhraseKind::Outro },
                         ],
                     });
-                    state.playhead_sec[d] = 75.0;
+                    state.seek_to(d, 75.0);
                 }
             }
             "playA" | "playB" if first => self.toggle_play(if step == "playA" { 1 } else { 2 }),
@@ -1113,18 +1103,16 @@ impl ReTraktorApp {
     fn start_recording(&mut self, dir: &std::path::Path) {
         match crate::recorder::Recording::start(dir, std::time::SystemTime::now()) {
             Ok((rec, tap)) => {
-                let installed = match self.audio.shared.lock() {
-                    Ok(mut state) => {
-                        state.recorder = Some(tap);
-                        true
+                // Poisoned only if the callback panicked mid-block: there is no engine left to record.
+                let stale = match self.audio.recorder.lock() {
+                    Ok(mut slot) => slot.replace(tap),
+                    Err(_) => {
+                        rec.discard();
+                        self.library.status_message = "Recording did not start: the audio engine is not available".into();
+                        return;
                     }
-                    Err(_) => false,
                 };
-                if !installed {
-                    rec.discard();
-                    self.library.status_message = "Recording did not start: the audio engine is not available".into();
-                    return;
-                }
+                drop(stale); // freed after the callback's lock is released
                 self.set_state.begin_recording();
                 self.library.status_message = format!("Recording to {}", rec.wav.display());
                 self.recording = Some(rec);
@@ -1134,9 +1122,9 @@ impl ReTraktorApp {
     }
 
     /// Takes the tap out of the audio callback, keeping its last partial chunk, and lets the
-    /// writer finish the file.
+    /// writer finish the file. The tap is flushed after the callback's lock is released.
     fn stop_recording(&mut self) {
-        let tap = self.audio.shared.lock().ok().and_then(|mut state| state.recorder.take());
+        let tap = self.audio.recorder.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
         if let Some(rec) = &self.recording {
             rec.stop(tap);
         }
@@ -1229,7 +1217,7 @@ impl ReTraktorApp {
                     let stems_ready = loaded.stems_ready;
                     if let Ok(mut state) = self.audio.shared.lock() {
                         state.loaded_tracks[d] = Some(loaded);
-                        state.playhead_sec[d] = 0.0;
+                        state.seek_to(d, 0.0);
                         state.is_playing[d] = false;
                         state.reset_jump_ease(d);
                     } else { continue; }
@@ -1254,6 +1242,8 @@ impl ReTraktorApp {
     }
 
     fn sync_audio_state(&mut self) {
+        // Track audio the callback has let go of is freed here, after the lock is released, never in the callback.
+        drop(self.audio.shared.lock().map(|mut s| s.take_retired()));
         if let Ok(mut state) = self.audio.shared.lock() {
             state.crossfader = self.crossfader_pos;
             state.crossfader_curve = if self.preferences.xfader_curve_idx == 2 {
@@ -1581,7 +1571,8 @@ impl ReTraktorApp {
                                 state.scratch_tick(d, scaled_ticks);
                             } else {
                                 let nudge_sec = (delta as f64 / 1024.0) * 0.08 * sens;
-                                state.playhead_sec[d] = (state.playhead_sec[d] + nudge_sec).max(0.0);
+                                let from = state.playhead_sec[d];
+                                state.seek_by(d, (from + nudge_sec).max(0.0) - from);
                             }
                         }
                         return;
@@ -1768,7 +1759,7 @@ impl ReTraktorApp {
                         self.deck_turntable_mode[0] = false;
                         self.deck_scratch_active[0] = false;
                         if let Ok(mut state) = self.audio.shared.lock() {
-                            state.scratch_active[0] = false;
+                            state.cancel_scratch(0);
                         }
                         self.bus.set("app.traktor.decks.1.jog.turntable", PropValue::Bool(false));
                     }
@@ -1780,7 +1771,7 @@ impl ReTraktorApp {
                         self.deck_turntable_mode[1] = false;
                         self.deck_scratch_active[1] = false;
                         if let Ok(mut state) = self.audio.shared.lock() {
-                            state.scratch_active[1] = false;
+                            state.cancel_scratch(1);
                         }
                         self.bus.set("app.traktor.decks.2.jog.turntable", PropValue::Bool(false));
                     }
@@ -1883,7 +1874,8 @@ impl ReTraktorApp {
                         } else {
                             // Nudge / Phase bend when outer rim is turned without touching top
                             let nudge_sec = (delta as f64 / 1024.0) * 0.08 * sens;
-                            state.playhead_sec[0] = (state.playhead_sec[0] + nudge_sec).max(0.0);
+                            let from = state.playhead_sec[0];
+                            state.seek_by(0, (from + nudge_sec).max(0.0) - from);
                         }
                     }
                 }
@@ -1895,7 +1887,8 @@ impl ReTraktorApp {
                             state.scratch_tick(1, scaled_ticks);
                         } else {
                             let nudge_sec = (delta as f64 / 1024.0) * 0.08 * sens;
-                            state.playhead_sec[1] = (state.playhead_sec[1] + nudge_sec).max(0.0);
+                            let from = state.playhead_sec[1];
+                            state.seek_by(1, (from + nudge_sec).max(0.0) - from);
                         }
                     }
                 }
@@ -2257,7 +2250,7 @@ impl ReTraktorApp {
         let d = deck_idx - 1;
         if let Some(&(_, cue_sec)) = self.deck_hotcues[d].iter().find(|(id, _)| *id == cue_num) {
             if let Ok(mut state) = self.audio.shared.lock() {
-                state.playhead_sec[d] = cue_sec;
+                state.seek_to(d, cue_sec);
             }
         } else if let Ok(state) = self.audio.shared.lock() {
             let current = state.playhead_sec[d];
@@ -2370,7 +2363,8 @@ impl ReTraktorApp {
             self.deck_loop_start_sec[d] = start;
         }
         // Playhead and loop change in one lock, so the next callback never wraps into the old loop.
-        state.playhead_sec[d] = to;
+        let from = state.playhead_sec[d];
+        state.seek_by(d, to - from);
         if state.is_playing[d] {
             state.ease_jump(d);
         } else {
@@ -3058,7 +3052,8 @@ impl ReTraktorApp {
         if wave_resp.dragged() {
             let dt = -wave_resp.drag_delta().x as f64 / 85.0;
             if let Ok(mut state) = self.audio.shared.lock() {
-                state.playhead_sec[d] = (state.playhead_sec[d] + dt).clamp(0.0, duration_sec);
+                let from = state.playhead_sec[d];
+                state.seek_by(d, (from + dt).clamp(0.0, duration_sec) - from);
             }
         }
     }
@@ -3477,7 +3472,7 @@ impl ReTraktorApp {
             );
             if stripe_resp.changed() {
                 if let Ok(mut state) = self.audio.shared.lock() {
-                    state.playhead_sec[d] = scrub_pos;
+                    state.seek_to(d, scrub_pos);
                 }
             }
 
@@ -3752,15 +3747,11 @@ impl ReTraktorApp {
 
                 // If stems were generated for a track, enable stems view if it is currently playing/loaded on any deck
                 if let Some(stemmed_id) = self.library.last_stemmed_track_id.take() {
-                    if let Some(track) = self.library.tracks.iter().find(|t| t.id == stemmed_id) {
-                        if let Ok(mut state) = self.audio.shared.lock() {
-                            for d in 0..4 {
-                                if let Some(ref mut loaded) = state.loaded_tracks[d] {
-                                    if loaded.title == track.title && loaded.artist == track.artist {
-                                        loaded.stems_ready = true;
-                                        self.deck_stem_view[d] = true;
-                                    }
-                                }
+                    if let Ok(mut state) = self.audio.shared.lock() {
+                        for d in (0..4).filter(|&d| self.deck_track_ids[d] == Some(stemmed_id)) {
+                            if let Some(loaded) = state.loaded_tracks[d].as_mut() {
+                                loaded.stems_ready = true;
+                                self.deck_stem_view[d] = true;
                             }
                         }
                     }
@@ -4081,6 +4072,33 @@ fn beat_phase_diff(master_beats: f64, beats: f64, period: f64) -> f64 {
 
 /// Moves deck `d` so its bar lines meet `other`'s (at most two beats either way).
 /// shortcut: counts bars in each track's own beats, so a half-time pairing (70 under 140) lines up every other bar.
+/// Decodes a finished separation's stems on a worker and installs them on each listed deck that still holds
+/// the very audio it held when asked (same loaded PCM, so the same library track and load). A deck reloaded
+/// meanwhile, even with a same-named track of the same length, keeps what it has. The lock is held only to install.
+fn install_stems(
+    shared: Arc<std::sync::Mutex<crate::audio::AudioSharedState>>,
+    decks: Vec<(usize, LoadedTrackAudio)>,
+    stem_dir: PathBuf,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let Some((_, mut stemmed)) = decks.first().cloned() else { return };
+        if !stemmed.load_stems_from_dir(&stem_dir) {
+            return;
+        }
+        let Ok(mut state) = shared.lock() else { return };
+        for (d, asked) in &decks {
+            if let Some(loaded) = state.loaded_tracks[*d].as_mut().filter(|l| Arc::ptr_eq(&l.pcm_stereo, &asked.pcm_stereo)) {
+                loaded.pcm_drums = stemmed.pcm_drums.clone();
+                loaded.pcm_bass = stemmed.pcm_bass.clone();
+                loaded.pcm_other = stemmed.pcm_other.clone();
+                loaded.pcm_vocals = stemmed.pcm_vocals.clone();
+                loaded.stem_peaks = Arc::clone(&stemmed.stem_peaks);
+                loaded.stems_ready = true;
+            }
+        }
+    })
+}
+
 fn snap_bars(state: &mut crate::audio::AudioSharedState, d: usize, other: usize) {
     let grid = |i: usize| state.loaded_tracks[i].as_ref().map(|t| (t.bpm.max(20.0), t.grid_offset_sec));
     if let (Some((bpm, offset)), Some((other_bpm, other_offset))) = (grid(d), grid(other)) {
@@ -4090,7 +4108,8 @@ fn snap_bars(state: &mut crate::audio::AudioSharedState, d: usize, other: usize)
             4.0,
         );
         let len = state.loaded_tracks[d].as_ref().map_or(0.0, |t| t.duration_sec);
-        state.playhead_sec[d] = (state.playhead_sec[d] + behind * 60.0 / bpm).clamp(0.0, len);
+        let from = state.playhead_sec[d];
+        state.seek_by(d, (from + behind * 60.0 / bpm).clamp(0.0, len) - from);
     }
 }
 
@@ -4494,7 +4513,7 @@ mod tests {
             sample_rate: 44100,
             waveform_peaks: Vec::new().into(),
             stem_peaks: Vec::new().into(),
-            pcm_stereo: Vec::new(),
+            pcm_stereo: Arc::default(),
             stems_ready: false,
             pcm_drums: None,
             pcm_bass: None,
@@ -4582,7 +4601,7 @@ mod tests {
             let mut block = vec![0.0f32; 500 * 2];
             // 500-frame blocks never line up with the recorder's chunks: the last one is partial.
             for _ in 0..rate / 500 + 1 {
-                AudioSystem::render_audio_f32(&app.audio.shared, &mut block, 2, rate);
+                app.audio.render_f32(&mut block, 2, rate);
                 speakers.extend_from_slice(&block);
             }
             let frames = speakers.len() / 2;
@@ -4607,7 +4626,7 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    fn recording_test_dir(name: &str) -> PathBuf {
+    pub(super) fn recording_test_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("retraktor-app-rec-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
@@ -4617,12 +4636,12 @@ mod tests {
     fn render_blocks(app: &ReTraktorApp, blocks: usize, rate: u32) {
         let mut block = vec![0.0f32; 500 * 2];
         for _ in 0..blocks {
-            AudioSystem::render_audio_f32(&app.audio.shared, &mut block, 2, rate);
+            app.audio.render_f32(&mut block, 2, rate);
         }
     }
 
     /// Polls like the GUI until the recording is finished; whether it finished cleanly.
-    fn poll_until_finished(app: &mut ReTraktorApp) -> bool {
+    pub(super) fn poll_until_finished(app: &mut ReTraktorApp) -> bool {
         let t0 = std::time::Instant::now();
         loop {
             let clean = app.poll_recording();
@@ -4688,10 +4707,10 @@ mod tests {
     fn recording_does_not_start_without_the_audio_engine() {
         let dir = recording_test_dir("engine");
         let mut app = ReTraktorApp::default();
-        let shared = Arc::clone(&app.audio.shared);
+        let slot = Arc::clone(&app.audio.recorder);
         let _ = std::thread::spawn(move || {
-            let _state = shared.lock().unwrap();
-            panic!("poisoning the audio state on purpose");
+            let _tap = slot.lock().unwrap();
+            panic!("poisoning the recorder slot on purpose");
         })
         .join();
         app.start_recording(&dir);
@@ -4808,7 +4827,7 @@ mod sync_audio {
     fn track(bpm: f64) -> crate::audio::LoadedTrackAudio {
         crate::audio::LoadedTrackAudio {
             title: "t".into(), artist: String::new(), duration_sec: 100.0, bpm, grid_offset_sec: 0.0, key: String::new(),
-            sample_rate: 44100, waveform_peaks: Vec::new().into(), stem_peaks: Vec::new().into(), pcm_stereo: vec![0.0; 44100 * 200],
+            sample_rate: 44100, waveform_peaks: Vec::new().into(), stem_peaks: Vec::new().into(), pcm_stereo: Arc::new(vec![0.0; 44100 * 200]),
             stems_ready: false, pcm_drums: None, pcm_bass: None, pcm_other: None, pcm_vocals: None, phrases: Vec::new(),
         }
     }
@@ -4861,7 +4880,7 @@ mod sync_audio {
             let before = { let mut s = shared.lock().unwrap(); s.keylock = [keylock; 4]; s.playhead_sec };
             let mut buf = vec![0.0f32; 512 * 2];
             for _ in 0..(48_000 * 2 / 512) {
-                crate::audio::AudioSystem::render_audio_f32(&shared, &mut buf, 2, 48_000);
+                app.audio.render_f32(&mut buf, 2, 48_000);
             }
             let after = shared.lock().unwrap().playhead_sec;
             let ratio = (after[1] - before[1]) / (after[0] - before[0]);
@@ -4914,7 +4933,7 @@ mod sync_audio {
     fn render(app: &ReTraktorApp, seconds: f64, block: usize, rate: u32) {
         let mut buf = vec![0.0f32; block * 2];
         for _ in 0..(seconds * rate as f64 / block as f64).round() as usize {
-            crate::audio::AudioSystem::render_audio_f32(&app.audio.shared, &mut buf, 2, rate);
+            app.audio.render_f32(&mut buf, 2, rate);
         }
     }
 
@@ -4932,8 +4951,8 @@ mod sync_audio {
             let mut tone = track(120.0); // silent except 26-28 s
             for f in 26 * 44_100..28 * 44_100 {
                 let v = (f as f32 * 0.06).sin() * 0.5;
-                tone.pcm_stereo[2 * f] = v;
-                tone.pcm_stereo[2 * f + 1] = v;
+                Arc::make_mut(&mut tone.pcm_stereo)[2 * f] = v;
+                Arc::make_mut(&mut tone.pcm_stereo)[2 * f + 1] = v;
             }
             let mut s = app.audio.shared.lock().unwrap();
             s.loaded_tracks[0] = Some(tone);
@@ -4946,7 +4965,7 @@ mod sync_audio {
         app.sync_audio_state();
         let block_peak = |app: &ReTraktorApp| {
             let mut buf = vec![0.0f32; 480 * 2];
-            crate::audio::AudioSystem::render_audio_f32(&app.audio.shared, &mut buf, 2, 48_000);
+            app.audio.render_f32(&mut buf, 2, 48_000);
             buf.iter().fold(0.0f32, |m, v| m.max(v.abs()))
         };
         assert!(block_peak(&app) < 1e-6, "the region before the jump should be silent");
@@ -5031,7 +5050,7 @@ mod sync_audio {
             assert!((app.deck_loop_start_sec[0] - 24.0).abs() < 1e-9, "UI and audio loops differ");
             let mut buf = vec![0.0f32; 512 * 2];
             for _ in 0..(rate as usize / 10 / 512) {
-                crate::audio::AudioSystem::render_audio_f32(&app.audio.shared, &mut buf, 2, rate);
+                app.audio.render_f32(&mut buf, 2, rate);
                 let p = playhead(&app, 0);
                 assert!((24.0..26.0).contains(&p), "{rate} Hz: left the moved loop at {p}");
             }
@@ -5077,10 +5096,11 @@ mod sync_audio {
                     let v = AMP * (i as f32 * std::f32::consts::TAU / 100.0).sin() * if i < 20 * 44_100 { 1.0 } else { -1.0 };
                     [v, -v]
                 })
-                .collect();
+                .collect::<Vec<_>>()
+                .into();
             if stems {
                 let quarter: Vec<f32> = t.pcm_stereo.iter().map(|v| v * 0.25).collect();
-                (t.pcm_drums, t.pcm_bass, t.pcm_other, t.pcm_vocals) = (Some(quarter.clone()), Some(quarter.clone()), Some(quarter.clone()), Some(quarter));
+                (t.pcm_drums, t.pcm_bass, t.pcm_other, t.pcm_vocals) = (Some(quarter.clone().into()), Some(quarter.clone().into()), Some(quarter.clone().into()), Some(quarter.into()));
             }
             t
         };
@@ -5113,7 +5133,7 @@ mod sync_audio {
                 let mut buf = vec![0.0f32; block * 2];
                 let mut play = |app: &ReTraktorApp, blocks: usize, out: &mut Vec<f32>| {
                     for _ in 0..blocks {
-                        crate::audio::AudioSystem::render_audio_f32(&app.audio.shared, &mut buf, 2, rate);
+                        app.audio.render_f32(&mut buf, 2, rate);
                         out.extend_from_slice(&buf);
                     }
                 };
@@ -5121,7 +5141,7 @@ mod sync_audio {
                     if smoothed {
                         assert!(app.beat_jump(0, dir));
                     } else {
-                        app.audio.shared.lock().unwrap().playhead_sec[0] += dir * 16.0;
+                        app.audio.shared.lock().unwrap().seek_by(0, dir * 16.0);
                     }
                 };
                 play(&app, lead, &mut out);
@@ -5174,7 +5194,7 @@ mod sync_audio {
             }
             app.audio.shared.lock().unwrap().is_playing[0] = true;
             let mut buf = vec![0.0f32; 256 * 2];
-            crate::audio::AudioSystem::render_audio_f32(&app.audio.shared, &mut buf, 2, 48_000);
+            app.audio.render_f32(&mut buf, 2, 48_000);
             buf
         };
         assert_eq!(paused(true), paused(false), "a paused jump changed the audio");
@@ -5189,7 +5209,7 @@ mod sync_audio {
         let flat = |flip: f64| {
             let mut t = track(120.0);
             t.duration_sec = 40.0;
-            t.pcm_stereo = (0..40 * 44_100).flat_map(|i| { let v = if (i as f64) < flip * 44_100.0 { 0.25 } else { -0.25 }; [v, -v] }).collect();
+            t.pcm_stereo = (0..40 * 44_100).flat_map(|i| { let v = if (i as f64) < flip * 44_100.0 { 0.25 } else { -0.25 }; [v, -v] }).collect::<Vec<_>>().into();
             t
         };
         let first_block = |exercise: bool, replace: bool| {
@@ -5202,7 +5222,7 @@ mod sync_audio {
             }
             app.deck_jump_beats[0] = 32;
             let mut buf = vec![0.0f32; 256 * 2];
-            crate::audio::AudioSystem::render_audio_f32(&app.audio.shared, &mut buf, 2, 48_000);
+            app.audio.render_f32(&mut buf, 2, 48_000);
             match (exercise, replace) {
                 (true, false) => {
                     assert!(app.beat_jump(0, 1.0)); // to the flipped half; the ease is never rendered
@@ -5210,7 +5230,7 @@ mod sync_audio {
                     assert!(app.beat_jump(0, -1.0) && app.beat_jump(0, 1.0));
                     app.toggle_play(1);
                 }
-                (false, false) => app.audio.shared.lock().unwrap().playhead_sec[0] += 16.0,
+                (false, false) => app.audio.shared.lock().unwrap().seek_by(0, 16.0),
                 (true, true) => {
                     assert!(app.beat_jump(0, 1.0));
                     let entry = crate::library_ui::UiTrackEntry { id: 7, ..Default::default() };
@@ -5220,15 +5240,185 @@ mod sync_audio {
                 }
                 (false, true) => {
                     app.audio.shared.lock().unwrap().loaded_tracks[0] = Some(flat(0.0));
-                    app.audio.shared.lock().unwrap().playhead_sec[0] = 0.0;
+                    app.audio.shared.lock().unwrap().seek_to(0, 0.0);
                 }
             }
             assert!(app.audio.shared.lock().unwrap().is_playing[0]);
-            crate::audio::AudioSystem::render_audio_f32(&app.audio.shared, &mut buf, 2, 48_000);
+            app.audio.render_f32(&mut buf, 2, 48_000);
             buf
         };
         assert_eq!(first_block(true, false), first_block(false, false), "stop and paused jumps left the pending ease");
         assert_eq!(first_block(true, true), first_block(false, true), "a new track played an ease from the old one");
+    }
+
+    /// Stems finished for deck A's and B's load go only where that same load still plays: B, reloaded
+    /// meanwhile with a same-named track of the same length, keeps its own audio.
+    #[test]
+    fn stems_install_only_on_the_load_they_were_made_for() {
+        let dir = std::env::temp_dir().join(format!("retraktor-stems-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["drums", "bass", "other", "vocals"] {
+            AudioSystem::write_stereo_wav_file(&dir.join(format!("{name}.wav")), &[1000i16; 2 * 4410], 44_100).unwrap();
+        }
+        let load = || crate::audio::LoadedTrackAudio { pcm_stereo: Arc::new(vec![0.0; 2 * 4410]), duration_sec: 0.1, ..track(120.0) };
+        let app = ReTraktorApp::default();
+        let (a, b) = (load(), load());
+        {
+            let mut s = app.audio.shared.lock().unwrap();
+            s.loaded_tracks[0] = Some(a.clone());
+            s.loaded_tracks[1] = Some(b.clone());
+        }
+        app.audio.shared.lock().unwrap().loaded_tracks[1] = Some(load()); // same title, artist and length
+        install_stems(app.audio.shared.clone(), vec![(0, a), (1, b)], dir.clone()).join().unwrap();
+        let s = app.audio.shared.lock().unwrap();
+        let (deck_a, deck_b) = (s.loaded_tracks[0].as_ref().unwrap(), s.loaded_tracks[1].as_ref().unwrap());
+        assert!(deck_a.stems_ready && deck_a.pcm_drums.as_ref().is_some_and(|d| d.len() == 2 * 4410), "deck A didn't get its stems");
+        assert!(!deck_b.stems_ready && deck_b.pcm_drums.is_none(), "the reloaded deck B got stems made for its old load");
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The UI holds the audio lock for 12 callbacks (32 ms at 48 kHz / 128) while it stops deck B with a
+    /// stop-play-stop burst and loads a new track on paused deck D. Meanwhile A (+6 %) and B (-4 %, key lock,
+    /// cued to the headphones on 3-4) keep moving and the mix is recorded. Right after, A beat-jumps from the
+    /// stale playhead the UI saw; later B starts again; then the output is reopened. Against a run where the
+    /// lock is never busy and each action happens at the block the audio picks it up: every block, in f32 and
+    /// in i16, plays the same (bitwise before the jump, to float rounding after), every playhead and play
+    /// state matches, the streamed WAV is exactly the main output with no block missing (through the hold and
+    /// the reopen), and deck D's old audio is freed by the UI thread, not the callback. The tracklist logs A and
+    /// B, then B again when it restarts, at the recording's own clock: frames recorded, not wall time.
+    #[test]
+    fn audio_plays_on_while_the_ui_holds_the_lock() {
+        const BLOCK: usize = 128;
+        const CH: usize = 4;
+        const HOLD: usize = 12;
+        let tone = |period: f32, amp: f32, title: &str| {
+            let mut t = track(120.0);
+            t.title = title.into();
+            t.duration_sec = 40.0;
+            t.pcm_stereo = Arc::new((0..40 * 44_100).flat_map(|i| { let v = amp * (i as f32 * std::f32::consts::TAU / period).sin(); [v, 0.5 * v] }).collect());
+            t
+        };
+        struct Run { out: Vec<f32>, take: Vec<i16>, playheads: [f64; 4], playing: [bool; 4], busy: u64, jump_block: usize }
+        // What `update` logs each UI frame while recording, with the crossfader in the middle.
+        let log_frame = |app: &mut ReTraktorApp| {
+            let at = app.recording.as_ref().unwrap().seconds();
+            let s = app.audio.shared.lock().unwrap();
+            for d in 0..2 {
+                let title = s.loaded_tracks[d].as_ref().map_or("", |t| t.title.as_str());
+                app.set_state.check_audible_track(d, s.is_playing[d], 1.0, 0.5, "", title, at);
+            }
+        };
+        let run = |contended: bool, to_i16: bool| -> Run {
+            let mut app = ReTraktorApp::default();
+            {
+                let mut s = app.audio.shared.lock().unwrap();
+                s.loaded_tracks[0] = Some(tone(100.0, 0.3, "A"));
+                s.loaded_tracks[1] = Some(tone(37.0, 0.2, "B"));
+                s.loaded_tracks[3] = Some(tone(53.0, 0.2, "D"));
+                s.playhead_sec = [10.0, 5.0, 0.0, 1.0];
+                s.is_playing = [true, true, false, false];
+            }
+            let dir = super::tests::recording_test_dir(&format!("hold-{contended}-{to_i16}"));
+            app.start_recording(&dir);
+            let (wav, cue, txt) = app.recording.as_ref().map(|r| (r.wav.clone(), r.cue.clone(), r.txt.clone())).unwrap();
+            log_frame(&mut app);
+            app.deck_pitch_fader = [6.0, -4.0, 0.0, 0.0];
+            app.deck_keylock[1] = true;
+            app.channel_cue[1] = true;
+            app.sync_audio_state();
+            let old_d = Arc::downgrade(&app.audio.shared.lock().unwrap().loaded_tracks[3].as_ref().unwrap().pcm_stereo);
+            let mut out = Vec::new();
+            let play = |app: &ReTraktorApp, blocks: usize, out: &mut Vec<f32>| {
+                for _ in 0..blocks {
+                    if to_i16 {
+                        let mut buf = [0i16; BLOCK * CH];
+                        app.audio.render_with(&mut buf, CH, 48_000, crate::audio::pcm_i16);
+                        out.extend(buf.iter().map(|&v| v as f32));
+                    } else {
+                        let mut buf = [0.0f32; BLOCK * CH];
+                        app.audio.render_f32(&mut buf, CH, 48_000);
+                        out.extend_from_slice(&buf);
+                    }
+                }
+            };
+            let ui_actions = |s: &mut crate::audio::AudioSharedState| {
+                for playing in [false, true, false] {
+                    s.is_playing[1] = playing;
+                    s.reset_jump_ease(1);
+                }
+                s.loaded_tracks[3] = Some(tone(29.0, 0.2, "D2"));
+                s.seek_to(3, 0.0);
+            };
+            play(&app, 20, &mut out);
+            if contended {
+                let mut held = app.audio.shared.lock().unwrap();
+                ui_actions(&mut held);
+                play(&app, HOLD, &mut out);
+            } else {
+                play(&app, HOLD, &mut out);
+                ui_actions(&mut app.audio.shared.lock().unwrap());
+            }
+            let jump_block = out.len() / (BLOCK * CH);
+            app.deck_jump_beats[0] = 8;
+            assert!(app.beat_jump(0, 1.0));
+            play(&app, 1, &mut out);
+            assert!(old_d.upgrade().is_some(), "the callback still had deck D's old audio");
+            app.sync_audio_state();
+            assert!(old_d.upgrade().is_none(), "the UI frame didn't free deck D's old audio");
+            log_frame(&mut app); // B is stopped
+            play(&app, 30, &mut out);
+            app.toggle_play(2);
+            play(&app, 30, &mut out);
+            let restart = app.recording.as_ref().unwrap().seconds();
+            assert_eq!(restart, (out.len() / CH) as f64 / 48_000.0, "the recording clock isn't the frames recorded");
+            log_frame(&mut app);
+
+            // Reopen: the new callback state carries on from the published playheads.
+            let before = app.audio.shared.lock().unwrap().playhead_sec;
+            app.audio.open("", 48_000, BLOCK as u32, true);
+            play(&app, 1, &mut out);
+            let s = app.audio.shared.lock().unwrap();
+            for (d, rate) in [(0, 1.06), (1, 0.96)] {
+                let moved = s.playhead_sec[d] - before[d];
+                assert!((moved - rate * BLOCK as f64 / 48_000.0).abs() < 1e-9, "deck {d} moved {moved} across the reopen");
+            }
+            drop(s);
+            app.stop_recording();
+            assert!(super::tests::poll_until_finished(&mut app), "{}", app.library.status_message);
+            let bytes = std::fs::read(&wav).unwrap();
+            assert_eq!(bytes[..80], crate::recorder::wav_header((bytes.len() as u64 - 80) / 4, 48_000));
+            let take = bytes[80..].chunks(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect();
+            let entries = [(0.0, "", "A"), (0.0, "", "B"), (restart, "", "B")];
+            let wav_name = wav.file_name().unwrap().to_str().unwrap();
+            assert_eq!(std::fs::read_to_string(&cue).unwrap(), crate::setlist::cue_sheet(&entries, wav_name));
+            assert_eq!(std::fs::read_to_string(&txt).unwrap(), crate::setlist::plain_tracklist(&entries));
+            std::fs::remove_dir_all(&dir).unwrap();
+            let s = app.audio.shared.lock().unwrap();
+            Run { out, take, playheads: s.playhead_sec, playing: s.is_playing, busy: app.audio.stats.busy_blocks.load(std::sync::atomic::Ordering::Relaxed), jump_block }
+        };
+        for to_i16 in [false, true] {
+            let (busy, calm) = (run(true, to_i16), run(false, to_i16));
+            let case = if to_i16 { "i16" } else { "f32" };
+            assert_eq!((busy.busy, calm.busy), (HOLD as u64, 0), "{case}: blocks played without the lock");
+            assert_eq!(busy.out.len(), calm.out.len());
+            let seam = busy.jump_block * BLOCK * CH;
+            assert_eq!(busy.out[..seam], calm.out[..seam], "{case}: the held blocks didn't play as uncontended ones");
+            let held = &busy.out[20 * BLOCK * CH..seam];
+            assert!(held.iter().step_by(CH).any(|v| v.abs() > 0.05) && held.iter().skip(2).step_by(CH).any(|v| v.abs() > 0.05), "{case}: silent while held");
+            let tolerance = if to_i16 { 1.0 } else { 1e-4 };
+            let off = busy.out.iter().zip(&calm.out).fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+            assert!(off <= tolerance, "{case}: {off} off the uncontended output after the jump");
+            for d in 0..4 {
+                assert!((busy.playheads[d] - calm.playheads[d]).abs() < 1e-9, "{case}: deck {d} at {} vs {}", busy.playheads[d], calm.playheads[d]);
+            }
+            assert_eq!(busy.playing, [true, true, false, false], "{case}: transport");
+            assert_eq!(busy.playing, calm.playing);
+            for run in [&busy, &calm] {
+                let main: Vec<i16> = run.out.chunks(CH).flat_map(|f| if to_i16 { [f[0] as i16, f[1] as i16] } else { [crate::audio::pcm_i16(f[0]), crate::audio::pcm_i16(f[1])] }).collect();
+                assert_eq!(run.take, main, "{case}: the recording isn't the main output");
+            }
+        }
     }
 
     /// The beat strip keeps one shape whatever phrase it names. Deck A walks through INTRO · 10,

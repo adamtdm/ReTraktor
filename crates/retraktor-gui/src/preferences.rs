@@ -771,7 +771,7 @@ impl PreferencesDialog {
         let device_label = devices
             .iter()
             .find(|c| c.id == self.audio_device_name)
-            .map_or_else(|| "System default".to_string(), label_of);
+            .map_or_else(|| if self.audio_device_name.is_empty() { "System default".to_string() } else { self.audio_device_name.clone() }, label_of);
         Self::list_row(
             ui,
             "Audio device",

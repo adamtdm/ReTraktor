@@ -109,7 +109,7 @@ impl Shared {
     }
 }
 
-/// The callback's end of a recording; lives in `AudioSharedState` while recording.
+/// The callback's end of a recording; lives in `AudioSystem::recorder` while recording.
 pub struct RecorderTap {
     shared: Arc<Shared>,
     current: Option<Vec<i16>>,
@@ -176,7 +176,7 @@ impl RecorderTap {
     }
 
     /// Hands the last partial chunk to the writer. Not for the callback: called after the tap
-    /// left `AudioSharedState`.
+    /// left `AudioSystem::recorder`.
     fn flush(mut self) {
         if let Some(chunk) = self.current.take() {
             self.hand_over(chunk);
@@ -238,7 +238,7 @@ pub struct Recording {
 
 impl Recording {
     /// Reserves fresh timestamped WAV/CUE/TXT names in `dir` and starts the writer. Install the
-    /// tap with `state.recorder = Some(tap)`.
+    /// tap in `AudioSystem::recorder`.
     pub fn start(dir: &Path, now: SystemTime) -> Result<(Self, RecorderTap), String> {
         std::fs::create_dir_all(dir).map_err(|e| format!("Could not create {}: {e}", dir.display()))?;
         let (mut file, wav, cue, txt) = crate::setlist::reserve_recording_paths(dir, now)
@@ -292,7 +292,7 @@ impl Recording {
         self.unsaved.is_some()
     }
 
-    /// Ends the recording. Pass the tap taken out of `AudioSharedState` so its last partial
+    /// Ends the recording. Pass the tap taken out of `AudioSystem::recorder` so its last partial
     /// chunk is kept; `None` only when the tap could not be taken.
     pub fn stop(&self, tap: Option<RecorderTap>) {
         if let Some(tap) = tap {
