@@ -522,6 +522,48 @@ pub enum HeadphoneOut {
     Off,
 }
 
+/// How long a beat jump eases from what was playing into the new spot.
+const JUMP_EASE_SEC: f64 = 0.003;
+
+/// Eases one playing deck across a beat jump, before the mixer. For `JUMP_EASE_SEC` the deck moves from
+/// the last frame it actually played to the audio at the new playhead, always a blend of the two, so the
+/// seam has no step. A jump during an ease starts a new one from whatever was last heard.
+/// shortcut: holds the last frame for 3 ms, read from both positions if jump transients need their original attack.
+#[derive(Clone, Copy, Default)]
+struct JumpEase {
+    /// The deck's last output frame before channel gain; silence while it plays nothing.
+    last: (f32, f32),
+    /// The frame the current ease starts from, and how many frames of it have played.
+    from: Option<(f32, f32)>,
+    done: u32,
+    requested: bool,
+}
+
+impl JumpEase {
+    /// The deck's output frame. `key_lock` drops a request: its time-stretch already crossfades a jump.
+    fn next(&mut self, new: (f32, f32), sample_rate: u32, key_lock: bool) -> (f32, f32) {
+        if std::mem::take(&mut self.requested) && !key_lock {
+            self.from = Some(self.last);
+            self.done = 0;
+        }
+        let out = match self.from {
+            None => new,
+            Some(from) => {
+                let len = (JUMP_EASE_SEC * sample_rate as f64).round().max(1.0) as u32;
+                self.done += 1;
+                if self.done >= len {
+                    self.from = None;
+                }
+                // Raised cosine with 0 < w <= 1, so every frame lies between `from` and the new audio.
+                let w = 0.5 - 0.5 * (PI * self.done.min(len) as f32 / len as f32).cos();
+                (from.0 + (new.0 - from.0) * w, from.1 + (new.1 - from.1) * w)
+            }
+        };
+        self.last = out;
+        out
+    }
+}
+
 /// Thread-safe shared state for UI <-> Audio Engine communication.
 pub struct AudioSharedState {
     pub engine: FourDeckAudioEngine,
@@ -545,6 +587,7 @@ pub struct AudioSharedState {
     pub keylock_hq: bool,
     keylocks: [KeyLock; 4],
     keylock_engaged: [bool; 4],
+    jump_ease: [JumpEase; 4],
     pub crossfader: f32,
     pub crossfader_curve: f32,
 
@@ -623,6 +666,7 @@ impl Default for AudioSharedState {
             keylock_hq: true,
             keylocks: Default::default(),
             keylock_engaged: [false; 4],
+            jump_ease: [JumpEase::default(); 4],
             crossfader: 0.5,
             crossfader_curve: 0.5,
             scratch_active: [false; 4],
@@ -654,6 +698,17 @@ impl Default for AudioSharedState {
 }
 
 impl AudioSharedState {
+    /// Deck `d` (0..4) just jumped while playing: the next frames ease across the seam.
+    pub fn ease_jump(&mut self, d: usize) {
+        self.jump_ease[d].requested = true;
+    }
+
+    /// Forgets deck `d`'s last frame and any pending or running ease, for a stop, a new track or a paused jump,
+    /// so nothing stale is heard if it plays again before the next callback.
+    pub fn reset_jump_ease(&mut self, d: usize) {
+        self.jump_ease[d] = JumpEase::default();
+    }
+
     pub fn enable_scratch(
         &mut self,
         deck: usize,
@@ -983,6 +1038,7 @@ impl AudioSystem {
             for d in 0..4 {
                 state.engine.strips[d].playing = state.is_playing[d];
                 if !state.is_playing[d] && !state.scratch_active[d] && !state.scratch_ramping[d] {
+                    state.jump_ease[d] = JumpEase::default(); // silent: no stale frame or request survives a stop
                     continue;
                 }
                 let mut advance_dt = 0.0_f64;
@@ -1136,9 +1192,13 @@ impl AudioSystem {
                         )
                     };
 
+                    let (stem_l, stem_r) = state.jump_ease[d].next((stem_l, stem_r), sr, keylock_on);
+
                     // 2. Channel gain (the 3-band EQ runs in the mixer engine).
                     let gain = (state.channel_gain[d] * 2.0).clamp(0.0, 2.0);
                     deck_samples[d] = (stem_l * gain, stem_r * gain);
+                } else {
+                    state.jump_ease[d] = JumpEase::default();
                 }
 
                 state.playhead_sec[d] += advance_dt;
@@ -1266,6 +1326,46 @@ impl Drop for AudioSystem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A jump eases from the last frame heard to the new audio in 3 ms at any rate, never leaving the
+    /// span between the two on either channel. A second jump mid-ease starts from where the first had got
+    /// to. Key lock drops the request.
+    #[test]
+    fn jump_ease_stays_between_old_and_new() {
+        let between = |x: f32, a: f32, b: f32| x >= a.min(b) - 1e-6 && x <= a.max(b) + 1e-6;
+        for sr in [44_100u32, 48_000, 96_000] {
+            let len = (0.003 * sr as f64).round() as usize;
+            let mut ease = JumpEase::default();
+            ease.next((0.5, -0.5), sr, false);
+            ease.requested = true;
+            let mut prev = (0.5f32, -0.5f32);
+            for i in 1..=len {
+                let out = ease.next((-0.5, 0.5), sr, false);
+                assert!(between(out.0, prev.0, -0.5) && between(out.1, prev.1, 0.5), "{sr} Hz frame {i}: {out:?} after {prev:?}");
+                prev = out;
+            }
+            assert_eq!(prev, (-0.5, 0.5), "{sr} Hz: not at the new audio after {len} frames");
+            assert!(ease.from.is_none());
+
+            // A second jump, then a third a third of the way into its ease: that one starts from the frame last heard.
+            ease.requested = true;
+            for _ in 0..len / 3 {
+                prev = ease.next((0.5, -0.5), sr, false);
+            }
+            let heard = prev;
+            ease.requested = true;
+            let first = ease.next((-0.25, 0.25), sr, false);
+            assert!((first.0 - heard.0).abs() < 0.01 && (first.1 - heard.1).abs() < 0.01, "{sr} Hz: {first:?} after {heard:?}");
+            for _ in 1..len {
+                let out = ease.next((-0.25, 0.25), sr, false);
+                assert!(between(out.0, heard.0, -0.25) && between(out.1, heard.1, 0.25));
+            }
+            assert_eq!(ease.next((0.1, 0.2), sr, false), (0.1, 0.2));
+        }
+        let mut ease = JumpEase { last: (0.5, -0.5), requested: true, ..Default::default() };
+        assert_eq!(ease.next((-0.5, 0.5), 48_000, true), (-0.5, 0.5), "key lock's crossfade covers the jump");
+        assert!(!ease.requested && ease.from.is_none());
+    }
 
     fn tone_track(hz: f32, sr: u32, secs: f32) -> LoadedTrackAudio {
         let pcm_stereo = (0..(sr as f32 * secs) as usize)

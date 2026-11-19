@@ -38,6 +38,7 @@
 * **`F2` — 4-Deck (`A / B / C / D`)**: All four decks with a 4-channel mixer.
 * **`F3` — Browser**: Mini deck strips and a full-height library for preparing sets.
 * **`F4` — Timeline**: Track A → Track B transition arranger with stem automation presets and live auditioning.
+* **Beat Jump** moves a loaded deck backward or forward by 4, 8, 16 or 32 beats. Choose a size in the `JUMP` row under the transport controls in Mix or 4-Deck. On a 120 BPM track, 32 beats moves 16 seconds through the track at any pitch setting. An active loop moves with the playhead. An arrow dims when the full jump would cross a track boundary.
 
 ### 3. Interactive Graphical Controller Surface Map & Remapper
 * Located in **Preferences** (`⚙ -> Controllers & MX2`).

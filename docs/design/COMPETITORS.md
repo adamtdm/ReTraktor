@@ -10,7 +10,7 @@ VirtualDJ 2026, Engine DJ, djay Pro 5.6 and Mixxx 2.6 (the open-source benchmark
 | Key lock (tempo change without pitch change) | all | Yes (Nov 2026): per-deck KEY, WSOLA time-stretch, stems included |
 | Headphone cue on a second output | all | Yes (Nov 2026): outputs 3–4 or split mono; PHONES level and CUE/MIX blend |
 | Real 3-band EQ / kills | all | Yes (Nov 2026): 24 dB/oct isolator (was a volume average) |
-| Beat jump / quantised cues and loops | all | **Missing** beat jump; loops exist |
+| Beat jump / quantised cues and loops | all | Beat jump supports 4, 8, 16 and 32 beats per deck. Cue and loop quantisation is still open. |
 | Frequency-coloured waveforms with beat and bar markers | all | Single-colour waveform with beat ticks |
 | Channel and master level meters | all | No visible per-channel meter in the 2-deck mixer |
 | Pre-listen in the browser | rekordbox, Serato, Engine, djay | Missing |
@@ -43,7 +43,7 @@ VirtualDJ 2026, Engine DJ, djay Pro 5.6 and Mixxx 2.6 (the open-source benchmark
 
 1. ~~Key lock, headphone cue, real EQ, device selection~~ (done Nov 2026; needs hardware testing).
 2. ~~Linked libraries: Traktor + rekordbox XML~~ (done); next Engine DJ (SQLite) and Serato (crates + tags).
-3. Beat jump and quantise.
+3. ~~Beat jump~~ (done Nov 2026) and quantise.
 4. Channel and master meters; frequency-coloured waveform.
 5. Browser pre-listen (headphone cue makes it cheap).
 6. Serato / Engine export and USB export.
