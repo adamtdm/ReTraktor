@@ -1475,22 +1475,38 @@ impl LibraryManager {
                     }
                 });
             }
+            // Overlapping roots (a folder and one inside it) find the same file twice.
+            for cands in found.values_mut() {
+                cands.sort();
+                cands.dedup();
+            }
+            let mut ambiguous = 0usize;
             let fixed: Vec<(usize, PathBuf)> = missing
                 .iter()
                 .filter_map(|(id, name, parent)| {
                     let cands = found.get(name)?;
-                    // Prefer a candidate in a folder with the same name as the original.
-                    let best = cands
-                        .iter()
-                        .find(|c| c.parent().and_then(|d| d.file_name()).is_some_and(|d| d.to_string_lossy().to_lowercase() == *parent))
-                        .unwrap_or(&cands[0]);
-                    Some((*id, best.clone()))
+                    if let [only] = cands.as_slice() {
+                        return Some((*id, only.clone()));
+                    }
+                    // Several files share the name: take the one in a folder named like the original, if exactly one is.
+                    let mut same_folder = cands.iter().filter(|c| c.parent().and_then(|d| d.file_name()).is_some_and(|d| d.to_string_lossy().to_lowercase() == *parent));
+                    match (same_folder.next(), same_folder.next()) {
+                        (Some(best), None) => Some((*id, best.clone())),
+                        _ => {
+                            ambiguous += 1;
+                            None
+                        }
+                    }
                 })
                 .collect();
             let n = fixed.len();
             let _ = tx.send(Msg::Relocated(fixed.clone()));
             read_tags_into(tx, &fixed);
-            format!("Relocated {n} of {} missing tracks", missing.len())
+            let mut done = format!("Relocated {n} of {} missing tracks", missing.len());
+            if ambiguous > 0 {
+                done += &format!(". Multiple matches for {ambiguous}. Use Search another folder…");
+            }
+            done
         });
     }
 
@@ -3337,5 +3353,54 @@ mod tests {
         assert_eq!(lib.tracks[0].file_path.as_deref(), Some(moved.join("song.flac").as_path()));
         assert!(!lib.tracks[0].missing);
         let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Relocates one missing track saved at `/old/Album/song.flac` among `files` (relative to the
+    /// temp dir), searching `roots` (relative too); returns its path, missing flag and the final status.
+    fn relocate_one(name: &str, files: &[&str], roots: &[&str]) -> (PathBuf, bool, String, PathBuf) {
+        let (mut lib, dir) = temp_lib(name);
+        for f in files {
+            let p = dir.join(f);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, b"x").unwrap();
+        }
+        let mut t = track("Song", Path::new("/old/Album/song.flac"));
+        t.missing = true;
+        lib.push_track(t);
+        lib.start_relocate(roots.iter().map(|r| dir.join(r)).collect());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while lib.is_busy() && Instant::now() < deadline {
+            lib.poll();
+            thread::sleep(Duration::from_millis(10));
+        }
+        let t = &lib.tracks[0];
+        let out = (t.file_path.clone().unwrap(), t.missing, lib.status_message.clone(), dir.clone());
+        let _ = fs::remove_dir_all(dir);
+        out
+    }
+
+    #[test]
+    fn relocate_counts_a_file_found_through_overlapping_roots_once() {
+        let (path, missing, status, dir) = relocate_one("reloc-overlap", &["new/Other/song.flac"], &["", "new"]);
+        assert_eq!(path, dir.join("new/Other/song.flac"));
+        assert!(!missing);
+        assert!(!status.contains("Multiple matches"), "{status}");
+    }
+
+    #[test]
+    fn relocate_picks_the_only_file_in_a_folder_named_like_the_original() {
+        let (path, missing, _, dir) = relocate_one("reloc-parent", &["a/Other/song.flac", "b/ALBUM/song.flac"], &[""]);
+        assert_eq!(path, dir.join("b/ALBUM/song.flac"));
+        assert!(!missing);
+    }
+
+    #[test]
+    fn relocate_leaves_tracks_with_tied_candidates_alone() {
+        for (name, files) in [("reloc-noparent", ["x/song.flac", "y/song.flac"]), ("reloc-twoparents", ["a/Album/song.flac", "b/album/song.flac"])] {
+            let (path, missing, status, _) = relocate_one(name, &files, &[""]);
+            assert_eq!(path, Path::new("/old/Album/song.flac"), "{name}");
+            assert!(missing, "{name}");
+            assert_eq!(status, "Relocated 0 of 1 missing tracks. Multiple matches for 1. Use Search another folder…", "{name}");
+        }
     }
 }
