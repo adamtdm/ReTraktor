@@ -92,6 +92,9 @@ fn write_track(out: &mut String, entry: &NmlEntry, track_id: &str) {
     if let Some(tr) = entry.album_track {
         out.push_str(&format!(" TrackNumber=\"{tr}\""));
     }
+    if let Some(r) = entry.ranking {
+        out.push_str(&format!(" Rating=\"{r}\""));
+    }
 
     let grid_cues: Vec<&NmlCue> = entry
         .cues
@@ -714,6 +717,8 @@ mod tests {
         assert_eq!(again.entries.len(), 2);
         assert_eq!(again.entries[0].cues.iter().filter(|c| c.hotcue >= 0).count(), 2);
         assert_eq!(again.entries[0].musical_key_value, Some(20));
+        assert_eq!(again.entries[0].ranking, Some(153));
+        assert_eq!(again.entries[1].ranking, None);
     }
 
     #[test]
