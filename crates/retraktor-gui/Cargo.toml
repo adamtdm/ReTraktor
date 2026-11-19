@@ -21,6 +21,7 @@ rfd = "0.15"
 png = "0.18"
 ureq = { version = "2.10", features = ["json"] }
 serde_json = "1.0"
+concurrent-queue = "2.5"
 
 [[bin]]
 name = "retraktor-gui"

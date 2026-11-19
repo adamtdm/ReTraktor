@@ -3011,6 +3011,7 @@ dependencies = [
 name = "retraktor-gui"
 version = "0.2.0"
 dependencies = [
+ "concurrent-queue",
  "cpal",
  "eframe",
  "egui_extras",

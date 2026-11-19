@@ -388,26 +388,43 @@ pub fn format_recording_timestamp(time: SystemTime) -> String {
     format!("{y:04}-{m:02}-{d:02}_{h:02}-{min:02}")
 }
 
-/// Finds non-colliding recording paths for WAV, CUE, and TXT files.
-/// Never overwrites existing files.
-pub fn unique_recording_paths(dir: &Path, time: SystemTime) -> (PathBuf, PathBuf, PathBuf) {
+/// Creates the WAV, CUE and TXT of a new recording under a fresh timestamped name and returns the
+/// open WAV. Never overwrites existing files: each name is claimed with `create_new`.
+pub fn reserve_recording_paths(dir: &Path, time: SystemTime) -> std::io::Result<(std::fs::File, PathBuf, PathBuf, PathBuf)> {
     let base_name = format!("ReTraktor_{}", format_recording_timestamp(time));
-    let mut candidate = base_name.clone();
-    let mut suffix = 1;
-
-    while dir.join(format!("{candidate}.wav")).exists()
-        || dir.join(format!("{candidate}.cue")).exists()
-        || dir.join(format!("{candidate}.txt")).exists()
-    {
-        candidate = format!("{base_name}_{suffix}");
+    let mut suffix = 0;
+    loop {
+        let stem = if suffix == 0 { base_name.clone() } else { format!("{base_name}_{suffix}") };
         suffix += 1;
+        let [wav, cue, txt] = ["wav", "cue", "txt"].map(|ext| dir.join(format!("{stem}.{ext}")));
+        let mut created = Vec::new();
+        let mut wav_file = None;
+        let mut taken = None;
+        for path in [&wav, &cue, &txt] {
+            match std::fs::OpenOptions::new().write(true).create_new(true).open(path) {
+                Ok(f) => {
+                    wav_file.get_or_insert(f);
+                    created.push(path);
+                }
+                Err(e) => {
+                    taken = Some(e);
+                    break;
+                }
+            }
+        }
+        match taken {
+            None => return Ok((wav_file.expect("wav was created"), wav, cue, txt)),
+            Some(e) => {
+                drop(wav_file);
+                for path in created {
+                    let _ = std::fs::remove_file(path);
+                }
+                if e.kind() != std::io::ErrorKind::AlreadyExists {
+                    return Err(e);
+                }
+            }
+        }
     }
-
-    (
-        dir.join(format!("{candidate}.wav")),
-        dir.join(format!("{candidate}.cue")),
-        dir.join(format!("{candidate}.txt")),
-    )
 }
 
 /// Live interactive state for the Set list workflow.
@@ -1070,6 +1087,22 @@ mod tests {
         assert!(cue.contains("INDEX 01 00:00:00"));
         assert!(cue.contains("TRACK 02 AUDIO"));
         assert!(cue.contains("INDEX 01 02:05:38")); // 125.5s = 2m 5s, 0.5 * 75 = 38 frames
+    }
+
+    #[test]
+    fn recording_names_never_clobber_a_leftover_sidecar() {
+        let dir = std::env::temp_dir().join(format!("retraktor-reserve-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1794354300);
+        let stem = format!("ReTraktor_{}", format_recording_timestamp(t));
+        std::fs::write(dir.join(format!("{stem}.txt")), "old tracklist").unwrap();
+        let (_, wav, cue, txt) = reserve_recording_paths(&dir, t).unwrap();
+        assert_eq!(wav, dir.join(format!("{stem}_1.wav")));
+        assert!(cue.exists() && txt.exists());
+        assert!(!dir.join(format!("{stem}.wav")).exists(), "half-claimed name was released");
+        assert_eq!(std::fs::read_to_string(dir.join(format!("{stem}.txt"))).unwrap(), "old tracklist");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

@@ -577,10 +577,8 @@ pub struct AudioSharedState {
     pub pattern_current_step: usize,
     pattern_phase_sec: f64,
 
-    // Master Mix Recorder (.WAV)
-    pub is_recording: bool,
-    pub recorded_samples: Vec<i16>,
-    pub recording_sample_rate: u32,
+    /// Master recorder tap while REC is on; see [`crate::recorder`].
+    pub recorder: Option<crate::recorder::RecorderTap>,
 }
 
 impl Default for AudioSharedState {
@@ -650,9 +648,7 @@ impl Default for AudioSharedState {
             pattern_decay: 0.6,
             pattern_current_step: 0,
             pattern_phase_sec: 0.0,
-            is_recording: false,
-            recorded_samples: Vec::new(),
-            recording_sample_rate: 48_000,
+            recorder: None,
         }
     }
 }
@@ -917,43 +913,12 @@ impl AudioSystem {
         });
     }
 
-    /// Writes a slice of interleaved stereo `i16` PCM samples to a standard RIFF `.wav` file on disk.
-    pub fn write_stereo_wav_file(
-        path: &Path,
-        samples: &[i16],
-        sample_rate: u32,
-    ) -> Result<f64, String> {
-        use std::io::Write;
-        let mut f = File::create(path)
-            .map_err(|e| format!("Failed to create {}: {e}", path.display()))?;
-        let data_bytes = (samples.len() * 2) as u32;
-        let riff_size = 36u32.saturating_add(data_bytes);
-        let channels = 2u16;
-        let bits_per_sample = 16u16;
-        let byte_rate = sample_rate * (channels as u32) * (bits_per_sample as u32 / 8);
-        let block_align = channels * (bits_per_sample / 8);
-
-        f.write_all(b"RIFF").map_err(|e| e.to_string())?;
-        f.write_all(&riff_size.to_le_bytes()).map_err(|e| e.to_string())?;
-        f.write_all(b"WAVEfmt ").map_err(|e| e.to_string())?;
-        f.write_all(&16u32.to_le_bytes()).map_err(|e| e.to_string())?;
-        f.write_all(&1u16.to_le_bytes()).map_err(|e| e.to_string())?; // PCM
-        f.write_all(&channels.to_le_bytes()).map_err(|e| e.to_string())?;
-        f.write_all(&sample_rate.to_le_bytes()).map_err(|e| e.to_string())?;
-        f.write_all(&byte_rate.to_le_bytes()).map_err(|e| e.to_string())?;
-        f.write_all(&block_align.to_le_bytes()).map_err(|e| e.to_string())?;
-        f.write_all(&bits_per_sample.to_le_bytes()).map_err(|e| e.to_string())?;
-        f.write_all(b"data").map_err(|e| e.to_string())?;
-        f.write_all(&data_bytes.to_le_bytes()).map_err(|e| e.to_string())?;
-
-        let mut byte_buf = Vec::with_capacity(samples.len() * 2);
-        for &s in samples {
-            byte_buf.extend_from_slice(&s.to_le_bytes());
-        }
-        f.write_all(&byte_buf).map_err(|e| e.to_string())?;
-
-        let dur_sec = (samples.len() / 2) as f64 / (sample_rate.max(1) as f64);
-        Ok(dur_sec)
+    /// Test fixture: interleaved stereo `i16` PCM as a WAV, with the recorder's header.
+    #[cfg(test)]
+    pub fn write_stereo_wav_file(path: &Path, samples: &[i16], sample_rate: u32) -> std::io::Result<()> {
+        let mut bytes = crate::recorder::wav_header(samples.len() as u64 / 2, sample_rate).to_vec();
+        bytes.extend(samples.iter().flat_map(|s| s.to_le_bytes()));
+        std::fs::write(path, bytes)
     }
 
     pub(crate) fn render_audio_f32(
@@ -985,8 +950,10 @@ impl AudioSystem {
         };
         let state = &mut *guard;
         output.fill(0.0);
-        state.recording_sample_rate = sr;
         state.engine.routing.sample_rate = sr;
+        if let Some(tap) = state.recorder.as_mut() {
+            tap.begin_block(sr);
+        }
 
         // Block-level scratch filter observation and release inertia ramping
         for d in 0..4 {
@@ -1237,13 +1204,8 @@ impl AudioSystem {
             ml = (ml + pat_sample).clamp(-1.0, 1.0);
             mr = (mr + pat_sample).clamp(-1.0, 1.0);
 
-            if state.is_recording && state.recorded_samples.capacity() >= state.recorded_samples.len() + 2 {
-                state
-                    .recorded_samples
-                    .push((ml.clamp(-1.0, 1.0) * 32767.0) as i16);
-                state
-                    .recorded_samples
-                    .push((mr.clamp(-1.0, 1.0) * 32767.0) as i16);
+            if let Some(tap) = state.recorder.as_mut() {
+                tap.push(ml, mr);
             }
 
             let out = &mut output[f * channels..(f + 1) * channels];
@@ -1259,6 +1221,10 @@ impl AudioSystem {
                 }
                 _ => out[..2].copy_from_slice(&[ml, mr]),
             }
+        }
+
+        if let Some(tap) = state.recorder.as_ref() {
+            tap.end_block();
         }
 
         // Update real-time peak meter state

@@ -150,7 +150,10 @@ pub struct ReTraktorApp {
     /// When the last load on a deck failed, shown on the deck for a few seconds.
     deck_load_failed: [Option<std::time::Instant>; 4],
     load_channel: (mpsc::Sender<LoadResult>, mpsc::Receiver<LoadResult>),
-    pending_recording: Option<(Vec<i16>, u32)>,
+    /// From REC until its WAV is finished (or left unsaved for RETRY SAVE).
+    recording: Option<crate::recorder::Recording>,
+    /// Close the window once the recording has been finished.
+    close_after_recording: bool,
 
     // Traktor Pro 4 16-Step Pattern Player State
     pub show_pattern_player: bool,
@@ -289,7 +292,8 @@ impl Default for ReTraktorApp {
             deck_loading: [false; 4],
             deck_load_failed: [None; 4],
             load_channel: mpsc::channel(),
-            pending_recording: None,
+            recording: None,
+            close_after_recording: false,
             show_pattern_player: false,
             pattern_enabled: false,
             pattern_selected_voice: 0,
@@ -361,9 +365,21 @@ impl eframe::App for ReTraktorApp {
         }
 
         // Flush the autosaved collection and preferences on close.
-        if ctx.input(|i| i.viewport().close_requested()) && self.pending_recording.is_some() {
+        if self.poll_recording() && self.close_after_recording {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        if self.recording.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
+        if ctx.input(|i| i.viewport().close_requested()) && self.recording.is_some() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.library.status_message = "Recording has not been saved. Click RETRY SAVE before closing.".into();
+            if self.recording.as_ref().is_some_and(|r| r.is_unsaved()) {
+                self.library.status_message = "Recording has not been saved. Click RETRY SAVE before closing.".into();
+            } else {
+                self.stop_recording();
+                self.close_after_recording = true;
+                self.library.status_message = "Finishing the recording before closing…".into();
+            }
         } else if ctx.input(|i| i.viewport().close_requested()) && !self.exit_confirmed {
             self.save_collection_according_to_prefs();
             let _ = self.preferences.save();
@@ -395,14 +411,11 @@ impl eframe::App for ReTraktorApp {
         }
 
         let dt = ctx.input(|i| i.stable_dt);
+        let (is_rec, rec_offset) = match &self.recording {
+            Some(rec) if rec.is_active() => (true, rec.seconds()),
+            _ => (false, 0.0),
+        };
         if let Ok(state) = self.audio.shared.lock() {
-            let is_rec = state.is_recording;
-            let rec_offset = if is_rec {
-                (state.recorded_samples.len() as f64) / (2.0 * state.recording_sample_rate as f64)
-            } else {
-                0.0
-            };
-
             for d in 0..2 {
                 let playing = state.is_playing[d];
                 self.set_state.update_playback(d, playing, dt);
@@ -1096,11 +1109,107 @@ impl ReTraktorApp {
         }
     }
 
-    fn save_pending_recording(&mut self, path: &std::path::Path) -> Result<f64, String> {
-        let (samples, rate) = self.pending_recording.as_ref().ok_or("No recording to save")?;
-        let duration = AudioSystem::write_stereo_wav_file(path, samples, *rate)?;
-        self.pending_recording = None;
-        Ok(duration)
+    /// REC: streams the master to a fresh WAV in `dir`, or says why it could not start.
+    fn start_recording(&mut self, dir: &std::path::Path) {
+        match crate::recorder::Recording::start(dir, std::time::SystemTime::now()) {
+            Ok((rec, tap)) => {
+                let installed = match self.audio.shared.lock() {
+                    Ok(mut state) => {
+                        state.recorder = Some(tap);
+                        true
+                    }
+                    Err(_) => false,
+                };
+                if !installed {
+                    rec.discard();
+                    self.library.status_message = "Recording did not start: the audio engine is not available".into();
+                    return;
+                }
+                self.set_state.recorded_audible_tracks.clear();
+                self.set_state.recording_start = Some(std::time::Instant::now());
+                self.library.status_message = format!("Recording to {}", rec.wav.display());
+                self.recording = Some(rec);
+            }
+            Err(e) => self.library.status_message = format!("Recording did not start: {e}"),
+        }
+    }
+
+    /// Takes the tap out of the audio callback, keeping its last partial chunk, and lets the
+    /// writer finish the file.
+    fn stop_recording(&mut self) {
+        let tap = self.audio.shared.lock().ok().and_then(|mut state| state.recorder.take());
+        if let Some(rec) = &self.recording {
+            rec.stop(tap);
+        }
+    }
+
+    /// Stops a recording that ended on its own and finishes one whose writer is done.
+    /// True once the WAV and its CUE and tracklist are saved with nothing to report.
+    fn poll_recording(&mut self) -> bool {
+        let Some(rec) = &self.recording else { return false };
+        if !rec.is_active() && !rec.is_stopping() {
+            self.stop_recording();
+        }
+        match self.recording.as_mut().and_then(|rec| rec.poll()) {
+            Some(outcome) => self.finish_recording(outcome),
+            None => false,
+        }
+    }
+
+    fn finish_recording(&mut self, outcome: Result<crate::recorder::Saved, String>) -> bool {
+        let Some(rec) = &self.recording else { return false };
+        let saved = match outcome {
+            Ok(saved) => saved,
+            Err(e) => {
+                self.close_after_recording = false;
+                self.library.status_message =
+                    format!("Could not finish {}: {e}. Click RETRY SAVE; keep the app open.", rec.wav.display());
+                return false;
+            }
+        };
+        // A failed write can leave the WAV shorter than the clock when a track was logged:
+        // list only tracks that start inside the saved audio.
+        let end = saved.seconds();
+        let entries: Vec<(f64, &str, &str)> = self
+            .set_state
+            .recorded_audible_tracks
+            .iter()
+            .filter(|(s, _, _)| *s < end)
+            .map(|(s, a, t)| (*s, a.as_str(), t.as_str()))
+            .collect();
+        let wav_name = rec.wav.file_name().and_then(|n| n.to_str()).unwrap_or("recording.wav");
+        let mut written = vec!["WAV"];
+        let mut failed = Vec::new();
+        match std::fs::write(&rec.cue, crate::setlist::cue_sheet(&entries, wav_name)) {
+            Ok(()) => written.push("CUE"),
+            Err(e) => failed.push(format!("CUE not written: {e}")),
+        }
+        match std::fs::write(&rec.txt, crate::setlist::plain_tracklist(&entries)) {
+            Ok(()) => written.push("tracklist"),
+            Err(e) => failed.push(format!("tracklist not written: {e}")),
+        }
+        let dir = rec.wav.parent().unwrap_or(std::path::Path::new(".")).display();
+        let clean = saved.reason.is_none() && failed.is_empty();
+        let mut msg = match saved.reason {
+            None if clean => format!("✔ Saved recording ({end:.1}s), CUE & tracklist to {dir}"),
+            None => format!("Saved recording ({end:.1}s): {} to {dir}", written.join(", ")),
+            Some(reason) => format!(
+                "Recording stopped early: {}{}. Saved {end:.1}s: {} to {dir}",
+                reason.describe(),
+                saved.error.as_deref().map(|e| format!(" ({e})")).unwrap_or_default(),
+                written.join(", "),
+            ),
+        };
+        for failure in &failed {
+            msg.push_str(&format!(". {failure}"));
+        }
+        if !clean && self.close_after_recording {
+            self.close_after_recording = false;
+            msg.push_str(". Close again to quit");
+        }
+        self.library.status_message = msg;
+        self.recording = None;
+        clean
     }
 
     fn finish_loads(&mut self) {
@@ -2349,18 +2458,14 @@ impl ReTraktorApp {
                     dot::dot_ring(ui, &mut self.cue_mix, 0.0, 1.0, 0.0, &mix_txt, "CUE/MIX", TraktorTheme::TEXT_PRIMARY(), true)
                         .on_hover_text(format!("Headphones hear the cued decks (left) or the main mix (right). {KNOB_TIP}"));
 
-                    let is_rec = self.audio.shared.lock().map(|s| s.is_recording).unwrap_or(false);
-                    let rec_sec = self
-                        .audio
-                        .shared
-                        .lock()
-                        .map(|s| s.recorded_samples.len() as f64 / (s.recording_sample_rate as f64 * 2.0))
-                        .unwrap_or(0.0);
-                    if show_rec || is_rec || self.pending_recording.is_some() {
-                        let rec_label = if is_rec {
-                            format!("REC {:02}:{:02}", (rec_sec / 60.0).floor() as u32, (rec_sec % 60.0).floor() as u32)
-                        } else {
-                            if self.pending_recording.is_some() { "RETRY SAVE" } else { "REC" }.to_string()
+                    let rec_state = self.recording.as_ref().map(|r| (r.is_active(), r.is_unsaved(), r.seconds()));
+                    let is_rec = matches!(rec_state, Some((true, _, _)));
+                    if show_rec || rec_state.is_some() {
+                        let rec_label = match rec_state {
+                            Some((true, _, sec)) => format!("REC {:02}:{:02}", (sec / 60.0).floor() as u32, (sec % 60.0).floor() as u32),
+                            Some((_, true, _)) => "RETRY SAVE".to_string(),
+                            Some(_) => "SAVING…".to_string(),
+                            None => "REC".to_string(),
                         };
                         let (rec_fill, rec_fg) = if is_rec {
                             (TraktorTheme::ACCENT(), on(TraktorTheme::ACCENT()))
@@ -2375,49 +2480,18 @@ impl ReTraktorApp {
                             })
                             .clicked()
                         {
-                            let mut samples_to_save = self.pending_recording.take();
-                            if samples_to_save.is_none() {
-                                if let Ok(mut state) = self.audio.shared.lock() {
-                                    if state.is_recording {
-                                        state.is_recording = false;
-                                        samples_to_save = Some((std::mem::take(&mut state.recorded_samples), state.recording_sample_rate));
-                                    } else {
-                                        state.recorded_samples = Vec::with_capacity(48_000 * 2 * 1800);
-                                        state.is_recording = true;
-                                        self.set_state.recorded_audible_tracks.clear();
-                                        self.set_state.recording_start = Some(std::time::Instant::now());
+                            match rec_state {
+                                None => {
+                                    let home = env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("."));
+                                    self.start_recording(&home.join("Music").join("ReTraktor"));
+                                }
+                                Some((true, _, _)) => self.stop_recording(),
+                                Some((_, true, _)) => {
+                                    if let Some(outcome) = self.recording.as_mut().map(|r| r.retry()) {
+                                        self.finish_recording(outcome);
                                     }
                                 }
-                            }
-                            if let Some((samples, sample_rate)) = samples_to_save {
-                                let home = env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("."));
-                                let rec_dir = home.join("Music").join("ReTraktor");
-                                let _ = std::fs::create_dir_all(&rec_dir);
-                                let (out_wav, out_cue, out_txt) = crate::setlist::unique_recording_paths(&rec_dir, std::time::SystemTime::now());
-                                self.pending_recording = Some((samples, sample_rate));
-                                match self.save_pending_recording(&out_wav) {
-                                    Ok(dur_s) => {
-                                        let entries: Vec<(f64, &str, &str)> = self
-                                            .set_state
-                                            .recorded_audible_tracks
-                                            .iter()
-                                            .map(|(s, a, t)| (*s, a.as_str(), t.as_str()))
-                                            .collect();
-                                        let wav_name = out_wav.file_name().and_then(|n| n.to_str()).unwrap_or("recording.wav");
-                                        let cue_str = crate::setlist::cue_sheet(&entries, wav_name);
-                                        let _ = std::fs::write(&out_cue, cue_str);
-                                        let txt_str = crate::setlist::plain_tracklist(&entries);
-                                        let _ = std::fs::write(&out_txt, txt_str);
-
-                                        self.library.status_message = format!(
-                                            "✔ Saved recording ({dur_s:.1}s), CUE & tracklist to {}",
-                                            rec_dir.display()
-                                        );
-                                    }
-                                    Err(e) => {
-                                        self.library.status_message = format!("Save failed: {e}. Click RETRY SAVE; keep the app open.");
-                                    }
-                                }
+                                Some(_) => {} // the writer is still finishing the file
                             }
                         }
                     }
@@ -3505,12 +3579,11 @@ impl ReTraktorApp {
         let mut stems = [[0.0f32; 4]; 4];
         let (mut peaks, mut main) = ([0.0f32; 4], (0.0, 0.0));
         let mut both_playing = false;
-        let mut is_recording = false;
+        let is_recording = self.recording.as_ref().is_some_and(|r| r.is_active());
         let mut in_key = false;
         if let Ok(state) = self.audio.shared.lock() {
             peaks = state.channel_peaks;
             main = (state.master_peak_l, state.master_peak_r);
-            is_recording = state.is_recording;
             both_playing = state.is_playing[0] || state.is_playing[1];
             in_key = state.loaded_tracks[0].as_ref().is_some_and(|a| {
                 state.loaded_tracks[1].as_ref().is_some_and(|b| {
@@ -4382,17 +4455,131 @@ mod tests {
         assert!(app.library.status_message.contains("Could not load"));
         assert_eq!(app.deck_track_ids[0], Some(12));
 
-        for rate in [44100, 96000] {
-            app.pending_recording = Some((vec![123; rate as usize * 2], rate));
-            assert!(app.save_pending_recording(&dir).is_err());
-            assert_eq!(app.pending_recording.as_ref().unwrap().0.len(), rate as usize * 2);
-            let out = dir.join("recording.wav");
-            assert_eq!(app.save_pending_recording(&out).unwrap(), 1.0);
-            assert!(app.pending_recording.is_none());
-            let decoded = LoadedTrackAudio::from_file(&out, "", "", 128.0, "1d").unwrap();
+        // REC through the real callback: the WAV holds exactly what the speakers got.
+        app.audio.shared.lock().unwrap().pattern_enabled = true;
+        for rate in [44100u32, 96000] {
+            app.start_recording(&dir.join("rec"));
+            let wav = app.recording.as_ref().unwrap().wav.clone();
+            let mut speakers = Vec::new();
+            let mut block = vec![0.0f32; 500 * 2];
+            // 500-frame blocks never line up with the recorder's chunks: the last one is partial.
+            for _ in 0..rate / 500 + 1 {
+                AudioSystem::render_audio_f32(&app.audio.shared, &mut block, 2, rate);
+                speakers.extend_from_slice(&block);
+            }
+            let frames = speakers.len() / 2;
+            assert_eq!(app.recording.as_ref().unwrap().seconds(), frames as f64 / rate as f64);
+            app.stop_recording();
+            let t0 = std::time::Instant::now();
+            while !app.poll_recording() {
+                assert!(t0.elapsed() < std::time::Duration::from_secs(10), "recording never finished");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(app.recording.is_none() && app.library.status_message.contains("Saved recording"));
+            let bytes = std::fs::read(&wav).unwrap();
+            let recorded: Vec<i16> = bytes[80..].chunks(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect();
+            let expected: Vec<i16> = speakers.iter().map(|s| (s.clamp(-1.0, 1.0) * 32767.0) as i16).collect();
+            assert!(expected.iter().any(|&s| s.abs() > 1000), "pattern player should be audible");
+            assert_eq!(recorded, expected);
+            let decoded = LoadedTrackAudio::from_file(&wav, "", "", 128.0, "1d").unwrap();
             assert_eq!(decoded.sample_rate, rate);
-            assert_eq!(decoded.duration_sec, 1.0);
+            assert!((decoded.duration_sec - frames as f64 / rate as f64).abs() < 1e-6);
+            assert!(wav.with_extension("cue").exists() && wav.with_extension("txt").exists());
         }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn recording_test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("retraktor-app-rec-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// Renders `blocks` 500-frame blocks through the real audio callback.
+    fn render_blocks(app: &ReTraktorApp, blocks: usize, rate: u32) {
+        let mut block = vec![0.0f32; 500 * 2];
+        for _ in 0..blocks {
+            AudioSystem::render_audio_f32(&app.audio.shared, &mut block, 2, rate);
+        }
+    }
+
+    /// Polls like the GUI until the recording is finished; whether it finished cleanly.
+    fn poll_until_finished(app: &mut ReTraktorApp) -> bool {
+        let t0 = std::time::Instant::now();
+        loop {
+            let clean = app.poll_recording();
+            if app.recording.is_none() {
+                return clean;
+            }
+            assert!(t0.elapsed() < std::time::Duration::from_secs(10), "recording never finished");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn recording_lists_only_tracks_inside_the_saved_audio() {
+        let dir = recording_test_dir("cue");
+        let mut app = ReTraktorApp::default();
+        app.audio.shared.lock().unwrap().pattern_enabled = true;
+        app.start_recording(&dir);
+        let (cue, txt) = app.recording.as_ref().map(|r| (r.cue.clone(), r.txt.clone())).unwrap();
+        render_blocks(&app, 88, 44_100); // 44 000 frames, just under 1 s
+        let end = 44_000.0 / 44_100.0;
+        // As after a failed write: the clock had run past what reached the disk.
+        app.set_state.recorded_audible_tracks = vec![
+            (0.5, "A".into(), "Inside".into()),
+            (end, "B".into(), "At the end".into()),
+            (end + 30.0, "C".into(), "Past the end".into()),
+        ];
+        // The tracklist cannot be written: its name is taken by a directory.
+        std::fs::remove_file(&txt).unwrap();
+        std::fs::create_dir(&txt).unwrap();
+        app.close_after_recording = true;
+        app.stop_recording();
+        assert!(!poll_until_finished(&mut app), "a missing tracklist is not a clean save");
+        assert!(!app.close_after_recording, "the window stays open so the DJ sees what happened");
+        let msg = &app.library.status_message;
+        assert!(msg.contains("WAV, CUE to") && msg.contains("tracklist not written") && !msg.contains('✔'), "{msg}");
+        let sheet = std::fs::read_to_string(&cue).unwrap();
+        assert_eq!(sheet.matches("TRACK ").count(), 1, "{sheet}");
+        assert!(sheet.contains("TITLE \"Inside\"") && sheet.contains("INDEX 01 00:00:38"), "{sheet}"); // 0.5 s = 37.5 frames
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn rate_change_mid_set_stops_and_keeps_the_first_rate() {
+        let dir = recording_test_dir("rate");
+        let mut app = ReTraktorApp::default();
+        app.audio.shared.lock().unwrap().pattern_enabled = true;
+        app.start_recording(&dir);
+        let wav = app.recording.as_ref().unwrap().wav.clone();
+        render_blocks(&app, 44, 44_100);
+        render_blocks(&app, 4, 48_000); // the card came back at another rate
+        assert!(!poll_until_finished(&mut app), "an early stop is not a clean save");
+        let msg = &app.library.status_message;
+        assert!(msg.contains("Recording stopped early: the sound card's sample rate changed"), "{msg}");
+        assert!(msg.contains("Saved 0.5s: WAV, CUE, tracklist"), "{msg}");
+        assert_eq!(std::fs::metadata(&wav).unwrap().len(), 80 + 22_000 * 4);
+        let decoded = LoadedTrackAudio::from_file(&wav, "", "", 128.0, "1d").unwrap();
+        assert_eq!(decoded.sample_rate, 44_100);
+        assert!((decoded.duration_sec - 22_000.0 / 44_100.0).abs() < 1e-6);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn recording_does_not_start_without_the_audio_engine() {
+        let dir = recording_test_dir("engine");
+        let mut app = ReTraktorApp::default();
+        let shared = Arc::clone(&app.audio.shared);
+        let _ = std::thread::spawn(move || {
+            let _state = shared.lock().unwrap();
+            panic!("poisoning the audio state on purpose");
+        })
+        .join();
+        app.start_recording(&dir);
+        assert!(app.recording.is_none());
+        assert!(app.library.status_message.contains("did not start"), "{}", app.library.status_message);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "the reserved files were removed");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

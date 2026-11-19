@@ -76,7 +76,7 @@
 * **rekordbox Export**: One click writes `~/Music/ReTraktor-rekordbox.xml` (tracks, cues, loops, grids, playlists) for rekordbox / CDJ USB export.
 * **Suggestions**: Ranks your collection by harmonic and tempo compatibility with the track on deck A.
 * **Track Info Editor**: Edit metadata in the collection, and optionally write it back into the file's tags.
-* **Built-In Master `.WAV` Mix Recorder (`● REC`)**: Record your live set directly from the post-maximizer master bus to `~/Music/ReTraktor_Master_Mix.wav` (16-bit / 48 kHz stereo PCM).
+* **Built-In Master `.WAV` Mix Recorder (`● REC`)**: Record your live set directly from the post-maximizer master bus to a timestamped 16-bit stereo WAV in `~/Music/ReTraktor` (at the sound card's rate), with a `.cue` and tracklist. Audio streams to disk as you play, so a set can run for hours. Past 4 GiB (about 3 h at 96 kHz) the file becomes RF64, which needs a player that reads RF64 and cannot currently be loaded onto a ReTraktor deck. If the disk falls behind or fails, or the sample rate changes, REC stops and says why; the audio already written to disk is kept.
 
 ### 8. Full Hardware Controller Support
 * **First-Class Traktor MX2 (`17CC:2420`) Support**: Complete NHL2 HID input/output mapping for all **83 buttons**, **6 encoders**, **26 12-bit pots/faders**, **2 capacitive 1024-tick jogwheels**, **105 top-panel LEDs**, and **12 RGB bottom-shell ambient LEDs** (with Deck State, Loop Status, and End-of-Track Warning modes), plus **4-Out / 2-In 24-bit/96kHz USB Audio Class 2.0** routing (Master L/R `Out 1/2` + Headphone Cue L/R `Out 3/4`).
