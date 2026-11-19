@@ -127,6 +127,8 @@ pub struct ReTraktorApp {
     pub deck_loop_active: [bool; 4],
     pub deck_loop_start_sec: [f64; 4],
     pub deck_loop_size_beats: [u32; 4],
+    /// Beat jump size per deck, one of `JUMP_SIZES`.
+    pub deck_jump_beats: [u32; 4],
     pub deck_hotcues: [Vec<(u8, f64)>; 4],
     pub deck_pad_mode: [DeckPadMode; 4],
     pub deck_sync_enabled: [bool; 4],
@@ -263,6 +265,7 @@ impl Default for ReTraktorApp {
             deck_loop_active: [false, false, false, false],
             deck_loop_start_sec: [0.0, 0.0, 0.0, 0.0],
             deck_loop_size_beats: [4, 4, 4, 4],
+            deck_jump_beats: [4; 4],
             deck_hotcues: [
                 vec![(1, 0.0), (2, 15.0), (3, 30.0), (4, 60.0)],
                 vec![(1, 0.0), (2, 16.0), (3, 32.0), (4, 64.0)],
@@ -668,7 +671,7 @@ impl ReTraktorApp {
     }
 
     /// Dev-only: walks SHOT_STEPS (90 frames each after SHOT_WARM frames) saving a PNG per step, then exits.
-    /// Steps: Mix FourDeck Browser Timeline prefs prefs:<Tab> nav:Missing|Suggestions|Files loadA loadB expandA stemsA pattern relocate wait.
+    /// Steps: Mix FourDeck Browser Timeline prefs prefs:<Tab> nav:Missing|Suggestions|Files loadA..loadD expandA expandAll stemsA pattern relocate wait.
     fn screenshot_step(&mut self, ctx: &egui::Context) {
         let Some((dir, steps)) = self.shot.clone() else { return };
         let warm: usize = std::env::var("SHOT_WARM").ok().and_then(|v| v.parse().ok()).unwrap_or(300);
@@ -772,6 +775,7 @@ impl ReTraktorApp {
             "prefs" => self.preferences.is_open = true,
             "noprefs" => self.preferences.is_open = false,
             "expandA" => self.deck_expanded[0] = true,
+            "expandAll" => self.deck_expanded = [true; 4],
             "pick" => self.library.selected_track_id = self.library.tracks.first().map(|t| t.id),
             "master" => self.tempo_master_deck = Some(0),
             "setpick" => self.set_state.selected_index = Some(1),
@@ -802,8 +806,8 @@ impl ReTraktorApp {
                     _ => NavItem::Collection,
                 };
             }
-            "loadA" | "loadB" if first => {
-                let deck = if step == "loadA" { 1 } else { 2 };
+            "loadA" | "loadB" | "loadC" | "loadD" if first => {
+                let deck = step.as_bytes()[4] as usize - b'A' as usize + 1;
                 let mut playable = self.library.tracks.iter().filter(|t| !t.missing && t.file_path.as_ref().is_some_and(|p| p.is_file()));
                 if let Some(id) = playable.nth(deck - 1).map(|t| t.id) {
                     self.library.load_to_deck(deck, id, [false; 4]);
@@ -1123,6 +1127,7 @@ impl ReTraktorApp {
                         state.loaded_tracks[d] = Some(loaded);
                         state.playhead_sec[d] = 0.0;
                         state.is_playing[d] = false;
+                        state.reset_jump_ease(d);
                     } else { continue; }
                     self.deck_track_ids[d] = Some(track.id);
                     self.deck_auto_cue_status[d] = None;
@@ -2138,6 +2143,9 @@ impl ReTraktorApp {
         if let Ok(mut state) = self.audio.shared.lock() {
             let d = deck_idx - 1;
             state.is_playing[d] = state.loaded_tracks[d].is_some() && !state.is_playing[d];
+            if !state.is_playing[d] {
+                state.reset_jump_ease(d);
+            }
         }
     }
 
@@ -2236,6 +2244,80 @@ impl ReTraktorApp {
         if self.deck_loop_active[d] {
             if let Ok(state) = self.audio.shared.lock() {
                 self.deck_loop_start_sec[d] = state.playhead_sec[d];
+            }
+        }
+    }
+
+    /// Where deck `d`'s beat jump lands from `playhead` (`dir` -1 back, 1 forward), plus the loop length
+    /// the audio uses for this deck (as in sync_audio_state). The one check behind both the arrows and the jump.
+    fn plan_beat_jump(&self, d: usize, dir: f64, playhead: f64, bpm: f64, duration: f64) -> Option<(f64, Option<f64>, f64)> {
+        let loop_len = self.deck_loop_size_beats[d] as f64 * (60.0 / bpm.max(30.0));
+        let active_loop = (self.deck_loop_active[d] && loop_len > 0.05).then_some((self.deck_loop_start_sec[d], loop_len));
+        let (to, loop_start) = beat_jump_target(playhead, bpm, duration, dir * self.deck_jump_beats[d] as f64, active_loop)?;
+        Some((to, loop_start, loop_len))
+    }
+
+    /// Beat jump on deck `d` from the live playhead. False, with the playhead and loop untouched, when it would leave the track.
+    fn beat_jump(&mut self, d: usize, dir: f64) -> bool {
+        let Ok(mut state) = self.audio.shared.lock() else { return false };
+        let Some(t) = state.loaded_tracks[d].as_ref() else { return false };
+        let Some((to, loop_start, loop_len)) = self.plan_beat_jump(d, dir, state.playhead_sec[d], t.bpm, t.duration_sec) else { return false };
+        if let Some(start) = loop_start {
+            self.deck_loop_start_sec[d] = start;
+        }
+        // Playhead and loop change in one lock, so the next callback never wraps into the old loop.
+        state.playhead_sec[d] = to;
+        if state.is_playing[d] {
+            state.ease_jump(d);
+        } else {
+            state.reset_jump_ease(d);
+        }
+        state.loop_active[d] = self.deck_loop_active[d];
+        state.loop_start_sec[d] = self.deck_loop_start_sec[d];
+        state.loop_len_sec[d] = loop_len;
+        true
+    }
+
+    /// JUMP ◀ [size] ▶ for one deck. The arrows grey out (and say why) from this frame's snapshot;
+    /// a click checks again against the live playhead.
+    fn beat_jump_controls(&mut self, ui: &mut Ui, d: usize, deck: &DeckView) {
+        let beats = self.deck_jump_beats[d];
+        let timed = beat_jump_target(0.0, deck.bpm, deck.duration_sec, 0.0, None).is_some(); // usable BPM and length
+        ui.label(caps("JUMP"));
+        let mut jump = None;
+        for (dir, arrow, word) in [(-1.0, "◀", "back"), (1.0, "▶", "forward")] {
+            if dir > 0.0 {
+                let combo = egui::ComboBox::from_id_salt(("beat_jump_size", d))
+                    .selected_text(format!("{beats} beats"))
+                    .width(66.0)
+                    .show_ui(ui, |ui| {
+                        for n in JUMP_SIZES {
+                            ui.selectable_value(&mut self.deck_jump_beats[d], n, format!("{n} beats"));
+                        }
+                    });
+                let combo = combo.response.on_hover_text("Beat jump size, the distance each arrow moves the playhead and any active loop");
+                combo.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::ComboBox, true, format!("Deck {} beat jump size {beats} beats", DECK_LETTERS[d])));
+            }
+            let enabled = self.plan_beat_jump(d, dir, deck.elapsed_sec, deck.bpm, deck.duration_sec).is_some();
+            let why = if timed {
+                format!("Can't jump {word} {beats} beats here. The playhead and any active loop must stay inside the track.")
+            } else {
+                "Beat jump needs the track's tempo and length".to_string()
+            };
+            let resp = ui
+                .add_enabled_ui(enabled, |ui| pill(ui, arrow, false, Color32::TRANSPARENT, HIT))
+                .inner
+                .on_hover_text(format!("Jump {word} {beats} beats, keeping the beat (moves an active loop too)"))
+                .on_disabled_hover_text(why);
+            let label = format!("Deck {} beat jump {word} {beats} beats", DECK_LETTERS[d]);
+            resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, &label));
+            if resp.clicked() {
+                jump = Some(dir);
+            }
+        }
+        if let Some(dir) = jump {
+            if !self.beat_jump(d, dir) {
+                self.library.status_message = format!("Jump would leave the track on deck {}", DECK_LETTERS[d]);
             }
         }
     }
@@ -2836,24 +2918,7 @@ impl ReTraktorApp {
                     let panel_rect = display(ui, |ui, ink| {
                         ui.set_width(display_w);
                         ui.vertical(|ui| {
-                            // Beat strip: the bar counter sweeps with the music, the phase meter shows drift from the other deck.
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 8.0;
-                                let phrase_info = current_phrase_info(&deck.phrases, deck.elapsed_sec, deck.bpm, deck.grid_offset_sec);
-                                let phrase_w = if phrase_info.is_some() { 68.0 } else { 0.0 };
-                                let avail = (display_w - 16.0 - if phrase_w > 0.0 { phrase_w + 8.0 } else { 0.0 }).max(100.0);
-                                let bar_w = (avail * 0.58).max(50.0);
-                                let meter_w = (avail - bar_w - 8.0).max(35.0);
-                                let (bar, _) = ui.allocate_exact_size(Vec2::new(bar_w, 11.0), Sense::hover());
-                                dot::bar_counter(ui.painter(), bar, (deck.elapsed_sec - deck.grid_offset_sec) * deck.bpm / 60.0, deck.is_playing, accent_color, ink);
-                                let (meter, resp) = ui.allocate_exact_size(Vec2::new(meter_w, 11.0), Sense::hover());
-                                dot::phase_meter(ui.painter(), meter, phase, accent_color, ink);
-                                resp.on_hover_text("Beat phase against the other deck: centre means the beats are locked");
-                                if let Some((kind_str, bars_rem)) = phrase_info {
-                                    let text = if bars_rem > 0 { format!("{kind_str} · {bars_rem}") } else { kind_str };
-                                    ui.label(RichText::new(text).font(crate::theme::dot_font(9.0)).color(ink));
-                                }
-                            });
+                            beat_strip(ui, d, &deck, phase, accent_color, ink, display_w - 16.0, 11.0);
                             // Readout numbers in dot font: BPM, KEY, REMAIN with fixed columns so A and B headers align
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 8.0;
@@ -2931,37 +2996,40 @@ impl ReTraktorApp {
 
     /// 4-Deck layout: decks A + C | four-channel mixer | decks B + D, each deck with its own waveform.
     fn show_four_deck_layout(&mut self, ui: &mut Ui) {
-        ui.horizontal_top(|ui| {
-            let mixer_w = (ui.available_width() * 0.36).clamp(460.0, 560.0);
-            let deck_w = ((ui.available_width() - mixer_w - 8.0) / 2.0).max(260.0);
-            // Shorter waveforms on short windows keep the browser on screen.
-            let wave_h = (36.0 + (ui.ctx().screen_rect().height() - 640.0) * 0.1).clamp(36.0, 80.0);
+        // Scrolls when C and D are taller than the window (1024 x 640), so every deck control stays reachable.
+        egui::ScrollArea::vertical().id_salt("four_deck").auto_shrink([false, true]).drag_to_scroll(false).show(ui, |ui| {
+            ui.horizontal_top(|ui| {
+                let mixer_w = (ui.available_width() * 0.36).clamp(460.0, 560.0);
+                let deck_w = ((ui.available_width() - mixer_w - 8.0) / 2.0).max(260.0);
+                // Shorter waveforms on short windows keep the browser on screen.
+                let wave_h = (36.0 + (ui.ctx().screen_rect().height() - 640.0) * 0.1).clamp(36.0, 80.0);
 
-            // A and B differ in height when one shows tools or stems; pad the shorter one so C and D line up.
-            let heights_id = ui.id().with("four_deck_top_heights");
-            let prev: [f32; 2] = ui.ctx().data(|d| d.get_temp(heights_id)).unwrap_or([0.0; 2]);
-            let row_h = prev[0].max(prev[1]);
-            let mut now = [0.0f32; 2];
-            ui.allocate_ui_with_layout(Vec2::new(deck_w, 340.0), Layout::top_down(Align::Min), |ui| {
-                ui.set_width(deck_w);
-                now[0] = self.show_single_deck(ui, 1, TraktorTheme::DECK_A(), true, wave_h, 0.0);
-                ui.add_space((row_h - now[0]).max(0.0));
-                self.show_single_deck(ui, 3, TraktorTheme::DECK_C(), true, wave_h, 0.0);
+                // A and B differ in height when one shows tools or stems; pad the shorter one so C and D line up.
+                let heights_id = ui.id().with("four_deck_top_heights");
+                let prev: [f32; 2] = ui.ctx().data(|d| d.get_temp(heights_id)).unwrap_or([0.0; 2]);
+                let row_h = prev[0].max(prev[1]);
+                let mut now = [0.0f32; 2];
+                ui.allocate_ui_with_layout(Vec2::new(deck_w, 340.0), Layout::top_down(Align::Min), |ui| {
+                    ui.set_width(deck_w);
+                    now[0] = self.show_single_deck(ui, 1, TraktorTheme::DECK_A(), true, wave_h, 0.0);
+                    ui.add_space((row_h - now[0]).max(0.0));
+                    self.show_single_deck(ui, 3, TraktorTheme::DECK_C(), true, wave_h, 0.0);
+                });
+                ui.allocate_ui_with_layout(Vec2::new(mixer_w, 340.0), Layout::top_down(Align::Min), |ui| {
+                    ui.set_width(mixer_w);
+                    self.show_mixer_section(ui, false);
+                });
+                ui.allocate_ui_with_layout(Vec2::new(deck_w, 340.0), Layout::top_down(Align::Min), |ui| {
+                    ui.set_width(deck_w);
+                    now[1] = self.show_single_deck(ui, 2, TraktorTheme::DECK_B(), true, wave_h, 0.0);
+                    ui.add_space((row_h - now[1]).max(0.0));
+                    self.show_single_deck(ui, 4, TraktorTheme::DECK_D(), true, wave_h, 0.0);
+                });
+                if now != prev {
+                    ui.ctx().data_mut(|d| d.insert_temp(heights_id, now));
+                    ui.ctx().request_repaint();
+                }
             });
-            ui.allocate_ui_with_layout(Vec2::new(mixer_w, 340.0), Layout::top_down(Align::Min), |ui| {
-                ui.set_width(mixer_w);
-                self.show_mixer_section(ui, false);
-            });
-            ui.allocate_ui_with_layout(Vec2::new(deck_w, 340.0), Layout::top_down(Align::Min), |ui| {
-                ui.set_width(deck_w);
-                now[1] = self.show_single_deck(ui, 2, TraktorTheme::DECK_B(), true, wave_h, 0.0);
-                ui.add_space((row_h - now[1]).max(0.0));
-                self.show_single_deck(ui, 4, TraktorTheme::DECK_D(), true, wave_h, 0.0);
-            });
-            if now != prev {
-                ui.ctx().data_mut(|d| d.insert_temp(heights_id, now));
-                ui.ctx().request_repaint();
-            }
         });
     }
 
@@ -3200,25 +3268,7 @@ impl ReTraktorApp {
             let looping = crate::theme::fade(ui.ctx(), ("deck_loop", d), self.deck_loop_active[d]);
             let panel_rect = display(ui, |ui, ink| {
                 ui.vertical(|ui| {
-                    // Beat strip: the bar counter sweeps with the music, the phase meter shows drift from the other deck.
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 8.0;
-                        let phrase_info = current_phrase_info(&deck.phrases, deck.elapsed_sec, bpm, deck.grid_offset_sec);
-                        let phrase_w = if phrase_info.is_some() { 68.0 } else { 0.0 };
-                        let total_w = ui.available_width();
-                        let avail = (total_w - if phrase_w > 0.0 { phrase_w + 8.0 } else { 0.0 }).max(100.0);
-                        let bar_w = (avail * 0.58).max(50.0);
-                        let meter_w = (avail - bar_w - 8.0).max(35.0);
-                        let (bar, _) = ui.allocate_exact_size(Vec2::new(bar_w, 12.0), Sense::hover());
-                        dot::bar_counter(ui.painter(), bar, (deck.elapsed_sec - deck.grid_offset_sec) * bpm / 60.0, deck.is_playing, accent_color, ink);
-                        let (meter, resp) = ui.allocate_exact_size(Vec2::new(meter_w, 12.0), Sense::hover());
-                        dot::phase_meter(ui.painter(), meter, phase, accent_color, ink);
-                        resp.on_hover_text("Beat phase against the other deck: centre means the beats are locked");
-                        if let Some((kind_str, bars_rem)) = phrase_info {
-                            let text = if bars_rem > 0 { format!("{kind_str} · {bars_rem}") } else { kind_str };
-                            ui.label(RichText::new(text).font(crate::theme::dot_font(9.0)).color(ink));
-                        }
-                    });
+                    beat_strip(ui, d, &deck, phase, accent_color, ink, ui.available_width(), 12.0);
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 14.0;
                         let advance = ui.fonts(|f| f.glyph_width(&crate::theme::dot_font(100.0), '0')) / 100.0;
@@ -3409,6 +3459,14 @@ impl ReTraktorApp {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| pitch_fader(ui, &mut self.deck_pitch_fader[d]));
                 }
             });
+            // 7b. Beat jump, with the pitch fader beside it when the transport row had no room for it.
+            row(ui, HIT, |ui| {
+                self.beat_jump_controls(ui, d, &deck);
+                if !pitch_inline && ui.available_width() >= 120.0 {
+                    pitch_inline = true;
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| pitch_fader(ui, &mut self.deck_pitch_fader[d]));
+                }
+            });
             if !pitch_inline {
                 ui.horizontal(|ui| {
                     ui.label(caps("PITCH"));
@@ -3455,7 +3513,8 @@ impl ReTraktorApp {
                 return;
             }
             ui.multiply_opacity(pads_t);
-            ui.horizontal(|ui| {
+            // Wraps rather than widening a narrow deck past the window edge.
+            ui.horizontal_wrapped(|ui| {
                 let shift = if d == 1 { "Shift+" } else { "" };
                 let progress = self.library.stem_job_progress.filter(|(id, _)| self.deck_track_ids[d] == Some(*id));
                 let label = match progress {
@@ -3908,6 +3967,31 @@ impl ReTraktorApp {
     }
 }
 
+/// Beat jump sizes, in beats.
+const JUMP_SIZES: [u32; 4] = [4, 8, 16, 32];
+
+/// Where a jump of `beats` (negative = back) lands: the new playhead and, with an active loop
+/// `(start, len)`, the loop's new start. Counted in the track's own beats (source seconds), so pitch,
+/// sync and play state never change the distance and the beat and bar phase are kept. `None` when the
+/// tempo or length is unusable or the playhead or the whole loop would leave [0, duration).
+fn beat_jump_target(playhead: f64, bpm: f64, duration: f64, beats: f64, active_loop: Option<(f64, f64)>) -> Option<(f64, Option<f64>)> {
+    if !(bpm.is_finite() && bpm > 0.0 && duration.is_finite() && duration > 0.0 && playhead.is_finite()) {
+        return None;
+    }
+    let shift = beats * 60.0 / bpm;
+    let to = playhead + shift;
+    if !(0.0..duration).contains(&to) {
+        return None;
+    }
+    match active_loop {
+        None => Some((to, None)),
+        Some((start, len)) => {
+            let start = start + shift;
+            (start >= 0.0 && start + len <= duration).then_some((to, Some(start)))
+        }
+    }
+}
+
 /// Playback ratio that brings `bpm` to `target`, folding the target by octaves so 70 follows 140 at half time.
 fn sync_ratio(bpm: f64, target: f64) -> f64 {
     let mut ratio = target.max(20.0) / bpm.max(20.0);
@@ -4115,6 +4199,45 @@ fn display(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui, Color32)) -> egui::Re
         .show(ui, |ui| ui.horizontal(|ui| add_contents(ui, on(bg))))
         .response
         .rect
+}
+
+/// Beat strip atop a deck display, `width` wide: the bar counter sweeps with the music, the phase meter
+/// shows drift from the other deck, and the phrase reads like `BREAKDOWN · 3` (bars to the next phrase).
+/// A track with phrases keeps one phrase slot throughout, so a changing label never moves the deck or the mixer.
+#[allow(clippy::too_many_arguments)]
+fn beat_strip(ui: &mut Ui, d: usize, deck: &DeckView, phase: Option<f64>, accent: Color32, ink: Color32, width: f32, height: f32) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        let font = crate::theme::dot_font(9.0);
+        let slot_w = if deck.phrases.is_empty() || deck.bpm <= 0.0 { 0.0 } else { phrase_slot_width(ui, &font) };
+        let avail = (width - if slot_w > 0.0 { slot_w + 8.0 } else { 0.0 }).max(100.0);
+        let bar_w = (avail * 0.58).max(50.0);
+        let meter_w = (avail - bar_w - 8.0).max(35.0);
+        let (bar, _) = ui.allocate_exact_size(Vec2::new(bar_w, height), Sense::hover());
+        dot::bar_counter(ui.painter(), bar, (deck.elapsed_sec - deck.grid_offset_sec) * deck.bpm / 60.0, deck.is_playing, accent, ink);
+        let (meter, resp) = ui.allocate_exact_size(Vec2::new(meter_w, height), Sense::hover());
+        dot::phase_meter(ui.painter(), meter, phase, accent, ink);
+        resp.on_hover_text("Beat phase against the other deck: centre means the beats are locked");
+        if slot_w <= 0.0 {
+            return;
+        }
+        let (rect, resp) = ui.allocate_exact_size(Vec2::new(slot_w, ui.fonts(|f| f.row_height(&font))), Sense::hover());
+        let Some((kind, bars)) = current_phrase_info(&deck.phrases, deck.elapsed_sec, deck.bpm, deck.grid_offset_sec) else { return };
+        let text = if bars > 0 { format!("{kind} · {bars}") } else { kind };
+        let mut job = egui::text::LayoutJob::simple_singleline(text.clone(), font, ink);
+        job.wrap = egui::text::TextWrapping::truncate_at_width(slot_w);
+        let galley = ui.fonts(|f| f.layout_job(job));
+        let cut = galley.elided;
+        ui.painter().galley(egui::pos2(rect.left(), rect.center().y - galley.size().y / 2.0), galley, ink);
+        let resp = if cut { resp.on_hover_text(&text) } else { resp };
+        resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, format!("Deck {} phrase {text}", DECK_LETTERS[d])));
+    });
+}
+
+/// Width in `font` of the longest realistic phrase label: the longest phrase name, BREAKDOWN, plus a two-digit countdown.
+// shortcut: a phrase over 99 bars is cut with an ellipsis (full text on hover), widen the sample if such phrases become common.
+fn phrase_slot_width(ui: &Ui, font: &egui::FontId) -> f32 {
+    ui.fonts(|f| f.layout_no_wrap("BREAKDOWN · 88".to_owned(), font.clone(), Color32::WHITE).size().x).ceil()
 }
 
 /// A number glanced at mid-mix: small caps label over the value in the dot-matrix face.
@@ -4508,6 +4631,37 @@ mod sync_audio {
         }
     }
 
+    /// An accessible node: name, role, rectangle, disabled.
+    type Node = (String, egui::accesskit::Role, egui::Rect, bool);
+
+    /// One frame of the workspace as `update` draws it in a `screen`-sized window; returns every named accessible node.
+    fn workspace_frame(ctx: &egui::Context, app: &mut ReTraktorApp, screen: egui::Rect, time: f64, events: Vec<egui::Event>) -> Vec<Node> {
+        let out = ctx.run(egui::RawInput { time: Some(time), events, screen_rect: Some(screen), ..Default::default() }, |ctx| {
+            egui::CentralPanel::default().frame(egui::Frame::none().inner_margin(4.0)).show(ctx, |ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(4.0, 4.0);
+                app.show_top_bar(ui);
+                match app.layout {
+                    TraktorLayout::FourDeck => app.show_four_deck_layout(ui),
+                    TraktorLayout::Timeline => {
+                        app.show_mini_decks_bar(ui);
+                        app.show_timeline_studio_layout(ui);
+                    }
+                    _ => app.show_parallel_layout(ui),
+                }
+                app.show_browser_panel(ui);
+            });
+        });
+        let nodes = out.platform_output.accesskit_update.map(|u| u.nodes).unwrap_or_default();
+        nodes
+            .into_iter()
+            .filter_map(|(_, n)| {
+                let b = n.bounds()?;
+                let r = egui::Rect::from_min_max(egui::pos2(b.x0 as f32, b.y0 as f32), egui::pos2(b.x1 as f32, b.y1 as f32));
+                Some((n.name()?.to_string(), n.role(), r, n.is_disabled()))
+            })
+            .collect()
+    }
+
     /// SYNC on B (130) under A (120): the audio callback really plays B at 120/130, with key lock off and on.
     #[test]
     fn synced_deck_plays_at_the_leaders_tempo() {
@@ -4563,5 +4717,492 @@ mod sync_audio {
         }
         app.sync_audio_state();
         assert!(bar_gap(&app).abs() < 1e-6, "starting play left the bars {} beats apart", bar_gap(&app));
+
+        // A beat jump on the synced deck moves whole bars: still on A's bar, at the same synced pitch.
+        let ratio = app.audio.shared.lock().unwrap().pitch_ratio[1];
+        app.deck_jump_beats[1] = 16;
+        for dir in [1.0, -1.0] {
+            assert!(app.beat_jump(1, dir));
+            app.sync_audio_state();
+            assert!(bar_gap(&app).abs() < 1e-6, "beat jump left the bars {} beats apart", bar_gap(&app));
+            assert!((app.audio.shared.lock().unwrap().pitch_ratio[1] - ratio).abs() < 1e-9);
+        }
+    }
+
+    fn render(app: &ReTraktorApp, seconds: f64, block: usize, rate: u32) {
+        let mut buf = vec![0.0f32; block * 2];
+        for _ in 0..(seconds * rate as f64 / block as f64).round() as usize {
+            crate::audio::AudioSystem::render_audio_f32(&app.audio.shared, &mut buf, 2, rate);
+        }
+    }
+
+    fn playhead(app: &ReTraktorApp, d: usize) -> f64 {
+        app.audio.shared.lock().unwrap().playhead_sec[d]
+    }
+
+    /// +32 beats at 120 BPM is 16 s of track whatever the pitch, from an off-grid spot; back returns.
+    /// The very first block after the jump plays the new region (a tone where the old one was silent).
+    /// Playing and paused decks both jump, and nothing on the other deck changes.
+    #[test]
+    fn beat_jump_moves_by_the_tracks_own_beats() {
+        let mut app = ReTraktorApp::default();
+        {
+            let mut tone = track(120.0); // silent except 26-28 s
+            for f in 26 * 44_100..28 * 44_100 {
+                let v = (f as f32 * 0.06).sin() * 0.5;
+                tone.pcm_stereo[2 * f] = v;
+                tone.pcm_stereo[2 * f + 1] = v;
+            }
+            let mut s = app.audio.shared.lock().unwrap();
+            s.loaded_tracks[0] = Some(tone);
+            s.loaded_tracks[1] = Some(track(120.0));
+            s.playhead_sec[0] = 10.37; // beat 20.74: between beats
+            s.playhead_sec[1] = 3.0;
+            s.is_playing[0] = true;
+        }
+        app.deck_pitch_fader[0] = 6.0;
+        app.sync_audio_state();
+        let block_peak = |app: &ReTraktorApp| {
+            let mut buf = vec![0.0f32; 480 * 2];
+            crate::audio::AudioSystem::render_audio_f32(&app.audio.shared, &mut buf, 2, 48_000);
+            buf.iter().fold(0.0f32, |m, v| m.max(v.abs()))
+        };
+        assert!(block_peak(&app) < 1e-6, "the region before the jump should be silent");
+        let p0 = playhead(&app, 0);
+        app.deck_jump_beats[0] = 32;
+        assert!(app.beat_jump(0, 1.0));
+        let p = playhead(&app, 0);
+        assert!((p - p0 - 16.0).abs() < 1e-9, "jumped {}", p - p0);
+        assert!(((p * 2.0).fract() - (p0 * 2.0).fract()).abs() < 1e-9, "beat phase lost");
+        assert!(block_peak(&app) > 0.05, "the first block after the jump didn't play the new region");
+        {
+            let s = app.audio.shared.lock().unwrap();
+            assert!(s.is_playing[0] && !s.is_playing[1]);
+            assert_eq!(s.playhead_sec[1], 3.0);
+            assert!((s.pitch_ratio[0] - 1.06).abs() < 1e-9);
+        }
+        assert_eq!(app.deck_jump_beats[1], 4, "decks share a jump size");
+
+        // Plays on at +6% from the new spot, then jumps back 16 s.
+        render(&app, 1.0, 480, 48_000);
+        let p = playhead(&app, 0);
+        assert!((p - (p0 + 16.0 + 1.06 * 1.01)).abs() < 1e-6, "played to {p}");
+        assert!(app.beat_jump(0, -1.0));
+        assert!((playhead(&app, 0) - (p - 16.0)).abs() < 1e-9);
+
+        // Paused deck B: 4 beats = 2 s, and it stays paused and put.
+        assert!(app.beat_jump(1, 1.0));
+        render(&app, 0.2, 512, 44_100);
+        assert_eq!(playhead(&app, 1), 5.0);
+        assert!(!app.audio.shared.lock().unwrap().is_playing[1]);
+    }
+
+    /// A jump that would leave [0, duration) is refused and leaves the deck where it was.
+    #[test]
+    fn beat_jump_refuses_to_leave_the_track() {
+        let mut app = ReTraktorApp::default();
+        app.audio.shared.lock().unwrap().loaded_tracks[0] = Some(track(120.0)); // 100 s long
+        let try_at = |app: &mut ReTraktorApp, at: f64, beats: u32, dir: f64| {
+            app.audio.shared.lock().unwrap().playhead_sec[0] = at;
+            app.deck_jump_beats[0] = beats;
+            (app.beat_jump(0, dir), playhead(app, 0))
+        };
+        assert_eq!(try_at(&mut app, 10.0, 32, -1.0), (false, 10.0));
+        assert_eq!(try_at(&mut app, 2.0, 4, -1.0), (true, 0.0), "landing on the very start is allowed");
+        assert_eq!(try_at(&mut app, 84.0, 32, 1.0), (false, 84.0), "the end itself is outside the track");
+        let (ok, p) = try_at(&mut app, 83.5, 32, 1.0);
+        assert!(ok && (p - 99.5).abs() < 1e-9);
+
+        for (bpm, duration) in [(f64::NAN, 100.0), (0.0, 100.0), (-120.0, 100.0), (f64::INFINITY, 100.0), (120.0, 0.0), (120.0, f64::NAN), (120.0, f64::INFINITY)] {
+            assert_eq!(beat_jump_target(10.0, bpm, duration, 4.0, None), None, "bpm {bpm}, duration {duration}");
+        }
+        let mut bad = track(0.0);
+        bad.duration_sec = 100.0;
+        app.audio.shared.lock().unwrap().loaded_tracks[0] = Some(bad);
+        assert_eq!(try_at(&mut app, 10.0, 4, 1.0), (false, 10.0));
+        app.audio.shared.lock().unwrap().loaded_tracks[0] = None;
+        assert!(!app.beat_jump(0, 1.0), "an empty deck jumped");
+    }
+
+    /// An active loop moves whole with the playhead, and the very next callback plays the new loop,
+    /// wrapping across block boundaries at common rates, key lock off and on.
+    #[test]
+    fn beat_jump_carries_an_active_loop() {
+        for (rate, keylock) in [(44_100, false), (48_000, true), (96_000, false)] {
+            let mut app = ReTraktorApp::default();
+            {
+                let mut s = app.audio.shared.lock().unwrap();
+                s.loaded_tracks[0] = Some(track(120.0));
+                s.playhead_sec[0] = 20.0;
+                s.is_playing[0] = true;
+                s.keylock[0] = keylock;
+            }
+            app.toggle_loop(1); // 4 beats = 2 s from 20.0; not yet handed to the audio
+            app.audio.shared.lock().unwrap().playhead_sec[0] = 21.995;
+            app.deck_jump_beats[0] = 8;
+            assert!(app.beat_jump(0, 1.0));
+            {
+                let s = app.audio.shared.lock().unwrap();
+                assert!((s.playhead_sec[0] - 25.995).abs() < 1e-9);
+                assert!(s.loop_active[0] && (s.loop_start_sec[0] - 24.0).abs() < 1e-9 && (s.loop_len_sec[0] - 2.0).abs() < 1e-9);
+            }
+            assert!((app.deck_loop_start_sec[0] - 24.0).abs() < 1e-9, "UI and audio loops differ");
+            let mut buf = vec![0.0f32; 512 * 2];
+            for _ in 0..(rate as usize / 10 / 512) {
+                crate::audio::AudioSystem::render_audio_f32(&app.audio.shared, &mut buf, 2, rate);
+                let p = playhead(&app, 0);
+                assert!((24.0..26.0).contains(&p), "{rate} Hz: left the moved loop at {p}");
+            }
+            assert!(playhead(&app, 0) < 25.0, "{rate} Hz: never wrapped");
+        }
+
+        // The whole loop must fit: blocked at either edge, untouched; a loop ending exactly at the end fits.
+        let mut app = ReTraktorApp::default();
+        app.audio.shared.lock().unwrap().loaded_tracks[0] = Some(track(120.0));
+        let setup = |app: &mut ReTraktorApp, start: f64, at: f64| {
+            app.deck_loop_active[0] = false;
+            app.audio.shared.lock().unwrap().playhead_sec[0] = start;
+            app.toggle_loop(1);
+            app.audio.shared.lock().unwrap().playhead_sec[0] = at;
+        };
+        setup(&mut app, 97.5, 98.0);
+        assert!(!app.beat_jump(0, 1.0), "the moved loop would run past the end");
+        assert_eq!((app.deck_loop_start_sec[0], playhead(&app, 0)), (97.5, 98.0));
+        setup(&mut app, 1.0, 2.5);
+        assert!(!app.beat_jump(0, -1.0), "the moved loop would start before the track");
+        assert_eq!((app.deck_loop_start_sec[0], playhead(&app, 0)), (1.0, 2.5));
+        setup(&mut app, 96.0, 97.0);
+        assert!(app.beat_jump(0, 1.0));
+        assert_eq!((app.deck_loop_start_sec[0], playhead(&app, 0)), (98.0, 99.0));
+    }
+
+    /// A playing beat jump from a tone into the same tone at opposite polarity (its left and right are
+    /// opposite too), heard at the master output. Unsmoothed, the seam steps by the whole swing. Smoothed,
+    /// no sample-to-sample step on either channel may exceed twice the tone's own. That holds at 44.1, 48
+    /// and 96 kHz, in 64, 333 and 512-frame blocks, with stems, and for a second jump back that comes
+    /// mid-ease. Afterwards the output is the destination audio, exactly as an unsmoothed jump plays
+    /// it, and the playhead keeps exact time. Key lock's own crossfade is left alone. A paused jump
+    /// doesn't change what plays when the deck starts.
+    #[test]
+    fn beat_jump_seam_eases_instead_of_stepping() {
+        const AMP: f32 = 0.25;
+        let tone_track = |stems: bool| {
+            let mut t = track(120.0);
+            t.duration_sec = 40.0;
+            // 441 Hz: exactly 100 samples a period, so the 16 s jump lands on the same phase. From 20 s on, polarity flips.
+            t.pcm_stereo = (0..40 * 44_100)
+                .flat_map(|i| {
+                    let v = AMP * (i as f32 * std::f32::consts::TAU / 100.0).sin() * if i < 20 * 44_100 { 1.0 } else { -1.0 };
+                    [v, -v]
+                })
+                .collect();
+            if stems {
+                let quarter: Vec<f32> = t.pcm_stereo.iter().map(|v| v * 0.25).collect();
+                (t.pcm_drums, t.pcm_bass, t.pcm_other, t.pcm_vocals) = (Some(quarter.clone()), Some(quarter.clone()), Some(quarter.clone()), Some(quarter));
+            }
+            t
+        };
+        // Largest sample-to-sample step per channel in interleaved stereo.
+        let max_step = |out: &[f32]| -> [f32; 2] {
+            let mut m = [0.0f32; 2];
+            for f in 1..out.len() / 2 {
+                for c in 0..2 {
+                    m[c] = m[c].max((out[2 * f + c] - out[2 * (f - 1) + c]).abs());
+                }
+            }
+            m
+        };
+        for (rate, block, stems, keylock) in [(44_100u32, 64usize, false, false), (48_000, 333, true, false), (96_000, 512, false, false), (48_000, 512, false, true)] {
+            let case = format!("{rate} Hz, {block}-frame blocks, stems {stems}, key lock {keylock}");
+            // `smoothed` jumps with the JUMP button's code; the other sets the playhead directly, as before the fix.
+            let run = |smoothed: bool| -> (Vec<f32>, usize, f64) {
+                let mut app = ReTraktorApp::default();
+                let lead = (0.02 * rate as f64) as usize / block + 1; // blocks before the first jump
+                {
+                    let mut s = app.audio.shared.lock().unwrap();
+                    s.loaded_tracks[0] = Some(tone_track(stems));
+                    // Arrive at the jump on a crest (a quarter period), where flipping polarity steps furthest.
+                    s.playhead_sec[0] = 10.0 + 25.0 / 44_100.0 - (lead * block) as f64 / rate as f64;
+                    s.is_playing[0] = true;
+                    s.keylock[0] = keylock;
+                }
+                app.deck_jump_beats[0] = 32;
+                let mut out = Vec::new();
+                let mut buf = vec![0.0f32; block * 2];
+                let mut play = |app: &ReTraktorApp, blocks: usize, out: &mut Vec<f32>| {
+                    for _ in 0..blocks {
+                        crate::audio::AudioSystem::render_audio_f32(&app.audio.shared, &mut buf, 2, rate);
+                        out.extend_from_slice(&buf);
+                    }
+                };
+                let jump = |app: &mut ReTraktorApp, dir: f64| {
+                    if smoothed {
+                        assert!(app.beat_jump(0, dir));
+                    } else {
+                        app.audio.shared.lock().unwrap().playhead_sec[0] += dir * 16.0;
+                    }
+                };
+                play(&app, lead, &mut out);
+                let seam = out.len() / 2;
+                jump(&mut app, 1.0);
+                play(&app, 1, &mut out);
+                jump(&mut app, -1.0); // mid-ease in 64-frame blocks (the ease is 3 ms)
+                play(&app, (0.05 * rate as f64) as usize / block + 1, &mut out);
+                let end = app.audio.shared.lock().unwrap().playhead_sec[0];
+                (out, seam, end)
+            };
+            let (eased, seam, eased_end) = run(true);
+            let (stepped, _, stepped_end) = run(false);
+            assert_eq!(eased[..2 * seam], stepped[..2 * seam], "{case}: the audio before the jump changed");
+            assert_eq!(eased_end.to_bits(), stepped_end.to_bits(), "{case}: the playhead's timing changed");
+            let frames = eased.len() / 2;
+            let expected_end = 10.0 + 25.0 / 44_100.0 + (frames - seam) as f64 / rate as f64;
+            assert!((eased_end - expected_end).abs() < 1e-9, "{case}: playhead at {eased_end}, expected {expected_end}");
+
+            let tone = max_step(&eased[2 * (seam - (0.01 * rate as f64) as usize)..2 * seam]);
+            let window = 2 * (seam - 1)..2 * (seam + (0.01 * rate as f64) as usize);
+            let (eased_seam, stepped_seam) = (max_step(&eased[window.clone()]), max_step(&stepped[window]));
+            eprintln!(
+                "seam {case}: tone step L {:.4} R {:.4} | unsmoothed L {:.4} R {:.4} ({:.1}x) | smoothed L {:.4} R {:.4} ({:.2}x)",
+                tone[0], tone[1], stepped_seam[0], stepped_seam[1], stepped_seam[0] / tone[0], eased_seam[0], eased_seam[1], eased_seam[0] / tone[0]
+            );
+            for c in 0..2 {
+                assert!(eased_seam[c] <= 2.0 * tone[c], "{case}: channel {c} steps {} across the seam, the tone itself {}", eased_seam[c], tone[c]);
+            }
+            if keylock {
+                assert_eq!(eased, stepped, "{case}: key lock already crossfades a jump; the ease must stay out of it");
+            } else {
+                assert!(stepped_seam[0] > 5.0 * tone[0], "{case}: this signal should crack without the ease");
+                // 20 ms after the second jump the ease is long over: the destination plays as an unsmoothed jump plays it.
+                let settled = 2 * (seam + (0.025 * rate as f64) as usize);
+                let off = eased[settled..].iter().zip(&stepped[settled..]).fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+                assert!(off < 1e-4, "{case}: still {off} off the destination audio");
+            }
+        }
+
+        // Paused: a jump moves the playhead only, so starting play sounds as if it had been set directly.
+        let paused = |smoothed: bool| {
+            let mut app = ReTraktorApp::default();
+            app.audio.shared.lock().unwrap().loaded_tracks[0] = Some(tone_track(false));
+            app.deck_jump_beats[0] = 32;
+            if smoothed {
+                assert!(app.beat_jump(0, 1.0));
+            } else {
+                app.audio.shared.lock().unwrap().playhead_sec[0] = 16.0;
+            }
+            app.audio.shared.lock().unwrap().is_playing[0] = true;
+            let mut buf = vec![0.0f32; 256 * 2];
+            crate::audio::AudioSystem::render_audio_f32(&app.audio.shared, &mut buf, 2, 48_000);
+            buf
+        };
+        assert_eq!(paused(true), paused(false), "a paused jump changed the audio");
+    }
+
+    /// A playing jump leaves an ease pending, then with no audio callback in between: stop, two paused
+    /// jumps and play again, or a new track and play. The deck must start exactly as if its playhead or
+    /// track had simply been set, with no ease from the frame heard before.
+    #[test]
+    fn stop_paused_jump_and_new_track_drop_a_pending_ease() {
+        // L +0.25 and R -0.25 until `flip` seconds, then the opposite.
+        let flat = |flip: f64| {
+            let mut t = track(120.0);
+            t.duration_sec = 40.0;
+            t.pcm_stereo = (0..40 * 44_100).flat_map(|i| { let v = if (i as f64) < flip * 44_100.0 { 0.25 } else { -0.25 }; [v, -v] }).collect();
+            t
+        };
+        let first_block = |exercise: bool, replace: bool| {
+            let mut app = ReTraktorApp::default();
+            {
+                let mut s = app.audio.shared.lock().unwrap();
+                s.loaded_tracks[0] = Some(flat(20.0));
+                s.playhead_sec[0] = 10.0;
+                s.is_playing[0] = true;
+            }
+            app.deck_jump_beats[0] = 32;
+            let mut buf = vec![0.0f32; 256 * 2];
+            crate::audio::AudioSystem::render_audio_f32(&app.audio.shared, &mut buf, 2, 48_000);
+            match (exercise, replace) {
+                (true, false) => {
+                    assert!(app.beat_jump(0, 1.0)); // to the flipped half; the ease is never rendered
+                    app.toggle_play(1);
+                    assert!(app.beat_jump(0, -1.0) && app.beat_jump(0, 1.0));
+                    app.toggle_play(1);
+                }
+                (false, false) => app.audio.shared.lock().unwrap().playhead_sec[0] += 16.0,
+                (true, true) => {
+                    assert!(app.beat_jump(0, 1.0));
+                    let entry = crate::library_ui::UiTrackEntry { id: 7, ..Default::default() };
+                    app.load_channel.0.send((0, app.load_generation[0], entry, Ok(flat(0.0)))).unwrap();
+                    app.finish_loads();
+                    app.toggle_play(1);
+                }
+                (false, true) => {
+                    app.audio.shared.lock().unwrap().loaded_tracks[0] = Some(flat(0.0));
+                    app.audio.shared.lock().unwrap().playhead_sec[0] = 0.0;
+                }
+            }
+            assert!(app.audio.shared.lock().unwrap().is_playing[0]);
+            crate::audio::AudioSystem::render_audio_f32(&app.audio.shared, &mut buf, 2, 48_000);
+            buf
+        };
+        assert_eq!(first_block(true, false), first_block(false, false), "stop and paused jumps left the pending ease");
+        assert_eq!(first_block(true, true), first_block(false, true), "a new track played an ease from the old one");
+    }
+
+    /// The beat strip keeps one shape whatever phrase it names. Deck A walks through INTRO · 10,
+    /// BREAKDOWN · 3, DROP · 30, BREAKDOWN · 88, an exceptional BREAKDOWN · 205 and OUTRO in Mix, 4-Deck and
+    /// Timeline, at the default window (1280 x 820, as in the screenshots) and the smallest (1024 x 640).
+    /// Deck A's readouts and JUMP row, and deck B's beyond the mixer, never move. The phrase slot keeps its
+    /// rectangle inside the deck display, every realistic label fits whole, and the cut-off long one still
+    /// gives its full text to screen readers.
+    #[test]
+    fn phrase_label_never_moves_the_deck() {
+        use retraktor_library::{Phrase, PhraseKind::*};
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        ctx.enable_accesskit();
+        let mut app = ReTraktorApp::default();
+        let mut a = track(120.0); // 2 s bars
+        a.duration_sec = 800.0;
+        a.phrases = [(0.0, Intro), (20.0, Build), (40.0, Breakdown), (46.0, Drop), (106.0, Breakdown), (282.0, Drop), (290.0, Breakdown), (700.0, Outro)]
+            .map(|(start_sec, kind)| Phrase { start_sec, kind })
+            .to_vec();
+        {
+            let mut s = app.audio.shared.lock().unwrap();
+            s.loaded_tracks[0] = Some(a);
+            s.loaded_tracks[1] = Some(track(120.0));
+        }
+        let stops = [(1.0, "INTRO · 10"), (40.5, "BREAKDOWN · 3"), (47.0, "DROP · 30"), (106.5, "BREAKDOWN · 88"), (290.5, "BREAKDOWN · 205"), (701.0, "OUTRO")];
+        let font = crate::theme::dot_font(9.0);
+        let text_w = |text: &str| ctx.fonts(|f| f.layout_no_wrap(text.to_owned(), font.clone(), Color32::WHITE).size().x);
+        let mut time = 0.0;
+        for (w, h) in [(1280.0, 820.0), (1024.0, 640.0)] {
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(w, h));
+            for layout in [TraktorLayout::Parallel, TraktorLayout::FourDeck, TraktorLayout::Timeline] {
+                app.layout = layout;
+                // Probes: deck A's display readouts and JUMP row, and deck B's beyond the mixer (they move if deck A or the
+                // mixer grows). Same-named ones (each deck's BPM) in screen order.
+                let probes = |nodes: &[Node]| {
+                    let mut p: Vec<(String, egui::Rect)> = nodes
+                        .iter()
+                        .filter(|n| ["Deck A beat jump", "Deck B beat jump", "BPM ", "KEY ", "IN KEY "].iter().any(|s| n.0.starts_with(s)))
+                        .map(|n| (n.0.clone(), n.2))
+                        .collect();
+                    p.sort_by(|a, b| (&a.0, a.1.min.x, a.1.min.y).partial_cmp(&(&b.0, b.1.min.x, b.1.min.y)).unwrap());
+                    p
+                };
+                let mut first: Option<(Vec<(String, egui::Rect)>, egui::Rect)> = None;
+                for (at, text) in stops {
+                    let case = format!("{w} x {h} {}, {text}", layout.label());
+                    app.audio.shared.lock().unwrap().playhead_sec[0] = at;
+                    let mut nodes = Vec::new();
+                    for _ in 0..6 {
+                        time += 0.1;
+                        nodes = workspace_frame(&ctx, &mut app, screen, time, vec![]);
+                    }
+                    let now = probes(&nodes);
+                    let slot = nodes.iter().find(|n| n.0.starts_with("Deck A phrase")).unwrap_or_else(|| panic!("{case}: no phrase node")).clone();
+                    let (base, first_slot) = first.get_or_insert_with(|| (now.clone(), slot.2));
+                    assert!(now.iter().any(|p| p.0.starts_with("BPM ")) && (layout == TraktorLayout::Timeline || now.iter().any(|p| p.0.starts_with("Deck B beat jump"))), "{case}: probes missing");
+                    assert_eq!(&now, base, "{case}: a deck or mixer control moved");
+                    assert_eq!(slot.0, format!("Deck A phrase {text}"), "{case}");
+                    assert_eq!(slot.2, *first_slot, "{case}: the phrase slot changed size or place");
+                    let remain = nodes
+                        .iter()
+                        .filter(|n| n.0.starts_with("REMAIN") && n.2.top() > slot.2.top() && n.2.x_range().intersects(slot.2.x_range()))
+                        .min_by(|p, q| p.2.top().total_cmp(&q.2.top()))
+                        .unwrap_or_else(|| panic!("{case}: no REMAIN under the phrase"));
+                    assert!(slot.2.right() <= remain.2.right() + 0.5 && screen.contains_rect(slot.2), "{case}: phrase slot {:?} leaves the display (REMAIN ends at {})", slot.2, remain.2.right());
+                    // Laid out as `beat_strip` draws it: realistic labels whole, the 3-digit countdown cut with an ellipsis.
+                    let mut job = egui::text::LayoutJob::simple_singleline(text.to_string(), font.clone(), Color32::WHITE);
+                    job.wrap = egui::text::TextWrapping::truncate_at_width(slot.2.width());
+                    let cut = ctx.fonts(|f| f.layout_job(job)).elided;
+                    assert_eq!(cut, text.ends_with("205"), "{case}: {text} is {} px in a {} px slot", text_w(text), slot.2.width());
+                }
+                let (base, slot) = first.unwrap();
+                eprintln!("geometry {w} x {h} {}: {} probes fixed across {} phrases, phrase slot {:.1} x {:.1} px", layout.label(), base.len(), stops.len(), slot.width(), slot.height());
+            }
+        }
+    }
+
+    /// The real Mix and 4-Deck layouts in the smallest window (1024 x 640) with Tools open on every deck:
+    /// each loaded deck's JUMP arrows and size picker are on screen (C and D once the 4-Deck view scrolls),
+    /// clicks jump, the picker changes the size, and an edge greys the arrow out.
+    #[test]
+    fn beat_jump_controls_reachable_in_the_real_layouts() {
+        use egui::accesskit::Role;
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1024.0, 640.0));
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        ctx.enable_accesskit();
+        let mut app = ReTraktorApp::default();
+        {
+            let mut s = app.audio.shared.lock().unwrap();
+            for d in 0..4 {
+                s.loaded_tracks[d] = Some(track(120.0));
+                s.playhead_sec[d] = 50.0;
+            }
+        }
+        app.deck_expanded = [true; 4];
+        let mut time = 0.0;
+        let mut frame = |app: &mut ReTraktorApp, events: Vec<egui::Event>| -> Vec<Node> {
+            time += 0.1;
+            workspace_frame(&ctx, app, screen, time, events)
+        };
+        let node = |nodes: &[Node], name: &str| nodes.iter().find(|n| n.0 == name).cloned().unwrap_or_else(|| panic!("no {name}"));
+        let settle = |app: &mut ReTraktorApp, frame: &mut dyn FnMut(&mut ReTraktorApp, Vec<egui::Event>) -> Vec<Node>, events: Vec<egui::Event>| {
+            frame(app, events);
+            (0..12).map(|_| frame(app, vec![])).last().unwrap()
+        };
+        let click = |app: &mut ReTraktorApp, frame: &mut dyn FnMut(&mut ReTraktorApp, Vec<egui::Event>) -> Vec<Node>, at: egui::Pos2| {
+            let button = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+            frame(app, vec![egui::Event::PointerMoved(at)]);
+            frame(app, vec![button(true)]);
+            frame(app, vec![button(false)]);
+        };
+        let controls = |letter: char| ["back 4 beats", "forward 4 beats", "size 4 beats"].map(|c| format!("Deck {letter} beat jump {c}"));
+        let assert_on_screen = |nodes: &[Node], letters: &str, what: &str| {
+            for letter in letters.chars() {
+                for name in controls(letter) {
+                    let r = node(nodes, &name).2;
+                    assert!(screen.contains_rect(r), "{what}: {name} at {r:?} is off the 1024 x 640 window");
+                }
+            }
+        };
+
+        app.layout = TraktorLayout::Parallel;
+        let nodes = settle(&mut app, &mut frame, vec![]);
+        assert_on_screen(&nodes, "AB", "Mix, Tools open");
+
+        app.layout = TraktorLayout::FourDeck;
+        let nodes = settle(&mut app, &mut frame, vec![]);
+        assert_on_screen(&nodes, "AB", "4-Deck top");
+        // C and D sit below the window until the deck area scrolls.
+        let wheel = egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: Vec2::new(0.0, -2000.0), modifiers: egui::Modifiers::NONE };
+        frame(&mut app, vec![egui::Event::PointerMoved(egui::pos2(500.0, 400.0))]);
+        let nodes = settle(&mut app, &mut frame, vec![wheel]);
+        assert_on_screen(&nodes, "CD", "4-Deck scrolled");
+
+        // Deck D (bottom right): forward, back, then 16 beats from the size menu.
+        click(&mut app, &mut frame, node(&nodes, "Deck D beat jump forward 4 beats").2.center());
+        assert_eq!(playhead(&app, 3), 52.0);
+        click(&mut app, &mut frame, node(&nodes, "Deck D beat jump back 4 beats").2.center());
+        assert_eq!(playhead(&app, 3), 50.0);
+        click(&mut app, &mut frame, node(&nodes, "Deck D beat jump size 4 beats").2.center());
+        let menu = frame(&mut app, vec![]);
+        let item = menu.iter().find(|n| n.0 == "16 beats" && n.1 != Role::ComboBox).expect("no 16 beats item");
+        click(&mut app, &mut frame, item.2.center());
+        assert_eq!(app.deck_jump_beats, [4, 4, 4, 16], "only deck D's size changes");
+        let nodes = frame(&mut app, vec![]);
+        click(&mut app, &mut frame, node(&nodes, "Deck D beat jump forward 16 beats").2.center());
+        assert_eq!(playhead(&app, 3), 58.0);
+
+        // 8 s from the end, 16 beats (8 s) forward lands on the end: greyed out, and a click does nothing.
+        app.audio.shared.lock().unwrap().playhead_sec[3] = 92.0;
+        let nodes = settle(&mut app, &mut frame, vec![]);
+        let fwd = node(&nodes, "Deck D beat jump forward 16 beats");
+        assert!(fwd.3 && !node(&nodes, "Deck D beat jump back 16 beats").3, "forward should be disabled, back enabled");
+        click(&mut app, &mut frame, fwd.2.center());
+        assert_eq!(playhead(&app, 3), 92.0);
     }
 }

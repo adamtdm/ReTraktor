@@ -1356,8 +1356,9 @@ pub fn deck_transport_bar(
     } else {
         TraktorTheme::TEXT_HIGHLIGHT()
     };
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing = Vec2::new(3.0, 0.0);
+    // Wraps on a narrow deck (Tools open at 1024 px) instead of pushing the next panel off screen.
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = Vec2::new(3.0, 3.0);
 
         let play_color = if is_playing {
             TraktorTheme::PLAY_ACTIVE()
@@ -1439,61 +1440,72 @@ pub fn deck_transport_bar(
         }
 
         ui.separator();
-
-        if !compact {
-            ui.label(RichText::new("LOOP").font(egui::FontId::proportional(10.5)).color(if loop_active { TraktorTheme::LOOP_ACTIVE() } else { TraktorTheme::TEXT_SECONDARY() }));
+        // The loop group wraps as one unit (caption, chevrons and sizes), never leaving a chevron alone.
+        // Its width comes from the previous frame, as egui lays out before it can measure.
+        let group_id = ui.id().with("loop_group");
+        let group_w: f32 = ui.data(|d| d.get_temp(group_id)).unwrap_or(0.0);
+        if ui.available_size_before_wrap().x < group_w {
+            ui.end_row();
         }
-        let chevron_fill = TraktorTheme::CONTROL();
-        if icon_button(ui, Icon::Prev, "", chevron_fill, TraktorTheme::TEXT_SECONDARY(), Vec2::new(22.0, H))
-            .on_hover_text("Halve loop length")
-            .clicked()
-        {
-            action = Some(TransportAction::HalveLoop);
-        }
-
-        // Compact decks show only the current loop length; it toggles the loop.
-        let sizes: &[u32] = if compact { std::slice::from_ref(&current_loop_beats) } else { &[1, 2, 4, 8, 16] };
-        for &beats in sizes {
-            let is_selected_size = current_loop_beats == beats;
-            let is_active_loop = loop_active && is_selected_size;
-            let fill = if is_active_loop {
-                TraktorTheme::LOOP_ACTIVE()
-            } else if is_selected_size {
-                TraktorTheme::CONTROL_HOVER()
-            } else {
-                TraktorTheme::CONTROL()
-            };
-            let fg = if is_active_loop {
-                active_fg
-            } else if is_selected_size {
-                TraktorTheme::LOOP_ACTIVE()
-            } else {
-                TraktorTheme::TEXT_SECONDARY()
-            };
-            if ui
-                .add(
-                    egui::Button::new(
-                        RichText::new(if compact { format!("LOOP {beats}") } else { format!("{beats}") })
-                            .color(fg)
-                            .font(egui::FontId::monospace(10.5))
-                            .strong(),
-                    )
-                    .fill(fill)
-                    .min_size(Vec2::new(24.0, H)),
-                )
-                .on_hover_text(format!("Loop {beats} beats: click to set and toggle the loop{}", key("L")))
+        let group = ui.horizontal(|ui| {
+            ui.set_min_height(H); // the caption centres on the buttons, not on egui's default row height
+            ui.spacing_mut().item_spacing = Vec2::new(3.0, 0.0);
+            if !compact {
+                ui.label(RichText::new("LOOP").font(egui::FontId::proportional(10.5)).color(if loop_active { TraktorTheme::LOOP_ACTIVE() } else { TraktorTheme::TEXT_SECONDARY() }));
+            }
+            let chevron_fill = TraktorTheme::CONTROL();
+            if icon_button(ui, Icon::Prev, "", chevron_fill, TraktorTheme::TEXT_SECONDARY(), Vec2::new(22.0, H))
+                .on_hover_text("Halve loop length")
                 .clicked()
             {
-                action = Some(TransportAction::SelectLoop(beats));
+                action = Some(TransportAction::HalveLoop);
             }
-        }
 
-        if icon_button(ui, Icon::Next, "", chevron_fill, TraktorTheme::TEXT_SECONDARY(), Vec2::new(22.0, H))
-            .on_hover_text("Double loop length")
-            .clicked()
-        {
-            action = Some(TransportAction::DoubleLoop);
-        }
+            // Compact decks show only the current loop length; it toggles the loop.
+            let sizes: &[u32] = if compact { std::slice::from_ref(&current_loop_beats) } else { &[1, 2, 4, 8, 16] };
+            for &beats in sizes {
+                let is_selected_size = current_loop_beats == beats;
+                let is_active_loop = loop_active && is_selected_size;
+                let fill = if is_active_loop {
+                    TraktorTheme::LOOP_ACTIVE()
+                } else if is_selected_size {
+                    TraktorTheme::CONTROL_HOVER()
+                } else {
+                    TraktorTheme::CONTROL()
+                };
+                let fg = if is_active_loop {
+                    active_fg
+                } else if is_selected_size {
+                    TraktorTheme::LOOP_ACTIVE()
+                } else {
+                    TraktorTheme::TEXT_SECONDARY()
+                };
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new(if compact { format!("LOOP {beats}") } else { format!("{beats}") })
+                                .color(fg)
+                                .font(egui::FontId::monospace(10.5))
+                                .strong(),
+                        )
+                        .fill(fill)
+                        .min_size(Vec2::new(24.0, H)),
+                    )
+                    .on_hover_text(format!("Loop {beats} beats: click to set and toggle the loop{}", key("L")))
+                    .clicked()
+                {
+                    action = Some(TransportAction::SelectLoop(beats));
+                }
+            }
+
+            if icon_button(ui, Icon::Next, "", chevron_fill, TraktorTheme::TEXT_SECONDARY(), Vec2::new(22.0, H))
+                .on_hover_text("Double loop length")
+                .clicked()
+            {
+                action = Some(TransportAction::DoubleLoop);
+            }
+        });
+        ui.data_mut(|d| d.insert_temp(group_id, group.response.rect.width()));
     });
     action
 }
