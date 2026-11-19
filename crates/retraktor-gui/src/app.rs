@@ -410,12 +410,8 @@ impl eframe::App for ReTraktorApp {
                 if is_rec {
                     let vol = self.channel_volume[d];
                     let xfader = self.crossfader_pos;
-                    let (artist, title) = if let Some(ref loaded) = state.loaded_tracks[d] {
-                        (loaded.artist.clone(), loaded.title.clone())
-                    } else {
-                        (String::new(), String::new())
-                    };
-                    self.set_state.check_audible_track(d, playing, vol, xfader, &artist, &title, rec_offset);
+                    let (artist, title) = state.loaded_tracks[d].as_ref().map_or(("", ""), |t| (t.artist.as_str(), t.title.as_str()));
+                    self.set_state.check_audible_track(d, playing, vol, xfader, artist, title, rec_offset);
                 }
             }
         }
@@ -2384,8 +2380,7 @@ impl ReTraktorApp {
                                     } else {
                                         state.recorded_samples = Vec::with_capacity(48_000 * 2 * 1800);
                                         state.is_recording = true;
-                                        self.set_state.recorded_audible_tracks.clear();
-                                        self.set_state.recording_start = Some(std::time::Instant::now());
+                                        self.set_state.begin_recording();
                                     }
                                 }
                             }
