@@ -1126,8 +1126,8 @@ impl ReTraktorApp {
                     } else { continue; }
                     self.deck_track_ids[d] = Some(track.id);
                     self.deck_auto_cue_status[d] = None;
-                    self.deck_hotcues[d] = track.cues.iter().filter(|c| (0..8).contains(&c.hotcue))
-                        .map(|c| ((c.hotcue + 1) as u8, c.start_ms / 1000.0)).collect();
+                    // The library entry may have changed while the file decoded; the queued copy is the fallback.
+                    self.deck_hotcues[d] = self.deck_library_track(d).unwrap_or(&track).hotcue_slots();
                     self.deck_loop_active[d] = false;
                     self.library.finish_deck_load(d, track.id, stems_ready);
                     self.set_state.on_track_loaded(d, track.id);
@@ -2143,15 +2143,69 @@ impl ReTraktorApp {
 
     fn jump_to_cue(&mut self, deck_idx: usize, cue_num: u8) {
         let d = deck_idx - 1;
-        if let Some(&(_, cue_sec)) = self.deck_hotcues[d].iter().find(|(id, _)| *id == cue_num) {
+        if !(1..=8).contains(&cue_num) {
+            return;
+        }
+        if let Some(&(_, cue_sec)) = self.deck_hotcue_slots(d).iter().find(|(id, _)| *id == cue_num) {
             if let Ok(mut state) = self.audio.shared.lock() {
                 state.playhead_sec[d] = cue_sec;
             }
-        } else if let Ok(state) = self.audio.shared.lock() {
-            let current = state.playhead_sec[d];
-            self.deck_hotcues[d].push((cue_num, current));
-            if let Some(track_id) = self.deck_track_ids[d] {
-                self.library.set_hotcues(track_id, &self.deck_hotcues[d]);
+            return;
+        }
+        let Some(current) = self.audio.shared.lock().ok().map(|state| state.playhead_sec[d]) else { return };
+        self.add_deck_hotcue(d, cue_num, current);
+    }
+
+    /// The library track a deck plays, if it is still in the library; its cues are the deck's cues.
+    fn deck_library_track(&self, d: usize) -> Option<&crate::library_ui::UiTrackEntry> {
+        let id = self.deck_track_ids[d]?;
+        self.library.track(id).filter(|t| t.id == id)
+    }
+
+    /// Hotcue pads for a deck, read from the library track so two decks with the same track, or a
+    /// load that finished after an edit, agree. Tracks outside the library keep deck-only pads.
+    /// Each read also updates the deck's own copy, so the pads it last showed (pad edits, analysis)
+    /// stay if the track is removed from the library while loaded.
+    fn deck_hotcue_slots(&mut self, d: usize) -> Vec<(u8, f64)> {
+        if let Some(slots) = self.deck_library_track(d).map(|t| t.hotcue_slots()) {
+            if self.deck_hotcues[d] != slots {
+                self.deck_hotcues[d] = slots.clone();
+            }
+            return slots;
+        }
+        self.deck_hotcues[d].clone()
+    }
+
+    /// Sets an empty pad (1..=8); a filled pad is never overwritten.
+    fn add_deck_hotcue(&mut self, d: usize, slot: u8, sec: f64) {
+        match self.deck_library_track(d).map(|t| t.id) {
+            Some(id) => {
+                self.library.add_hotcue(id, slot, sec);
+                self.refresh_deck_hotcue_copies(id);
+            }
+            None => {
+                if (1..=8).contains(&slot) && !self.deck_hotcues[d].iter().any(|&(s, _)| s == slot) {
+                    self.deck_hotcues[d].push((slot, sec));
+                }
+            }
+        }
+    }
+
+    fn clear_deck_hotcue(&mut self, d: usize, slot: u8) {
+        match self.deck_library_track(d).map(|t| t.id) {
+            Some(id) => {
+                self.library.clear_hotcue(id, slot);
+                self.refresh_deck_hotcue_copies(id);
+            }
+            None => self.deck_hotcues[d].retain(|&(s, _)| s != slot),
+        }
+    }
+
+    /// Updates the deck-only pad copy on every deck playing this track, including decks not on screen.
+    fn refresh_deck_hotcue_copies(&mut self, id: usize) {
+        for d in 0..4 {
+            if self.deck_track_ids[d] == Some(id) {
+                self.deck_hotcue_slots(d);
             }
         }
     }
@@ -2165,7 +2219,7 @@ impl ReTraktorApp {
             self.deck_auto_cue_status[d] = Some("No phrases detected".to_string());
             return;
         }
-        let existing = self.deck_hotcues[d].clone();
+        let existing = self.deck_hotcue_slots(d);
         let proposed = retraktor_library::auto_cues(&deck.phrases, &existing);
         if proposed.is_empty() {
             if existing.len() >= 8 {
@@ -2177,12 +2231,8 @@ impl ReTraktorApp {
         }
         let mut added_names = Vec::new();
         for (slot, sec, label) in proposed {
-            self.deck_hotcues[d].push((slot, sec));
+            self.add_deck_hotcue(d, slot, sec);
             added_names.push(label.to_lowercase());
-        }
-        self.deck_hotcues[d].sort_by_key(|&(slot, _)| slot);
-        if let Some(track_id) = self.deck_track_ids[d] {
-            self.library.set_hotcues(track_id, &self.deck_hotcues[d]);
         }
         let status = format!("Added {} cues: {}", added_names.len(), added_names.join(", "));
         self.deck_auto_cue_status[d] = Some(status);
@@ -2879,7 +2929,7 @@ impl ReTraktorApp {
             });
         }
 
-        let cues = self.deck_hotcues[d].clone();
+        let cues = self.deck_hotcue_slots(d);
         let loop_len = self.deck_loop_size_beats[d] as f64 * (60.0 / deck.bpm.max(30.0));
         let wave_resp = if self.deck_stem_view[d] {
             scrolling_stem_waveforms(
@@ -3278,7 +3328,7 @@ impl ReTraktorApp {
             });
 
             // 4. Scrolling waveform (4-Deck; Mix draws them full width above).
-            let cues = self.deck_hotcues[d].clone();
+            let cues = self.deck_hotcue_slots(d);
             let loop_len_sec = self.deck_loop_size_beats[d] as f64 * (60.0 / bpm.max(30.0));
             if include_scrolling_waveform && waveform_height > 10.0 {
                 let wave_resp = if self.deck_stem_view[d] {
@@ -3418,6 +3468,7 @@ impl ReTraktorApp {
 
             // 8. Hotcue pads: always on screen, they are played, not configured.
             let gap = ui.spacing().item_spacing.x;
+            let hotcues = self.deck_hotcue_slots(d);
             ui.horizontal(|ui| {
                 let w = (ui.available_width() - 7.0 * gap) / 8.0;
                 // Always hotcues on screen; the other pad modes belong to the hardware pads.
@@ -3425,7 +3476,7 @@ impl ReTraktorApp {
                 for i in 1..=8usize {
                     let (lit, fill, tip) = match mode {
                         DeckPadMode::Hotcues => (
-                            self.deck_hotcues[d].iter().any(|(c, _)| *c == i as u8),
+                            hotcues.iter().any(|(c, _)| *c == i as u8),
                             TraktorTheme::hotcue_color(i),
                             "Jump to this hotcue, or set it here if empty. Right-click to clear",
                         ),
@@ -3443,10 +3494,7 @@ impl ReTraktorApp {
                         self.trigger_performance_pad(deck_idx, i as u8);
                     }
                     if pad.secondary_clicked() && mode == DeckPadMode::Hotcues {
-                        self.deck_hotcues[d].retain(|(c, _)| *c != i as u8);
-                        if let Some(track_id) = self.deck_track_ids[d] {
-                            self.library.set_hotcues(track_id, &self.deck_hotcues[d]);
-                        }
+                        self.clear_deck_hotcue(d, i as u8);
                     }
                 }
             });
@@ -4355,12 +4403,19 @@ mod tests {
         app.deck_hotcues[0] = vec![(1, 42.0)];
         app.library.pending_loads.push((1, track.clone()));
         app.drain_pending_loads();
+        // A pad set in the library while the file decodes wins over the queued copy's empty pads.
+        let pad6 = retraktor_formats::nml::NmlCue {
+            name: "Hotcue 6".into(), displ_order: 0, cue_type: retraktor_core::CueType::Cue,
+            start_ms: 3000.0, len_ms: 0.0, repeats: -1, hotcue: 5, grid_bpm: None,
+        };
+        app.library.tracks.push(crate::library_ui::UiTrackEntry { cues: vec![pad6], ..track.clone() });
+        app.library.rebuild_index();
         let result = app.load_channel.1.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
         assert!(result.3.is_ok());
         app.load_channel.0.send(result).unwrap();
         app.finish_loads();
         assert_eq!(app.deck_track_ids[0], Some(12));
-        assert!(app.deck_hotcues[0].is_empty());
+        assert_eq!(app.deck_hotcues[0], [(6, 3.0)]);
         let view = app.deck_view(0).unwrap();
         assert!(Arc::ptr_eq(&view.peaks, &app.audio.shared.lock().unwrap().loaded_tracks[0].as_ref().unwrap().waveform_peaks));
 
@@ -4394,6 +4449,57 @@ mod tests {
             assert_eq!(decoded.duration_sec, 1.0);
         }
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn hotcue_pads_on_two_decks_share_the_library_track() {
+        let dir = std::env::temp_dir().join(format!("retraktor-hotcue-decks-{}", std::process::id()));
+        let mut app = ReTraktorApp::default();
+        app.library = LibraryManager::new(dir.join("collection.nml"));
+        let intro = retraktor_formats::nml::NmlCue {
+            name: "Intro".into(), displ_order: 0, cue_type: retraktor_core::CueType::Cue,
+            start_ms: 1500.0, len_ms: 0.0, repeats: -1, hotcue: -1, grid_bpm: None,
+        };
+        app.library.tracks.push(crate::library_ui::UiTrackEntry { id: 40, title: "Shared".into(), cues: vec![intro.clone()], ..Default::default() });
+        app.library.rebuild_index();
+        // Both decks loaded the track before any pad was set: their load snapshots are empty.
+        app.deck_track_ids = [Some(40), Some(40), None, None];
+        let set_playhead = |app: &ReTraktorApp, d: usize, sec: f64| app.audio.shared.lock().unwrap().playhead_sec[d] = sec;
+        let playhead = |app: &ReTraktorApp, d: usize| app.audio.shared.lock().unwrap().playhead_sec[d];
+
+        set_playhead(&app, 0, 12.0);
+        app.jump_to_cue(1, 1);
+        set_playhead(&app, 1, 20.0);
+        app.jump_to_cue(2, 2);
+        app.jump_to_cue(2, 1);
+        assert_eq!(playhead(&app, 1), 12.0, "B jumps to A's pad 1 instead of overwriting it");
+        assert_eq!(app.deck_hotcue_slots(0), [(1, 12.0), (2, 20.0)]);
+        assert_eq!(app.deck_hotcue_slots(1), app.deck_hotcue_slots(0));
+        app.jump_to_cue(1, 9);
+        assert_eq!(app.library.track(40).unwrap().cues.len(), 3, "pad 9 does not exist");
+
+        app.clear_deck_hotcue(0, 2);
+        assert_eq!(app.deck_hotcue_slots(1), [(1, 12.0)]);
+        assert_eq!(app.library.track(40).unwrap().cues[0], intro, "the memory cue survives pad edits");
+
+        // Analysis fills pad 4 in the library; deck B shows it on its next draw.
+        let mut auto = intro.clone();
+        (auto.name, auto.start_ms, auto.hotcue) = ("Auto 4".into(), 45_000.0, 3);
+        app.library.tracks[0].cues.push(auto);
+        assert_eq!(app.deck_hotcue_slots(1), [(1, 12.0), (4, 45.0)]);
+
+        // Removed from the library while loaded: deck B keeps the pads it last showed, not the load snapshot.
+        app.library.tracks.clear();
+        app.library.rebuild_index();
+        assert_eq!(app.deck_hotcue_slots(1), [(1, 12.0), (4, 45.0)]);
+        set_playhead(&app, 1, 30.0);
+        app.jump_to_cue(2, 3);
+        app.jump_to_cue(2, 1);
+        assert_eq!(playhead(&app, 1), 12.0);
+        assert_eq!(app.deck_hotcue_slots(1), [(1, 12.0), (4, 45.0), (3, 30.0)]);
+        app.clear_deck_hotcue(1, 1);
+        assert_eq!(app.deck_hotcue_slots(1), [(4, 45.0), (3, 30.0)]);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

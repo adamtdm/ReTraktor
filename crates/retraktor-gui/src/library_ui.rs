@@ -127,6 +127,11 @@ impl UiTrackEntry {
         })
     }
 
+    /// The filled hotcue pads as (pad 1..=8, seconds), in the track's cue order.
+    pub fn hotcue_slots(&self) -> Vec<(u8, f64)> {
+        self.cues.iter().filter(|c| (0..8).contains(&c.hotcue)).map(|c| ((c.hotcue + 1) as u8, c.start_ms / 1000.0)).collect()
+    }
+
     /// Applies detected values. Without `overwrite` only unknown values are filled.
     /// Auto cues and a beatgrid are only added to tracks that have no cues of that kind.
     pub fn apply_analysis(&mut self, a: &TrackAnalysis, overwrite: bool) {
@@ -682,6 +687,9 @@ pub struct LibraryManager {
     scanned_ids: Vec<usize>,
     /// Library track currently on each deck.
     deck_tracks: [Option<usize>; 4],
+    /// Lowest id `push_track` may hand out next. Ids are never reused within a session, so a deck or a
+    /// pending load that still holds a removed track's id can never reach a different track.
+    next_track_id: usize,
     /// Last destructive change: (description, tracks, playlists) before it happened.
     undo: Option<(String, Vec<UiTrackEntry>, Vec<UserPlaylist>)>,
 
@@ -760,6 +768,7 @@ impl LibraryManager {
             auto_analyze: false,
             scanned_ids: Vec::new(),
             deck_tracks: [None; 4],
+            next_track_id: 1,
             undo: None,
             renaming: None,
             editing: None,
@@ -988,24 +997,45 @@ impl LibraryManager {
         self.touch();
     }
 
-    /// Stores deck-side hotcues on the track so they survive a reload and autosave to .nml.
-    pub fn set_hotcues(&mut self, id: usize, cues: &[(u8, f64)]) {
-        let Some(t) = self.tracks.iter_mut().find(|t| t.id == id) else { return };
-        t.cues.retain(|c| c.hotcue < 0 || c.hotcue >= 8);
-        for &(slot, sec) in cues {
-            if (1..=8).contains(&slot) {
-                t.cues.push(NmlCue {
-                    name: format!("Hotcue {slot}"),
-                    displ_order: 0,
-                    cue_type: retraktor_core::CueType::Cue,
-                    start_ms: sec * 1000.0,
-                    len_ms: 0.0,
-                    repeats: -1,
-                    hotcue: (slot - 1) as i64,
-                    grid_bpm: None,
-                });
-            }
+    /// Sets an empty hotcue pad (1..=8) on the track so it survives a reload and autosaves to .nml.
+    /// A pad that already holds a cue, loop or grid is left exactly as it is.
+    pub fn add_hotcue(&mut self, id: usize, slot: u8, sec: f64) {
+        if !(1..=8).contains(&slot) {
+            return;
         }
+        let Some(t) = self.track_mut(id).filter(|t| t.id == id) else { return };
+        let hotcue = i64::from(slot) - 1;
+        if t.cues.iter().any(|c| c.hotcue == hotcue) {
+            return;
+        }
+        t.cues.push(NmlCue {
+            name: format!("Hotcue {slot}"),
+            displ_order: 0,
+            cue_type: retraktor_core::CueType::Cue,
+            start_ms: sec * 1000.0,
+            len_ms: 0.0,
+            repeats: -1,
+            hotcue,
+            grid_bpm: None,
+        });
+        self.touch();
+    }
+
+    /// Clears one hotcue pad (1..=8), leaving every other cue untouched. A grid marker on the pad
+    /// only leaves the pad, so the track keeps its beatgrid; a cue or loop on it is deleted.
+    pub fn clear_hotcue(&mut self, id: usize, slot: u8) {
+        if !(1..=8).contains(&slot) {
+            return;
+        }
+        let Some(t) = self.track_mut(id).filter(|t| t.id == id) else { return };
+        let hotcue = i64::from(slot) - 1;
+        if !t.cues.iter().any(|c| c.hotcue == hotcue) {
+            return;
+        }
+        for grid in t.cues.iter_mut().filter(|c| c.hotcue == hotcue && c.cue_type == retraktor_core::CueType::Grid) {
+            grid.hotcue = -1;
+        }
+        t.cues.retain(|c| c.hotcue != hotcue);
         self.touch();
     }
 
@@ -1026,8 +1056,11 @@ impl LibraryManager {
         self.id_index.get(&id).and_then(|&i| self.tracks.get_mut(i))
     }
 
-    fn next_id(&self) -> usize {
-        self.tracks.iter().map(|t| t.id).max().unwrap_or(0) + 1
+    fn next_id(&mut self) -> usize {
+        // Entries pushed with their own ids (demo, tests) raise the mark too.
+        let id = self.tracks.iter().map(|t| t.id + 1).fold(self.next_track_id, usize::max);
+        self.next_track_id = id + 1;
+        id
     }
 
     fn push_track(&mut self, mut t: UiTrackEntry) -> usize {
@@ -3212,6 +3245,79 @@ mod tests {
         assert_eq!(alpha.musical_key, "8m");
         assert_eq!(alpha.cues.len(), 1);
         assert_eq!(alpha.cues[0].hotcue, 2);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn hotcue_pad_edits_keep_other_cues_through_nml_reload() {
+        use retraktor_core::CueType;
+        let (mut lib, dir) = temp_lib("hotcue-pads");
+        let cue = |name: &str, displ_order, cue_type, start_ms, len_ms, repeats, hotcue, grid_bpm| NmlCue {
+            name: name.into(), displ_order, cue_type, start_ms, len_ms, repeats, hotcue, grid_bpm,
+        };
+        let grid = cue("Beat", 0, CueType::Grid, 250.0, 0.0, -1, 0, Some(126.5));
+        let intro = cue("Intro", 1, CueType::Cue, 1500.0, 0.0, -1, -1, None);
+        let build = cue("Build", 2, CueType::Loop, 30000.0, 7619.0, 4, 2, None);
+        let drop = cue("Drop", 3, CueType::Cue, 61000.0, 0.0, -1, 4, None);
+        let mut t = track("Pads", &dir.join("pads.flac"));
+        t.cues = vec![grid.clone(), intro.clone(), build.clone(), drop.clone()];
+        let id = lib.push_track(t);
+        let cues = |lib: &LibraryManager| lib.track(id).unwrap().cues.clone();
+
+        // A filled pad, an invalid pad or an empty clear never touches the cue list.
+        let before = cues(&lib);
+        for slot in [0, 9] {
+            lib.add_hotcue(id, slot, 1.0);
+            lib.clear_hotcue(id, slot);
+        }
+        lib.add_hotcue(id, 5, 99.0);
+        lib.clear_hotcue(id, 8);
+        assert_eq!(cues(&lib), before);
+
+        // Setting and clearing pad 2 leaves every other cue as it was, in order.
+        lib.add_hotcue(id, 2, 10.0);
+        assert_eq!(cues(&lib)[..4], before[..]);
+        assert_eq!((cues(&lib)[4].hotcue, cues(&lib)[4].start_ms), (1, 10000.0));
+        lib.clear_hotcue(id, 2);
+        assert_eq!(cues(&lib), before);
+
+        // Clearing the grid's pad keeps the grid; clearing the loop's pad deletes the loop.
+        lib.clear_hotcue(id, 1);
+        lib.clear_hotcue(id, 3);
+        lib.add_hotcue(id, 7, 90.0);
+        let unslotted_grid = NmlCue { hotcue: -1, ..grid };
+        let pad7 = cue("Hotcue 7", 0, CueType::Cue, 90000.0, 0.0, -1, 6, None);
+        let expected = vec![unslotted_grid, intro, drop, pad7];
+        assert_eq!(cues(&lib), expected);
+        assert_eq!(lib.track(id).unwrap().hotcue_slots(), [(5, 61.0), (7, 90.0)]);
+
+        let path = lib.collection_path.clone();
+        lib.save_collection_nml(&path).unwrap();
+        let back = LibraryManager::new(path);
+        assert_eq!(back.tracks.iter().find(|t| t.title == "Pads").unwrap().cues, expected);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn track_ids_are_never_reused_while_a_load_is_pending() {
+        let (mut lib, dir) = temp_lib("deck-ids");
+        lib.push_track(track("Older", &dir.join("a.flac")));
+        let file = dir.join("b.flac");
+        fs::write(&file, b"queued, never decoded").unwrap();
+        let pending = lib.push_track(track("Pending", &file));
+        lib.load_to_deck(1, pending, [false; 4]);
+        assert_eq!(lib.pending_loads.len(), 1, "load is queued but unfinished");
+
+        // Removing the highest id while its load is pending must not free that id for the next import.
+        lib.apply(Action::RemoveFromCollection(vec![pending]), [false; 4], 2);
+        let new = lib.push_track(track("New", &dir.join("c.flac")));
+        assert!(new > pending);
+        assert!(lib.track(pending).is_none());
+
+        // Entries pushed with their own id (demo data) raise the mark as well.
+        lib.tracks.push(UiTrackEntry { id: 50, title: "Manual".into(), ..Default::default() });
+        lib.rebuild_index();
+        assert_eq!(lib.push_track(track("After manual", &dir.join("d.flac"))), 51);
         let _ = fs::remove_dir_all(dir);
     }
 
