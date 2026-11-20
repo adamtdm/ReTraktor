@@ -421,6 +421,12 @@ impl LoadedTrackAudio {
     }
 }
 
+/// Whether a playhead has reached the end of a track `duration_sec` long (its decoded length). The nanosecond of
+/// slack absorbs the roundoff of a playhead summed frame by frame, far less than any output frame.
+fn at_track_end(playhead_sec: f64, duration_sec: f64) -> bool {
+    playhead_sec >= duration_sec - 1e-9
+}
+
 /// Mixxx / xwax-based Alpha-Beta tracking filter for authentic turntable physics simulation.
 #[derive(Clone, Copy, Debug)]
 pub struct AlphaBetaFilter {
@@ -609,6 +615,14 @@ pub struct AudioSharedState {
     jump_ease: [JumpEase; 4],
     /// Shared side only: forget the deck's ease at the next handoff (applied before a later request).
     jump_ease_reset: [bool; 4],
+    /// Callback side only: decks this copy stopped at the end of their track and hasn't yet told the shared state.
+    stopped_at_end: [bool; 4],
+    /// Plays asked for per deck ([`AudioSharedState::start_playing`]); the callback's copy is the count it last took,
+    /// so it can tell a Play pressed while it was locked out from a play flag it has outlived.
+    play_requests: [u64; 4],
+    /// Callback side only: per deck, the playhead its last step left and the rounding that step lost (see
+    /// [`advance_playhead`]).
+    playhead_residual: [(f64, f64); 4],
     pub crossfader: f32,
     pub crossfader_curve: f32,
 
@@ -698,6 +712,9 @@ impl Default for AudioSharedState {
             keylock_engaged: [false; 4],
             jump_ease: [JumpEase::default(); 4],
             jump_ease_reset: [false; 4],
+            stopped_at_end: [false; 4],
+            play_requests: [0; 4],
+            playhead_residual: [(0.0, 0.0); 4],
             crossfader: 0.5,
             crossfader_curve: 0.5,
             scratch_active: [false; 4],
@@ -758,6 +775,22 @@ impl AudioSharedState {
             Some(Seek::By(sum)) => Seek::By(sum + delta_sec),
             None => Seek::By(delta_sec),
         });
+    }
+
+    /// Starts deck `d` (Play, CUP, Sync + Play Both) if it has a track. A deck parked at the end of its track
+    /// starts again from the top; one moved off the end first (a cue, a click on the track) starts there, and one
+    /// in an active loop that runs past the end carries on round the loop.
+    pub fn start_playing(&mut self, d: usize) {
+        let Some(duration) = self.loaded_tracks[d].as_ref().map(|t| t.duration_sec) else {
+            self.is_playing[d] = false;
+            return;
+        };
+        self.play_requests[d] = self.play_requests[d].wrapping_add(1);
+        let looping = self.loop_active[d] && self.loop_len_sec[d] > 0.05; // as the callback judges a loop
+        if !looping && at_track_end(self.playhead_sec[d], duration) {
+            self.seek_to(d, 0.0);
+        }
+        self.is_playing[d] = true;
     }
 
     /// Track audio the callback no longer plays. Drop it after releasing the lock.
@@ -1233,33 +1266,7 @@ impl AudioSystem {
                     continue;
                 }
                 if let Ok(mut state) = shared.try_lock() {
-                    state.pending_seek = [None; 4]; // with no callback, `playhead_sec` itself is the position
-                    if state.pattern_enabled {
-                        let bpm = state.engine.clock.bpm.max(40.0);
-                        let step_dur = (60.0 / bpm) / 4.0;
-                        state.pattern_phase_sec += dt;
-                        state.pattern_current_step = ((state.pattern_phase_sec / step_dur).floor() as usize) % 16;
-                    }
-                    for d in 0..4 {
-                        if state.is_playing[d] || state.scratch_active[d] || state.scratch_ramping[d] {
-                            let ratio = if state.scratch_active[d] || state.scratch_ramping[d] {
-                                state.scratch_rate[d]
-                            } else {
-                                state.pitch_ratio[d]
-                            };
-                            state.playhead_sec[d] += dt * ratio;
-                            if state.loop_active[d] && state.loop_len_sec[d] > 0.05 {
-                                let end = state.loop_start_sec[d] + state.loop_len_sec[d];
-                                if state.playhead_sec[d] >= end {
-                                    state.playhead_sec[d] = state.loop_start_sec[d];
-                                }
-                            } else if let Some(track) = &state.loaded_tracks[d] {
-                                if state.playhead_sec[d] >= track.duration_sec || state.playhead_sec[d] < 0.0 {
-                                    state.playhead_sec[d] = 0.0;
-                                }
-                            }
-                        }
-                    }
+                    fallback_tick(&mut state, dt);
                 }
             }
         });
@@ -1285,6 +1292,43 @@ impl AudioSystem {
     #[cfg(test)]
     pub fn render_f32(&self, output: &mut [f32], channels: usize, sr: u32) {
         self.render_with(output, channels, sr, |x| x);
+    }
+}
+
+/// One tick of the clock that moves the playheads while no sound card runs, `dt` seconds after the last.
+/// Plain playback stops at the end of the track as in the callback; loops and scratches keep going as before.
+fn fallback_tick(state: &mut AudioSharedState, dt: f64) {
+    state.pending_seek = [None; 4]; // with no callback, `playhead_sec` itself is the position
+    if state.pattern_enabled {
+        let bpm = state.engine.clock.bpm.max(40.0);
+        let step_dur = (60.0 / bpm) / 4.0;
+        state.pattern_phase_sec += dt;
+        state.pattern_current_step = ((state.pattern_phase_sec / step_dur).floor() as usize) % 16;
+    }
+    for d in 0..4 {
+        if !state.scratch_active[d] && state.scratch_ramping[d] {
+            release_step(state, d, dt); // the callback's jog physics isn't running to end the ramp
+        }
+        let scratching = state.scratch_active[d] || state.scratch_ramping[d];
+        if state.is_playing[d] || scratching {
+            let ratio = if scratching { state.scratch_rate[d] } else { state.pitch_ratio[d] };
+            state.playhead_sec[d] += dt * ratio;
+            let duration = state.loaded_tracks[d].as_ref().map(|t| t.duration_sec);
+            if state.loop_active[d] && state.loop_len_sec[d] > 0.05 {
+                let end = state.loop_start_sec[d] + state.loop_len_sec[d];
+                if state.playhead_sec[d] >= end {
+                    state.playhead_sec[d] = state.loop_start_sec[d];
+                }
+            } else if let Some(duration) = duration {
+                if !scratching && at_track_end(state.playhead_sec[d], duration) {
+                    state.playhead_sec[d] = duration;
+                    state.is_playing[d] = false;
+                    state.reset_jump_ease(d);
+                } else if (scratching && ratio > 0.0 && state.playhead_sec[d] >= duration) || state.playhead_sec[d] < 0.0 {
+                    state.playhead_sec[d] = 0.0;
+                }
+            }
+        }
     }
 }
 
@@ -1479,11 +1523,8 @@ impl Renderer {
         }
 
         for d in 0..4 {
-            let same = match (&self.tracks[d], &s.loaded_tracks[d]) {
-                (Some(mine), Some(theirs)) => mine.same_audio(theirs),
-                (mine, theirs) => mine.is_none() && theirs.is_none(),
-            };
-            if !same {
+            settle_end(r, &self.tracks[d], s, d);
+            if !same_track(&self.tracks[d], &s.loaded_tracks[d]) {
                 let releasing = self.tracks[d].as_ref().map_or(0, |t| t.buffers().iter().flatten().count());
                 // shortcut: with no room to retire the old buffers, the deck keeps its old audio (and its seek waits)
                 // until the UI frees some, which it does every frame.
@@ -1506,11 +1547,19 @@ impl Renderer {
                 r.jump_ease[d].requested = true;
             }
         }
+        r.play_requests = s.play_requests;
     }
 
-    /// Handoff out: playheads and meters as of the end of this block.
-    fn publish_to(&self, s: &mut AudioSharedState) {
-        let r = &self.state;
+    /// Handoff out: playheads and meters as of the end of this block, and decks that reached the end of their
+    /// track in it. The lock was held since `take_from`, so only a newer track the callback couldn't take yet
+    /// (its old audio still waiting to be retired) has a play flag of its own to keep.
+    fn publish_to(&mut self, s: &mut AudioSharedState) {
+        let r = &mut self.state;
+        for d in 0..4 {
+            if std::mem::take(&mut r.stopped_at_end[d]) && same_track(&self.tracks[d], &s.loaded_tracks[d]) {
+                s.is_playing[d] = false;
+            }
+        }
         s.playhead_sec = r.playhead_sec;
         s.channel_peaks = r.channel_peaks;
         s.master_peak_l = r.master_peak_l;
@@ -1530,20 +1579,44 @@ impl Drop for Renderer {
     fn drop(&mut self) {
         let shared = Arc::clone(&self.shared);
         let mut s = shared.lock().unwrap_or_else(PoisonError::into_inner);
+        // Unless a newer stream already took over: seeks the UI made since the last handoff land here as they would
+        // have in the callback (a move by an amount from where the deck really got to, a jump to a spot exactly),
+        // after a deck that ran out during busy blocks is settled as there.
+        if s.renderer_generation == self.generation {
+            for d in 0..4 {
+                settle_end(&mut self.state, &self.tracks[d], &mut s, d);
+                apply_seek(&mut self.state.playhead_sec[d], &mut s, d);
+                s.playhead_sec[d] = self.state.playhead_sec[d];
+            }
+            s.pattern_phase_sec = self.state.pattern_phase_sec;
+        }
         for t in self.tracks.iter_mut().filter_map(Option::take) {
             s.retired.extend(t.buffers().into_iter().flatten().cloned());
         }
-        if s.renderer_generation != self.generation {
-            return; // a newer stream already took over
-        }
-        // Seeks the UI made since the last handoff land here as they would have in the callback: a move by an
-        // amount from where the deck really got to, a jump to a spot exactly.
-        for d in 0..4 {
-            apply_seek(&mut self.state.playhead_sec[d], &mut s, d);
-            s.playhead_sec[d] = self.state.playhead_sec[d];
-        }
-        s.pattern_phase_sec = self.state.pattern_phase_sec;
     }
+}
+
+/// Whether the callback's audio for a deck is the track the UI has loaded there (both empty counts).
+fn same_track(mine: &Option<DeckPcm>, theirs: &Option<LoadedTrackAudio>) -> bool {
+    match (mine, theirs) {
+        (Some(mine), Some(theirs)) => mine.same_audio(theirs),
+        (mine, theirs) => mine.is_none() && theirs.is_none(),
+    }
+}
+
+/// At a handoff (or the stream's close) after deck `d` ran out while the lock was busy, the UI's play flag for it
+/// may be one the deck has outlived. Whatever the UI did since stands: a new track, a move (cue, jump), and a Play,
+/// which at the end of the track starts from the top. With none, the deck stays stopped at the end.
+fn settle_end(r: &mut AudioSharedState, mine: &Option<DeckPcm>, s: &mut AudioSharedState, d: usize) {
+    if !std::mem::take(&mut r.stopped_at_end[d]) || !same_track(mine, &s.loaded_tracks[d]) || s.pending_seek[d].is_some() {
+        return;
+    }
+    if s.play_requests[d] != r.play_requests[d] && s.is_playing[d] {
+        r.playhead_sec[d] = 0.0;
+    } else {
+        s.is_playing[d] = false;
+    }
+    r.is_playing[d] = s.is_playing[d];
 }
 
 /// One block of jog physics in the callback's state: the scratch filter observes the ticks that arrived (none
@@ -1555,16 +1628,44 @@ fn jog_physics(r: &mut AudioSharedState, block_dt: f64) {
             r.scratch_filter[d].observation(r.scratch_dx_per_tick[d] * ticks as f64, block_dt);
             r.scratch_rate[d] = r.scratch_filter[d].predicted_velocity();
         } else if r.scratch_ramping[d] {
-            let target = r.scratch_ramp_target[d];
-            // Smooth exponential decay towards playback speed (tau = 0.065s)
-            let next = target + (r.scratch_rate[d] - target) * (-block_dt / 0.065).exp();
-            r.scratch_rate[d] = next;
-            if (next - target).abs() < 0.005 {
-                r.scratch_rate[d] = target;
-                r.scratch_ramping[d] = false;
-            }
+            release_step(r, d, block_dt);
         }
     }
+}
+
+/// `dt` seconds of a released platter easing back to the speed it was let go towards; the ramp ends there.
+fn release_step(r: &mut AudioSharedState, d: usize, dt: f64) {
+    let target = r.scratch_ramp_target[d];
+    // Smooth exponential decay towards playback speed (tau = 0.065s)
+    let next = target + (r.scratch_rate[d] - target) * (-dt / 0.065).exp();
+    r.scratch_rate[d] = next;
+    if (next - target).abs() < 0.005 {
+        r.scratch_rate[d] = target;
+        r.scratch_ramping[d] = false;
+    }
+}
+
+/// Moves deck `d`'s playhead by `step` seconds with compensated (Kahan) summation: a plain sum of millions of
+/// per-frame steps falls nanoseconds short, enough to play a track's last frame twice. The lost rounding is carried
+/// only while the playhead is where the last step left it, so a seek, wrap or stop starts afresh.
+fn advance_playhead(r: &mut AudioSharedState, d: usize, step: f64) {
+    let (left_at, lost) = r.playhead_residual[d];
+    let from = r.playhead_sec[d];
+    let step = if left_at == from { step - lost } else { step };
+    let to = from + step;
+    r.playhead_residual[d] = (to, (to - from) - step);
+    r.playhead_sec[d] = to;
+}
+
+/// Plain playback of deck `d` reached the end of its track: park it exactly there, silent, with no key lock
+/// history or jump ease left over to be heard if it plays again, and mark it for the next handoff.
+fn stop_at_track_end(r: &mut AudioSharedState, d: usize, end: f64) {
+    r.playhead_sec[d] = end;
+    r.playhead_residual[d] = (0.0, 0.0); // a hand resting on the parked deck holds it exactly here
+    r.is_playing[d] = false;
+    r.stopped_at_end[d] = true;
+    r.keylock_engaged[d] = false; // the next key-locked start re-primes the stretcher
+    r.jump_ease[d] = JumpEase::default();
 }
 
 /// Applies (and clears) deck `d`'s pending seek to `playhead`; a move by an amount stays within the loaded track.
@@ -1618,6 +1719,15 @@ impl Renderer {
 
                 let mut true_stems = None;
                 let scratching = state.scratch_active[d] || state.scratch_ramping[d];
+                let looping = state.loop_active[d] && state.loop_len_sec[d] > 0.05;
+                // Plain playback ends after the last decoded frame; a loop or a hand on the platter carries on as before.
+                let track_end = tracks[d].as_ref().filter(|_| !scratching && !looping).map(|t| t.duration_sec);
+                if let Some(end) = track_end.filter(|&end| at_track_end(state.playhead_sec[d], end)) {
+                    // Already there: not one more frame, nor one from the channel's EQ and filter fed silence.
+                    stop_at_track_end(state, d, end);
+                    state.engine.strips[d].playing = false;
+                    continue;
+                }
                 let keylock_on = state.keylock[d] && !scratching;
                 if keylock_on && !state.keylock_engaged[d] {
                     state.keylocks[d].reset();
@@ -1764,9 +1874,9 @@ impl Renderer {
                     state.jump_ease[d] = JumpEase::default();
                 }
 
-                state.playhead_sec[d] += advance_dt;
+                advance_playhead(state, d, advance_dt);
 
-                if state.loop_active[d] && state.loop_len_sec[d] > 0.05 {
+                if looping {
                     let loop_start = state.loop_start_sec[d];
                     let loop_end = loop_start + state.loop_len_sec[d];
                     if state.playhead_sec[d] >= loop_end {
@@ -1774,7 +1884,10 @@ impl Renderer {
                     } else if state.playhead_sec[d] < loop_start {
                         state.playhead_sec[d] = loop_end - (loop_start - state.playhead_sec[d]);
                     }
-                } else if state.playhead_sec[d] >= track_dur {
+                } else if let Some(end) = track_end.filter(|&end| at_track_end(state.playhead_sec[d], end)) {
+                    stop_at_track_end(state, d, end);
+                } else if track_end.is_none() && advance_dt > 0.0 && state.playhead_sec[d] >= track_dur {
+                    // Only moving forward past the end comes round: a hand resting on a parked deck stays put.
                     state.playhead_sec[d] = 0.0;
                 } else if state.playhead_sec[d] < 0.0 {
                     state.playhead_sec[d] = 0.0;
@@ -2259,6 +2372,413 @@ mod tests {
         let (calm, busy) = (run(false), run(true));
         assert_eq!(calm, busy, "the release played differently while the UI held the lock");
         assert_eq!((busy.2, busy.3), (1.0, false), "not back at playing speed");
+    }
+
+    /// `frames` frames of steady 0.25 at `sr`: every frame of it is audible at the output, even through the stem split.
+    fn flat_track(frames: usize, sr: u32) -> LoadedTrackAudio {
+        let mut t = tone_track(0.0, sr, 0.0);
+        t.pcm_stereo = Arc::new(vec![0.25; frames * 2]);
+        t.duration_sec = frames as f64 / sr as f64;
+        t
+    }
+
+    fn render_at(r: &mut Renderer, sr: u32) -> Vec<f32> {
+        let mut out = vec![0.0f32; 256];
+        r.render(&mut out, 2, sr, |x| x);
+        out
+    }
+
+    /// Plain playback stops after the last decoded frame: the deck sounds for exactly the output frames that read
+    /// the track, whether they end inside a block, on a block's last frame, or within 100 ms of the start, at 44.1,
+    /// 48 and 96 kHz, with the track and the card at different rates both ways, and pitched down. The block that ends
+    /// it already tells the UI the deck stopped, exactly at the end; the next block is silent; Play then starts it
+    /// from the top and it sounds again. A pause in mid-track resumes where it was.
+    #[test]
+    fn plain_playback_stops_after_the_last_frame() {
+        // (track rate, card rate, pitch, track frames, output frames that read them)
+        let mut cases: Vec<(u32, u32, f64, usize, usize)> = vec![
+            (48_000, 96_000, 1.0, 384, 768),  // the last one reads half a frame past the track's last frame
+            (96_000, 48_000, 1.0, 421, 211),  // every other track frame, the last one included
+            (44_100, 48_000, 1.0, 441, 480),
+            (48_000, 48_000, 0.9, 384, 427),
+        ];
+        for sr in [44_100u32, 48_000, 96_000] {
+            for frames in [3 * 128, 3 * 128 + 37, (0.05 * sr as f64) as usize] {
+                cases.push((sr, sr, 1.0, frames, frames));
+            }
+        }
+        for (track_sr, sr, pitch, frames, heard_frames) in cases {
+            let case = format!("{frames} frames at {track_sr} Hz on {sr} Hz at {pitch}x");
+            let end = frames as f64 / track_sr as f64;
+            let shared = Arc::new(Mutex::new(AudioSharedState::default()));
+            {
+                let mut s = shared.lock().unwrap();
+                s.loaded_tracks[0] = Some(flat_track(frames, track_sr));
+                s.pitch_ratio[0] = pitch;
+                s.start_playing(0);
+            }
+            let mut r = Renderer::new(Arc::clone(&shared), Arc::default(), Arc::default());
+            let heard: Vec<f32> = (0..heard_frames.div_ceil(128)).flat_map(|_| render_at(&mut r, sr)).step_by(2).collect();
+            assert!(heard[..heard_frames].iter().all(|&x| x != 0.0), "{case}: a frame of the track went unheard");
+            assert!(heard[heard_frames..].iter().all(|&x| x == 0.0), "{case}: sound after the last frame");
+            {
+                let s = shared.lock().unwrap();
+                assert!(!s.is_playing[0], "{case}: the block that ended it didn't say so");
+                assert_eq!(s.playhead_sec[0], end, "{case}: not parked at the end");
+            }
+            assert!(render_at(&mut r, sr).iter().all(|&x| x == 0.0), "{case}: the next block isn't silent");
+            assert_eq!(shared.lock().unwrap().playhead_sec[0], end, "{case}: moved after the end");
+
+            shared.lock().unwrap().start_playing(0);
+            assert_eq!(shared.lock().unwrap().playhead_sec[0], 0.0, "{case}: Play at the end didn't go to the top");
+            let again = render_at(&mut r, sr);
+            assert!(again[..2 * 128.min(heard_frames)].iter().all(|&x| x != 0.0), "{case}: silent after Play");
+            assert!(shared.lock().unwrap().is_playing[0] || heard_frames <= 128, "{case}: stopped again early");
+        }
+
+        let (shared, _, mut r) = playing_deck();
+        block(&mut r);
+        shared.lock().unwrap().is_playing[0] = false;
+        block(&mut r);
+        shared.lock().unwrap().start_playing(0);
+        block(&mut r);
+        assert!((shared.lock().unwrap().playhead_sec[0] - (1.0 + 2.0 * PERIOD)).abs() < 1e-9, "a mid-track pause didn't resume in place");
+    }
+
+    /// Ending exactly on a block's last frame leaves nothing stale to hear on a restart: a key-locked deck re-primes
+    /// its time-stretch, and a jump ease still running on another deck is dropped. A third deck plays on throughout.
+    #[test]
+    fn track_end_on_a_block_boundary_clears_key_lock_and_jump_ease() {
+        let shared = Arc::new(Mutex::new(AudioSharedState::default()));
+        {
+            let mut s = shared.lock().unwrap();
+            s.loaded_tracks[0] = Some(flat_track(3 * 128, 48_000));
+            s.loaded_tracks[1] = Some(flat_track(3 * 128, 48_000));
+            s.loaded_tracks[2] = Some(tone_track(330.0, 48_000, 12.0));
+            s.keylock[0] = true;
+            s.is_playing = [true, true, true, false];
+        }
+        let mut r = Renderer::new(Arc::clone(&shared), Arc::default(), Arc::default());
+        block(&mut r);
+        block(&mut r);
+        shared.lock().unwrap().ease_jump(1); // its 3 ms ease outlasts the last 128 frames
+        block(&mut r);
+        {
+            let s = shared.lock().unwrap();
+            assert_eq!((s.is_playing, s.playhead_sec[0], s.playhead_sec[1]), ([false, false, true, false], 0.008, 0.008));
+        }
+        assert!(!r.state.keylock_engaged[0], "key lock would carry on from before the end");
+        let ease = r.state.jump_ease[1];
+        assert!(ease.from.is_none() && ease.last == (0.0, 0.0) && !ease.requested, "a jump ease survived the end");
+
+        {
+            let mut s = shared.lock().unwrap();
+            s.start_playing(0);
+            s.start_playing(1);
+        }
+        block(&mut r);
+        assert!(r.state.keylock_engaged[0] && r.state.jump_ease[1].from.is_none());
+        let s = shared.lock().unwrap();
+        assert!(s.is_playing[0] && s.is_playing[1] && (s.playhead_sec[2] - 4.0 * PERIOD).abs() < 1e-9);
+    }
+
+    /// The deck runs out while the UI holds the lock, the UI still thinking it plays. With no command meanwhile,
+    /// the first block back says it stopped, at the end, and plays nothing; Play then starts it from the top. A cue,
+    /// a beat jump back, or a new track played during the hold are newer commands and stand; so is a Play (pause then
+    /// Play, or Sync + Play) from the stale position the UI last saw, which starts from the top as the deck had ended.
+    /// A new track whose audio must wait for the old one's to be retired keeps its play flag through the wait. A
+    /// stream closing (a reopen) right after such a hold leaves the deck stopped too, unless a cue is pending, and
+    /// the next stream follows.
+    #[test]
+    fn track_end_during_a_ui_hold_stays_stopped_unless_the_ui_moved_on() {
+        let near_end = |act: &dyn Fn(&mut AudioSharedState)| {
+            let (shared, recorder, mut r) = playing_deck();
+            shared.lock().unwrap().seek_to(0, 11.99); // 480 frames to go
+            block(&mut r);
+            {
+                let mut s = shared.lock().unwrap();
+                for _ in 0..10 {
+                    block(&mut r);
+                }
+                assert!(s.is_playing[0]);
+                act(&mut s);
+            }
+            (shared, recorder, r)
+        };
+        let silent = |out: &[f32]| out.iter().all(|&x| x == 0.0);
+        let state = |shared: &Arc<Mutex<AudioSharedState>>| {
+            let s = shared.lock().unwrap();
+            (s.is_playing[0], s.playhead_sec[0])
+        };
+        let close = |(playing, at): (bool, f64), want: f64, what: &str| {
+            assert!(playing && (at - want).abs() < 1e-9, "{what}: playing {playing} at {at}, expected {want}");
+        };
+
+        let (shared, _, mut r) = near_end(&|_| {});
+        assert!(silent(&block(&mut r)), "sound after the end");
+        assert_eq!(state(&shared), (false, 12.0), "the stale play flag won");
+        assert!(silent(&block(&mut r)) && state(&shared) == (false, 12.0));
+        shared.lock().unwrap().start_playing(0);
+        assert!(!silent(&block(&mut r)));
+        close(state(&shared), PERIOD, "Play at the end");
+
+        for (act, want, what) in [
+            (&(|s: &mut AudioSharedState| s.seek_to(0, 5.0)) as &dyn Fn(&mut AudioSharedState), 5.0, "a cue"),
+            (&|s: &mut AudioSharedState| s.seek_by(0, -2.0), 10.0, "a jump back"),
+            (
+                &|s: &mut AudioSharedState| {
+                    s.loaded_tracks[0] = Some(tone_track(330.0, 48_000, 12.0));
+                    s.seek_to(0, 0.0);
+                    s.start_playing(0);
+                },
+                0.0,
+                "a new track",
+            ),
+            (&|s: &mut AudioSharedState| { s.is_playing[0] = false; s.start_playing(0) }, 0.0, "pause then Play"),
+            (&|s: &mut AudioSharedState| s.start_playing(0), 0.0, "Sync + Play"),
+        ] {
+            let (shared, _, mut r) = near_end(act);
+            assert!(!silent(&block(&mut r)), "{what}: silent");
+            close(state(&shared), want + PERIOD, what);
+        }
+
+        let (shared, _, mut r) = near_end(&|s| {
+            while s.retired.len() < s.retired.capacity() {
+                s.retired.push(Arc::default());
+            }
+            s.loaded_tracks[0] = Some(tone_track(330.0, 48_000, 12.0));
+            s.seek_to(0, 0.0);
+            s.start_playing(0);
+        });
+        assert!(silent(&block(&mut r)), "the old track played on");
+        assert!(shared.lock().unwrap().is_playing[0], "the old track's end stopped the new one");
+        drop(shared.lock().unwrap().take_retired()); // a UI frame
+        assert!(!silent(&block(&mut r)));
+        close(state(&shared), PERIOD, "the new track once taken");
+
+        // Reopens: no blocks between the hold and the close.
+        let (shared, recorder, r) = near_end(&|_| {});
+        drop(r);
+        assert_eq!(state(&shared), (false, 12.0), "the close let the stale play flag stand");
+        let mut r = Renderer::new(Arc::clone(&shared), Arc::default(), recorder);
+        assert!(silent(&block(&mut r)) && state(&shared) == (false, 12.0), "the new stream played on");
+
+        let (shared, recorder, r) = near_end(&|s| s.seek_to(0, 5.0));
+        drop(r);
+        assert_eq!(state(&shared), (true, 5.0), "the close dropped the cue");
+        let mut r = Renderer::new(Arc::clone(&shared), Arc::default(), recorder);
+        assert!(!silent(&block(&mut r)));
+        close(state(&shared), 5.0 + PERIOD, "a cue across a reopen");
+    }
+
+    /// At the end of the track an active loop keeps the deck going round it, also a loop that runs past the end; a
+    /// held platter dragged forward past the end comes round to the start, and a paused one dragged back holds at 0,
+    /// as before. None of them changes whether the deck plays.
+    #[test]
+    fn loops_and_scratches_cross_the_track_end_as_before() {
+        for (start, len) in [(11.9, 0.08), (11.97, 0.1)] {
+            let (shared, _, mut r) = playing_deck();
+            {
+                let mut s = shared.lock().unwrap();
+                s.seek_to(0, start);
+                (s.loop_active[0], s.loop_start_sec[0], s.loop_len_sec[0]) = (true, start, len);
+            }
+            for _ in 0..200 {
+                block(&mut r);
+            }
+            let (playing, at) = {
+                let s = shared.lock().unwrap();
+                (s.is_playing[0], s.playhead_sec[0])
+            };
+            assert!(playing && at >= start && at < start + len, "loop {start}+{len}: playing {playing} at {at}");
+            assert!(block(&mut r).iter().any(|&x| x != 0.0));
+        }
+
+        let scratch = |from: f64, playing: bool, ticks: i64, blocks: usize| {
+            let (shared, _, mut r) = playing_deck();
+            {
+                let mut s = shared.lock().unwrap();
+                s.seek_to(0, from);
+                s.is_playing[0] = playing;
+            }
+            block(&mut r);
+            shared.lock().unwrap().enable_scratch(0, 1024, 33.333333333333336, 0.125, 0.125 / 32.0);
+            for _ in 0..blocks {
+                shared.lock().unwrap().scratch_tick(0, ticks);
+                block(&mut r);
+            }
+            let s = shared.lock().unwrap();
+            (s.is_playing[0], s.playhead_sec[0])
+        };
+        let (playing, at) = scratch(11.98, true, 3, 20);
+        assert!(playing && at < 0.2, "forward past the end: playing {playing} at {at}");
+        assert_eq!(scratch(0.01, false, -3, 60), (false, 0.0), "back past the start");
+    }
+
+    /// With no sound card the timer clock follows the same rule: plain playback of a 44.1 kHz, a 96 kHz and a
+    /// sub-100 ms track parks exactly at the end and stays there, and Play starts it from the top; a loop past the
+    /// end and a held platter go round as before.
+    #[test]
+    fn fallback_clock_stops_at_the_track_end() {
+        for (sr, secs) in [(44_100, 2.0), (96_000, 2.0), (48_000, 0.05)] {
+            let mut s = AudioSharedState::default();
+            let t = tone_track(440.0, sr, secs);
+            let end = t.duration_sec;
+            s.loaded_tracks[0] = Some(t);
+            s.seek_to(0, end - 0.03);
+            s.start_playing(0);
+            fallback_tick(&mut s, 0.016);
+            assert!(s.is_playing[0] && s.playhead_sec[0] < end, "{sr} Hz: stopped early");
+            fallback_tick(&mut s, 0.016);
+            assert_eq!((s.is_playing[0], s.playhead_sec[0]), (false, end), "{sr} Hz: not parked at the end");
+            fallback_tick(&mut s, 0.016);
+            assert_eq!((s.is_playing[0], s.playhead_sec[0]), (false, end), "{sr} Hz: moved after the end");
+            s.start_playing(0);
+            fallback_tick(&mut s, 0.016);
+            assert!(s.is_playing[0] && (s.playhead_sec[0] - 0.016).abs() < 1e-9, "{sr} Hz: Play at the end");
+        }
+
+        let mut s = AudioSharedState::default();
+        s.loaded_tracks[0] = Some(tone_track(440.0, 48_000, 2.0));
+        s.seek_to(0, 1.97);
+        s.start_playing(0);
+        (s.loop_active[0], s.loop_start_sec[0], s.loop_len_sec[0]) = (true, 1.97, 0.1);
+        for _ in 0..20 {
+            fallback_tick(&mut s, 0.016);
+        }
+        assert!(s.is_playing[0] && s.playhead_sec[0] >= 1.97 && s.playhead_sec[0] < 2.07, "loop past the end");
+
+        s.loop_active[0] = false;
+        s.seek_to(0, 1.99);
+        (s.scratch_active[0], s.scratch_rate[0]) = (true, 1.0);
+        fallback_tick(&mut s, 0.016);
+        assert!(s.is_playing[0] && s.playhead_sec[0] == 0.0, "a held platter past the end");
+    }
+
+    /// With no sound card, a jog released while the deck plays eases up to the pitched speed and the ramp ends;
+    /// plain playback then stops at the end of the track, and Play starts it from the top. Released while paused,
+    /// the platter eases to a stop and stays there.
+    #[test]
+    fn fallback_clock_ends_a_jog_release_ramp() {
+        let mut s = AudioSharedState::default();
+        s.loaded_tracks[0] = Some(tone_track(440.0, 48_000, 2.0));
+        s.seek_to(0, 1.0);
+        s.pitch_ratio[0] = 0.92;
+        s.enable_scratch(0, 1024, 33.333333333333336, 0.125, 0.125 / 32.0); // a hand on the paused platter
+        s.start_playing(0);
+        s.disable_scratch(0); // and let go
+        for _ in 0..100 {
+            fallback_tick(&mut s, 0.016);
+        }
+        assert!(!s.scratch_ramping[0] && s.scratch_rate[0] == 0.92, "the release ramp never ended");
+        assert_eq!((s.is_playing[0], s.playhead_sec[0]), (false, 2.0), "didn't stop at the end");
+        s.start_playing(0);
+        fallback_tick(&mut s, 0.016);
+        assert!(s.is_playing[0] && (s.playhead_sec[0] - 0.016 * 0.92).abs() < 1e-9, "Play at the end");
+
+        s.enable_scratch(0, 1024, 33.333333333333336, 0.125, 0.125 / 32.0);
+        s.is_playing[0] = false;
+        s.disable_scratch(0);
+        for _ in 0..40 {
+            fallback_tick(&mut s, 0.016);
+        }
+        let at = s.playhead_sec[0];
+        fallback_tick(&mut s, 0.016);
+        assert!(!s.scratch_ramping[0] && s.scratch_rate[0] == 0.0 && s.playhead_sec[0] == at, "a paused release kept moving");
+    }
+
+    /// A hand resting on a deck parked at the end of its track holds it there, on both clocks, so the DJ can drag
+    /// back from the end to cue; it doesn't jump to the intro.
+    #[test]
+    fn a_hand_on_a_parked_deck_holds_the_end() {
+        let (shared, _, mut r) = playing_deck();
+        shared.lock().unwrap().seek_to(0, 11.99);
+        for _ in 0..5 {
+            block(&mut r);
+        }
+        assert_eq!(shared.lock().unwrap().playhead_sec[0], 12.0);
+        shared.lock().unwrap().enable_scratch(0, 1024, 33.333333333333336, 0.125, 0.125 / 32.0);
+        for _ in 0..10 {
+            block(&mut r);
+        }
+        assert_eq!(shared.lock().unwrap().playhead_sec[0], 12.0, "a resting hand moved the parked deck");
+        for _ in 0..30 {
+            shared.lock().unwrap().scratch_tick(0, -3);
+            block(&mut r);
+        }
+        let at = shared.lock().unwrap().playhead_sec[0];
+        assert!(at > 11.5 && at < 12.0, "dragging back from the end landed at {at}");
+
+        let mut s = AudioSharedState::default();
+        s.loaded_tracks[0] = Some(tone_track(440.0, 48_000, 2.0));
+        s.seek_to(0, 1.99);
+        s.start_playing(0);
+        fallback_tick(&mut s, 0.016);
+        assert_eq!((s.is_playing[0], s.playhead_sec[0]), (false, 2.0));
+        s.enable_scratch(0, 1024, 33.333333333333336, 0.125, 0.125 / 32.0);
+        for _ in 0..5 {
+            fallback_tick(&mut s, 0.016);
+        }
+        assert_eq!(s.playhead_sec[0], 2.0, "a resting hand moved the parked deck without a sound card");
+        s.scratch_rate[0] = -1.0; // the timer holds a touch's speed; this one drags back
+        fallback_tick(&mut s, 0.016);
+        assert!((s.playhead_sec[0] - (2.0 - 0.016)).abs() < 1e-9);
+    }
+
+    /// Paused inside an active loop that runs past the end of the track, Play carries on round the loop from where
+    /// the deck was, not from the top.
+    #[test]
+    fn play_inside_a_loop_past_the_end_keeps_the_loop_phase() {
+        let (shared, _, mut r) = playing_deck();
+        {
+            let mut s = shared.lock().unwrap();
+            s.seek_to(0, 11.97);
+            (s.loop_active[0], s.loop_start_sec[0], s.loop_len_sec[0]) = (true, 11.97, 0.1);
+        }
+        for _ in 0..15 {
+            block(&mut r);
+        }
+        shared.lock().unwrap().is_playing[0] = false;
+        block(&mut r);
+        let paused_at = shared.lock().unwrap().playhead_sec[0];
+        assert!(paused_at > 12.0 && paused_at < 12.07, "not paused past the end: {paused_at}");
+        shared.lock().unwrap().start_playing(0);
+        assert_eq!(shared.lock().unwrap().playhead_sec[0], paused_at, "Play left the loop");
+        block(&mut r);
+        let s = shared.lock().unwrap();
+        assert!(s.is_playing[0] && (s.playhead_sec[0] - (paused_at + PERIOD)).abs() < 1e-9, "loop phase lost");
+    }
+
+    /// A plain sum of 1/48000 s steps over 60 s (and of 1/96000 s over 30 s) falls nanoseconds short of the end,
+    /// which would play the last frame twice. The callback's compensated playhead, stepped as it steps it up to the
+    /// last block, ends the track on its last frame: that block is audible to its end and says the deck stopped,
+    /// exactly at the end; the next is silent.
+    #[test]
+    fn a_long_track_ends_on_its_last_frame() {
+        for (sr, secs) in [(48_000u32, 60.0), (96_000, 30.0)] {
+            let frames = (sr as f64 * secs) as usize;
+            let dt = 1.0 / sr as f64;
+            let plain = (0..frames).fold(0.0f64, |p, _| p + dt);
+            assert!(plain < secs - 1e-9, "{sr} Hz: the plain sum ({plain}) reaches the end, so this case shows nothing");
+            let shared = Arc::new(Mutex::new(AudioSharedState::default()));
+            {
+                let mut s = shared.lock().unwrap();
+                let mut t = flat_track(256, sr); // reads past these frames hold the last one: no minutes of PCM
+                t.duration_sec = secs;
+                s.loaded_tracks[0] = Some(t);
+                s.is_playing[0] = true;
+            }
+            let mut r = Renderer::new(Arc::clone(&shared), Arc::default(), Arc::default());
+            for _ in 0..frames - 128 {
+                advance_playhead(&mut r.state, 0, dt);
+            }
+            assert!(render_at(&mut r, sr).iter().all(|&x| x != 0.0), "{sr} Hz: the last block isn't all heard");
+            {
+                let s = shared.lock().unwrap();
+                assert_eq!((s.is_playing[0], s.playhead_sec[0]), (false, secs), "{sr} Hz: still playing after the last frame");
+            }
+            assert!(render_at(&mut r, sr).iter().all(|&x| x == 0.0), "{sr} Hz: the last frame played again");
+        }
     }
 
     /// Six seconds of UI hold while two decks play and REC streams to disk, in f32 and in i16: every block lands

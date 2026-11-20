@@ -970,7 +970,7 @@ impl ReTraktorApp {
             "cueplay" => {
                 self.jump_to_cue(deck, 1);
                 if let Ok(mut st) = self.audio.shared.lock() {
-                    st.is_playing[d] = st.loaded_tracks[d].is_some();
+                    st.start_playing(d);
                 }
             }
             "sync" => self.sync_deck(deck),
@@ -2193,8 +2193,8 @@ impl ReTraktorApp {
                 if i.key_pressed(Key::A) {
                     self.sync_deck(2);
                     if let Ok(mut state) = self.audio.shared.lock() {
-                        state.is_playing[0] = state.loaded_tracks[0].is_some();
-                        state.is_playing[1] = state.loaded_tracks[1].is_some();
+                        state.start_playing(0);
+                        state.start_playing(1);
                     }
                 }
 
@@ -2239,7 +2239,11 @@ impl ReTraktorApp {
     fn toggle_play(&mut self, deck_idx: usize) {
         if let Ok(mut state) = self.audio.shared.lock() {
             let d = deck_idx - 1;
-            state.is_playing[d] = state.loaded_tracks[d].is_some() && !state.is_playing[d];
+            if state.is_playing[d] {
+                state.is_playing[d] = false;
+            } else {
+                state.start_playing(d);
+            }
             if !state.is_playing[d] {
                 state.reset_jump_ease(d);
             }
@@ -2875,8 +2879,8 @@ impl ReTraktorApp {
                     {
                         self.sync_deck(2);
                         if let Ok(mut state) = self.audio.shared.lock() {
-                            state.is_playing[0] = state.loaded_tracks[0].is_some();
-                            state.is_playing[1] = state.loaded_tracks[1].is_some();
+                            state.start_playing(0);
+                            state.start_playing(1);
                         }
                     }
                 });
@@ -3494,7 +3498,7 @@ impl ReTraktorApp {
                         TransportAction::Cup => {
                             self.jump_to_cue(deck_idx, 1);
                             if let Ok(mut state) = self.audio.shared.lock() {
-                                state.is_playing[d] = state.loaded_tracks[d].is_some();
+                                state.start_playing(d);
                             }
                         }
                         TransportAction::ToggleFlux => {
