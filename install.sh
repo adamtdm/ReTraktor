@@ -85,7 +85,7 @@ if [[ "$DISTRO_ID" == "ubuntu" || "$DISTRO_ID" == "debian" || "$DISTRO_ID" == "p
     $SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         build-essential pkg-config curl git \
         libudev-dev libusb-1.0-0-dev libhidapi-dev \
-        libasound2-dev libpipewire-0.3-dev \
+        libasound2-dev libpipewire-0.3-dev libspa-0.2-dev libclang-dev libdbus-1-dev \
         libx11-dev libxkbcommon-dev libgl1-mesa-dev \
         pipewire pipewire-alsa wireplumber \
         python3 python3-pip python3-venv ffmpeg
@@ -93,21 +93,21 @@ elif [[ "$DISTRO_ID" == "fedora" || "$DISTRO_ID" == "rhel" || "$DISTRO_ID" == "c
     $SUDO dnf install -y \
         gcc gcc-c++ make pkgconf-pkg-config curl git \
         systemd-devel libusb1-devel hidapi-devel \
-        alsa-lib-devel pipewire-devel pipewire-alsa wireplumber \
+        alsa-lib-devel pipewire-devel clang-devel dbus-devel pipewire-alsa wireplumber \
         libxkbcommon-devel libX11-devel mesa-libGL-devel \
         python3 python3-pip ffmpeg
 elif [[ "$DISTRO_ID" == "arch" || "$DISTRO_ID" == "manjaro" || "$DISTRO_LIKE" == *"arch"* ]]; then
     $SUDO pacman -S --needed --noconfirm \
         base-devel pkgconf curl git \
         systemd-libs libusb hidapi \
-        alsa-lib pipewire pipewire-alsa wireplumber \
+        alsa-lib pipewire clang dbus pipewire-alsa wireplumber \
         libxkbcommon libx11 mesa \
         python python-pip ffmpeg
 elif [[ "$DISTRO_ID" == "opensuse"* || "$DISTRO_LIKE" == *"suse"* ]]; then
     $SUDO zypper --non-interactive install \
         gcc gcc-c++ make pkg-config curl git \
         systemd-devel libusb-1_0-devel libhidapi-devel \
-        alsa-devel pipewire-devel ffmpeg
+        alsa-devel pipewire-devel clang-devel dbus-1-devel ffmpeg
 else
     log_warn "Unknown Linux distribution. Ensure you have libudev, libusb, hidapi, alsa, and pipewire installed."
 fi
@@ -199,8 +199,8 @@ Version: ${VERSION}
 Section: sound
 Priority: optional
 Architecture: ${DEB_ARCH}
-Depends: libasound2, libusb-1.0-0, libhidapi-hidraw0 | libhidapi-libusb0, libgl1 | libglvnd0, libx11-6
-Recommends: pipewire, wireplumber
+Depends: libasound2, libusb-1.0-0, libhidapi-hidraw0 | libhidapi-libusb0, libgl1 | libglvnd0, libx11-6, libpipewire-0.3-0t64 (>= 0.3.53) | libpipewire-0.3-0 (>= 0.3.53), libdbus-1-3
+Recommends: pipewire, wireplumber, rtkit
 Maintainer: ReTraktor Project <https://github.com/adamtdm/ReTraktor>
 Description: Clean-room Linux re-implementation of Traktor Pro 4
  ReTraktor provides complete 4-deck DJ mixing, reactive CSI 1.0 QML scripting,

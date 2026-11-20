@@ -23,7 +23,7 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
             libudev-dev libusb-1.0-0-dev libhidapi-dev \
-            libasound2-dev libpipewire-0.3-dev \
+            libasound2-dev libpipewire-0.3-dev libspa-0.2-dev libclang-dev libdbus-1-dev \
             pipewire pipewire-alsa wireplumber \
             file wget
 

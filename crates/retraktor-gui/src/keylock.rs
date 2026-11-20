@@ -12,6 +12,11 @@ const GRAIN: usize = 2048;
 const HOP: usize = GRAIN / 2;
 /// Up to the main mix plus four stems, all aligned the same way.
 pub const MAX_SOURCES: usize = 5;
+/// Alignment compares at most this many points (every 4th source frame over a hop): a hop's worth up to a
+/// step of 8 (a 384 kHz track on a 48 kHz card), beyond that a hop's first 8192 frames. Fixed, so the
+/// scratch buffers are reserved once and the audio callback never allocates.
+const MAX_SPAN: usize = 2048;
+const MAX_TOLERANCE: usize = 480;
 
 pub struct KeyLock {
     acc: Vec<[f32; MAX_SOURCES * 2]>,
@@ -19,14 +24,17 @@ pub struct KeyLock {
     pos: usize,
     /// Source frame where the previous grain would naturally continue.
     next_cont: Option<f64>,
+    /// Alignment scratch, reserved up front so the audio callback never allocates (see `best_start`).
     reference: Vec<f32>,
+    candidates: Vec<f32>,
 }
 
 impl Default for KeyLock {
     fn default() -> Self {
         // Periodic Hann: two half-overlapping windows sum to exactly 1.
         let window = (0..GRAIN).map(|i| 0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / GRAIN as f32).cos()).collect();
-        Self { acc: vec![[0.0; MAX_SOURCES * 2]; GRAIN], window, pos: 0, next_cont: None, reference: Vec::new() }
+        let (reference, candidates) = (Vec::with_capacity(MAX_SPAN), Vec::with_capacity(MAX_SPAN + 2 * MAX_TOLERANCE / 4));
+        Self { acc: vec![[0.0; MAX_SOURCES * 2]; GRAIN], window, pos: 0, next_cont: None, reference, candidates }
     }
 }
 
@@ -96,13 +104,13 @@ impl KeyLock {
     /// Searches every 4th frame of a mono copy, then refines the winner frame by frame.
     fn best_start(&mut self, src: &[f32], cont: f64, target: f64, step: f64, loop_frames: Option<(f64, f64)>, hq: bool) -> f64 {
         const D: usize = 4;
-        let tolerance: usize = if hq { 480 } else { 240 };
+        let tolerance: usize = if hq { MAX_TOLERANCE } else { MAX_TOLERANCE / 2 };
         let frames = src.len() / 2;
         let mono = |p: f64| {
             let i = (wrap(p, loop_frames).max(0.0) as usize).min(frames.saturating_sub(1));
             src.get(i * 2).map_or(0.0, |l| l + src[i * 2 + 1])
         };
-        let span = ((HOP as f64 * step) as usize / D).max(1);
+        let span = ((HOP as f64 * step) as usize / D).clamp(1, MAX_SPAN);
         self.reference.clear();
         self.reference.extend((0..span).map(|j| mono(cont + (j * D) as f64)));
         if self.reference.iter().all(|x| x.abs() < 1e-6) {
@@ -118,7 +126,9 @@ impl KeyLock {
             dot / energy.sqrt()
         };
         let lo = target - tolerance as f64;
-        let candidates: Vec<f32> = (0..(2 * tolerance / D + span)).map(|i| mono(lo + (i * D) as f64)).collect();
+        self.candidates.clear();
+        self.candidates.extend((0..(2 * tolerance / D + span)).map(|i| mono(lo + (i * D) as f64)));
+        let candidates = &self.candidates;
         let mut best = (f32::MIN, 0usize);
         for lag in 0..=2 * tolerance / D {
             let (mut dot, mut energy) = (0.0f32, 1e-9f32);

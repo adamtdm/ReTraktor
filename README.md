@@ -38,6 +38,7 @@
 * **`F2` — 4-Deck (`A / B / C / D`)**: All four decks with a 4-channel mixer.
 * **`F3` — Browser**: Mini deck strips and a full-height library for preparing sets.
 * **`F4` — Timeline**: Track A → Track B transition arranger with stem automation presets and live auditioning.
+* **Beat Jump** moves a loaded deck backward or forward by 4, 8, 16 or 32 beats. Choose a size in the `JUMP` row under the transport controls in Mix or 4-Deck. On a 120 BPM track, 32 beats moves 16 seconds through the track at any pitch setting. An active loop moves with the playhead. An arrow dims when the full jump would cross a track boundary.
 
 ### 3. Interactive Graphical Controller Surface Map & Remapper
 * Located in **Preferences** (`⚙ -> Controllers & MX2`).
@@ -76,7 +77,7 @@
 * **rekordbox Export**: One click writes `~/Music/ReTraktor-rekordbox.xml` (tracks, cues, loops, grids, playlists) for rekordbox / CDJ USB export.
 * **Suggestions**: Ranks your collection by harmonic and tempo compatibility with the track on deck A.
 * **Track Info Editor**: Edit metadata in the collection, and optionally write it back into the file's tags.
-* **Built-In Master `.WAV` Mix Recorder (`● REC`)**: Record your live set directly from the post-maximizer master bus to `~/Music/ReTraktor_Master_Mix.wav` (16-bit / 48 kHz stereo PCM).
+* **Built-In Master `.WAV` Mix Recorder (`● REC`)**: Record your live set directly from the post-maximizer master bus to a timestamped 16-bit stereo WAV in `~/Music/ReTraktor` (at the sound card's rate), with a `.cue` and tracklist. Audio streams to disk as you play, so a set can run for hours. Past 4 GiB (about 3 h at 96 kHz) the file becomes RF64, which needs a player that reads RF64 and cannot currently be loaded onto a ReTraktor deck. If the disk falls behind or fails, or the sample rate changes, REC stops and says why; the audio already written to disk is kept.
 
 ### 8. Full Hardware Controller Support
 * **First-Class Traktor MX2 (`17CC:2420`) Support**: Complete NHL2 HID input/output mapping for all **83 buttons**, **6 encoders**, **26 12-bit pots/faders**, **2 capacitive 1024-tick jogwheels**, **105 top-panel LEDs**, and **12 RGB bottom-shell ambient LEDs** (with Deck State, Loop Status, and End-of-Track Warning modes), plus **4-Out / 2-In 24-bit/96kHz USB Audio Class 2.0** routing (Master L/R `Out 1/2` + Headphone Cue L/R `Out 3/4`).
@@ -121,25 +122,28 @@ retraktor-gui
 
 #### 1. Install System Development Libraries
 
+ReTraktor plays through PipeWire directly when it runs, and asks RealtimeKit (`rtkit`) for real-time scheduling of its audio thread. It needs PipeWire 0.3.53 or newer; building it needs the PipeWire and SPA headers, `libclang` and the D-Bus headers. Without a PipeWire server it plays through ALSA, including PulseAudio's ALSA plugin. **Preferences > Audio** shows which route opened, any fallback, and any underruns.
+
 * **Ubuntu / Pop!_OS / Debian / Mint**:
   ```bash
   sudo apt update
   sudo apt install -y build-essential pkg-config curl git \
       libudev-dev libusb-1.0-0-dev libhidapi-dev libasound2-dev \
-      libpipewire-0.3-dev libx11-dev libxkbcommon-dev libgl1-mesa-dev
+      libpipewire-0.3-dev libspa-0.2-dev libclang-dev libdbus-1-dev \
+      libx11-dev libxkbcommon-dev libgl1-mesa-dev
   ```
 
 * **Fedora / RHEL**:
   ```bash
   sudo dnf install -y gcc gcc-c++ pkgconfig git \
       systemd-devel libusb1-devel hidapi-devel alsa-lib-devel \
-      pipewire-devel libX11-devel libxkbcommon-devel mesa-libGL-devel
+      pipewire-devel clang-devel dbus-devel libX11-devel libxkbcommon-devel mesa-libGL-devel
   ```
 
 * **Arch Linux / Manjaro**:
   ```bash
   sudo pacman -S --needed base-devel pkgconf git \
-      systemd libusb hidapi alsa-lib pipewire libx11 libxkbcommon mesa
+      systemd libusb hidapi alsa-lib pipewire clang dbus libx11 libxkbcommon mesa
   ```
 
 #### 2. Install Rust Toolchain (if not already installed)
