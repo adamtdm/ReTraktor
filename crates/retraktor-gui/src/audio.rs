@@ -45,6 +45,21 @@ pub struct LoadedTrackAudio {
     pub pcm_other: Option<Vec<f32>>,
     pub pcm_vocals: Option<Vec<f32>>,
     pub phrases: Vec<retraktor_library::Phrase>,
+    /// Auto gain trim (linear), played after the stems beside the channel GAIN. `from_file`
+    /// measures it; a deck load with Auto gain off sets it to 1.0.
+    pub auto_gain: f32,
+    /// `waveform_peaks` and `stem_peaks` as if the audio were `auto_gain` times louder, so deck
+    /// waveforms show the level the deck plays. The same arrays as the analysed ones at unity.
+    pub played_peaks: Arc<[[f32; 3]]>,
+    pub played_stem_peaks: Arc<[[f32; 4]]>,
+}
+
+/// One waveform bucket's linear levels, before the display floors, ceilings and curves.
+#[derive(Clone, Copy)]
+pub struct BucketLevels {
+    band_peak: [f32; 3],
+    band_mean: [f32; 3],
+    stem_peak: [f32; 4],
 }
 
 impl LoadedTrackAudio {
@@ -53,14 +68,38 @@ impl LoadedTrackAudio {
         pcm_stereo: &[f32],
         sample_rate: u32,
     ) -> (Vec<[f32; 3]>, Vec<[f32; 4]>) {
-        let total_frames = pcm_stereo.len() / 2;
-        if total_frames == 0 || sample_rate == 0 {
+        if pcm_stereo.len() < 2 || sample_rate == 0 {
             return (vec![[0.1, 0.1, 0.1]; 120], vec![[0.1, 0.1, 0.1, 0.1]; 120]);
         }
+        Self::shape_peaks(&Self::measure_buckets(pcm_stereo, sample_rate), 1.0)
+    }
+
+    /// Display peaks from `buckets` as if the audio were `gain` times louder: the gain scales the
+    /// linear levels before the floors, ceilings and curves, as louder audio would.
+    pub fn shape_peaks(buckets: &[BucketLevels], gain: f32) -> (Vec<[f32; 3]>, Vec<[f32; 4]>) {
+        buckets.iter().map(|b| {
+            let [max_low, max_mid, max_high] = b.band_peak.map(|v| v * gain);
+            let [avg_low, avg_mid, avg_high] = b.band_mean.map(|v| v * gain);
+            let [max_drums, max_bass, max_inst, max_vocals] = b.stem_peak.map(|v| (v * gain).min(1.0));
+            // Blend RMS and Peak with power-curve shaping for realistic Traktor Pro 4 transient silhouettes
+            let shaped_low = ((max_low * 0.65 + avg_low * 0.75) * 1.15).clamp(0.02, 0.96).powf(0.85);
+            let shaped_mid = ((max_mid * 0.60 + avg_mid * 0.70) * 1.25).clamp(0.02, 0.92).powf(0.95);
+            let shaped_high = ((max_high * 0.55 + avg_high * 0.65) * 1.35).clamp(0.01, 0.88).powf(1.05);
+            ([shaped_low, shaped_mid, shaped_high], [
+                (max_drums * 0.88).clamp(0.02, 0.95).powf(0.9),
+                (max_bass * 0.85).clamp(0.02, 0.92).powf(0.9),
+                (max_inst * 0.78).clamp(0.02, 0.86).powf(1.05),
+                (max_vocals * 0.80).clamp(0.02, 0.88).powf(1.0),
+            ])
+        }).unzip()
+    }
+
+    /// Measures the linear levels of every `PEAKS_PER_SEC` bucket of `pcm_stereo` in one pass.
+    pub fn measure_buckets(pcm_stereo: &[f32], sample_rate: u32) -> Vec<BucketLevels> {
+        let total_frames = pcm_stereo.len() / 2;
         let frames_per_bucket = ((sample_rate as usize) / PEAKS_PER_SEC).max(64);
         let num_buckets = (total_frames / frames_per_bucket).max(1);
-        let mut peaks = Vec::with_capacity(num_buckets);
-        let mut stems = Vec::with_capacity(num_buckets);
+        let mut buckets = Vec::with_capacity(num_buckets);
 
         let mut lp_state = 0.0_f32;
         let mut mp_state = 0.0_f32;
@@ -106,10 +145,11 @@ impl LoadedTrackAudio {
                 slow_env += 0.006 * (abs_in - slow_env);
                 let transient = (fast_env - slow_env).max(0.0);
 
-                let drums_val = (transient * 2.1 + high * 0.65).min(1.0);
-                let bass_val = (low * 1.15).min(1.0);
-                let inst_val = (side_ch.abs() * 1.6 + mid * 0.55).min(1.0);
-                let vocal_val = ((mid - side_ch.abs() * 0.5).max(0.0) * 1.45).min(1.0);
+                // Uncapped here; `shape_peaks` caps them at 1.0 after the gain.
+                let drums_val = transient * 2.1 + high * 0.65;
+                let bass_val = low * 1.15;
+                let inst_val = side_ch.abs() * 1.6 + mid * 0.55;
+                let vocal_val = (mid - side_ch.abs() * 0.5).max(0.0) * 1.45;
 
                 sum_low += low;
                 sum_mid += mid;
@@ -137,23 +177,13 @@ impl LoadedTrackAudio {
                     max_vocals = vocal_val;
                 }
             }
-            // Blend RMS and Peak with power-curve shaping for realistic Traktor Pro 4 transient silhouettes
-            let avg_low = sum_low / n;
-            let avg_mid = sum_mid / n;
-            let avg_high = sum_high / n;
-            let shaped_low = ((max_low * 0.65 + avg_low * 0.75) * 1.15).clamp(0.02, 0.96).powf(0.85);
-            let shaped_mid = ((max_mid * 0.60 + avg_mid * 0.70) * 1.25).clamp(0.02, 0.92).powf(0.95);
-            let shaped_high = ((max_high * 0.55 + avg_high * 0.65) * 1.35).clamp(0.01, 0.88).powf(1.05);
-
-            peaks.push([shaped_low, shaped_mid, shaped_high]);
-            stems.push([
-                (max_drums * 0.88).clamp(0.02, 0.95).powf(0.9),
-                (max_bass * 0.85).clamp(0.02, 0.92).powf(0.9),
-                (max_inst * 0.78).clamp(0.02, 0.86).powf(1.05),
-                (max_vocals * 0.80).clamp(0.02, 0.88).powf(1.0),
-            ]);
+            buckets.push(BucketLevels {
+                band_peak: [max_low, max_mid, max_high],
+                band_mean: [sum_low / n, sum_mid / n, sum_high / n],
+                stem_peak: [max_drums, max_bass, max_inst, max_vocals],
+            });
         }
-        (peaks, stems)
+        buckets
     }
 
     /// Decodes a real audio file (`.mp3`, `.flac`, `.wav`, `.ogg`, `.m4a`, `.aac`) from disk using Symphonia.
@@ -253,8 +283,11 @@ impl LoadedTrackAudio {
         }
 
         let duration_sec = (pcm_stereo.len() / 2) as f64 / (sr as f64);
-        let (waveform_peaks, stem_peaks) = Self::compute_waveform_peaks(&pcm_stereo, sr);
+        let buckets = Self::measure_buckets(&pcm_stereo, sr);
+        let (waveform_peaks, stem_peaks) = Self::shape_peaks(&buckets, 1.0);
         let phrases = retraktor_library::detect_phrases(&waveform_peaks, fallback_bpm, 0.0, duration_sec);
+        let auto_gain = retraktor_library::autogain_multiplier(&pcm_stereo, sr);
+        let (played_peaks, played_stem_peaks) = Self::shape_peaks(&buckets, auto_gain);
 
         let mut loaded = Self {
             title,
@@ -273,6 +306,9 @@ impl LoadedTrackAudio {
             pcm_other: None,
             pcm_vocals: None,
             phrases,
+            auto_gain,
+            played_peaks: played_peaks.into(),
+            played_stem_peaks: played_stem_peaks.into(),
         };
 
         if let Some(dir) = crate::demucs::DemucsManager::get_cached_stem_dir(path) {
@@ -382,6 +418,7 @@ impl LoadedTrackAudio {
                 let frames_per_bucket = ((self.sample_rate as usize) / PEAKS_PER_SEC).max(64);
                 let num_buckets = (total_frames / frames_per_bucket).max(1);
                 let mut real_peaks = Vec::with_capacity(num_buckets);
+                let mut played_peaks = Vec::with_capacity(num_buckets);
 
                 for b_idx in 0..num_buckets {
                     let start = b_idx * frames_per_bucket * 2;
@@ -398,12 +435,10 @@ impl LoadedTrackAudio {
                         if let Some(&s) = v.get(i) { max_v = max_v.max(s.abs()); }
                     }
 
-                    real_peaks.push([
-                        max_d.clamp(0.04, 1.0),
-                        max_b.clamp(0.04, 1.0),
-                        max_o.clamp(0.04, 1.0),
-                        max_v.clamp(0.04, 1.0),
-                    ]);
+                    let maxima = [max_d, max_b, max_o, max_v];
+                    real_peaks.push(maxima.map(|m| m.clamp(0.04, 1.0)));
+                    // Stems that arrive after a deck load use its latched gain; on load, `finish_loads` swaps in unity when Auto gain is off.
+                    played_peaks.push(maxima.map(|m| (m * self.auto_gain).clamp(0.04, 1.0)));
                 }
 
                 self.pcm_drums = Some(d);
@@ -411,6 +446,7 @@ impl LoadedTrackAudio {
                 self.pcm_other = Some(o);
                 self.pcm_vocals = Some(v);
                 self.stem_peaks = real_peaks.into();
+                self.played_stem_peaks = played_peaks.into();
                 self.stems_ready = true;
                 return true;
             }
@@ -1023,6 +1059,7 @@ impl AudioSystem {
                 let mut raw_l = 0.0_f32;
                 let mut raw_r = 0.0_f32;
                 let mut has_sample = false;
+                let mut auto_gain = 1.0_f32;
 
                 let effective_rate = if state.scratch_active[d] || state.scratch_ramping[d] {
                     state.scratch_rate[d]
@@ -1040,6 +1077,7 @@ impl AudioSystem {
 
                 if let Some(track) = &state.loaded_tracks[d] {
                     track_dur = track.duration_sec.max(0.1);
+                    auto_gain = track.auto_gain;
                     let tsr = track.sample_rate as f64;
                     let sample_pos = state.playhead_sec[d] * tsr;
                     let stems = [&track.pcm_drums, &track.pcm_bass, &track.pcm_other, &track.pcm_vocals];
@@ -1169,8 +1207,8 @@ impl AudioSystem {
                         )
                     };
 
-                    // 2. Channel gain (the 3-band EQ runs in the mixer engine).
-                    let gain = (state.channel_gain[d] * 2.0).clamp(0.0, 2.0);
+                    // 2. Channel gain times the track's auto gain (the 3-band EQ runs in the mixer engine).
+                    let gain = (state.channel_gain[d] * 2.0).clamp(0.0, 2.0) * auto_gain;
                     deck_samples[d] = (stem_l * gain, stem_r * gain);
                 }
 
@@ -1325,6 +1363,9 @@ mod tests {
             pcm_other: None,
             pcm_vocals: None,
             phrases: Vec::new(),
+            auto_gain: 1.0,
+            played_peaks: Vec::new().into(),
+            played_stem_peaks: Vec::new().into(),
         }
     }
 
@@ -1396,6 +1437,36 @@ mod tests {
         // CUE off: nothing in the headphones at the CUE end of the blend.
         let p = render_peaks(|st| st.engine.strips[0].volume = 0.0, 4);
         assert!(p[2] < 0.01, "no cue pressed, headphones silent: {p:?}");
+    }
+
+    /// Two tones 12 dB apart: with auto gain they play at the same level on the main and in the cue, and GAIN still trims around it.
+    #[test]
+    fn auto_gain_matches_tracks_in_main_and_cue_beside_manual_gain() {
+        let play = |amp: f32, matched: bool, setup: &dyn Fn(&mut AudioSharedState)| {
+            render_peaks(|st| {
+                let t = st.loaded_tracks[0].as_mut().unwrap();
+                t.pcm_stereo.iter_mut().for_each(|s| *s *= amp / 0.5);
+                if matched {
+                    t.auto_gain = retraktor_library::autogain_multiplier(&t.pcm_stereo, t.sample_rate);
+                }
+                setup(st);
+            }, 4)
+        };
+        let cue_only = |st: &mut AudioSharedState| {
+            st.engine.strips[0].volume = 0.0;
+            st.engine.strips[0].cue_enabled = true;
+        };
+        let ratio = |matched: bool, setup: &dyn Fn(&mut AudioSharedState), ch: usize| {
+            play(0.4, matched, setup)[ch] / play(0.1, matched, setup)[ch]
+        };
+        assert!((ratio(false, &|_| {}, 0) / 4.0 - 1.0).abs() < 0.02, "off keeps the 12 dB difference");
+        assert!((ratio(true, &|_| {}, 0) - 1.0).abs() < 0.02, "main not matched");
+        assert!((ratio(true, &cue_only, 2) - 1.0).abs() < 0.02, "cue not matched");
+
+        let centre = play(0.1, true, &|_| {})[0];
+        let trimmed = play(0.1, true, &|st| st.channel_gain[0] = 0.25)[0];
+        assert!((trimmed / centre - 0.5).abs() < 0.01, "GAIN at -6 dB: {trimmed} vs {centre}");
+        assert!(centre < 0.99, "matched level clipped: {centre}");
     }
 
     #[test]
@@ -1471,5 +1542,70 @@ mod tests {
         for p in &wf_peaks_sq {
             assert!(p[0] <= 1.0 && p[1] <= 1.0 && p[2] <= 1.0);
         }
+    }
+
+    /// Two copies of one recording 18 dB apart, each loaded with its own measured auto gain, play the
+    /// same, so their waveforms and stem lanes (estimated, then separated stems arriving late) must look
+    /// the same. The silent break stays dark and the quieter section stays quieter and visible.
+    #[test]
+    fn auto_gain_waveforms_match_level_shifted_copies() {
+        let dir = std::env::temp_dir().join(format!("retraktor-played-peaks-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sr = 44_100;
+        let tau = std::f32::consts::TAU;
+        // Bass, chords and hats: 3 s, then 2 s of digital silence, then 3 s of the same 10 dB down.
+        let sample = |i: usize, amp: f32| {
+            let t = i as f32 / sr as f32;
+            let section = [1.0, 1.0, 1.0, 0.0, 0.0, 0.316, 0.316, 0.316][i / sr as usize];
+            amp * section * (0.5 * (tau * 60.0 * t).sin() + 0.3 * (tau * 1000.0 * t).sin() + 0.2 * (tau * 6000.0 * t).sin())
+        };
+        let load = |name: &str, amp: f32| {
+            let pcm: Vec<i16> = (0..8 * sr as usize).flat_map(|i| {
+                let v = (sample(i, amp) * 32767.0) as i16;
+                [v, v]
+            }).collect();
+            let path = dir.join(format!("{name}.wav"));
+            AudioSystem::write_stereo_wav_file(&path, &pcm, sr).unwrap();
+            let mut track = LoadedTrackAudio::from_file(&path, name, "", 128.0, "1d").unwrap();
+            let estimated_stems = track.played_stem_peaks.clone();
+            let stem_dir = dir.join(name);
+            std::fs::create_dir_all(&stem_dir).unwrap();
+            for stem in ["drums", "bass", "other", "vocals"] {
+                std::fs::copy(&path, stem_dir.join(format!("{stem}.wav"))).unwrap();
+            }
+            assert!(track.load_stems_from_dir(&stem_dir));
+            (track, estimated_stems)
+        };
+        let (loud, loud_estimated) = load("loud", 0.5);
+        let (quiet, quiet_estimated) = load("quiet", 0.5 / 7.943);
+
+        let db = |g: f32| 20.0 * g.log10();
+        assert!((db(quiet.auto_gain) - db(loud.auto_gain) - 18.0).abs() < 0.1, "{} vs {}", quiet.auto_gain, loud.auto_gain);
+        // Half a pixel of a 36 px Mix-deck half height.
+        fn same_picture<const N: usize>(a: &[[f32; N]], b: &[[f32; N]], what: &str) {
+            assert_eq!(a.len(), b.len());
+            for (i, (x, y)) in a.iter().zip(b).enumerate() {
+                assert!(x.iter().zip(y).all(|(x, y)| (x - y).abs() < 0.5 / 36.0), "{what} bucket {i}: {x:?} vs {y:?}");
+            }
+        }
+        same_picture(&loud.played_peaks, &quiet.played_peaks, "3-band");
+        same_picture(&loud_estimated, &quiet_estimated, "estimated stems");
+        same_picture(&loud.played_stem_peaks, &quiet.played_stem_peaks, "separated stems");
+
+        // Buckets well inside each section, at 60 a second.
+        let (loud_part, silent_part, quieter_part) = (30..150, 210..290, 330..450);
+        let loudest = |p: &[f32]| p.iter().copied().fold(0.0, f32::max);
+        for track in [&loud, &quiet] {
+            let bands = &track.played_peaks;
+            assert!(silent_part.clone().all(|i| crate::widgets::quantize_dot_rows(loudest(&bands[i]), 7) == 0), "silent break lit");
+            assert!(silent_part.clone().all(|i| crate::widgets::quantize_dot_rows(loudest(&track.played_stem_peaks[i]), 3) == 0), "silent stems lit");
+            let level = |part: std::ops::Range<usize>| part.clone().map(|i| loudest(&bands[i])).sum::<f32>() / part.len() as f32;
+            assert!(level(quieter_part.clone()) < 0.8 * level(loud_part.clone()), "section change flattened");
+            assert!(crate::widgets::quantize_dot_rows(level(quieter_part.clone()), 7) >= 1, "quieter section went dark");
+        }
+        // Unity keeps the analysed picture, which phrases read: the copies differ there.
+        assert_eq!(&*quiet.waveform_peaks, &LoadedTrackAudio::compute_waveform_peaks(&quiet.pcm_stereo, sr).0[..]);
+        assert!(loud.waveform_peaks[90][0] - quiet.waveform_peaks[90][0] > 0.2);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

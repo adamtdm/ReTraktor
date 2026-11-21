@@ -333,9 +333,32 @@ pub(crate) fn dot_grid_metrics(width: f32, height: f32, max_cols: usize, max_hal
     (cols, half_rows, step_x, step_y, radius)
 }
 
+/// The waveform analysis floors digital silence at or under this (0.04 for separated stems), so a
+/// dot lane this low stays dark while real low-level content lights a row.
+const WAVEFORM_SILENCE: f32 = 0.04;
+/// Deck waveforms' vertical zoom above the silence floor, through typical levels.
+const WAVEFORM_ZOOM: f32 = 2.2;
+/// Slope of the headroom ramp that takes over from the zoom near the top and reaches full height at 1.0.
+const WAVEFORM_HEADROOM_SLOPE: f32 = 0.48;
+
+/// Deck waveforms' fixed vertical zoom, the same for every deck and track, applied to heights only.
+/// Silence is unchanged; above it amplitudes stretch by `WAVEFORM_ZOOM` up to a knee (about 0.33 in,
+/// 0.68 out), then follow a gentler ramp to 1.0, so hot peaks stay in order instead of flattening.
+fn zoom_waveform(amp: f32) -> f32 {
+    if amp <= WAVEFORM_SILENCE {
+        return amp;
+    }
+    let zoomed = WAVEFORM_SILENCE + (amp - WAVEFORM_SILENCE) * WAVEFORM_ZOOM;
+    zoomed.min(1.0 - (1.0 - amp) * WAVEFORM_HEADROOM_SLOPE)
+}
+
+fn zoom_bands((low, mid, high): (f32, f32, f32)) -> (f32, f32, f32) {
+    (zoom_waveform(low), zoom_waveform(mid), zoom_waveform(high))
+}
+
 /// Quantises a `[0, 1]` amplitude into how many dot pairs (`0..=half_rows`) should light up.
 pub(crate) fn quantize_dot_rows(amp: f32, half_rows: usize) -> usize {
-    if half_rows == 0 || amp <= 0.02 {
+    if half_rows == 0 || amp <= WAVEFORM_SILENCE {
         return 0;
     }
     ((amp.clamp(0.0, 1.0) * half_rows as f32).ceil() as usize).clamp(1, half_rows)
@@ -360,7 +383,8 @@ fn sample_scrolling_3band(peaks: &[[f32; 3]], time_sec: f64) -> Option<(f32, f32
 }
 
 /// Draws a 3-band waveform inside `rect` in the given `style`.
-/// `sample_at_x` returns `Some((low, mid, high))` for a given `x` coordinate in `rect`.
+/// `sample_at_x` returns `Some((played, tone))` for a given `x` coordinate in `rect`: `(low, mid, high)`
+/// at the level the deck plays, for heights, and as analysed, for colours and the bass-core cues.
 fn paint_3band_waveform(
     painter: &egui::Painter,
     rect: Rect,
@@ -369,7 +393,7 @@ fn paint_3band_waveform(
     max_dot_cols: usize,
     max_dot_half_rows: usize,
     scroll_px: f64,
-    sample_at_x: impl Fn(f32) -> Option<(f32, f32, f32)>,
+    sample_at_x: impl Fn(f32) -> Option<((f32, f32, f32), (f32, f32, f32))>,
 ) {
     use crate::theme::WaveformStyle;
     // Columns sit on fixed track positions and glide with the audio; screen-fixed columns shimmer.
@@ -384,8 +408,8 @@ fn paint_3band_waveform(
             let cols = (rect.width() / col_w).ceil() as usize;
             for i in 0..cols + 2 {
                 let col_x = rect.left() + (i as f32) * col_w - shift(col_w);
-                let Some((low_amp, mid_amp, high_amp)) = sample_at_x(col_x) else { continue };
-                let (outer_col, mid_col, core_col) = spectrum_colors(low_amp, mid_amp, high_amp);
+                let Some(((low_amp, mid_amp, high_amp), tone)) = sample_at_x(col_x) else { continue };
+                let (outer_col, mid_col, core_col) = spectrum_colors(tone.0, tone.1, tone.2);
                 let total_env = low_amp.max(mid_amp * 0.92).max(high_amp * 0.85);
                 let h_outer = (total_env * max_half_h).max(1.0);
                 painter.line_segment(
@@ -414,8 +438,8 @@ fn paint_3band_waveform(
                 let near = (1.0 - ((col_x - playhead_x).abs() / glow_w)).clamp(0.0, 1.0);
                 let sampled = sample_at_x(col_x);
                 let (lit_outer, lit_mid, lit_core, outer_col, mid_col, core_col) =
-                    if let Some((low, mid, high)) = sampled {
-                        let (oc, mc, cc) = spectrum_colors(low, mid, high);
+                    if let Some(((low, mid, high), tone)) = sampled {
+                        let (oc, mc, cc) = spectrum_colors(tone.0, tone.1, tone.2);
                         let env = low.max(mid * 0.92).max(high * 0.85);
                         let lo = quantize_dot_rows(env, half_rows);
                         let lm = quantize_dot_rows(mid.max(low * 0.75) * 0.75, half_rows).min(lo);
@@ -456,8 +480,8 @@ fn paint_3band_waveform(
             let glow_w = pitch * 4.0;
             for c in 0..cols + 2 {
                 let col_x = rect.left() + (c as f32 + 0.5) * pitch - shift(pitch);
-                let Some((low, mid, high)) = sample_at_x(col_x) else { continue };
-                let (outer_col, mid_col, core_col) = spectrum_colors(low, mid, high);
+                let Some(((low, mid, high), tone)) = sample_at_x(col_x) else { continue };
+                let (outer_col, mid_col, core_col) = spectrum_colors(tone.0, tone.1, tone.2);
                 let near = (1.0 - ((col_x - playhead_x).abs() / glow_w)).clamp(0.0, 1.0);
                 let boost = |col: Color32| {
                     if near > 0.0 {
@@ -479,7 +503,7 @@ fn paint_3band_waveform(
                     rounding,
                     boost(mid_col),
                 );
-                if low > 0.12 {
+                if tone.0 > 0.12 {
                     let h_core = (low * max_half_h * 0.42).max(0.8).min(h_mid);
                     painter.rect_filled(
                         Rect::from_center_size(Pos2::new(col_x, center_y), Vec2::new(bar_w, h_core * 2.0)),
@@ -495,15 +519,15 @@ fn paint_3band_waveform(
             let mut prev: Option<(Pos2, Pos2, Color32)> = None;
             for c in 0..=cols + 1 {
                 let col_x = (rect.left() + (c as f32) * step - shift(step)).min(rect.right());
-                if let Some((low, mid, high)) = sample_at_x(col_x) {
-                    let (outer_col, mid_col, core_col) = spectrum_colors(low, mid, high);
+                if let Some(((low, mid, high), tone)) = sample_at_x(col_x) {
+                    let (outer_col, mid_col, core_col) = spectrum_colors(tone.0, tone.1, tone.2);
                     let env = low.max(mid * 0.92).max(high * 0.85);
                     let h = (env * max_half_h).max(0.8);
                     let top = Pos2::new(col_x, center_y - h);
                     let bot = Pos2::new(col_x, center_y + h);
-                    let stroke_col = if low > 0.55 {
+                    let stroke_col = if tone.0 > 0.55 {
                         core_col
-                    } else if mid >= high {
+                    } else if tone.1 >= tone.2 {
                         mid_col
                     } else {
                         outer_col
@@ -536,7 +560,7 @@ pub fn paint_waveform_style_preview(
         [Pos2::new(rect.left(), cy), Pos2::new(rect.right(), cy)],
         Stroke::new(0.5_f32, TraktorTheme::WAVEFORM_GRID().gamma_multiply(0.35)),
     );
-    let sample_at_x = |x: f32| -> Option<(f32, f32, f32)> {
+    let sample_at_x = |x: f32| -> Option<((f32, f32, f32), (f32, f32, f32))> {
         let t = ((x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
         // Synthetic 4-beat phrase with kick transients, mid chord body, and hi-hat offbeats
         let beat_phase = (t * 4.0).fract();
@@ -546,7 +570,7 @@ pub fn paint_waveform_style_preview(
         let low = (kick * 0.92 + 0.12 * phrase).clamp(0.08, 0.98);
         let mid = ((0.35 + 0.45 * (t * PI * 3.0).sin().abs()) * phrase + kick * 0.25).clamp(0.12, 0.92);
         let high = (offbeat * 0.78 + 0.22 * (t * PI * 7.0).cos().abs()).clamp(0.08, 0.90);
-        Some((low, mid, high))
+        Some(((low, mid, high), (low, mid, high)))
     };
     paint_3band_waveform(painter, rect, cx, style, 22, 4, 0.0, sample_at_x);
     for b in 1..4 {
@@ -573,6 +597,7 @@ pub fn scrolling_waveform(
     cues: &[(u8, f64)],
     phrases: &[retraktor_library::Phrase],
     waveform_peaks: &[[f32; 3]],
+    played_peaks: &[[f32; 3]],
     loop_active: bool,
     loop_start_sec: f64,
     loop_len_sec: f64,
@@ -627,7 +652,7 @@ pub fn scrolling_waveform(
     let scroll_px = (elapsed_sec + ((rect.left() - center_x) / pixels_per_sec) as f64) * pixels_per_sec as f64;
     paint_3band_waveform(painter, rect, center_x, style, 120, 7, scroll_px, |col_x| {
         let time_at_col = elapsed_sec + ((col_x - center_x) / pixels_per_sec) as f64;
-        sample_scrolling_3band(waveform_peaks, time_at_col)
+        Some((zoom_bands(sample_scrolling_3band(played_peaks, time_at_col)?), sample_scrolling_3band(waveform_peaks, time_at_col)?))
     });
 
     // 3. Subtle Beatgrid Lines (drawn cleanly over the waveform like Traktor Pro 4)
@@ -825,7 +850,7 @@ pub fn scrolling_stem_waveforms(
             p0[1] + (p1[1] - p0[1]) * frac,
             p0[2] + (p1[2] - p0[2]) * frac,
             p0[3] + (p1[3] - p0[3]) * frac,
-        ])
+        ].map(zoom_waveform))
     };
 
     let muted_col = TraktorTheme::WAVEFORM_GRID().gamma_multiply(0.4);
@@ -1083,6 +1108,7 @@ pub fn stripe_overview(
     elapsed_sec: &mut f64,
     total_len_sec: f64,
     waveform_peaks: &[[f32; 3]],
+    played_peaks: &[[f32; 3]],
     cues: &[(u8, f64)],
     phrases: &[retraktor_library::Phrase],
     loop_active: bool,
@@ -1114,6 +1140,11 @@ pub fn stripe_overview(
         let scrub_x = rect.left() + norm_pos * rect.width();
         let cy = rect.center().y;
         let style = crate::theme::waveform_style();
+        // `(low, mid, high)` of the bucket under `frac` of the track, or None before analysis.
+        let bucket = |peaks: &[[f32; 3]], frac: f32| {
+            let p = peaks.get(((frac * peaks.len() as f32) as usize).min(peaks.len().saturating_sub(1)))?;
+            Some((p[0], p[1], p[2]))
+        };
 
         if style == crate::theme::WaveformStyle::Classic {
             // Overview spectrum waveform columns (high density)
@@ -1121,16 +1152,11 @@ pub fn stripe_overview(
             for c in 0..cols {
                 let x = rect.left() + (c as f32) * 1.5;
                 let frac = c as f32 / cols.max(1) as f32;
-                let (low, mid, high) = if !waveform_peaks.is_empty() {
-                    let idx = ((frac * waveform_peaks.len() as f32) as usize)
-                        .min(waveform_peaks.len() - 1);
-                    let p = waveform_peaks[idx];
-                    (p[0], p[1], p[2])
-                } else {
+                let (Some((low, mid, high)), Some(tone)) = (bucket(played_peaks, frac).map(zoom_bands), bucket(waveform_peaks, frac)) else {
                     continue;
                 };
 
-                let (outer_col, mid_col, core_col) = spectrum_colors(low, mid, high);
+                let (outer_col, mid_col, core_col) = spectrum_colors(tone.0, tone.1, tone.2);
                 let h_outer = ((low.max(mid).max(high)) * (height - 6.0) * 0.5).max(1.0);
                 let h_core = (low * (height - 6.0) * 0.28).max(0.5);
 
@@ -1140,18 +1166,13 @@ pub fn stripe_overview(
                 );
                 painter.line_segment(
                     [Pos2::new(x, cy - h_core), Pos2::new(x, cy + h_core)],
-                    Stroke::new(1.2_f32, if low > 0.55 { core_col } else { mid_col }),
+                    Stroke::new(1.2_f32, if tone.0 > 0.55 { core_col } else { mid_col }),
                 );
             }
         } else {
             paint_3band_waveform(painter, rect, scrub_x, style, 64, 2, 0.0, |col_x| {
-                if waveform_peaks.is_empty() {
-                    return None;
-                }
                 let frac = ((col_x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
-                let idx = ((frac * waveform_peaks.len() as f32) as usize).min(waveform_peaks.len() - 1);
-                let p = waveform_peaks[idx];
-                Some((p[0], p[1], p[2]))
+                Some((zoom_bands(bucket(played_peaks, frac)?), bucket(waveform_peaks, frac)?))
             });
         }
 
@@ -1646,5 +1667,37 @@ mod tests {
         assert_eq!(quantize_dot_rows(0.5, 6), 3);
         assert_eq!(quantize_dot_rows(1.0, half_rows), half_rows);
         assert_eq!(quantize_dot_rows(1.5, half_rows), half_rows);
+    }
+
+    /// The deck waveform zoom roughly doubles typical matched columns, keeps every silence floor
+    /// dark, and keeps hot peaks in order under full height.
+    #[test]
+    fn waveform_zoom_doubles_typical_levels_keeps_silence_dark_and_hot_peaks_apart() {
+        // Classic column height in the Mix deck at 1280x820 (an 89.2 px lane, 45% each side).
+        let column_px = |amp: f32| amp * 0.9 * 89.2;
+        // Today's matched median and 90th-percentile columns, 20 and 30 px.
+        let (median, p90) = (20.0 / column_px(1.0), 30.0 / column_px(1.0));
+        let px = column_px(zoom_waveform(median));
+        assert!((38.0..=42.0).contains(&px), "median column {px} px");
+        let px = column_px(zoom_waveform(p90));
+        assert!((54.0..=60.0).contains(&px), "90th-percentile column {px} px");
+        // Quiet detail just above the floor gets the full zoom.
+        assert!((zoom_waveform(0.1) - (WAVEFORM_SILENCE + 0.06 * WAVEFORM_ZOOM)).abs() < 1e-6);
+
+        // The analysis' own silence floors (3-band, estimated stems, separated stems) stay put and dark.
+        let (silent_bands, silent_stems) = crate::audio::LoadedTrackAudio::compute_waveform_peaks(&[0.0; 96_000], 48_000);
+        for floor in silent_bands[0].into_iter().chain(silent_stems[0]).chain([0.04]) {
+            assert_eq!(zoom_waveform(floor), floor);
+            assert_eq!(quantize_dot_rows(zoom_waveform(floor), 7), 0, "silence at {floor} lit a dot");
+        }
+
+        // Rising everywhere with no jump at the floor or the knee, full height only at 1.0.
+        let curve: Vec<f32> = (0..=1000).map(|i| zoom_waveform(i as f32 / 1000.0)).collect();
+        assert!(curve.windows(2).all(|w| w[1] > w[0] && w[1] - w[0] <= WAVEFORM_ZOOM / 1000.0 + 1e-6));
+        assert_eq!(zoom_waveform(1.0), 1.0);
+        // Hot peaks keep at least the ramp's share of their spacing instead of flattening at a cap.
+        let hot = [0.5, 0.6, 0.75, 0.9, 0.96].map(zoom_waveform);
+        assert!(hot.windows(2).all(|w| w[1] - w[0] >= 0.06 * WAVEFORM_HEADROOM_SLOPE * 0.99), "{hot:?}");
+        assert!(hot[4] < 1.0, "{hot:?}");
     }
 }

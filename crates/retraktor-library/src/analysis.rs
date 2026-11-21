@@ -157,6 +157,40 @@ fn compute_loudness_and_brightness(samples: &[f32]) -> (f32, f32, f32) {
     (loudness_db, peak_db, hf_ratio)
 }
 
+/// Linear trim for interleaved stereo PCM (`[L, R, L, R, ...]`) at its native `sample_rate`.
+/// It brings the integrated loudness (ITU-R BS.1770 / EBU R128: K-weighted and gated) to
+/// [`crate::AUTOGAIN_TARGET_LUFS`], within ±[`crate::AUTOGAIN_MAX_DB`]. It then lowers the trim
+/// as far as needed, even below unity, to keep the louder channel's true (intersample) peak at or
+/// under [`crate::AUTOGAIN_TRUE_PEAK_CEILING_DBTP`]. Audio too short or quiet to pass the loudness
+/// gate gets no makeup but still honours the ceiling. Non-finite samples or a meter error give unity.
+pub fn autogain_multiplier(interleaved_stereo: &[f32], sample_rate: u32) -> f32 {
+    if interleaved_stereo.iter().any(|s| !s.is_finite()) {
+        return 1.0;
+    }
+    let frames = &interleaved_stereo[..interleaved_stereo.len() / 2 * 2];
+    let measure = || -> Result<(f64, f64), ebur128::Error> {
+        let mode = ebur128::Mode::I | ebur128::Mode::TRUE_PEAK;
+        let mut meter = ebur128::EbuR128::new(2, sample_rate, mode)?;
+        meter.add_frames_f32(frames)?;
+        let lufs = meter.loudness_global()?;
+        // 32 zero frames push out the true-peak interpolator's last outputs (at most 12 frames of
+        // latency); read after the loudness so they never enter a gating block.
+        meter.add_frames_f32(&[0.0; 64])?;
+        Ok((lufs, meter.true_peak(0)?.max(meter.true_peak(1)?)))
+    };
+    let Ok((lufs, true_peak)) = measure() else { return 1.0 };
+    if lufs.is_nan() || !true_peak.is_finite() {
+        return 1.0;
+    }
+    let max_db = crate::AUTOGAIN_MAX_DB;
+    // The meter reads -inf below its gate (silence, or under 400 ms): no makeup then.
+    let musical_db = if lufs.is_finite() { (crate::AUTOGAIN_TARGET_LUFS - lufs).clamp(-max_db, max_db) } else { 0.0 };
+    // +inf for digital silence, so the ceiling then leaves the trim alone.
+    let ceiling_db = crate::AUTOGAIN_TRUE_PEAK_CEILING_DBTP - 20.0 * true_peak.log10();
+    let db = musical_db.min(ceiling_db);
+    if db.is_finite() { 10f64.powf(db / 20.0) as f32 } else { 1.0 }
+}
+
 /// Radix-2 Cooley-Tukey in-place complex FFT. `re` and `im` must have power-of-two length.
 fn fft_in_place(re: &mut [f32], im: &mut [f32]) {
     let n = re.len();
@@ -1050,6 +1084,70 @@ mod tests {
             res_quiet.energy
         );
         assert!(res_loud.loudness_db > res_quiet.loudness_db);
+    }
+
+    /// Expected values come from the standards, not from the meter: EBU Tech 3341 (a stereo
+    /// 997 Hz sine reads its peak level in LUFS), the BS.1770 K-weighting curve, the analytic peak
+    /// of an fs/4 tone, and BS.1770 gating.
+    #[test]
+    fn autogain_meets_lufs_target_under_true_peak_ceiling() {
+        // Interleaved stereo sine; `right` scales the right channel.
+        fn sine(hz: f64, amp: f64, sr: u32, frames: usize, phase: f64, right: f32) -> Vec<f32> {
+            (0..frames).flat_map(|i| {
+                let v = (amp * (std::f64::consts::TAU * hz * i as f64 / sr as f64 + phase).sin()) as f32;
+                [v, v * right]
+            }).collect()
+        }
+        let db = |g: f32| 20.0 * (g as f64).log10();
+        let close = |got: f64, want: f64, tol: f64, what: &str| {
+            assert!((got - want).abs() <= tol, "{what}: {got:.3} dB, expected {want:.3}");
+        };
+        let target = crate::AUTOGAIN_TARGET_LUFS;
+
+        // 997 Hz at -26.02 dBFS peak reads -26.02 LUFS, so it needs +8.02 dB at every rate.
+        for sr in [44_100, 48_000, 96_000] {
+            let g = autogain_multiplier(&sine(997.0, 0.05, sr, sr as usize * 3, 0.0, 1.0), sr);
+            close(db(g), target - db(0.05), 0.1, &format!("997 Hz at {sr} Hz"));
+        }
+        // K-weighting: about -2.95 dB at 60 Hz (RLB high-pass) against +0.69 dB at 1 kHz (shelf), so
+        // 60 Hz needs 3.6 dB more. FFmpeg ebur128 agrees (-12.6 vs -9.0 LUFS at equal amplitude).
+        let at = |hz: f64| autogain_multiplier(&sine(hz, 0.05, 48_000, 48_000 * 3, 0.0, 1.0), 48_000);
+        close(db(at(60.0)) - db(at(997.0)), 3.6, 0.1, "60 Hz minus 1 kHz");
+        // BS.1770 sums channel energies, so opposite polarity is as loud as in phase.
+        assert_eq!(
+            autogain_multiplier(&sine(997.0, 0.05, 48_000, 48_000, 0.0, -1.0), 48_000),
+            autogain_multiplier(&sine(997.0, 0.05, 48_000, 48_000, 0.0, 1.0), 48_000)
+        );
+        // Very quiet: the largest boost, no more.
+        close(db(autogain_multiplier(&sine(997.0, 0.001, 48_000, 48_000 * 3, 0.0, 1.0), 48_000)), 18.0, 1e-3, "-60 LUFS");
+
+        // Gating: 5 s at -20 LUFS then 5 s at -60 LUFS. The relative gate drops the quiet half, so
+        // the trim is about +2 dB; averaging all 10 s would read -23 LUFS and give +5.
+        let mut gated = sine(997.0, 0.1, 48_000, 240_000, 0.0, 1.0);
+        gated.extend(sine(997.0, 0.001, 48_000, 240_000, 0.0, 1.0));
+        close(db(autogain_multiplier(&gated, 48_000)), 2.0, 0.25, "gated");
+
+        // Intersample peak: an fs/4 tone at 45 degrees has samples at +-A/sqrt 2 but peaks at A, 3 dB
+        // higher. A -40 LUFS bed wants +18 dB; the last 8 right-channel frames carry an A = 0.25
+        // burst, so the -1 dBTP ceiling allows 11.04 dB where a sample-peak cap would allow 14.05.
+        // Ending the clip on the burst also needs the meter's end flush (FFmpeg reads -12.0 dBTP).
+        for sr in [44_100, 48_000, 96_000] {
+            let frames = sr as usize * 3;
+            let mut pcm = sine(997.0, 0.01, sr, frames, 0.0, 1.0);
+            let burst = sine(sr as f64 / 4.0, 0.25, sr, frames, std::f64::consts::FRAC_PI_4, 1.0);
+            for f in frames - 8..frames {
+                pcm[f * 2 + 1] = burst[f * 2];
+            }
+            close(db(autogain_multiplier(&pcm, sr)), crate::AUTOGAIN_TRUE_PEAK_CEILING_DBTP - db(0.25), 0.3, &format!("fs/4 burst at {sr} Hz"));
+        }
+        // Under 400 ms nothing passes the gate, so no makeup, but a hot hit still gets the ceiling cut.
+        close(db(autogain_multiplier(&sine(997.0, 1.0, 48_000, 4_800, 0.0, 1.0), 48_000)), -1.0, 0.05, "short hot hit");
+        assert_eq!(autogain_multiplier(&sine(997.0, 0.01, 48_000, 4_800, 0.0, 1.0), 48_000), 1.0);
+
+        for unity in [Vec::new(), vec![0.0; 96_000], vec![f32::NAN; 96_000], vec![f32::INFINITY; 4]] {
+            assert_eq!(autogain_multiplier(&unity, 48_000), 1.0);
+        }
+        assert_eq!(autogain_multiplier(&sine(997.0, 0.05, 48_000, 48_000, 0.0, 1.0), 0), 1.0, "meter error");
     }
 
     #[test]

@@ -707,6 +707,9 @@ impl ReTraktorApp {
                                 pcm_other: None,
                                 pcm_vocals: None,
                                 phrases: Vec::new(),
+                                auto_gain: 1.0,
+                                played_peaks: vec![[0.4, 0.5, 0.3]; 300].into(),
+                                played_stem_peaks: vec![[0.4, 0.5, 0.3, 0.2]; 300].into(),
                             });
                         }
                     }
@@ -810,6 +813,11 @@ impl ReTraktorApp {
                     self.drain_pending_loads();
                 } else if let Ok(mut state) = self.audio.shared.lock() {
                     let d = deck - 1;
+                    let peaks: Arc<[[f32; 3]]> = (0..1200).map(|i| {
+                        let phase = (i as f32 / 1200.0) * 8.0;
+                        let bass = ((phase * 3.14).sin().abs()).clamp(0.1, 0.9);
+                        [bass, 0.5, 0.3]
+                    }).collect::<Vec<_>>().into();
                     state.loaded_tracks[d] = Some(crate::audio::LoadedTrackAudio {
                         title: if d == 0 { "Solaris (Extended Mix)".into() } else { "Midnight Sun".into() },
                         artist: if d == 0 { "Articuno".into() } else { "Helios".into() },
@@ -818,11 +826,7 @@ impl ReTraktorApp {
                         grid_offset_sec: 0.0,
                         key: if d == 0 { "8m".into() } else { "9m".into() },
                         sample_rate: 44100,
-                        waveform_peaks: (0..1200).map(|i| {
-                            let phase = (i as f32 / 1200.0) * 8.0;
-                            let bass = ((phase * 3.14).sin().abs()).clamp(0.1, 0.9);
-                            [bass, 0.5, 0.3]
-                        }).collect::<Vec<_>>().into(),
+                        waveform_peaks: peaks.clone(),
                         stem_peaks: Vec::new().into(),
                         pcm_stereo: Vec::new(),
                         stems_ready: false,
@@ -838,6 +842,9 @@ impl ReTraktorApp {
                             retraktor_library::Phrase { start_sec: 150.0, kind: retraktor_library::PhraseKind::Drop },
                             retraktor_library::Phrase { start_sec: 210.0, kind: retraktor_library::PhraseKind::Outro },
                         ],
+                        auto_gain: 1.0,
+                        played_peaks: peaks,
+                        played_stem_peaks: Vec::new().into(),
                     });
                     state.playhead_sec[d] = 75.0;
                 }
@@ -1108,7 +1115,13 @@ impl ReTraktorApp {
             if generation != self.load_generation[d] { continue; }
             self.deck_loading[d] = false;
             match result {
-                Ok(loaded) => {
+                Ok(mut loaded) => {
+                    // Read on each load, so switching it never jumps the level of a track on air.
+                    if !self.preferences.autogain {
+                        loaded.auto_gain = 1.0;
+                        loaded.played_peaks = loaded.waveform_peaks.clone();
+                        loaded.played_stem_peaks = loaded.stem_peaks.clone();
+                    }
                     // The first successful load opens the decks; after that the view is the DJ's choice.
                     let mut switched = false;
                     if !self.first_load_done {
@@ -2909,6 +2922,7 @@ impl ReTraktorApp {
                 &cues,
                 &deck.phrases,
                 &deck.peaks,
+                &deck.played_peaks,
                 self.deck_loop_active[d],
                 self.deck_loop_start_sec[d],
                 loop_len,
@@ -3077,7 +3091,9 @@ impl ReTraktorApp {
             elapsed_sec: state.playhead_sec[d],
             is_playing: state.is_playing[d],
             peaks: t.waveform_peaks.clone(),
-            stem_peaks: t.stem_peaks.clone(),
+            // Stem lanes have fixed colours, so they only need the played level.
+            stem_peaks: t.played_stem_peaks.clone(),
+            played_peaks: t.played_peaks.clone(),
             phrases: t.phrases.clone(),
         })
     }
@@ -3309,6 +3325,7 @@ impl ReTraktorApp {
                         &cues,
                         &deck.phrases,
                         &deck.peaks,
+                        &deck.played_peaks,
                         self.deck_loop_active[d],
                         self.deck_loop_start_sec[d],
                         loop_len_sec,
@@ -3349,6 +3366,7 @@ impl ReTraktorApp {
                 &mut scrub_pos,
                 deck.duration_sec,
                 &deck.peaks,
+                &deck.played_peaks,
                 &cues,
                 &deck.phrases,
                 self.deck_loop_active[d],
@@ -3977,6 +3995,9 @@ struct DeckView {
     is_playing: bool,
     peaks: Arc<[[f32; 3]]>,
     stem_peaks: Arc<[[f32; 4]]>,
+    /// `peaks` at the level the deck plays (after auto gain): waveform heights come from these,
+    /// colours from `peaks`.
+    played_peaks: Arc<[[f32; 3]]>,
     phrases: Vec<retraktor_library::Phrase>,
 }
 
@@ -4310,6 +4331,9 @@ mod tests {
             pcm_other: None,
             pcm_vocals: None,
             phrases: Vec::new(),
+            auto_gain: 1.0,
+            played_peaks: Vec::new().into(),
+            played_stem_peaks: Vec::new().into(),
         });
         let space = || vec![egui::Event::Key { key: Key::Space, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }];
         let press = |app: &mut ReTraktorApp, events| {
@@ -4393,6 +4417,53 @@ mod tests {
             assert_eq!(decoded.sample_rate, rate);
             assert_eq!(decoded.duration_sec, 1.0);
         }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Auto gain is read when a deck load lands: switching it on leaves the track on air alone and
+    /// matches the next load, with the other deck untouched.
+    #[test]
+    fn auto_gain_preference_applies_on_the_next_load() {
+        let dir = std::env::temp_dir().join(format!("retraktor-autogain-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tone = |name: &str, amp: f32| {
+            let path = dir.join(name);
+            let pcm: Vec<i16> = (0..44_100).flat_map(|i| {
+                let v = (amp * (std::f32::consts::TAU * 1000.0 * i as f32 / 44_100.0).sin() * 32767.0) as i16;
+                [v, v]
+            }).collect();
+            AudioSystem::write_stereo_wav_file(&path, &pcm, 44_100).unwrap();
+            crate::library_ui::UiTrackEntry { id: 1, title: name.into(), file_path: Some(path), bpm: 128.0, musical_key: "1d".into(), ..Default::default() }
+        };
+        let (quiet, loud) = (tone("quiet.wav", 0.1), tone("loud.wav", 0.4));
+        let mut app = ReTraktorApp::default();
+        app.library = LibraryManager::new(dir.join("collection.nml"));
+        let load = |app: &mut ReTraktorApp, deck: usize, track: &crate::library_ui::UiTrackEntry| {
+            app.library.pending_loads.push((deck, track.clone()));
+            app.drain_pending_loads();
+            let result = app.load_channel.1.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+            app.load_channel.0.send(result).unwrap();
+            app.finish_loads();
+        };
+        let gains = |app: &ReTraktorApp| app.audio.shared.lock().unwrap().loaded_tracks.each_ref().map(|t| t.as_ref().map(|t| t.auto_gain));
+
+        app.preferences.autogain = false;
+        load(&mut app, 1, &quiet);
+        assert_eq!(gains(&app)[0], Some(1.0), "off: played as it is");
+        assert!(app.audio.shared.lock().unwrap().loaded_tracks[0].as_ref().is_some_and(|t| {
+            Arc::ptr_eq(&t.played_peaks, &t.waveform_peaks) && Arc::ptr_eq(&t.played_stem_peaks, &t.stem_peaks)
+        }), "off: the waveform shows the track as analysed");
+        app.preferences.autogain = true;
+        app.sync_audio_state();
+        assert_eq!(gains(&app)[0], Some(1.0), "the track on air jumped when auto gain was switched on");
+        load(&mut app, 2, &loud);
+        let g = gains(&app);
+        assert_eq!(g[0], Some(1.0), "loading deck B changed deck A");
+        load(&mut app, 1, &quiet);
+        let g2 = gains(&app);
+        assert_eq!(g2[1], g[1], "reloading deck A changed deck B");
+        // Both decks now meet at the same level, 12 dB apart before.
+        assert!((0.1 * g2[0].unwrap() / (0.4 * g2[1].unwrap()) - 1.0).abs() < 0.01, "{g2:?}");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -4505,6 +4576,7 @@ mod sync_audio {
             title: "t".into(), artist: String::new(), duration_sec: 100.0, bpm, grid_offset_sec: 0.0, key: String::new(),
             sample_rate: 44100, waveform_peaks: Vec::new().into(), stem_peaks: Vec::new().into(), pcm_stereo: vec![0.0; 44100 * 200],
             stems_ready: false, pcm_drums: None, pcm_bass: None, pcm_other: None, pcm_vocals: None, phrases: Vec::new(),
+            auto_gain: 1.0, played_peaks: Vec::new().into(), played_stem_peaks: Vec::new().into(),
         }
     }
 

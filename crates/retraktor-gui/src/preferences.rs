@@ -1092,7 +1092,7 @@ impl PreferencesDialog {
         Self::list_row(
             ui,
             "Auto gain",
-            "Match volume across quiet and loud tracks automatically.",
+            "Match volume across quiet and loud tracks automatically. Applies to the next track you load. Its waveform shows the matched level.",
             |ui| {
                 crate::dot::dot_toggle(ui, &mut self.autogain, TraktorTheme::PLAY_ACTIVE(), "Auto gain");
             },
