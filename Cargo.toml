@@ -16,3 +16,7 @@ version = "0.2.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Clean-room Linux re-implementation of Traktor Pro 4"
+
+# Auto gain meters every loaded track; unoptimized, the loudness meter takes about 8 s on a 2-minute song (0.15 s optimized).
+[profile.dev.package.ebur128]
+opt-level = 3
