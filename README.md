@@ -38,6 +38,7 @@
 * **`F2` — 4-Deck (`A / B / C / D`)**: All four decks with a 4-channel mixer.
 * **`F3` — Browser**: Mini deck strips and a full-height library for preparing sets.
 * **`F4` — Timeline**: Track A → Track B transition arranger with stem automation presets and live auditioning.
+* **Beat Jump** moves a loaded deck backward or forward by 4, 8, 16 or 32 beats. Choose a size in the `JUMP` row under the transport controls in Mix or 4-Deck. On a 120 BPM track, 32 beats moves 16 seconds through the track at any pitch setting. An active loop moves with the playhead. An arrow dims when the full jump would cross a track boundary.
 
 ### 3. Interactive Graphical Controller Surface Map & Remapper
 * Located in **Preferences** (`⚙ -> Controllers & MX2`).
@@ -72,11 +73,12 @@
 * **Music Library**: Reads real tags (ID3, Vorbis, MP4, AIFF) — artist, title, album, genre, BPM, key, label, remixer, year — and never invents missing values. Scans music folders in the background, handles 20,000+ track collections in a virtualized table with multi-select, sortable/resizable columns, and right-click actions.
 * **Traktor Collection Import & Relocate**: Import an existing `collection.nml` (v19/v20) with cue points, loops, beatgrids, ratings and playlists intact; tracks whose files moved are re-linked by file name from your music folders.
 * **Playlists**: Create, rename, delete and export (`.m3u8`) playlists; drag tracks onto a playlist, onto a deck, or onto "new playlist". Everything autosaves to `~/.local/share/retraktor/collection.nml` (your Traktor files are never modified).
-* **Track Analysis**: Detects BPM + beatgrid, musical key (Open Key), a 1–10 energy level and up to 8 auto cue points at phrase changes. Runs in the background ("Analyze N tracks" fills only unknown values; right-click → Analyze replaces them) and automatically when an unanalysed track is loaded. Your existing cues are never replaced. Slow tracks are sometimes detected at double tempo — use ×½ in Edit track info. CLI: `retraktor-cli analyze <files>`.
+* **Track Analysis**: Detects BPM + beatgrid, musical key (Open Key), a 1–10 energy level and up to 8 auto cue points at phrase changes. Runs in the background ("Analyze N tracks" fills only unknown values; right-click → Analyze replaces them) and automatically when an unanalysed track is loaded: the deck plays straight away, showing BPM and key as "…" until they are found (sync and loops wait for the BPM). Your existing cues are never replaced. Slow tracks are sometimes detected at double tempo — use ×½ in Edit track info. CLI: `retraktor-cli analyze <files>`.
 * **rekordbox Export**: One click writes `~/Music/ReTraktor-rekordbox.xml` (tracks, cues, loops, grids, playlists) for rekordbox / CDJ USB export.
+* **Headphone Preview**: Select a track and press **Preview** in the browser toolbar, or the controller's Preview button, to hear it in the headphones only (their output pair, or the left ear with Split cue). Every track row has a small whole-track waveform in the Preview column, just left of the title; click anywhere on it to select the track and preview from there, or click again to move (Shift/Ctrl+click only selects, and double-clicking a waveform never loads a deck). Waveforms fill in as files are read: the previewing and selected tracks first, then the rows on screen one at a time. Each finished waveform, from a row, a preview or a deck load, is kept in `~/.cache/retraktor/stripes` in Traktor's stripe layout (256 KB a track, never deleted), so a track seen before shows at once without being read again, until its file changes; a file that can't be read is marked "Not available". The rows and the strip under each deck draw the same overview, in the look chosen in Preferences > Look > Track overview: Traktor (the default for new users), Native (ReTraktor's original look, in your waveform style; kept by anyone who used ReTraktor before) or rekordbox. A look is only a shape (centred and shaded, Native's own, or layered from the bottom); all three, like the deck waveforms, draw bass, mids and highs in the colours chosen in Preferences > Decks & Mixer > Waveform colours, where Spectrum is the theme's own waveform colours. Browsing never plays anything. The decks, the main output and REC are untouched. Previewing another track replaces the first. To stop, press Preview again on the same track, or **Stop preview** at the bottom of the browser, which stays there while you browse elsewhere. Playback starts as soon as the first second around the chosen spot is read. Previews and waveforms cover the first 15 minutes of a file, like the decks.
 * **Suggestions**: Ranks your collection by harmonic and tempo compatibility with the track on deck A.
 * **Track Info Editor**: Edit metadata in the collection, and optionally write it back into the file's tags.
-* **Built-In Master `.WAV` Mix Recorder (`● REC`)**: Record your live set directly from the post-maximizer master bus to `~/Music/ReTraktor_Master_Mix.wav` (16-bit / 48 kHz stereo PCM).
+* **Built-In Master `.WAV` Mix Recorder (`● REC`)**: Record your live set directly from the post-maximizer master bus to a timestamped 16-bit stereo WAV in `~/Music/ReTraktor` (at the sound card's rate), with a `.cue` and tracklist. Audio streams to disk as you play, so a set can run for hours. Past 4 GiB (about 3 h at 96 kHz) the file becomes RF64, which needs a player that reads RF64 and cannot currently be loaded onto a ReTraktor deck. If the disk falls behind or fails, or the sample rate changes, REC stops and says why; the audio already written to disk is kept.
 
 ### 8. Full Hardware Controller Support
 * **First-Class Traktor MX2 (`17CC:2420`) Support**: Complete NHL2 HID input/output mapping for all **83 buttons**, **6 encoders**, **26 12-bit pots/faders**, **2 capacitive 1024-tick jogwheels**, **105 top-panel LEDs**, and **12 RGB bottom-shell ambient LEDs** (with Deck State, Loop Status, and End-of-Track Warning modes), plus **4-Out / 2-In 24-bit/96kHz USB Audio Class 2.0** routing (Master L/R `Out 1/2` + Headphone Cue L/R `Out 3/4`).
@@ -121,25 +123,30 @@ retraktor-gui
 
 #### 1. Install System Development Libraries
 
+ReTraktor plays through PipeWire directly when it runs, and asks RealtimeKit (`rtkit`) for real-time scheduling of its audio thread. It needs PipeWire 0.3.53 or newer; building it needs the PipeWire and SPA headers, `libclang` and the D-Bus headers. Without a PipeWire server it plays through ALSA, including PulseAudio's ALSA plugin. **Preferences > Audio** shows which route opened, any fallback, and any underruns.
+
+ReTraktor plays through one audio interface at a time. Under **Outputs** in **Preferences > Audio**, pick the stereo pair wired to your speakers and the pair that feeds your headphones, from the adjacent pairs the interface offers (1–2, 3–4 and so on). Each interface keeps its own choice and starts with main on 1–2 and headphones on 3–4. A headphone jack that only mirrors the main output has no pair of its own, so it can't carry a separate cue mix. Picking the other output's pair swaps the two without interrupting playback. If the open output lacks the main pair, the main mix plays on 1–2. If it lacks the headphone pair, or that pair is the main one, there are no headphones. The system default output plays the main mix alone, though Split cue still works there. An interface missing at start plays on the system default until you plug it in and press **Rescan**.
+
 * **Ubuntu / Pop!_OS / Debian / Mint**:
   ```bash
   sudo apt update
   sudo apt install -y build-essential pkg-config curl git \
       libudev-dev libusb-1.0-0-dev libhidapi-dev libasound2-dev \
-      libpipewire-0.3-dev libx11-dev libxkbcommon-dev libgl1-mesa-dev
+      libpipewire-0.3-dev libspa-0.2-dev libclang-dev libdbus-1-dev \
+      libx11-dev libxkbcommon-dev libgl1-mesa-dev
   ```
 
 * **Fedora / RHEL**:
   ```bash
   sudo dnf install -y gcc gcc-c++ pkgconfig git \
       systemd-devel libusb1-devel hidapi-devel alsa-lib-devel \
-      pipewire-devel libX11-devel libxkbcommon-devel mesa-libGL-devel
+      pipewire-devel clang-devel dbus-devel libX11-devel libxkbcommon-devel mesa-libGL-devel
   ```
 
 * **Arch Linux / Manjaro**:
   ```bash
   sudo pacman -S --needed base-devel pkgconf git \
-      systemd libusb hidapi alsa-lib pipewire libx11 libxkbcommon mesa
+      systemd libusb hidapi alsa-lib pipewire clang dbus libx11 libxkbcommon mesa
   ```
 
 #### 2. Install Rust Toolchain (if not already installed)

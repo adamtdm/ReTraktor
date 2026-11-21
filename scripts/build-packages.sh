@@ -77,8 +77,8 @@ Version: ${VERSION}
 Section: sound
 Priority: optional
 Architecture: ${DEB_ARCH}
-Depends: libasound2, libusb-1.0-0, libhidapi-hidraw0 | libhidapi-libusb0
-Recommends: pipewire, wireplumber
+Depends: libasound2, libusb-1.0-0, libhidapi-hidraw0 | libhidapi-libusb0, libpipewire-0.3-0t64 (>= 0.3.53) | libpipewire-0.3-0 (>= 0.3.53), libdbus-1-3
+Recommends: pipewire, wireplumber, rtkit
 Maintainer: ReTraktor Project <https://github.com/adamtdm/ReTraktor>
 Description: Clean-room Linux re-implementation of Traktor Pro 4
  ReTraktor provides complete 4-deck DJ mixing, reactive CSI 1.0 QML scripting,
