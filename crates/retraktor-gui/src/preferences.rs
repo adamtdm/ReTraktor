@@ -89,8 +89,13 @@ pub struct PreferencesDialog {
     pub request_folder_pick: bool,
     /// The running output stream (device and rate), if any; set by the app each frame.
     pub audio_output: Option<String>,
-    /// Channels of the running output; set by the app each frame.
+    /// Channels of the running output, and the routing it plays; set by the app each frame.
     pub audio_output_channels: u16,
+    pub audio_route: crate::audio::OutputRoute,
+    /// The running output is a system default (chosen, or a fallback); set by the app each frame.
+    pub audio_on_system_default: bool,
+    /// Rescan was pressed: the app tries the chosen output again if it isn't the one playing.
+    pub audio_rescanned: bool,
     /// Outputs found on this computer; `None` until the Audio page first shows.
     pub audio_devices: Option<Vec<crate::audio::OutputChoice>>,
     pub is_open: bool,
@@ -104,10 +109,9 @@ pub struct PreferencesDialog {
 
     // Output & Input Routing
     pub mixing_mode: usize, // 0: Internal (Software), 1: External (Hardware Mixer)
-    pub monitor_out_l: String,
-    pub monitor_out_r: String,
-    pub master_out_l: String,
-    pub master_out_r: String,
+    /// Main and headphone pair indices (0 = channels 1–2) per output ID the user set them for; others use
+    /// main 1–2, headphones 3–4. Two distinct pairs below [`crate::audio::MAX_OUTPUT_PAIRS`].
+    pub output_pairs: std::collections::BTreeMap<String, [u8; 2]>,
     pub booth_out_l: String,
     pub booth_out_r: String,
     pub split_cue: bool,
@@ -224,6 +228,9 @@ impl Default for PreferencesDialog {
         Self {
             audio_output: None,
             audio_output_channels: 0,
+            audio_route: crate::audio::OutputRoute::default(),
+            audio_on_system_default: false,
+            audio_rescanned: false,
             audio_devices: None,
             is_open: false,
             current_tab: PrefsTab::Controllers,
@@ -235,10 +242,7 @@ impl Default for PreferencesDialog {
             buffer_size: 128,
             audio_device_name: String::new(),
             mixing_mode: 0,
-            monitor_out_l: "Channel 3 (Headphones L)".to_string(),
-            monitor_out_r: "Channel 4 (Headphones R)".to_string(),
-            master_out_l: "Channel 1 (Master Out L)".to_string(),
-            master_out_r: "Channel 2 (Master Out R)".to_string(),
+            output_pairs: Default::default(),
             booth_out_l: "Channel 5 (Booth Out L)".to_string(),
             booth_out_r: "Channel 6 (Booth Out R)".to_string(),
             split_cue: false,
@@ -357,11 +361,12 @@ impl PreferencesDialog {
             .join(", ");
         let c = &self.library_columns;
         format!(
-            "{{\n  \"sample_rate\": {},\n  \"buffer_size\": {},\n  \"audio_device_name\": \"{}\",\n  \"split_cue\": {},\n  \"keylock_quality\": {},\n  \"four_deck_mode\": {},\n  \"waveform_color_mode\": {},\n  \"eq_model_idx\": {},\n  \"filter_model_idx\": {},\n  \"filter_resonance\": {},\n  \"xfader_curve_idx\": {},\n  \"autogain\": {},\n  \"limiter_enabled\": {},\n  \"lock_playing_decks\": {},\n  \"scan_on_startup\": {},\n  \"analyze_new_tracks\": {},\n  \"key_notation_idx\": {},\n  \"collection_save_format\": {},\n  \"prompt_save_on_exit\": {},\n  \"col_album\": {},\n  \"col_bpm\": {},\n  \"col_key\": {},\n  \"col_stems\": {},\n  \"col_duration\": {},\n  \"col_genre\": {},\n  \"col_rating\": {},\n  \"col_comment\": {},\n  \"col_remixer\": {},\n  \"col_label\": {},\n  \"col_year\": {},\n  \"col_bitrate\": {},\n  \"col_format\": {},\n  \"col_track_number\": {},\n  \"col_energy\": {},\n  \"music_folders\": [{}]\n}}",
+            "{{\n  \"sample_rate\": {},\n  \"buffer_size\": {},\n  \"audio_device_name\": {},\n  \"split_cue\": {},\n  \"output_pairs\": {},\n  \"keylock_quality\": {},\n  \"four_deck_mode\": {},\n  \"waveform_color_mode\": {},\n  \"eq_model_idx\": {},\n  \"filter_model_idx\": {},\n  \"filter_resonance\": {},\n  \"xfader_curve_idx\": {},\n  \"autogain\": {},\n  \"limiter_enabled\": {},\n  \"lock_playing_decks\": {},\n  \"scan_on_startup\": {},\n  \"analyze_new_tracks\": {},\n  \"key_notation_idx\": {},\n  \"collection_save_format\": {},\n  \"prompt_save_on_exit\": {},\n  \"col_album\": {},\n  \"col_bpm\": {},\n  \"col_key\": {},\n  \"col_stems\": {},\n  \"col_duration\": {},\n  \"col_genre\": {},\n  \"col_rating\": {},\n  \"col_comment\": {},\n  \"col_remixer\": {},\n  \"col_label\": {},\n  \"col_year\": {},\n  \"col_bitrate\": {},\n  \"col_format\": {},\n  \"col_track_number\": {},\n  \"col_energy\": {},\n  \"music_folders\": [{}]\n}}",
             self.sample_rate,
             self.buffer_size,
-            self.audio_device_name.replace('"', "\\\""),
+            serde_json::json!(self.audio_device_name),
             self.split_cue,
+            output_pairs_json(&self.output_pairs),
             self.keylock_quality,
             self.four_deck_mode,
             self.waveform_color_mode,
@@ -397,6 +402,9 @@ impl PreferencesDialog {
     }
 
     pub fn apply_json_str(&mut self, text: &str) {
+        // The pairs from the whole file when it is valid JSON (also once another tool re-indented it), else
+        // from their own line, as for the rest of an older or hand-broken file.
+        let mut pairs = serde_json::from_str::<serde_json::Value>(text).map(|doc| doc["output_pairs"].clone()).unwrap_or_default();
         for line in text.lines() {
             let trimmed = line.trim().trim_end_matches(',');
             if let Some((k, v)) = trimmed.split_once(':') {
@@ -405,8 +413,9 @@ impl PreferencesDialog {
                 match key {
                     "sample_rate" => if let Ok(n) = val.parse() { self.sample_rate = n; },
                     "buffer_size" => if let Ok(n) = val.parse() { self.buffer_size = n; },
-                    "audio_device_name" => self.audio_device_name = val.to_string(),
+                    "audio_device_name" => self.audio_device_name = serde_json::from_str(v.trim()).unwrap_or_else(|_| val.to_string()),
                     "split_cue" => self.split_cue = val == "true",
+                    "output_pairs" if pairs.is_null() => pairs = serde_json::from_str(v.trim()).unwrap_or_default(),
                     "keylock_quality" => if let Ok(n) = val.parse() { self.keylock_quality = n; },
                     "four_deck_mode" => self.four_deck_mode = val == "true",
                     "waveform_color_mode" => if let Ok(n) = val.parse() { self.waveform_color_mode = n; },
@@ -452,6 +461,15 @@ impl PreferencesDialog {
                 }
             }
         }
+        if !pairs.is_null() {
+            self.output_pairs = output_pairs_from(&pairs);
+        }
+    }
+
+    /// The routing chosen for the selected output.
+    pub fn output_route(&self) -> crate::audio::OutputRoute {
+        let [main, headphones] = self.output_pairs.get(&self.audio_device_name).copied().unwrap_or([0, 1]);
+        if self.split_cue { crate::audio::OutputRoute::Split } else { crate::audio::OutputRoute::Pairs { main, headphones: Some(headphones) } }
     }
 
     /// Renders an accessible, high-contrast settings card container with consistent border and padding.
@@ -756,10 +774,6 @@ impl PreferencesDialog {
         });
     }
 
-    pub fn headphone_out(&self) -> crate::audio::HeadphoneOut {
-        if self.split_cue { crate::audio::HeadphoneOut::Split } else { crate::audio::HeadphoneOut::Channels34 }
-    }
-
     /// Backwards compatibility shim
     pub fn show(&mut self, _ctx: &egui::Context) {}
 
@@ -771,14 +785,15 @@ impl PreferencesDialog {
         let device_label = devices
             .iter()
             .find(|c| c.id == self.audio_device_name)
-            .map_or_else(|| "System default".to_string(), label_of);
+            .map_or_else(|| if self.audio_device_name.is_empty() { "System default".to_string() } else { self.audio_device_name.clone() }, label_of);
         Self::list_row(
             ui,
             "Audio device",
-            "Pick your controller's sound card to use its headphone socket. Changes apply straight away.",
+            "Choose the audio interface your speakers and headphones are wired to. Changes apply straight away.",
             |ui| {
                 if ui.button("Rescan").on_hover_text("Look again for sound cards (after plugging one in)").clicked() {
                     self.audio_devices = None;
+                    self.audio_rescanned = true;
                 }
                 egui::ComboBox::from_id_salt("audio_device_combo")
                     .selected_text(device_label)
@@ -869,20 +884,76 @@ impl PreferencesDialog {
             },
         );
 
-        Self::list_row(ui, "Main output", "Your speakers or the controller's main output.", |ui| {
-            ui.label(RichText::new("Channels 1–2").color(TraktorTheme::TEXT_SECONDARY()));
-        });
-
-        let split = self.split_cue;
-        let (hp_text, hp_ok) = if split {
-            ("Channels 1–2, split: left ear = cue, right ear = main (mono)".to_string(), true)
-        } else if self.audio_output_channels >= 4 {
-            ("Channels 3–4".to_string(), true)
-        } else {
-            ("Not available: this output has 2 channels. Choose your controller's sound card, or turn on Split cue.".to_string(), false)
+        // The pairs the chosen output has, however wide the open stream is: as listed, else as the open stream
+        // when that is the chosen output. The system default, whose wiring is unknown, stays stereo; Split cue
+        // uses 1–2 and keeps the pairs for when it is turned off.
+        use crate::audio::{pair_label, Placement};
+        let devices = self.audio_devices.get_or_insert_with(crate::audio::list_outputs).clone();
+        let device = self.audio_device_name.clone();
+        let channels = self.audio_output_channels as usize;
+        let playing_it = channels > 0 && !self.audio_on_system_default;
+        let listed = devices.iter().find(|c| c.id == device).map(|c| c.channels).or(playing_it.then_some(self.audio_output_channels));
+        let missing = !device.is_empty() && listed.is_none();
+        let offered = if device.is_empty() { 1 } else { listed.map_or(0, |ch| (ch / 2).min(crate::audio::MAX_OUTPUT_PAIRS.into()) as u8) };
+        let saved = self.output_pairs.get(&device).copied().unwrap_or([0, 1]);
+        let mut pairs = saved;
+        let pair_name = |pair: u8| {
+            let note = if missing { " (saved; output not found)" } else if pair < offered { "" } else { " (not on this output)" };
+            format!("Channels {}{note}", pair_label(2 * pair as usize))
         };
-        Self::list_row(ui, "Headphones", "Where the cue mix goes. Use the mixer's PHONES knobs for level and cue/main blend.", |ui| {
-            ui.label(RichText::new(hp_text).color(if hp_ok { TraktorTheme::PLAY_ACTIVE() } else { TraktorTheme::ACCENT() }));
+        // A mono output, Split cue and the system default show what they really play, not the pairs kept for
+        // later; a missing output shows its saved pairs.
+        let mono = !missing && (listed == Some(1) || channels == 1);
+        let shown = |bus: usize, pairs: [u8; 2]| match bus {
+            _ if mono => ["Channel 1 (mono)", "None on a mono output"][bus].to_string(),
+            _ if missing => pair_name(pairs[bus]),
+            _ if self.split_cue && channels == 0 => "Split cue (no output open)".to_string(),
+            _ if self.split_cue => format!("Channels 1–2, {} ear (split cue)", ["right", "left"][bus]),
+            1 if device.is_empty() => "None on the system default".to_string(),
+            _ => pair_name(pairs[bus]),
+        };
+        for (bus, title, about) in [
+            (0, "Main output", "The pair wired to your speakers, as the audio interface numbers its outputs."),
+            (1, "Headphones", "The pair that feeds the headphone output on its own, for the cue mix. A jack that only mirrors the main output has no pair of its own. Use the mixer's PHONES knobs for level and cue/main blend."),
+        ] {
+            Self::list_row(ui, title, about, |ui| {
+                ui.add_enabled_ui(!self.split_cue && offered >= 2, |ui| {
+                    egui::ComboBox::from_id_salt(("output_pair", bus)).selected_text(shown(bus, pairs)).width(260.0).show_ui(ui, |ui| {
+                        for pair in 0..offered {
+                            if ui.selectable_label(pairs[bus] == pair, pair_name(pair)).clicked() {
+                                pairs = choose_pair(pairs, bus, pair);
+                            }
+                        }
+                    });
+                });
+            });
+        }
+        // One hint: a chosen card that isn't the one playing (missing at start, or back since) is reopened by Rescan.
+        let not_open = !device.is_empty() && (channels == 0 || self.audio_on_system_default);
+        if pairs != saved {
+            self.output_pairs.insert(device, pairs);
+        }
+
+        let (now, ok) = match self.audio_route.place(channels) {
+            _ if channels == 0 => ("No output open".to_string(), false),
+            Placement::Mono => ("Mono output: the main mix only, no headphones".to_string(), false),
+            Placement::Split => ("Channels 1–2 split: left ear = cue, right ear = main (mono)".to_string(), true),
+            Placement::Pairs { main, phones: Some(h) } => (format!("Main on {}, headphones on {} of {channels} channels", pair_label(main), pair_label(h)), true),
+            Placement::Pairs { main, phones: None } => (format!("Main on {}, no headphones", pair_label(main)), false),
+        };
+        let instead = if channels == 0 { "nothing is open" } else { "the system default plays" };
+        let hint = match () {
+            _ if not_open && missing => format!(" · The chosen output isn't connected ({instead}): plug it in, then press Rescan under Sound card."),
+            _ if not_open => format!(" · The chosen output isn't open ({instead}): press Rescan under Sound card."),
+            _ if ok || channels < 2 => String::new(),
+            _ if self.audio_on_system_default => " · Choose an audio interface with a separate headphone pair, or turn on Split cue.".to_string(),
+            // The pair selectors are disabled below two pairs, so only offer them when they work.
+            _ if offered < 2 => format!(" · This {channels}-channel output has one stereo pair: choose an audio interface with two stereo output pairs, or turn on Split cue."),
+            _ => format!(" · This {channels}-channel output has no free pair for them: choose another pair or audio interface, or turn on Split cue."),
+        };
+        let (now, ok) = (now + &hint, ok && !not_open);
+        Self::list_row(ui, "Playing now", "Where the mix really goes on the open output, after any fallback.", |ui| {
+            ui.label(RichText::new(now).color(if ok { TraktorTheme::PLAY_ACTIVE() } else { TraktorTheme::ACCENT() }));
         });
 
         Self::list_row(
@@ -1249,10 +1320,11 @@ impl PreferencesDialog {
         Self::list_row(
             ui,
             "Waveform colours",
-            "Colour scheme used to draw bass, mids, and highs on waveforms.",
+            "Colours of bass, mids and highs on the deck waveforms and every track overview. Spectrum uses the theme's own waveform colours (Preferences > Look).",
             |ui| {
                 egui::ComboBox::from_id_salt("wf_palette_combo")
-                    .selected_text(palettes[self.waveform_color_mode.min(2)])
+                    // An unknown choice (a newer version's) draws as Spectrum, so it shows as Spectrum.
+                    .selected_text(*palettes.get(self.waveform_color_mode).unwrap_or(&palettes[0]))
                     .width(220.0)
                     .show_ui(ui, |ui| {
                         for (i, p) in palettes.iter().enumerate() {
@@ -2285,6 +2357,35 @@ impl PreferencesDialog {
     }
 }
 
+/// Main and headphone pairs after choosing `pair` for `bus` (0 = main): the other output's pair swaps the two
+/// in one step, so they never share one.
+fn choose_pair(mut pairs: [u8; 2], bus: usize, pair: u8) -> [u8; 2] {
+    if pairs[1 - bus] == pair {
+        pairs[1 - bus] = pairs[bus];
+    }
+    pairs[bus] = pair;
+    pairs
+}
+
+/// The saved pairs as one JSON line, by first channel: `{"pw:k2": {"main": 3, "headphones": 1}}`.
+fn output_pairs_json(pairs: &std::collections::BTreeMap<String, [u8; 2]>) -> String {
+    let first_channel = |pair: u8| 2 * pair as u16 + 1;
+    let saved = pairs.iter().map(|(id, [main, phones])| (id.clone(), serde_json::json!({ "main": first_channel(*main), "headphones": first_channel(*phones) })));
+    serde_json::Value::Object(saved.collect()).to_string()
+}
+
+/// Saved pairs back as pair indices. An entry that isn't two different odd first channels on the first
+/// [`crate::audio::MAX_OUTPUT_PAIRS`] pairs is dropped, so that output gets the defaults again.
+fn output_pairs_from(saved: &serde_json::Value) -> std::collections::BTreeMap<String, [u8; 2]> {
+    let pair = |first: &serde_json::Value| {
+        first.as_u64().filter(|c| c % 2 == 1 && *c < 2 * crate::audio::MAX_OUTPUT_PAIRS as u64).map(|c| (c / 2) as u8)
+    };
+    let entries = saved.as_object().into_iter().flatten();
+    entries
+        .filter_map(|(id, p)| Some((id.clone(), [pair(&p["main"])?, pair(&p["headphones"])?])).filter(|(_, [main, phones])| main != phones))
+        .collect()
+}
+
 /// High-contrast light text on `ROW_SELECTED` across dark and light presets.
 fn on_selected_text() -> Color32 {
     if crate::theme::palette().is_dark() {
@@ -2404,6 +2505,7 @@ mod tests {
         original.library_columns.remixer = true;
         original.library_columns.bitrate = true;
         original.collection_save_format = 2;
+        original.waveform_color_mode = 1;
         original.music_folders = vec!["/DATA/Media/Music".into(), "/home/dj/My Music, Old".into()];
 
         let json = original.to_json_str();
@@ -2419,6 +2521,68 @@ mod tests {
         assert!(restored.library_columns.remixer);
         assert!(restored.library_columns.bitrate);
         assert_eq!(restored.collection_save_format, 2);
+        assert_eq!(restored.waveform_color_mode, 1);
         assert_eq!(restored.music_folders, original.music_folders);
+    }
+
+    /// Main and headphone pairs are kept per output, so a Xone:K2 (main 3–4, headphones 1–2) and another
+    /// controller keep their own across a switch and a restart, also from a file another tool re-indented.
+    /// Older files and other outputs get main 1–2, headphones 3–4; Split cue keeps the pairs for later. A
+    /// malformed, out-of-range or shared entry is dropped rather than offered. Device IDs with quotes and
+    /// backslashes survive, and an older file with a broken line still gives its pairs. Choosing the other
+    /// output's pair in the selector swaps the two, either way round.
+    #[test]
+    fn output_pairs_are_kept_per_output() {
+        use crate::audio::OutputRoute;
+        assert_eq!(choose_pair([0, 1], 0, 1), [1, 0], "main to 3–4: headphones to 1–2");
+        assert_eq!(choose_pair([0, 1], 1, 0), [1, 0], "headphones to 1–2: main to 3–4");
+        assert_eq!(choose_pair([0, 1], 1, 2), [0, 2], "a free pair: main stays");
+        assert_eq!(choose_pair([1, 0], 0, 1), [1, 0], "the pair it has");
+
+        let mut prefs = PreferencesDialog::default();
+        prefs.apply_json_str("{\n  \"sample_rate\": 48000,\n  \"split_cue\": false\n}");
+        assert_eq!(prefs.output_route(), OutputRoute::default(), "an older file");
+        let odd_id = r#"alsa:hw:CARD="Q\x",DEV=0"#;
+        prefs.audio_device_name = odd_id.into();
+        prefs.output_pairs.insert("pw:k2".into(), [1, 0]);
+        prefs.output_pairs.insert(odd_id.into(), [0, 2]);
+        let json = prefs.to_json_str();
+        assert_eq!(json.lines().filter(|l| l.contains("pw:k2")).count(), 1, "{json}");
+
+        let mut restored = PreferencesDialog::default();
+        restored.apply_json_str(&json);
+        assert_eq!((restored.audio_device_name.as_str(), &restored.output_pairs), (odd_id, &prefs.output_pairs), "{json}");
+        let broken_folder = json.replace("\"music_folders\": [", "\"music_folders\": [\"/a\"b\\c\", ");
+        assert!(serde_json::from_str::<serde_json::Value>(&broken_folder).is_err(), "{broken_folder}");
+        let mut legacy = PreferencesDialog::default();
+        legacy.apply_json_str(&broken_folder);
+        assert_eq!((legacy.audio_device_name.as_str(), &legacy.output_pairs), (odd_id, &prefs.output_pairs), "line by line: {broken_folder}");
+        let pretty = serde_json::to_string_pretty(&serde_json::from_str::<serde_json::Value>(&json).unwrap()).unwrap();
+        let mut reindented = PreferencesDialog::default();
+        reindented.apply_json_str(&pretty);
+        assert_eq!(reindented.output_pairs, prefs.output_pairs, "{pretty}");
+
+        let k2 = OutputRoute::Pairs { main: 1, headphones: Some(0) };
+        for (device, split, route) in [
+            ("pw:k2", false, k2),
+            ("pw:laptop", false, OutputRoute::default()),
+            (odd_id, false, OutputRoute::Pairs { main: 0, headphones: Some(2) }),
+            ("pw:k2", true, OutputRoute::Split),
+            ("pw:k2", false, k2),
+        ] {
+            restored.audio_device_name = device.into();
+            restored.split_cue = split;
+            assert_eq!(restored.output_route(), route, "{device}, split cue {split}");
+        }
+
+        let bad = r#"{"output_pairs": {"pw:ok": {"main": 63, "headphones": 1}, "pw:even": {"main": 2, "headphones": 1},
+            "pw:shared": {"main": 3, "headphones": 3}, "pw:far": {"main": 65, "headphones": 1}, "pw:neg": {"main": -1, "headphones": 1},
+            "pw:huge": {"main": 18446744073709551615, "headphones": 1}, "pw:frac": {"main": 1.5, "headphones": 3},
+            "pw:half": {"main": 1}, "pw:list": [3, 1], "pw:text": {"main": "3", "headphones": "1"}}}"#;
+        for (text, kept) in [(bad, vec![("pw:ok".to_string(), [31, 0])]), (r#"{"output_pairs": "nonsense"}"#, vec![]), ("\"output_pairs\": {not json", vec![])] {
+            let mut prefs = PreferencesDialog::default();
+            prefs.apply_json_str(text);
+            assert_eq!(prefs.output_pairs, kept.into_iter().collect(), "{text}");
+        }
     }
 }

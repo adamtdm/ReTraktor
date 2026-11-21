@@ -1,5 +1,6 @@
 use crate::audio::PEAKS_PER_SEC;
 use crate::theme::TraktorTheme;
+use retraktor_formats::StripeColumn;
 use eframe::egui::{self, Color32, Pos2, Rect, Response, RichText, Sense, Stroke, Ui, Vec2};
 use std::f32::consts::PI;
 
@@ -295,17 +296,14 @@ pub fn vu_meter(ui: &mut Ui, level_l: f32, level_r: f32, height: f32) {
     draw_channel(rect.left() + 1.0 + seg_w + 1.0, level_r);
 }
 
-/// Maps 3-band `[low, mid, high]` amplitudes into the active theme's `WAVEFORM_*` spectrum colors:
-/// - Outer silhouette: `WAVEFORM_HIGH` blended with `WAVEFORM_MID`
-/// - Inner body: `WAVEFORM_MID` blended with `WAVEFORM_LOW`
-/// - Core transients: `WAVEFORM_LOW`
-fn spectrum_colors(low: f32, mid: f32, high: f32) -> (Color32, Color32, Color32) {
+/// Maps 3-band `[low, mid, high]` amplitudes into the waveform colours `bands` ([`crate::theme::waveform_bands`]):
+/// - Outer silhouette: highs blended with mids
+/// - Inner body: mids blended with bass
+/// - Core transients: bass
+fn spectrum_colors([low_c, mid_c, high_c]: [Color32; 3], low: f32, mid: f32, high: f32) -> (Color32, Color32, Color32) {
     let mix = |a: Color32, b: Color32, t: f32| -> Color32 {
         Color32::from(egui::Rgba::from(a) * (1.0 - t) + egui::Rgba::from(b) * t)
     };
-    let low_c = TraktorTheme::WAVEFORM_LOW();
-    let mid_c = TraktorTheme::WAVEFORM_MID();
-    let high_c = TraktorTheme::WAVEFORM_HIGH();
 
     let h_ratio = (high / (high + mid + 0.05)).clamp(0.0, 1.0);
     let outer_col = mix(mid_c, high_c, 0.5 + 0.5 * h_ratio).gamma_multiply(195.0 / 255.0);
@@ -359,13 +357,15 @@ fn sample_scrolling_3band(peaks: &[[f32; 3]], time_sec: f64) -> Option<(f32, f32
     ))
 }
 
-/// Draws a 3-band waveform inside `rect` in the given `style`.
+/// Draws a 3-band waveform inside `rect` in the given `style`, in the waveform colours `bands`.
 /// `sample_at_x` returns `Some((low, mid, high))` for a given `x` coordinate in `rect`.
+#[allow(clippy::too_many_arguments)]
 fn paint_3band_waveform(
     painter: &egui::Painter,
     rect: Rect,
     playhead_x: f32,
     style: crate::theme::WaveformStyle,
+    bands: [Color32; 3],
     max_dot_cols: usize,
     max_dot_half_rows: usize,
     scroll_px: f64,
@@ -385,7 +385,7 @@ fn paint_3band_waveform(
             for i in 0..cols + 2 {
                 let col_x = rect.left() + (i as f32) * col_w - shift(col_w);
                 let Some((low_amp, mid_amp, high_amp)) = sample_at_x(col_x) else { continue };
-                let (outer_col, mid_col, core_col) = spectrum_colors(low_amp, mid_amp, high_amp);
+                let (outer_col, mid_col, core_col) = spectrum_colors(bands, low_amp, mid_amp, high_amp);
                 let total_env = low_amp.max(mid_amp * 0.92).max(high_amp * 0.85);
                 let h_outer = (total_env * max_half_h).max(1.0);
                 painter.line_segment(
@@ -415,7 +415,7 @@ fn paint_3band_waveform(
                 let sampled = sample_at_x(col_x);
                 let (lit_outer, lit_mid, lit_core, outer_col, mid_col, core_col) =
                     if let Some((low, mid, high)) = sampled {
-                        let (oc, mc, cc) = spectrum_colors(low, mid, high);
+                        let (oc, mc, cc) = spectrum_colors(bands, low, mid, high);
                         let env = low.max(mid * 0.92).max(high * 0.85);
                         let lo = quantize_dot_rows(env, half_rows);
                         let lm = quantize_dot_rows(mid.max(low * 0.75) * 0.75, half_rows).min(lo);
@@ -457,7 +457,7 @@ fn paint_3band_waveform(
             for c in 0..cols + 2 {
                 let col_x = rect.left() + (c as f32 + 0.5) * pitch - shift(pitch);
                 let Some((low, mid, high)) = sample_at_x(col_x) else { continue };
-                let (outer_col, mid_col, core_col) = spectrum_colors(low, mid, high);
+                let (outer_col, mid_col, core_col) = spectrum_colors(bands, low, mid, high);
                 let near = (1.0 - ((col_x - playhead_x).abs() / glow_w)).clamp(0.0, 1.0);
                 let boost = |col: Color32| {
                     if near > 0.0 {
@@ -496,7 +496,7 @@ fn paint_3band_waveform(
             for c in 0..=cols + 1 {
                 let col_x = (rect.left() + (c as f32) * step - shift(step)).min(rect.right());
                 if let Some((low, mid, high)) = sample_at_x(col_x) {
-                    let (outer_col, mid_col, core_col) = spectrum_colors(low, mid, high);
+                    let (outer_col, mid_col, core_col) = spectrum_colors(bands, low, mid, high);
                     let env = low.max(mid * 0.92).max(high * 0.85);
                     let h = (env * max_half_h).max(0.8);
                     let top = Pos2::new(col_x, center_y - h);
@@ -548,7 +548,7 @@ pub fn paint_waveform_style_preview(
         let high = (offbeat * 0.78 + 0.22 * (t * PI * 7.0).cos().abs()).clamp(0.08, 0.90);
         Some((low, mid, high))
     };
-    paint_3band_waveform(painter, rect, cx, style, 22, 4, 0.0, sample_at_x);
+    paint_3band_waveform(painter, rect, cx, style, crate::theme::waveform_bands(), 22, 4, 0.0, sample_at_x);
     for b in 1..4 {
         let bx = rect.left() + (b as f32 / 4.0) * rect.width();
         painter.line_segment(
@@ -625,7 +625,7 @@ pub fn scrolling_waveform(
     let beat_len_sec = 60.0 / bpm.max(30.0);
     let style = crate::theme::waveform_style();
     let scroll_px = (elapsed_sec + ((rect.left() - center_x) / pixels_per_sec) as f64) * pixels_per_sec as f64;
-    paint_3band_waveform(painter, rect, center_x, style, 120, 7, scroll_px, |col_x| {
+    paint_3band_waveform(painter, rect, center_x, style, crate::theme::waveform_bands(), 120, 7, scroll_px, |col_x| {
         let time_at_col = elapsed_sec + ((col_x - center_x) / pixels_per_sec) as f64;
         sample_scrolling_3band(waveform_peaks, time_at_col)
     });
@@ -1076,13 +1076,125 @@ pub fn scrolling_stem_waveforms(
     response
 }
 
+/// The overview columns under fractions `from..to` of the track: the mean bands (`0..=1`) of those drawn and their
+/// loudest total, or `None` where nothing is decoded yet. At least one column, so a narrow span samples one.
+pub(crate) fn overview_span(overview: &[StripeColumn], from: f32, to: f32) -> Option<([f32; 3], f32)> {
+    let n = overview.len();
+    if n == 0 {
+        return None;
+    }
+    let first = ((from.clamp(0.0, 1.0) * n as f32) as usize).min(n - 1);
+    let end = ((to.clamp(0.0, 1.0) * n as f32).ceil() as usize).clamp(first + 1, n);
+    let (mut sum, mut count, mut total) = ([0f32; 3], 0, 0u8);
+    for c in overview[first..end].iter().filter(|c| **c != StripeColumn::default()) {
+        sum = [sum[0] + c.low as f32, sum[1] + c.mid as f32, sum[2] + c.high as f32];
+        count += 1;
+        total = total.max(c.total);
+    }
+    (count > 0).then(|| (sum.map(|v| v / count as f32 / 255.0), total as f32 / 255.0))
+}
+
+/// The background and whole-track overview under a deck, also drawn in the browser rows, in the chosen
+/// overview look and waveform colours. Columns not decoded yet are left blank; `playhead_x` lights the waveform
+/// styles that glow.
+pub fn paint_overview_waveform(painter: &egui::Painter, rect: Rect, overview: &[StripeColumn], playhead_x: f32) {
+    paint_overview_look(painter, rect, overview, playhead_x, crate::theme::overview_look(), crate::theme::waveform_bands());
+}
+
+/// `overview` in the shape of `look`, in the waveform colours `bands` (`[bass, mids, highs]`), whatever the look.
+fn paint_overview_look(painter: &egui::Painter, rect: Rect, overview: &[StripeColumn], playhead_x: f32, look: crate::theme::OverviewLook, bands: [Color32; 3]) {
+    use crate::theme::OverviewLook;
+    let background = TraktorTheme::WAVEFORM_BG(); // once: each call reads the theme
+    painter.rect_filled(rect, 1.0, background);
+    painter.rect_stroke(rect, 1.0, Stroke::new(1.0_f32, TraktorTheme::BORDER_COLOR()));
+    let frac = |x: f32| (x - rect.left()) / rect.width().max(1.0);
+    // Native samples one column where each mark falls; the others take every column under a pixel.
+    let sampled = |x: f32| overview_span(overview, frac(x), frac(x)).map(|([low, mid, high], _)| (low, mid, high));
+    let pixel = |x: f32| overview_span(overview, frac(x), frac(x + 1.0));
+    let painter = &painter.with_clip_rect(rect.shrink(1.0));
+    let vline = |x: f32, top: f32, bottom: f32, colour: Color32| painter.line_segment([Pos2::new(x, top), Pos2::new(x, bottom)], Stroke::new(1.0, colour));
+    let style = crate::theme::waveform_style();
+    match look {
+        OverviewLook::Native if style == crate::theme::WaveformStyle::Classic => {
+            let cy = rect.center().y;
+            let cols = (rect.width() / 1.5).ceil() as usize;
+            for c in 0..cols {
+                let x = rect.left() + (c as f32) * 1.5;
+                let Some((low, mid, high)) = sampled(rect.left() + c as f32 / cols.max(1) as f32 * rect.width()) else { continue };
+                let (outer_col, mid_col, core_col) = spectrum_colors(bands, low, mid, high);
+                let h_outer = ((low.max(mid).max(high)) * (rect.height() - 6.0) * 0.5).max(1.0);
+                let h_core = (low * (rect.height() - 6.0) * 0.28).max(0.5);
+                painter.line_segment([Pos2::new(x, cy - h_outer), Pos2::new(x, cy + h_outer)], Stroke::new(1.2_f32, outer_col));
+                painter.line_segment(
+                    [Pos2::new(x, cy - h_core), Pos2::new(x, cy + h_core)],
+                    Stroke::new(1.2_f32, if low > 0.55 { core_col } else { mid_col }),
+                );
+            }
+        }
+        OverviewLook::Native => paint_3band_waveform(painter, rect, playhead_x, style, bands, 64, 2, 0.0, sampled),
+        OverviewLook::Traktor => {
+            let (cy, half) = (rect.center().y, rect.height() * 0.5 - 1.5);
+            let [low_c, mid_c, high_c] = bands.map(egui::Rgba::from);
+            for px in 0..rect.width().ceil() as usize {
+                let x = rect.left() + px as f32;
+                let Some(([low, mid, high], loudest)) = pixel(x) else { continue };
+                // The band colours mixed by how much of each there is: bass alone is the bass colour.
+                let sum = (low + mid + high).max(1e-3);
+                let body_col = Color32::from(low_c * (low / sum) + mid_c * (mid / sum) + high_c * (high / sum));
+                let x = x + 0.5;
+                let body = low.max(mid).max(high) * half;
+                // A faint halo out to the loudest hit, then the body in its own colour, darkening from the centre out.
+                vline(x, cy - loudest * half, cy + loudest * half, body_col.gamma_multiply(0.22));
+                vline(x, cy - body, cy + body, crate::theme::mix(background, body_col, 0.55));
+                vline(x, cy - body * 0.6, cy + body * 0.6, crate::theme::mix(background, body_col, 0.8));
+                vline(x, cy - body * 0.25, cy + body * 0.25, body_col);
+            }
+        }
+        OverviewLook::Rekordbox => {
+            let (bottom, height) = (rect.bottom() - 1.5, rect.height() - 3.0);
+            for px in 0..rect.width().ceil() as usize {
+                let x = rect.left() + px as f32;
+                let Some(([low, mid, high], loudest)) = pixel(x) else { continue };
+                let x = x + 0.5;
+                // Layers stacked from the bottom, bass, mids, then highs. The height blends the body with the loudest
+                // hit (not floored at it, which flattens mastered tracks into a wall). Each band gets its share of
+                // that height, so a bass hit alone stays all bass rather than gaining a cap of highs.
+                let share = [low * 0.6, mid * 0.25, high * 0.25];
+                let sum = share.iter().sum::<f32>().max(1e-3);
+                let top = (0.55 * sum + 0.45 * loudest).min(1.0);
+                let bass_top = top * share[0] / sum;
+                let mids_top = bass_top + top * share[1] / sum;
+                vline(x, bottom - top * height, bottom, bands[2]);
+                vline(x, bottom - mids_top * height, bottom, bands[1]);
+                vline(x, bottom - bass_top * height, bottom, bands[0]);
+            }
+        }
+    }
+}
+
+/// A small sample of `look` for the Preferences > Look cards: a track with an intro, a drop, a quiet breakdown and
+/// a second drop, drawn as the decks and rows draw it.
+pub fn paint_overview_look_preview(painter: &egui::Painter, rect: Rect, look: crate::theme::OverviewLook) {
+    let columns: Vec<StripeColumn> = (0..128)
+        .map(|i| {
+            let t = i as f32 / 128.0;
+            let energy = if t < 0.15 { 0.45 } else if (0.5..0.65).contains(&t) { 0.18 } else { 0.85 };
+            let kick = if (i % 4 == 0) && !(0.5..0.65).contains(&t) { 1.0 } else { 0.7 };
+            let band = |v: f32| (v.clamp(0.0, 1.0) * 255.0) as u8;
+            let (low, mid, high) = (band(energy * kick), band(energy * 0.8), band(0.25 + energy * 0.35));
+            StripeColumn { low, mid, high, total: low.max(mid).max(high) }
+        })
+        .collect();
+    paint_overview_look(painter, rect, &columns, rect.center().x, look, crate::theme::waveform_bands());
+}
+
 /// Full-Track Stripe Overview Minimap Widget (`PRTS` Style with spectrum ribbon & playhead window)
 #[allow(clippy::too_many_arguments)]
 pub fn stripe_overview(
     ui: &mut Ui,
     elapsed_sec: &mut f64,
     total_len_sec: f64,
-    waveform_peaks: &[[f32; 3]],
+    overview: &[StripeColumn],
     cues: &[(u8, f64)],
     phrases: &[retraktor_library::Phrase],
     loop_active: bool,
@@ -1107,53 +1219,9 @@ pub fn stripe_overview(
 
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
-        painter.rect_filled(rect, 1.0, TraktorTheme::WAVEFORM_BG());
-        painter.rect_stroke(rect, 1.0, Stroke::new(1.0_f32, TraktorTheme::BORDER_COLOR()));
-
         let norm_pos = (*elapsed_sec / total).clamp(0.0, 1.0) as f32;
         let scrub_x = rect.left() + norm_pos * rect.width();
-        let cy = rect.center().y;
-        let style = crate::theme::waveform_style();
-
-        if style == crate::theme::WaveformStyle::Classic {
-            // Overview spectrum waveform columns (high density)
-            let cols = (rect.width() / 1.5).ceil() as usize;
-            for c in 0..cols {
-                let x = rect.left() + (c as f32) * 1.5;
-                let frac = c as f32 / cols.max(1) as f32;
-                let (low, mid, high) = if !waveform_peaks.is_empty() {
-                    let idx = ((frac * waveform_peaks.len() as f32) as usize)
-                        .min(waveform_peaks.len() - 1);
-                    let p = waveform_peaks[idx];
-                    (p[0], p[1], p[2])
-                } else {
-                    continue;
-                };
-
-                let (outer_col, mid_col, core_col) = spectrum_colors(low, mid, high);
-                let h_outer = ((low.max(mid).max(high)) * (height - 6.0) * 0.5).max(1.0);
-                let h_core = (low * (height - 6.0) * 0.28).max(0.5);
-
-                painter.line_segment(
-                    [Pos2::new(x, cy - h_outer), Pos2::new(x, cy + h_outer)],
-                    Stroke::new(1.2_f32, outer_col),
-                );
-                painter.line_segment(
-                    [Pos2::new(x, cy - h_core), Pos2::new(x, cy + h_core)],
-                    Stroke::new(1.2_f32, if low > 0.55 { core_col } else { mid_col }),
-                );
-            }
-        } else {
-            paint_3band_waveform(painter, rect, scrub_x, style, 64, 2, 0.0, |col_x| {
-                if waveform_peaks.is_empty() {
-                    return None;
-                }
-                let frac = ((col_x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
-                let idx = ((frac * waveform_peaks.len() as f32) as usize).min(waveform_peaks.len() - 1);
-                let p = waveform_peaks[idx];
-                Some((p[0], p[1], p[2]))
-            });
-        }
+        paint_overview_waveform(painter, rect, overview, scrub_x);
 
         // Minute markers along top of stripe (like Traktor Pro 4)
         let total_mins = (total / 60.0).floor() as usize;
@@ -1356,8 +1424,9 @@ pub fn deck_transport_bar(
     } else {
         TraktorTheme::TEXT_HIGHLIGHT()
     };
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing = Vec2::new(3.0, 0.0);
+    // Wraps on a narrow deck (Tools open at 1024 px) instead of pushing the next panel off screen.
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = Vec2::new(3.0, 3.0);
 
         let play_color = if is_playing {
             TraktorTheme::PLAY_ACTIVE()
@@ -1439,61 +1508,72 @@ pub fn deck_transport_bar(
         }
 
         ui.separator();
-
-        if !compact {
-            ui.label(RichText::new("LOOP").font(egui::FontId::proportional(10.5)).color(if loop_active { TraktorTheme::LOOP_ACTIVE() } else { TraktorTheme::TEXT_SECONDARY() }));
+        // The loop group wraps as one unit (caption, chevrons and sizes), never leaving a chevron alone.
+        // Its width comes from the previous frame, as egui lays out before it can measure.
+        let group_id = ui.id().with("loop_group");
+        let group_w: f32 = ui.data(|d| d.get_temp(group_id)).unwrap_or(0.0);
+        if ui.available_size_before_wrap().x < group_w {
+            ui.end_row();
         }
-        let chevron_fill = TraktorTheme::CONTROL();
-        if icon_button(ui, Icon::Prev, "", chevron_fill, TraktorTheme::TEXT_SECONDARY(), Vec2::new(22.0, H))
-            .on_hover_text("Halve loop length")
-            .clicked()
-        {
-            action = Some(TransportAction::HalveLoop);
-        }
-
-        // Compact decks show only the current loop length; it toggles the loop.
-        let sizes: &[u32] = if compact { std::slice::from_ref(&current_loop_beats) } else { &[1, 2, 4, 8, 16] };
-        for &beats in sizes {
-            let is_selected_size = current_loop_beats == beats;
-            let is_active_loop = loop_active && is_selected_size;
-            let fill = if is_active_loop {
-                TraktorTheme::LOOP_ACTIVE()
-            } else if is_selected_size {
-                TraktorTheme::CONTROL_HOVER()
-            } else {
-                TraktorTheme::CONTROL()
-            };
-            let fg = if is_active_loop {
-                active_fg
-            } else if is_selected_size {
-                TraktorTheme::LOOP_ACTIVE()
-            } else {
-                TraktorTheme::TEXT_SECONDARY()
-            };
-            if ui
-                .add(
-                    egui::Button::new(
-                        RichText::new(if compact { format!("LOOP {beats}") } else { format!("{beats}") })
-                            .color(fg)
-                            .font(egui::FontId::monospace(10.5))
-                            .strong(),
-                    )
-                    .fill(fill)
-                    .min_size(Vec2::new(24.0, H)),
-                )
-                .on_hover_text(format!("Loop {beats} beats: click to set and toggle the loop{}", key("L")))
+        let group = ui.horizontal(|ui| {
+            ui.set_min_height(H); // the caption centres on the buttons, not on egui's default row height
+            ui.spacing_mut().item_spacing = Vec2::new(3.0, 0.0);
+            if !compact {
+                ui.label(RichText::new("LOOP").font(egui::FontId::proportional(10.5)).color(if loop_active { TraktorTheme::LOOP_ACTIVE() } else { TraktorTheme::TEXT_SECONDARY() }));
+            }
+            let chevron_fill = TraktorTheme::CONTROL();
+            if icon_button(ui, Icon::Prev, "", chevron_fill, TraktorTheme::TEXT_SECONDARY(), Vec2::new(22.0, H))
+                .on_hover_text("Halve loop length")
                 .clicked()
             {
-                action = Some(TransportAction::SelectLoop(beats));
+                action = Some(TransportAction::HalveLoop);
             }
-        }
 
-        if icon_button(ui, Icon::Next, "", chevron_fill, TraktorTheme::TEXT_SECONDARY(), Vec2::new(22.0, H))
-            .on_hover_text("Double loop length")
-            .clicked()
-        {
-            action = Some(TransportAction::DoubleLoop);
-        }
+            // Compact decks show only the current loop length; it toggles the loop.
+            let sizes: &[u32] = if compact { std::slice::from_ref(&current_loop_beats) } else { &[1, 2, 4, 8, 16] };
+            for &beats in sizes {
+                let is_selected_size = current_loop_beats == beats;
+                let is_active_loop = loop_active && is_selected_size;
+                let fill = if is_active_loop {
+                    TraktorTheme::LOOP_ACTIVE()
+                } else if is_selected_size {
+                    TraktorTheme::CONTROL_HOVER()
+                } else {
+                    TraktorTheme::CONTROL()
+                };
+                let fg = if is_active_loop {
+                    active_fg
+                } else if is_selected_size {
+                    TraktorTheme::LOOP_ACTIVE()
+                } else {
+                    TraktorTheme::TEXT_SECONDARY()
+                };
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new(if compact { format!("LOOP {beats}") } else { format!("{beats}") })
+                                .color(fg)
+                                .font(egui::FontId::monospace(10.5))
+                                .strong(),
+                        )
+                        .fill(fill)
+                        .min_size(Vec2::new(24.0, H)),
+                    )
+                    .on_hover_text(format!("Loop {beats} beats: click to set and toggle the loop{}", key("L")))
+                    .clicked()
+                {
+                    action = Some(TransportAction::SelectLoop(beats));
+                }
+            }
+
+            if icon_button(ui, Icon::Next, "", chevron_fill, TraktorTheme::TEXT_SECONDARY(), Vec2::new(22.0, H))
+                .on_hover_text("Double loop length")
+                .clicked()
+            {
+                action = Some(TransportAction::DoubleLoop);
+            }
+        });
+        ui.data_mut(|d| d.insert_temp(group_id, group.response.rect.width()));
     });
     action
 }
@@ -1630,6 +1710,100 @@ pub fn render_shortcuts_hud(ctx: &egui::Context, is_open: &mut bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A hit three quarters through a 3:51 track is drawn three quarters along the overview at a row's width and
+    /// a deck's, where their playheads put 0.75 of the track, and nowhere else nearby. A half-decoded track is
+    /// drawn up to where it is decoded and blank after.
+    #[test]
+    fn overview_columns_sit_at_their_place_in_the_track() {
+        let n = 13_842;
+        let peaks: Vec<[f32; 3]> = (0..n).map(|j| if j == n * 3 / 4 { [1.0; 3] } else { [0.2; 3] }).collect();
+        let overview = crate::overview::from_peaks(&peaks);
+        for width in [150.0f32, 900.0] {
+            let hit = |px: f32| overview_span(&overview, px / width, (px + 1.0) / width).unwrap().1 == 1.0;
+            let at = (0.75 * width).floor();
+            assert!(hit(at), "{width} px: no hit at {at}");
+            assert!(!hit(at - 3.0) && !hit(at + 3.0), "{width} px: the hit is smeared");
+        }
+        let half: Vec<[f32; 3]> = (0..1000).map(|j| if j < 500 { [0.3; 3] } else { [0.0; 3] }).collect();
+        let half = crate::overview::from_peaks(&half);
+        assert!(overview_span(&half, 0.2, 0.21).is_some() && overview_span(&half, 0.8, 0.81).is_none());
+        assert!(overview_span(&[], 0.0, 1.0).is_none());
+    }
+
+    /// The lines, boxes and dots `look` paints for `columns` in `bands` at 120 x 40 px, with their colours.
+    fn render(columns: &[StripeColumn], look: crate::theme::OverviewLook, bands: [Color32; 3]) -> Vec<(egui::Shape, Option<Color32>)> {
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(120.0, 40.0));
+        let ctx = egui::Context::default();
+        let out = ctx.run(egui::RawInput::default(), |ctx| {
+            paint_overview_look(&ctx.layer_painter(egui::LayerId::background()), rect, columns, 60.0, look, bands);
+        });
+        out.shapes
+            .into_iter()
+            .map(|clipped| {
+                let colour = match &clipped.shape {
+                    egui::Shape::LineSegment { stroke, .. } => match stroke.color {
+                        egui::epaint::ColorMode::Solid(c) => Some(c),
+                        _ => None,
+                    },
+                    egui::Shape::Rect(r) => Some(r.fill),
+                    egui::Shape::Circle(c) => Some(c.fill),
+                    _ => None,
+                };
+                (clipped.shape, colour)
+            })
+            .collect()
+    }
+
+    /// The same stripe in two sets of waveform colours: every look (Native in whatever waveform style is set)
+    /// paints exactly the same shapes, only in other colours. In the layered look a bass hit alone is bass from
+    /// the bottom to the top, not capped by the mids' or highs' colour.
+    #[test]
+    fn overview_looks_are_shapes_in_the_waveform_colours() {
+        use crate::theme::OverviewLook;
+        let column = |low: u8, mid: u8, high: u8| StripeColumn { low, mid, high, total: low.max(mid).max(high) };
+        let music: Vec<StripeColumn> = (0..256u32).map(|i| column((40 + i * 7 % 200) as u8, (30 + i * 13 % 180) as u8, (20 + i * 29 % 160) as u8)).collect();
+        let spectrum = [Color32::from_rgb(232, 48, 52), Color32::from_rgb(210, 210, 210), Color32::from_rgb(120, 120, 120)];
+        let ultraviolet = [Color32::from_rgb(150, 90, 255), Color32::from_rgb(255, 70, 200), Color32::from_rgb(150, 230, 255)];
+        for look in OverviewLook::ALL {
+            let (a, b) = (render(&music, look, spectrum), render(&music, look, ultraviolet));
+            assert!(a.len() > 100 && a.len() == b.len(), "{look:?}: {} and {} shapes", a.len(), b.len());
+            let geometry = |(shape, _): &(egui::Shape, Option<Color32>)| shape.visual_bounding_rect();
+            assert!(a.iter().map(geometry).eq(b.iter().map(geometry)), "{look:?} changed shape with the colours");
+            let recoloured = a.iter().zip(&b).filter(|(x, y)| x.1 != y.1).count();
+            assert!(recoloured > a.len() / 2, "{look:?}: only {recoloured} of {} shapes took the new colours", a.len());
+        }
+
+        // A kick with the floors a decode leaves in the other bands.
+        let bass_hit = vec![column(255, 5, 3); 64];
+        let mut stacks = std::collections::BTreeMap::<i32, (f32, f32)>::new(); // x: (top of everything, top of bass)
+        for (shape, colour) in render(&bass_hit, OverviewLook::Rekordbox, ultraviolet) {
+            if let egui::Shape::LineSegment { points, .. } = shape {
+                let stack = stacks.entry(points[0].x as i32).or_insert((f32::MAX, f32::MAX));
+                stack.0 = stack.0.min(points[0].y);
+                if colour == Some(ultraviolet[0]) {
+                    stack.1 = stack.1.min(points[0].y);
+                }
+            }
+        }
+        let bottom = 40.0 - 1.5;
+        assert!(stacks.len() > 100, "{} columns drawn", stacks.len());
+        for (x, (top, bass_top)) in stacks {
+            assert!(bottom - bass_top >= 0.95 * (bottom - top), "x {x}: bass up to {bass_top}, the stack up to {top}");
+        }
+
+        // A mastered passage: every column has a full-scale hit, but the body under it rises and falls with the beat.
+        let mastered: Vec<StripeColumn> = (0..120u32).map(|i| StripeColumn { total: 255, ..column((60 + i * 37 % 180) as u8, 90, 60) }).collect();
+        let mut tops = std::collections::BTreeMap::<i32, f32>::new();
+        for (shape, _) in render(&mastered, OverviewLook::Rekordbox, ultraviolet) {
+            if let egui::Shape::LineSegment { points, .. } = shape {
+                let top = tops.entry(points[0].x as i32).or_insert(f32::MAX);
+                *top = top.min(points[0].y);
+            }
+        }
+        let (lowest, highest) = tops.values().fold((f32::MIN, f32::MAX), |(lo, hi), &y| (lo.max(y), hi.min(y)));
+        assert!(lowest - highest > 4.0, "the beat envelope is flattened: tops span {highest}..{lowest} px");
+    }
 
     #[test]
     fn dot_grid_quantisation_bounds_and_shape_budget() {

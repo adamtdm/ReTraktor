@@ -388,26 +388,43 @@ pub fn format_recording_timestamp(time: SystemTime) -> String {
     format!("{y:04}-{m:02}-{d:02}_{h:02}-{min:02}")
 }
 
-/// Finds non-colliding recording paths for WAV, CUE, and TXT files.
-/// Never overwrites existing files.
-pub fn unique_recording_paths(dir: &Path, time: SystemTime) -> (PathBuf, PathBuf, PathBuf) {
+/// Creates the WAV, CUE and TXT of a new recording under a fresh timestamped name and returns the
+/// open WAV. Never overwrites existing files: each name is claimed with `create_new`.
+pub fn reserve_recording_paths(dir: &Path, time: SystemTime) -> std::io::Result<(std::fs::File, PathBuf, PathBuf, PathBuf)> {
     let base_name = format!("ReTraktor_{}", format_recording_timestamp(time));
-    let mut candidate = base_name.clone();
-    let mut suffix = 1;
-
-    while dir.join(format!("{candidate}.wav")).exists()
-        || dir.join(format!("{candidate}.cue")).exists()
-        || dir.join(format!("{candidate}.txt")).exists()
-    {
-        candidate = format!("{base_name}_{suffix}");
+    let mut suffix = 0;
+    loop {
+        let stem = if suffix == 0 { base_name.clone() } else { format!("{base_name}_{suffix}") };
         suffix += 1;
+        let [wav, cue, txt] = ["wav", "cue", "txt"].map(|ext| dir.join(format!("{stem}.{ext}")));
+        let mut created = Vec::new();
+        let mut wav_file = None;
+        let mut taken = None;
+        for path in [&wav, &cue, &txt] {
+            match std::fs::OpenOptions::new().write(true).create_new(true).open(path) {
+                Ok(f) => {
+                    wav_file.get_or_insert(f);
+                    created.push(path);
+                }
+                Err(e) => {
+                    taken = Some(e);
+                    break;
+                }
+            }
+        }
+        match taken {
+            None => return Ok((wav_file.expect("wav was created"), wav, cue, txt)),
+            Some(e) => {
+                drop(wav_file);
+                for path in created {
+                    let _ = std::fs::remove_file(path);
+                }
+                if e.kind() != std::io::ErrorKind::AlreadyExists {
+                    return Err(e);
+                }
+            }
+        }
     }
-
-    (
-        dir.join(format!("{candidate}.wav")),
-        dir.join(format!("{candidate}.cue")),
-        dir.join(format!("{candidate}.txt")),
-    )
 }
 
 /// Live interactive state for the Set list workflow.
@@ -421,6 +438,8 @@ pub struct SetUiState {
     pub recorded_audible_tracks: Vec<(f64, String, String)>,
     pub recording_start: Option<std::time::Instant>,
     pub recording_samples_start_len: usize,
+    /// Whether each deck's current playback is already in the recording log.
+    deck_logged: [bool; 4],
     /// Clear asks once before it empties the set.
     confirm_clear: bool,
 }
@@ -438,19 +457,28 @@ impl Default for SetUiState {
             recorded_audible_tracks: Vec::new(),
             recording_start: None,
             recording_samples_start_len: 0,
+            deck_logged: [false; 4],
         }
     }
 }
 
 impl SetUiState {
-    /// Resets deck play duration when a new track is loaded.
+    /// Resets deck play duration when a new track is loaded; any load, even a reload, logs again.
     pub fn on_track_loaded(&mut self, deck_idx: usize, track_id: usize) {
         if deck_idx < 4 {
+            self.deck_logged[deck_idx] = false;
             if self.deck_loaded_track_id[deck_idx] != Some(track_id) {
                 self.deck_loaded_track_id[deck_idx] = Some(track_id);
                 self.deck_play_duration[deck_idx] = 0.0;
             }
         }
+    }
+
+    /// Starts a fresh recording log.
+    pub fn begin_recording(&mut self) {
+        self.recorded_audible_tracks.clear();
+        self.recording_start = Some(std::time::Instant::now());
+        self.deck_logged = [false; 4];
     }
 
     /// Updates playback duration per deck and marks tracks as played after 30 seconds.
@@ -492,7 +520,7 @@ impl SetUiState {
         None
     }
 
-    /// Logs a track if it becomes audible during recording.
+    /// Logs a deck's track the first time it becomes audible in each playback during recording.
     pub fn check_audible_track(
         &mut self,
         deck_idx: usize,
@@ -503,7 +531,12 @@ impl SetUiState {
         title: &str,
         offset_sec: f64,
     ) {
-        if !is_playing || channel_vol <= 0.05 || artist.is_empty() && title.is_empty() {
+        let Some(logged) = self.deck_logged.get_mut(deck_idx) else { return };
+        if !is_playing {
+            *logged = false;
+            return;
+        }
+        if *logged || channel_vol <= 0.05 || artist.is_empty() && title.is_empty() {
             return;
         }
 
@@ -515,20 +548,12 @@ impl SetUiState {
         };
 
         if audible {
-            // Avoid duplicate consecutive logging
-            let is_duplicate = self
-                .recorded_audible_tracks
-                .last()
-                .map(|(_, a, t)| a == artist && t == title)
-                .unwrap_or(false);
-
-            if !is_duplicate {
-                self.recorded_audible_tracks.push((
-                    offset_sec.max(0.0),
-                    artist.to_string(),
-                    title.to_string(),
-                ));
-            }
+            *logged = true;
+            self.recorded_audible_tracks.push((
+                offset_sec.max(0.0),
+                artist.to_string(),
+                title.to_string(),
+            ));
         }
     }
 
@@ -1073,6 +1098,22 @@ mod tests {
     }
 
     #[test]
+    fn recording_names_never_clobber_a_leftover_sidecar() {
+        let dir = std::env::temp_dir().join(format!("retraktor-reserve-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1794354300);
+        let stem = format!("ReTraktor_{}", format_recording_timestamp(t));
+        std::fs::write(dir.join(format!("{stem}.txt")), "old tracklist").unwrap();
+        let (_, wav, cue, txt) = reserve_recording_paths(&dir, t).unwrap();
+        assert_eq!(wav, dir.join(format!("{stem}_1.wav")));
+        assert!(cue.exists() && txt.exists());
+        assert!(!dir.join(format!("{stem}.wav")).exists(), "half-claimed name was released");
+        assert_eq!(std::fs::read_to_string(dir.join(format!("{stem}.txt"))).unwrap(), "old tracklist");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn civil_datetime_computation() {
         // Known epoch 0 -> 1970-01-01 00:00
         let (y, m, d, h, min) = civil_datetime_from_secs(0);
@@ -1082,5 +1123,42 @@ mod tests {
         // 1794354300 seconds from epoch
         let (y2, m2, d2, h2, min2) = civil_datetime_from_secs(1794354300);
         assert_eq!((y2, m2, d2, h2, min2), (2026, 11, 10, 23, 45));
+    }
+
+    #[test]
+    fn recording_logs_each_deck_play_once() {
+        // One UI frame: decks A and B as (playing, volume, title).
+        fn frame(s: &mut SetUiState, t: f64, xfader: f32, decks: [(bool, f32, &str); 2]) {
+            for (d, (playing, vol, title)) in decks.into_iter().enumerate() {
+                s.check_audible_track(d, playing, vol, xfader, "Artist", title, t);
+            }
+        }
+        fn log(s: &SetUiState) -> Vec<(f64, &str)> {
+            s.recorded_audible_tracks.iter().map(|(t, _, title)| (*t, title.as_str())).collect()
+        }
+        let mut s = SetUiState::default();
+        s.on_track_loaded(1, 7);
+        s.begin_recording();
+        for t in [0.0, 1.0, 2.0] {
+            frame(&mut s, t, 0.0, [(true, 1.0, "A"), (true, 1.0, "B")]); // B playing but crossfaded out
+        }
+        for t in [10.0, 11.0, 12.0] {
+            frame(&mut s, t, 0.5, [(true, 1.0, "A"), (true, 1.0, "B")]); // blend
+        }
+        frame(&mut s, 13.0, 0.5, [(true, 0.0, "A"), (true, 1.0, "B")]); // fader dip on A
+        frame(&mut s, 14.0, 0.5, [(true, 1.0, "A"), (true, 1.0, "B")]);
+        frame(&mut s, 20.0, 0.5, [(true, 1.0, "A"), (false, 1.0, "B")]); // B stopped...
+        frame(&mut s, 21.0, 0.5, [(true, 1.0, "A"), (true, 1.0, "B")]); // ...and replayed
+        frame(&mut s, 22.0, 0.5, [(true, 1.0, "A"), (true, 1.0, "B")]);
+        s.on_track_loaded(1, 7); // reload, same metadata
+        frame(&mut s, 30.0, 0.5, [(true, 1.0, "A"), (true, 1.0, "B")]);
+        s.on_track_loaded(0, 8); // replacement
+        frame(&mut s, 31.0, 0.5, [(true, 1.0, "C"), (true, 1.0, "B")]);
+        frame(&mut s, 32.0, 0.5, [(true, 1.0, "C"), (true, 1.0, "B")]);
+        assert_eq!(log(&s), [(0.0, "A"), (10.0, "B"), (21.0, "B"), (30.0, "B"), (31.0, "C")]);
+
+        s.begin_recording();
+        frame(&mut s, 0.0, 0.5, [(true, 1.0, "C"), (true, 1.0, "B")]);
+        assert_eq!(log(&s), [(0.0, "C"), (0.0, "B")]);
     }
 }
