@@ -10,7 +10,14 @@ use retraktor_formats::{
 use std::collections::BTreeMap;
 
 pub mod analysis;
-pub use analysis::{analyze_mono, auto_cues, detect_phrases, Phrase, PhraseKind, TrackAnalysis};
+pub use analysis::{analyze_mono, auto_cues, autogain_multiplier, detect_phrases, Phrase, PhraseKind, TrackAnalysis};
+
+/// Deck auto gain brings every track's integrated loudness to this level, in LUFS.
+pub const AUTOGAIN_TARGET_LUFS: f64 = -18.0;
+/// Largest loudness correction deck auto gain makes either way, in dB.
+pub const AUTOGAIN_MAX_DB: f64 = 18.0;
+/// Deck auto gain never lifts a track's true (intersample) peak above this, in dBTP.
+pub const AUTOGAIN_TRUE_PEAK_CEILING_DBTP: f64 = -1.0;
 
 /// Harmonic Key Wheel mapping Traktor's `MUSICAL_KEY/@VALUE` (`0..=23`), Open Key (`1d..12d`, `1m..12m`),
 /// and Camelot (`1B..12B`, `1A..12A`) notation.

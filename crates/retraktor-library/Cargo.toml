@@ -8,3 +8,4 @@ description = "ReTraktor music library index, Smartlist query evaluator, and Dec
 [dependencies]
 retraktor-core = { path = "../retraktor-core" }
 retraktor-formats = { path = "../retraktor-formats" }
+ebur128 = "0.1.11"
