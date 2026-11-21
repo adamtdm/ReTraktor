@@ -21,7 +21,46 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::thread;
 use std::sync::{Arc, mpsc};
-type LoadResult = (usize, u64, crate::library_ui::UiTrackEntry, Result<LoadedTrackAudio, String>);
+
+/// A library track in the headphone preview: its audio, streamed in as it decodes, and the engine's serial for it.
+#[derive(Clone)]
+struct Preview {
+    track: usize,
+    pcm: Arc<crate::audio::PreviewPcm>,
+    serial: u64,
+}
+
+/// What a deck load's worker sends, in this order, for the load (deck, generation) it was started for: the track,
+/// playable (or why not); then, after it is playable, its overview as kept in the stripe cache (when the cache
+/// didn't have it yet), the analysis of a track that lacked BPM or key and its cached AI stems. One channel, so they
+/// arrive in that order.
+enum DeckResult {
+    Loaded(usize, u64, crate::library_ui::UiTrackEntry, Result<LoadedTrackAudio, String>),
+    /// The track's overview as its browser row draws it, for the audio it was made from.
+    Overview(usize, u64, Arc<Vec<f32>>, crate::overview::Overview),
+    /// For library track (id): BPM, grid, key and phrases, the audio they were worked out from, and what the library
+    /// already had (kept, not replaced).
+    Analysis(usize, u64, usize, retraktor_library::TrackAnalysis, Arc<Vec<f32>>, Kept),
+    Stems(usize, u64, LoadedTrackAudio),
+}
+
+/// What a track already had when its deck load started, which a late analysis must not replace.
+#[derive(Clone, Copy, Debug)]
+struct Kept {
+    bpm: bool,
+    /// A grid cue (imported or set by hand), whatever its offset, even 0.
+    grid: bool,
+    phrases: bool,
+    /// The library track's hot cue revision at the load (`LibraryManager::cue_revision`): a hand edit since, on any
+    /// deck, means no auto hot cues.
+    cue_revision: u64,
+}
+
+/// How long a selection rests before its overview is decoded, so scrolling through the browser decodes nothing.
+const BROWSE_SETTLE: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// Row waveforms kept in memory (8 KB each; finished ones are also in the stripe cache): many screens of browsing.
+const ROW_WAVEFORMS_KEPT: usize = 1000;
 
 /// Traktor Pro 4 + Next-Gen Workspace Layouts (switchable from Top Header or F1..F6)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -104,8 +143,8 @@ pub struct ReTraktorApp {
     pub cue_mix: f32,
     pub cue_volume: f32,
     pub deck_keylock: [bool; 4],
-    /// Sound-card settings the open stream was built with.
-    audio_applied: Option<(String, u32, u32, bool)>,
+    /// The sound-card settings (device, rate, buffer) last opened, and the width it asked for then.
+    audio_applied: Option<((String, u32, u32), u16)>,
     pub master_tempo: f64,
     /// The deck whose tempo the MASTER button made the clock, if any.
     tempo_master_deck: Option<usize>,
@@ -151,7 +190,25 @@ pub struct ReTraktorApp {
     deck_loading: [bool; 4],
     /// When the last load on a deck failed, shown on the deck for a few seconds.
     deck_load_failed: [Option<std::time::Instant>; 4],
-    load_channel: (mpsc::Sender<LoadResult>, mpsc::Receiver<LoadResult>),
+    load_channel: (mpsc::Sender<DeckResult>, mpsc::Receiver<DeckResult>),
+    /// The library track in the headphone preview, from its press until it ends or is stopped.
+    preview: Option<Preview>,
+    preview_loader: crate::audio::PreviewLoader,
+    /// Where finished tracks' overview stripes are kept, for the rows and the decks (the preview worker has its own copy).
+    stripes: crate::overview::StripeCache,
+    /// Decoded (or decoding) audio of recent tracks: the selection's overview, the preview, and one more, for reuse.
+    prepared: Vec<(usize, Arc<crate::audio::PreviewPcm>)>,
+    /// The selection as last seen, and since when: its overview is decoded once it has rested [`BROWSE_SETTLE`].
+    browse_seen: (Option<usize>, std::time::Instant),
+    /// The resting selection (track, path) whose file was last looked at: once per selection, not every frame.
+    browse_looked: Option<(usize, Option<PathBuf>)>,
+    /// The tracks in `library.row_waveforms`, oldest first, to drop the oldest past [`ROW_WAVEFORMS_KEPT`].
+    row_waveform_order: std::collections::VecDeque<usize>,
+    /// The row in view whose waveform the preview worker is making (peaks only, no audio kept), after the preview
+    /// and the selection.
+    row_job: Option<(usize, Arc<crate::audio::PreviewPcm>)>,
+    /// A deck whose BPM and key are still being worked out (shown as pending, not as zero).
+    deck_analysing: [bool; 4],
     /// From REC until its WAV is finished (or left unsaved for RETRY SAVE).
     recording: Option<crate::recorder::Recording>,
     /// Close the window once the recording has been finished.
@@ -295,6 +352,15 @@ impl Default for ReTraktorApp {
             deck_loading: [false; 4],
             deck_load_failed: [None; 4],
             load_channel: mpsc::channel(),
+            preview: None,
+            preview_loader: crate::audio::PreviewLoader::new(crate::overview::StripeCache::user()),
+            stripes: crate::overview::StripeCache::user(),
+            prepared: Vec::new(),
+            browse_seen: (None, std::time::Instant::now()),
+            browse_looked: None,
+            row_waveform_order: Default::default(),
+            row_job: None,
+            deck_analysing: [false; 4],
             recording: None,
             close_after_recording: false,
             show_pattern_player: false,
@@ -359,13 +425,7 @@ impl eframe::App for ReTraktorApp {
             self.screenshot_step(ctx);
         }
 
-        // Open (or reopen) the sound card whenever its settings change.
-        let p = &self.preferences;
-        let want = (p.audio_device_name.clone(), p.sample_rate, p.buffer_size, !p.split_cue);
-        if self.audio_applied.as_ref() != Some(&want) {
-            self.audio.open(&want.0, want.1, want.2, want.3);
-            self.audio_applied = Some(want);
-        }
+        self.apply_audio_output();
 
         // Flush the autosaved collection and preferences on close.
         if self.poll_recording() && self.close_after_recording {
@@ -404,6 +464,7 @@ impl eframe::App for ReTraktorApp {
         }
 
         self.finish_loads();
+        self.poll_preview();
         if self.deck_loading.iter().any(|&l| l) {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
@@ -436,6 +497,7 @@ impl eframe::App for ReTraktorApp {
         self.sync_audio_state();
 
         crate::theme::apply_visuals(ctx);
+        crate::theme::set_waveform_colours(self.preferences.waveform_color_mode);
 
         // One 4 px gutter everywhere: window edge to panel, and panel to panel.
         egui::CentralPanel::default()
@@ -636,6 +698,8 @@ impl eframe::App for ReTraktorApp {
         self.preferences.audio_output = self.audio.status_line();
         self.audio.log_stream_trouble();
         self.preferences.audio_output_channels = self.audio.output_channels;
+        self.preferences.audio_route = self.audio.output_route;
+        self.preferences.audio_on_system_default = self.audio.on_system_default();
         self.preferences.show(ctx);
 
         // Live Performance Shortcuts HUD Overlay
@@ -703,6 +767,7 @@ impl ReTraktorApp {
                                 sample_rate: 48000,
                                 waveform_peaks: vec![[0.4, 0.5, 0.3]; 300].into(),
                                 stem_peaks: vec![[0.4, 0.5, 0.3, 0.2]; 300].into(),
+                                overview: crate::overview::from_peaks(&[[0.4, 0.5, 0.3]; 300]),
                                 stems_ready: true,
                                 pcm_drums: None,
                                 pcm_bass: None,
@@ -813,6 +878,11 @@ impl ReTraktorApp {
                     self.drain_pending_loads();
                 } else if let Ok(mut state) = self.audio.shared.lock() {
                     let d = deck - 1;
+                    let peaks: Arc<[[f32; 3]]> = (0..1200).map(|i| {
+                        let phase = (i as f32 / 1200.0) * 8.0;
+                        let bass = ((phase * 3.14).sin().abs()).clamp(0.1, 0.9);
+                        [bass, 0.5, 0.3]
+                    }).collect();
                     state.loaded_tracks[d] = Some(crate::audio::LoadedTrackAudio {
                         title: if d == 0 { "Solaris (Extended Mix)".into() } else { "Midnight Sun".into() },
                         artist: if d == 0 { "Articuno".into() } else { "Helios".into() },
@@ -821,11 +891,8 @@ impl ReTraktorApp {
                         grid_offset_sec: 0.0,
                         key: if d == 0 { "8m".into() } else { "9m".into() },
                         sample_rate: 44100,
-                        waveform_peaks: (0..1200).map(|i| {
-                            let phase = (i as f32 / 1200.0) * 8.0;
-                            let bass = ((phase * 3.14).sin().abs()).clamp(0.1, 0.9);
-                            [bass, 0.5, 0.3]
-                        }).collect::<Vec<_>>().into(),
+                        overview: crate::overview::from_peaks(&peaks),
+                        waveform_peaks: peaks,
                         stem_peaks: Vec::new().into(),
                         pcm_stereo: Arc::default(),
                         stems_ready: false,
@@ -1053,7 +1120,6 @@ impl ReTraktorApp {
 
     /// Decodes queued library loads on worker threads; real files only, never synthetic audio.
     fn drain_pending_loads(&mut self) {
-        let library_tx = self.library.sender();
         for (deck_idx, track) in std::mem::take(&mut self.library.pending_loads) {
             let d = deck_idx.clamp(1, 4) - 1;
             self.load_generation[d] += 1;
@@ -1062,38 +1128,75 @@ impl ReTraktorApp {
             self.library.deck_refused[d] = None;
             let generation = self.load_generation[d];
             let tx = self.load_channel.0.clone();
-            let library_tx = library_tx.clone();
+            let stripes = self.stripes.clone();
+            let cue_revision = self.library.cue_revision(track.id);
+            // A complete, exact preview or overview decode of the same, unchanged file saves decoding it again.
+            // shortcut: one still under way is ignored and the file decoded afresh, wait on it if loads straight after selecting matter.
+            let reuse = track.file_path.as_ref().and_then(|path| {
+                let mut decoded = self.prepared.iter().map(|(_, p)| p).chain(self.preview.as_ref().map(|p| &p.pcm));
+                decoded.find(|p| &p.path == path && p.complete()).cloned()
+            });
             thread::spawn(move || {
-                let Some(path) = track.file_path.as_ref() else {
-                    let _ = tx.send((d, generation, track, Err("No file path".into())));
+                let Some(path) = track.file_path.clone() else {
+                    let _ = tx.send(DeckResult::Loaded(d, generation, track, Err("No file path".into())));
                     return;
                 };
-                match LoadedTrackAudio::from_file(path, &track.title, &track.artist, track.bpm, &track.musical_key) {
-                    Ok(mut loaded) => {
-                        // Unanalysed track: analyse the PCM we just decoded and report back to the library.
-                        if let Some(grid) = track.cues.iter().find(|c| c.cue_type == retraktor_core::CueType::Grid) {
-                            loaded.grid_offset_sec = grid.start_ms / 1000.0;
-                        }
-                        if track.bpm <= 0.0 || track.musical_key.is_empty() {
-                            let mono = crate::library_ui::stereo_to_mono(&loaded.pcm_stereo);
-                            let a = retraktor_library::analyze_mono(&mono, loaded.sample_rate);
-                            if track.bpm <= 0.0 {
-                                loaded.bpm = a.bpm;
-                                loaded.grid_offset_sec = a.beatgrid_offset_sec;
-                            }
-                            if track.musical_key.is_empty() {
-                                loaded.key = a.key_open.clone();
-                            }
-                            if !a.phrases.is_empty() {
-                                loaded.phrases = a.phrases.clone();
-                            }
-                            let _ = library_tx.send(crate::library_ui::Msg::Analyzed(track.id, a, false));
-                        } else if !track.phrases.is_empty() {
-                            loaded.phrases = track.phrases.clone();
-                        }
-                        let _ = tx.send((d, generation, track, Ok(loaded)));
+                // Before decoding, so a file replaced meanwhile isn't kept under its new version's name.
+                let identity = crate::audio::file_identity(&path);
+                // Only a decode that is exactly what `from_file` gives, of the file as it is now (see `to_vec`).
+                let reused = reuse.as_ref().and_then(|p| Some((p.to_vec()?, p.layout()?.sample_rate, p.tags()?.clone())));
+                drop(reuse);
+                let decoded = match reused {
+                    Some((pcm, sr, (title, artist))) => {
+                        let mut loaded = LoadedTrackAudio::from_pcm(pcm, sr, &track.title, &track.artist, track.bpm, &track.musical_key);
+                        loaded.title = title.unwrap_or(loaded.title);
+                        loaded.artist = artist.unwrap_or(loaded.artist);
+                        Ok(loaded)
                     }
-                    Err(e) => { let _ = tx.send((d, generation, track, Err(e))); },
+                    None => LoadedTrackAudio::from_file(&path, &track.title, &track.artist, track.bpm, &track.musical_key),
+                };
+                let mut loaded = match decoded {
+                    Ok(loaded) => loaded,
+                    Err(e) => {
+                        let _ = tx.send(DeckResult::Loaded(d, generation, track, Err(e)));
+                        return;
+                    }
+                };
+                if let Some(grid) = track.cues.iter().find(|c| c.cue_type == retraktor_core::CueType::Grid) {
+                    loaded.grid_offset_sec = grid.start_ms / 1000.0;
+                }
+                let unanalysed = track.bpm <= 0.0 || track.musical_key.is_empty();
+                if !track.phrases.is_empty() {
+                    loaded.phrases = track.phrases.clone();
+                }
+                let kept = Kept {
+                    bpm: track.bpm > 0.0,
+                    grid: track.cues.iter().any(|c| c.cue_type == retraktor_core::CueType::Grid),
+                    phrases: !track.phrases.is_empty(),
+                    cue_revision,
+                };
+                // A bounded read: the deck draws the kept overview from the start, as the track's row does.
+                let kept_overview = stripes.load(&path, identity).map(|(overview, _)| overview);
+                if let Some(overview) = &kept_overview {
+                    loaded.overview = Arc::clone(overview);
+                }
+                // Playable now. Its overview, analysis and cached stems follow, for this load only (`finish_loads` checks).
+                let (id, later) = (track.id, loaded.clone());
+                let _ = tx.send(DeckResult::Loaded(d, generation, track, Ok(loaded)));
+                if kept_overview.is_none() {
+                    // The load's own peaks, no second pass: whichever stripe is kept first (this or a row's) is drawn by both.
+                    let overview = stripes.store(&path, identity, &later.waveform_peaks, later.duration_sec).unwrap_or_else(|| Arc::clone(&later.overview));
+                    let _ = tx.send(DeckResult::Overview(d, generation, Arc::clone(&later.pcm_stereo), overview));
+                }
+                if unanalysed {
+                    let a = retraktor_library::analyze_mono(&crate::library_ui::stereo_to_mono(&later.pcm_stereo), later.sample_rate);
+                    let _ = tx.send(DeckResult::Analysis(d, generation, id, a, Arc::clone(&later.pcm_stereo), kept));
+                }
+                if let Some(dir) = crate::demucs::DemucsManager::get_cached_stem_dir(&path) {
+                    let mut stemmed = later;
+                    if stemmed.load_stems_from_dir(&dir) {
+                        let _ = tx.send(DeckResult::Stems(d, generation, stemmed));
+                    }
                 }
             });
         }
@@ -1200,7 +1303,37 @@ impl ReTraktorApp {
     }
 
     fn finish_loads(&mut self) {
-        while let Ok((d, generation, track, result)) = self.load_channel.1.try_recv() {
+        while let Ok(result) = self.load_channel.1.try_recv() {
+            let (d, generation, track, result) = match result {
+                DeckResult::Loaded(d, generation, track, result) => (d, generation, track, result),
+                DeckResult::Analysis(d, generation, id, a, audio, kept) => {
+                    self.apply_deck_analysis(d, generation, id, &a, &audio, kept);
+                    continue;
+                }
+                DeckResult::Overview(d, generation, audio, overview) => {
+                    let Ok(mut state) = self.audio.shared.lock() else { continue };
+                    let current = generation == self.load_generation[d];
+                    if let Some(loaded) = state.loaded_tracks[d].as_mut().filter(|l| current && Arc::ptr_eq(&l.pcm_stereo, &audio)) {
+                        loaded.overview = overview;
+                    }
+                    continue;
+                }
+                DeckResult::Stems(d, generation, stemmed) => {
+                    let Ok(mut state) = self.audio.shared.lock() else { continue };
+                    // Only on the load they were decoded for, still holding that audio.
+                    let current = generation == self.load_generation[d];
+                    if let Some(loaded) = state.loaded_tracks[d].as_mut().filter(|l| current && Arc::ptr_eq(&l.pcm_stereo, &stemmed.pcm_stereo)) {
+                        loaded.pcm_drums = stemmed.pcm_drums;
+                        loaded.pcm_bass = stemmed.pcm_bass;
+                        loaded.pcm_other = stemmed.pcm_other;
+                        loaded.pcm_vocals = stemmed.pcm_vocals;
+                        loaded.stem_peaks = stemmed.stem_peaks;
+                        loaded.stems_ready = true;
+                        self.deck_stem_view[d] = true;
+                    }
+                    continue;
+                }
+            };
             if generation != self.load_generation[d] { continue; }
             self.deck_loading[d] = false;
             match result {
@@ -1222,9 +1355,9 @@ impl ReTraktorApp {
                         state.reset_jump_ease(d);
                     } else { continue; }
                     self.deck_track_ids[d] = Some(track.id);
+                    self.deck_analysing[d] = track.bpm <= 0.0 || track.musical_key.is_empty();
                     self.deck_auto_cue_status[d] = None;
-                    self.deck_hotcues[d] = track.cues.iter().filter(|c| (0..8).contains(&c.hotcue))
-                        .map(|c| ((c.hotcue + 1) as u8, c.start_ms / 1000.0)).collect();
+                    self.deck_hotcues[d] = deck_hotcues_of(&track.cues);
                     self.deck_loop_active[d] = false;
                     self.library.finish_deck_load(d, track.id, stems_ready);
                     self.set_state.on_track_loaded(d, track.id);
@@ -1239,6 +1372,331 @@ impl ReTraktorApp {
                 }
             }
         }
+    }
+
+    /// BPM, grid, key and phrases worked out after deck `d` became playable, for library track `id` that lacked BPM
+    /// or key. The library entry takes it whatever the deck holds now. The deck takes it only on the load it was worked
+    /// out for, still holding that audio, and only what is still missing: a BPM, grid cue (even at 0) or phrases the
+    /// library had stay, as does anything set meanwhile; the playhead and transport don't move. Auto hot cues, for
+    /// entry and deck alike, only if no slot is taken and the track's hot cues weren't set or cleared by hand since
+    /// the load, on any deck.
+    fn apply_deck_analysis(&mut self, d: usize, generation: u64, id: usize, a: &retraktor_library::TrackAnalysis, audio: &Arc<Vec<f32>>, kept: Kept) {
+        let on_deck = generation == self.load_generation[d]
+            && self.audio.shared.lock().is_ok_and(|s| s.loaded_tracks[d].as_ref().is_some_and(|t| Arc::ptr_eq(&t.pcm_stereo, audio)));
+        let hot_cues = self.library.cue_revision(id) == kept.cue_revision;
+        self.library.apply_late_analysis(id, a, hot_cues);
+        if !on_deck {
+            return;
+        }
+        let Ok(mut state) = self.audio.shared.lock() else { return };
+        let Some(t) = state.loaded_tracks[d].as_mut() else { return };
+        self.deck_analysing[d] = false;
+        if !kept.bpm && t.bpm <= 0.0 {
+            t.bpm = a.bpm;
+            if !kept.grid {
+                t.grid_offset_sec = a.beatgrid_offset_sec;
+            }
+        }
+        if t.key.is_empty() {
+            t.key = a.key_open.clone();
+        }
+        if !kept.phrases && !a.phrases.is_empty() {
+            t.phrases = a.phrases.clone();
+        }
+        drop(state);
+        if let Some(track) = self.library.track(id).filter(|_| hot_cues) {
+            self.deck_hotcues[d] = deck_hotcues_of(&track.cues); // the entry's, auto cues included
+        }
+    }
+
+    /// Opens (or reopens) the sound card whenever its settings change. A routing the open stream has the
+    /// channels for (swapping main and headphone pairs) switches at the next block instead, so playback and
+    /// recording carry on; so does one needing a width already asked for, so a narrower card isn't reopened
+    /// every frame. Rescan tries the chosen card again once, only while it isn't the one playing.
+    fn apply_audio_output(&mut self) {
+        let p = &self.preferences;
+        let (route, settings) = (p.output_route(), (p.audio_device_name.clone(), p.sample_rate, p.buffer_size));
+        let stranded = self.audio.output_channels == 0 || (!settings.0.is_empty() && self.audio.on_system_default());
+        let retry = std::mem::take(&mut self.preferences.audio_rescanned) && stranded;
+        let fits = |asked: u16| self.audio.output_channels >= route.width() || asked == route.width();
+        match &self.audio_applied {
+            Some((open, asked)) if *open == settings && fits(*asked) && !retry => self.audio.reroute(route),
+            _ => {
+                self.audio.open(&settings.0, settings.1, settings.2, route);
+                self.audio_applied = Some((settings, route.width()));
+            }
+        }
+    }
+
+    /// A Preview press, from the browser toolbar or a controller, for the `selected` track: the track already in
+    /// the preview stops, any other playable one replaces it (from its start), and no selection stops whatever
+    /// plays. A track that can't be previewed leaves the current preview playing. Decks, history and the set are
+    /// never touched.
+    fn press_preview(&mut self, selected: Option<usize>) {
+        let current = self.preview.as_ref().map(|p| p.track);
+        let Some(id) = selected.filter(|&id| current != Some(id)) else {
+            match current {
+                Some(id) => {
+                    self.stop_preview();
+                    self.library.status_message = format!("Stopped the preview of '{}'", self.track_title(id));
+                }
+                None => self.library.status_message = "Select a track to preview it".into(),
+            }
+            return;
+        };
+        self.start_preview(id, 0.0);
+    }
+
+    /// A click on track `id`'s row waveform at `at` (a fraction of the track): the preview of that track moves
+    /// there, otherwise that track's preview starts there. Never touches a deck.
+    fn click_overview(&mut self, id: usize, at: f64) {
+        let at = if at.is_finite() { at.clamp(0.0, 1.0) } else { 0.0 };
+        match self.preview.as_ref().filter(|p| p.track == id) {
+            Some(p) => {
+                p.pcm.want(at);
+                self.preview_loader.nudge();
+                if let Ok(mut state) = self.audio.shared.lock() {
+                    state.seek_preview(at);
+                }
+            }
+            None => self.start_preview(id, at),
+        }
+    }
+
+    /// Starts track `id` in the headphones from `at` (a fraction of the track), replacing any preview, once it
+    /// is known to be playable; otherwise says why and leaves the current preview alone.
+    fn start_preview(&mut self, id: usize, at: f64) {
+        let refused = match self.library.track(id) {
+            None => Err("That track is no longer in the collection".to_string()),
+            Some(t) => match (t.file_path.clone().filter(|p| p.is_file()), self.preview_route_missing()) {
+                (None, _) => Err(format!("File not found for '{}' — use Relocate", t.title)),
+                (_, Some(why)) => Err(format!("Can't preview '{}': {why}", t.title)),
+                (Some(path), None) => Ok((t.title.clone(), path)),
+            },
+        };
+        let (title, path) = match refused {
+            Ok(found) => found,
+            Err(why) => {
+                let still = self.preview.as_ref().map(|p| format!(" · still previewing '{}'", self.track_title(p.track))).unwrap_or_default();
+                self.library.status_message = why + &still;
+                return;
+            }
+        };
+        self.stop_preview();
+        // The selection's overview (or an earlier preview) may have decoded this already.
+        let pcm = match self.prepared.iter().find(|(t, p)| *t == id && p.path == path && p.failed().is_none() && p.same_file()) {
+            Some((_, p)) => Arc::clone(p),
+            None => crate::audio::PreviewPcm::new(path, at),
+        };
+        pcm.want(at);
+        let serial = match self.audio.shared.lock() {
+            Ok(mut state) => state.start_preview(Arc::clone(&pcm), at),
+            Err(_) => {
+                self.library.status_message = format!("Could not preview '{title}': the audio engine is not available");
+                return;
+            }
+        };
+        self.remember_prepared(id, &pcm);
+        self.preview = Some(Preview { track: id, pcm, serial });
+        self.update_preview_jobs();
+        self.library.status_message = format!("Previewing '{title}' in the headphones");
+    }
+
+    /// Stops the preview, whether it is still decoding or playing; nothing more of it is heard.
+    fn stop_preview(&mut self) {
+        if self.preview.take().is_none() {
+            return;
+        }
+        if let Ok(mut state) = self.audio.shared.lock() {
+            state.stop_preview();
+        }
+        self.update_preview_jobs();
+    }
+
+    /// Keeps `pcm` for track `id` for reuse, alongside at most one other (the preview playing, or the selection);
+    /// the oldest that is neither playing nor selected goes first.
+    fn remember_prepared(&mut self, id: usize, pcm: &Arc<crate::audio::PreviewPcm>) {
+        self.prepared.retain(|(t, p)| *t != id || Arc::ptr_eq(p, pcm));
+        if !self.prepared.iter().any(|(_, p)| Arc::ptr_eq(p, pcm)) {
+            self.prepared.push((id, Arc::clone(pcm)));
+        }
+        while self.prepared.len() > 2 {
+            let keep = |t: usize| self.preview.as_ref().is_some_and(|p| p.track == t) || t == id || self.library.selected_track_id == Some(t);
+            match self.prepared.iter().position(|(t, _)| !keep(*t)) {
+                Some(i) => drop(self.prepared.remove(i)),
+                None => break,
+            }
+        }
+    }
+
+    /// The preview worker decodes the playing preview first, then the selected track's overview, then a row's waveform.
+    fn update_preview_jobs(&self) {
+        let selected = self.library.selected_track_id;
+        let browse = self.prepared.iter().find(|(t, _)| Some(*t) == selected).map(|(_, p)| p);
+        self.preview_loader.set(self.preview.as_ref().map(|p| &p.pcm), browse, self.row_job.as_ref().map(|(_, p)| p));
+    }
+
+    /// A finished (or in-progress) decode of track `id` at its current path, for the overview. No file check here
+    /// (it runs every frame): `prepare_selection` drops a replaced file's decode once, when the selection rests.
+    fn prepared_for(&self, id: usize) -> Option<&Arc<crate::audio::PreviewPcm>> {
+        let path = self.library.track(id)?.file_path.as_ref()?;
+        self.prepared.iter().find(|(t, p)| *t == id && &p.path == path).map(|(_, p)| p)
+    }
+
+    /// Once the selection has rested, decodes it for its overview (only that: browsing never plays anything).
+    fn prepare_selection(&mut self) {
+        let selected = self.library.selected_track_id;
+        if selected != self.browse_seen.0 {
+            self.browse_seen = (selected, std::time::Instant::now());
+            self.browse_looked = None; // a newly selected track's file is looked at again
+            self.update_preview_jobs(); // the old selection's decode stops
+            return;
+        }
+        let Some(id) = selected.filter(|_| self.browse_seen.1.elapsed() >= BROWSE_SETTLE) else { return };
+        // The file is looked at once per resting selection (again if its path changes), not every frame.
+        let path = self.library.track(id).and_then(|t| t.file_path.clone());
+        if self.browse_looked.as_ref().is_some_and(|(t, p)| *t == id && *p == path) {
+            return;
+        }
+        self.browse_looked = Some((id, path.clone()));
+        self.prepared.retain(|(t, p)| *t != id || p.same_file()); // a file replaced since is decoded again
+        if self.prepared_for(id).is_some() {
+            self.update_preview_jobs();
+            return;
+        }
+        let Some(path) = path.filter(|p| p.is_file()) else { return };
+        let pcm = crate::audio::PreviewPcm::new(path, 0.0);
+        self.remember_prepared(id, &pcm);
+        self.update_preview_jobs();
+    }
+
+    /// Why the cue mix can't reach headphones on the open output, if it can't.
+    fn preview_route_missing(&self) -> Option<String> {
+        use crate::audio::OutputRoute;
+        let (route, channels) = (self.audio.output_route, self.audio.output_channels as usize);
+        let fix = "Choose another pair or an audio interface with a separate headphone pair, or turn on Split cue in Preferences > Audio > Outputs";
+        match route {
+            _ if route.place(channels).headphones_heard() => None,
+            _ if channels == 0 => Some("no audio output is open".into()),
+            OutputRoute::Split => Some("Split cue needs a stereo output".into()),
+            OutputRoute::Pairs { headphones: Some(h), .. } => {
+                Some(format!("this {channels}-channel output has no free channels {} for headphones. {fix}", crate::audio::pair_label(2 * h as usize)))
+            }
+            OutputRoute::Pairs { headphones: None, .. } => Some(format!("the system default output has no headphone pair. {fix}")),
+        }
+    }
+
+    fn track_title(&self, id: usize) -> String {
+        self.library.track(id).map_or_else(|| "the track".into(), |t| t.title.clone())
+    }
+
+    /// Each frame: ends a preview that lost its headphone output, couldn't be read or ran out (so the same track
+    /// can be started again), and decodes the resting selection for its overview.
+    fn poll_preview(&mut self) {
+        if let Some(p) = self.preview.clone() {
+            let title = self.track_title(p.track);
+            let progress = self.audio.shared.lock().map(|s| s.preview_progress).unwrap_or_default();
+            if let Some(why) = self.preview_route_missing() {
+                self.stop_preview();
+                self.library.status_message = format!("Stopped the preview of '{title}': {why}");
+            } else if let Some(e) = p.pcm.failed() {
+                self.stop_preview();
+                self.library.status_message = format!("Could not preview '{title}': {e}");
+            } else if progress.serial == p.serial && progress.ended {
+                self.stop_preview();
+                self.library.status_message = format!("Preview of '{title}' finished");
+            }
+        }
+        self.prepare_selection();
+        self.prepare_rows();
+    }
+
+    /// Each frame: every decode under way (the preview, the selection, a row) updates its row's waveform; then
+    /// the first row in view still without a finished one gets a peaks-only decode, unless the preview or the
+    /// selection is decoding it anyway. That decode goes on while its row stays in view; scrolled away, it stops.
+    /// Missing files and finished waveforms (or failures) are never decoded again, so nothing is retried every frame.
+    fn prepare_rows(&mut self) {
+        let visible = std::mem::take(&mut self.library.visible_rows);
+        let selected = self.library.selected_track_id;
+        // A stopped preview or an earlier selection is no longer decoded: only what it finished counts.
+        let decodes: Vec<(usize, Arc<crate::audio::PreviewPcm>)> = self
+            .prepared
+            .iter()
+            .filter(|(t, p)| Some(*t) == selected || p.complete() || p.failed().is_some())
+            .cloned()
+            .chain(self.preview.as_ref().map(|p| (p.track, Arc::clone(&p.pcm))))
+            .chain(self.row_job.clone())
+            .collect();
+        for (id, pcm) in &decodes {
+            self.note_row_waveform(*id, pcm);
+        }
+        let decoding_anyway = |app: &Self, id: usize| app.preview.as_ref().is_some_and(|p| p.track == id) || (selected == Some(id) && app.prepared_for(id).is_some());
+        let wanted = |app: &Self, id: usize| {
+            let t = app.library.track(id).filter(|t| !t.missing)?;
+            let path = t.file_path.as_ref()?;
+            let finished = app.library.row_waveforms.get(&id).is_some_and(|w| &w.path == path && w.made_from.is_none());
+            (!finished && !decoding_anyway(app, id)).then(|| path.clone())
+        };
+        // Kept only while its row is in view and still wants this very file (not one it has been relinked away from).
+        if self.row_job.as_ref().is_some_and(|(id, job)| visible.contains(id) && wanted(self, *id).as_ref() == Some(&job.path)) {
+            return;
+        }
+        let next = visible.iter().find_map(|&id| Some((id, crate::audio::PreviewPcm::peaks_only(wanted(self, id)?))));
+        if self.row_job.is_some() || next.is_some() {
+            self.row_job = next;
+            self.update_preview_jobs();
+        }
+    }
+
+    /// Track `id`'s row waveform from `pcm`, a decode of its file (or its stripe, found in the cache instead), if
+    /// more has been decoded since it was last made. A finished waveform stands until a decode finds the file
+    /// changed (replaced or repaired); a finished error also gives way to a decode of the same file that reads fine.
+    /// One from a decode of another path (before a relink) is never made. No file is looked at here: decodes carry
+    /// what they found.
+    fn note_row_waveform(&mut self, id: usize, pcm: &Arc<crate::audio::PreviewPcm>) {
+        // A complete decode is finished once the worker has kept its overview (`cached`), so rows draw what decks do.
+        let finished = pcm.failed().is_some() || pcm.cached().is_some();
+        let made_from = (!finished).then(|| (Arc::as_ptr(pcm) as usize, pcm.filled(), pcm.playable_frames()));
+        let identity = pcm.identity();
+        let current_path = self.library.track(id).and_then(|t| t.file_path.as_ref()) == Some(&pcm.path);
+        let kept = self.library.row_waveforms.get(&id).filter(|w| w.path == pcm.path);
+        let keep = kept.is_some_and(|w| {
+            w.identity == identity
+                && match w.made_from {
+                    None => w.peaks.is_ok() || pcm.failed().is_some(),
+                    Some(_) => w.made_from == made_from,
+                }
+        });
+        if !current_path || keep || (pcm.filled() == 0 && !finished) {
+            return;
+        }
+        let peaks = match (pcm.failed(), pcm.cached()) {
+            (Some(e), _) => Err(e.to_string()),
+            (None, Some((overview, length))) => Ok((Arc::clone(overview), Some(*length))),
+            (None, None) => Ok((crate::overview::from_peaks(&pcm.overview_peaks().unwrap_or_default()), pcm.duration_sec())),
+        };
+        let waveform = crate::library_ui::RowWaveform { path: pcm.path.clone(), peaks, made_from, identity };
+        if self.library.row_waveforms.insert(id, waveform).is_none() {
+            self.row_waveform_order.push_back(id);
+            while self.row_waveform_order.len() > ROW_WAVEFORMS_KEPT {
+                if let Some(oldest) = self.row_waveform_order.pop_front() {
+                    self.library.row_waveforms.remove(&oldest);
+                }
+            }
+        }
+    }
+
+    /// Where the preview is, as a fraction of its track, once it has found its place.
+    fn preview_position(&self, p: &Preview) -> Option<f64> {
+        let progress = self.audio.shared.lock().map(|s| s.preview_progress).ok()?;
+        let frames = p.pcm.playable_frames()?.max(1) as f64;
+        (progress.serial == p.serial && progress.started).then(|| (progress.frame / frames).clamp(0.0, 1.0))
+    }
+
+    /// What the browser shows about the preview: the Stop state, and where the track previewing is.
+    fn browser_preview_view(&mut self) {
+        self.library.previewing = self.preview.as_ref().map(|p| (p.track, p.pcm.filled() == 0 && p.pcm.failed().is_none()));
+        self.library.preview_position = self.preview.as_ref().and_then(|p| self.preview_position(p));
     }
 
     fn sync_audio_state(&mut self) {
@@ -1264,8 +1722,9 @@ impl ReTraktorApp {
             state.pattern_pitch = self.pattern_pitch;
             state.pattern_decay = self.pattern_decay;
 
+            // Only a known BPM is a grid to sync with; a track still being analysed has none yet.
             let grids: [Option<(f64, f64)>; 4] =
-                std::array::from_fn(|i| state.loaded_tracks[i].as_ref().map(|t| (t.bpm.max(20.0), t.grid_offset_sec)));
+                std::array::from_fn(|i| state.loaded_tracks[i].as_ref().filter(|t| t.bpm > 0.0).map(|t| (t.bpm.max(20.0), t.grid_offset_sec)));
             for d in 0..4 {
                 state.channel_gain[d] = self.channel_gain[d];
                 state.engine.strips[d].volume = self.channel_volume[d];
@@ -1322,11 +1781,11 @@ impl ReTraktorApp {
             state.cue_mix = self.cue_mix;
             state.cue_volume = self.cue_volume;
             state.keylock_hq = self.preferences.keylock_quality == 0;
-            state.headphone_out = self.preferences.headphone_out();
             // A master deck drives the clock at its live tempo; an ejected deck releases it.
             if let Some(m) = self.tempo_master_deck {
                 match grids[m] {
                     Some((bpm, _)) => self.master_tempo = bpm * (1.0 + self.deck_pitch_fader[m] as f64 / 100.0),
+                    None if state.loaded_tracks[m].is_some() => {} // still analysing: the clock holds its tempo
                     None => self.tempo_master_deck = None,
                 }
             }
@@ -1749,6 +2208,7 @@ impl ReTraktorApp {
                     "surface.right.flux" => self.deck_flux_active[1] = !self.deck_flux_active[1],
                     "surface.left.loop_size.push" => self.toggle_loop(1),
                     "surface.right.loop_size.push" => self.toggle_loop(2),
+                    "surface.left.browse.preview" | "surface.right.browse.preview" => self.press_preview(self.library.selected_track_id),
 
                     // Turntable Vinyl Scratch Mode vs CDJ Jog Bend Mode
                     "surface.left.mode.turntable" => {
@@ -2325,7 +2785,8 @@ impl ReTraktorApp {
     /// Shifts a loaded track's beatgrid and/or scales its tempo, on the deck and in the library entry.
     fn adjust_deck_grid(&mut self, d: usize, shift_sec: f64, bpm_factor: f64) {
         let Ok(mut state) = self.audio.shared.lock() else { return };
-        let Some(t) = state.loaded_tracks[d].as_mut() else { return };
+        // No grid to move or scale until the BPM is known.
+        let Some(t) = state.loaded_tracks[d].as_mut().filter(|t| t.bpm > 0.0) else { return };
         t.grid_offset_sec += shift_sec;
         t.bpm = (t.bpm * bpm_factor).clamp(20.0, 400.0);
         let (offset, bpm) = (t.grid_offset_sec, t.bpm);
@@ -2337,6 +2798,12 @@ impl ReTraktorApp {
 
     fn toggle_loop(&mut self, deck_idx: usize) {
         let d = deck_idx - 1;
+        // A loop is a number of beats: with no BPM yet it would be a guess, and change length when it arrives.
+        let no_bpm = self.audio.shared.lock().map_or(true, |s| s.loaded_tracks[d].as_ref().is_some_and(|t| t.bpm <= 0.0));
+        if !self.deck_loop_active[d] && no_bpm {
+            self.library.status_message = format!("Loops on deck {} wait for its BPM", DECK_LETTERS[d]);
+            return;
+        }
         self.deck_loop_active[d] = !self.deck_loop_active[d];
         if self.deck_loop_active[d] {
             if let Ok(state) = self.audio.shared.lock() {
@@ -2987,14 +3454,14 @@ impl ReTraktorApp {
                                 ui.spacing_mut().item_spacing.x = 8.0;
                                 let size = 18.0;
                                 let pitch_pct = self.deck_pitch_fader[d];
-                                let bpm_txt = format!("{:.2}", deck.bpm * (1.0 + pitch_pct as f64 / 100.0));
+                                let bpm_txt = bpm_text(deck.bpm, pitch_pct, self.deck_analysing[d]);
                                 ui.allocate_ui_with_layout(Vec2::new(95.0, 24.0), Layout::left_to_right(Align::Center), |ui| {
                                     if bpm_reset_clicked(readout(ui, "BPM", &bpm_txt, size, ink)) {
                                         self.reset_tempo(d);
                                     }
                                 });
                                 ui.allocate_ui_with_layout(Vec2::new(85.0, 24.0), Layout::left_to_right(Align::Center), |ui| {
-                                    readout(ui, if in_key { "IN KEY" } else { "KEY" }, &deck.key, size, ink);
+                                    readout(ui, if in_key { "IN KEY" } else { "KEY" }, key_text(&deck.key, self.deck_analysing[d]), size, ink);
                                 });
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                     readout(ui, "REMAIN", &deck.remaining(), size, ink);
@@ -3168,7 +3635,7 @@ impl ReTraktorApp {
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             display(ui, |ui, ink| {
                 ui.spacing_mut().item_spacing.x = 14.0;
-                if bpm_reset_clicked(readout(ui, "BPM", &format!("{:.2}", deck.bpm * (1.0 + self.deck_pitch_fader[d] as f64 / 100.0)), 20.0, ink)) {
+                if bpm_reset_clicked(readout(ui, "BPM", &bpm_text(deck.bpm, self.deck_pitch_fader[d], self.deck_analysing[d]), 20.0, ink)) {
                     self.reset_tempo(d);
                 }
                 readout(ui, "REMAIN", &deck.remaining(), 20.0, ink);
@@ -3210,6 +3677,7 @@ impl ReTraktorApp {
             is_playing: state.is_playing[d],
             peaks: t.waveform_peaks.clone(),
             stem_peaks: t.stem_peaks.clone(),
+            overview: t.overview.clone(),
             phrases: t.phrases.clone(),
         })
     }
@@ -3338,12 +3806,12 @@ impl ReTraktorApp {
                         let advance = ui.fonts(|f| f.glyph_width(&crate::theme::dot_font(100.0), '0')) / 100.0;
                         let size = ((ui.available_width() - 3.0 * 14.0) / (20.0 * advance)).floor().clamp(16.0, 30.0);
                         let pitch_pct = self.deck_pitch_fader[d];
-                        if bpm_reset_clicked(readout(ui, "BPM", &format!("{:.2}", bpm * (1.0 + pitch_pct as f64 / 100.0)), size, ink)) {
+                        if bpm_reset_clicked(readout(ui, "BPM", &bpm_text(bpm, pitch_pct, self.deck_analysing[d]), size, ink)) {
                             self.reset_tempo(d);
                         }
                         readout(ui, "PITCH", &format!("{pitch_pct:+.1}%"), size, ink);
                         // A compatible key says so in words, not just in brightness.
-                        readout(ui, if in_key { "IN KEY" } else { "KEY" }, &deck.key, size, ink);
+                        readout(ui, if in_key { "IN KEY" } else { "KEY" }, key_text(&deck.key, self.deck_analysing[d]), size, ink);
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             readout(ui, "REMAIN", &deck.remaining(), size, ink);
                         });
@@ -3462,7 +3930,7 @@ impl ReTraktorApp {
                 ui,
                 &mut scrub_pos,
                 deck.duration_sec,
-                &deck.peaks,
+                &deck.overview,
                 &cues,
                 &deck.phrases,
                 self.deck_loop_active[d],
@@ -3729,6 +4197,7 @@ impl ReTraktorApp {
 
                 let four_deck_mode = self.layout == TraktorLayout::FourDeck || self.preferences.four_deck_mode;
                 let locked_decks = self.locked_decks();
+                self.browser_preview_view();
                 self.library.show_browser_content(
                     ui,
                     four_deck_mode,
@@ -3737,6 +4206,12 @@ impl ReTraktorApp {
                     &mut self.preferences.music_folders,
                 );
                 self.drain_pending_loads();
+                if let Some(selected) = self.library.preview_requested.take() {
+                    self.press_preview(selected);
+                }
+                if let Some((id, at)) = self.library.overview_clicked.take() {
+                    self.click_overview(id, at);
+                }
 
                 // If a track was loaded and has stems ready, automatically enable deck stems view
                 if let Some((d, stems_ready)) = self.library.last_loaded_deck.take() {
@@ -4052,6 +4527,29 @@ fn beat_jump_target(playhead: f64, bpm: f64, duration: f64, beats: f64, active_l
 }
 
 /// Playback ratio that brings `bpm` to `target`, folding the target by octaves so 70 follows 140 at half time.
+/// A deck's hot cues (slot 1..=8, seconds) from a library entry's cues, of any kind, in its first eight slots.
+fn deck_hotcues_of(cues: &[retraktor_formats::nml::NmlCue]) -> Vec<(u8, f64)> {
+    cues.iter().filter(|c| (0..8).contains(&c.hotcue)).map(|c| ((c.hotcue + 1) as u8, c.start_ms / 1000.0)).collect()
+}
+
+/// A deck's tempo as its readout shows it: still being worked out, or unknown, rather than 0.00.
+fn bpm_text(bpm: f64, pitch_pct: f32, analysing: bool) -> String {
+    match bpm > 0.0 {
+        true => format!("{:.2}", bpm * (1.0 + pitch_pct as f64 / 100.0)),
+        false if analysing => "…".into(),
+        false => "—".into(),
+    }
+}
+
+/// A deck's key as its readout shows it, likewise.
+fn key_text(key: &str, analysing: bool) -> &str {
+    match key.is_empty() {
+        false => key,
+        true if analysing => "…",
+        true => "—",
+    }
+}
+
 fn sync_ratio(bpm: f64, target: f64) -> f64 {
     let mut ratio = target.max(20.0) / bpm.max(20.0);
     while ratio > std::f64::consts::SQRT_2 {
@@ -4100,7 +4598,7 @@ fn install_stems(
 }
 
 fn snap_bars(state: &mut crate::audio::AudioSharedState, d: usize, other: usize) {
-    let grid = |i: usize| state.loaded_tracks[i].as_ref().map(|t| (t.bpm.max(20.0), t.grid_offset_sec));
+    let grid = |i: usize| state.loaded_tracks[i].as_ref().filter(|t| t.bpm > 0.0).map(|t| (t.bpm.max(20.0), t.grid_offset_sec));
     if let (Some((bpm, offset)), Some((other_bpm, other_offset))) = (grid(d), grid(other)) {
         let behind = beat_phase_diff(
             (state.playhead_sec[other] - other_offset) * other_bpm / 60.0,
@@ -4148,6 +4646,7 @@ struct DeckView {
     is_playing: bool,
     peaks: Arc<[[f32; 3]]>,
     stem_peaks: Arc<[[f32; 4]]>,
+    overview: crate::overview::Overview,
     phrases: Vec<retraktor_library::Phrase>,
 }
 
@@ -4480,7 +4979,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(200));
         let results: Vec<_> = app.load_channel.1.try_iter().collect();
         assert_eq!(results.len(), 2);
-        let (stale, current): (Vec<_>, Vec<_>) = results.into_iter().partition(|r| r.1 == 1);
+        let (stale, current): (Vec<_>, Vec<_>) = results.into_iter().partition(|r| matches!(r, DeckResult::Loaded(_, 1, ..)));
         app.load_channel.0.send(stale.into_iter().next().unwrap()).unwrap();
         app.finish_loads();
         assert!(app.deck_loading[0], "a stale result ended loading");
@@ -4513,6 +5012,7 @@ mod tests {
             sample_rate: 44100,
             waveform_peaks: Vec::new().into(),
             stem_peaks: Vec::new().into(),
+            overview: Vec::new().into(),
             pcm_stereo: Arc::default(),
             stems_ready: false,
             pcm_drums: None,
@@ -4566,7 +5066,7 @@ mod tests {
         app.library.pending_loads.push((1, track.clone()));
         app.drain_pending_loads();
         let result = app.load_channel.1.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
-        assert!(result.3.is_ok());
+        assert!(matches!(result, DeckResult::Loaded(_, _, _, Ok(_))));
         app.load_channel.0.send(result).unwrap();
         app.finish_loads();
         assert_eq!(app.deck_track_ids[0], Some(12));
@@ -4576,7 +5076,7 @@ mod tests {
 
         app.load_generation[0] += 1;
         let stale = LoadedTrackAudio::from_file(&wav, "Stale", "", 128.0, "1d").unwrap();
-        app.load_channel.0.send((0, 1, track.clone(), Ok(stale))).unwrap();
+        app.load_channel.0.send(DeckResult::Loaded(0, 1, track.clone(), Ok(stale))).unwrap();
         app.finish_loads();
         assert_eq!(app.deck_view(0).unwrap().title, "Real WAV");
 
@@ -4586,7 +5086,7 @@ mod tests {
         app.library.pending_loads.push((1, bad_track));
         app.drain_pending_loads();
         let result = app.load_channel.1.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
-        assert!(result.3.is_err());
+        assert!(matches!(result, DeckResult::Loaded(_, _, _, Err(_))));
         app.load_channel.0.send(result).unwrap();
         app.finish_loads();
         assert!(app.library.status_message.contains("Could not load"));
@@ -4827,7 +5327,7 @@ mod sync_audio {
     fn track(bpm: f64) -> crate::audio::LoadedTrackAudio {
         crate::audio::LoadedTrackAudio {
             title: "t".into(), artist: String::new(), duration_sec: 100.0, bpm, grid_offset_sec: 0.0, key: String::new(),
-            sample_rate: 44100, waveform_peaks: Vec::new().into(), stem_peaks: Vec::new().into(), pcm_stereo: Arc::new(vec![0.0; 44100 * 200]),
+            sample_rate: 44100, waveform_peaks: Vec::new().into(), stem_peaks: Vec::new().into(), overview: Vec::new().into(), pcm_stereo: Arc::new(vec![0.0; 44100 * 200]),
             stems_ready: false, pcm_drums: None, pcm_bass: None, pcm_other: None, pcm_vocals: None, phrases: Vec::new(),
         }
     }
@@ -5234,7 +5734,7 @@ mod sync_audio {
                 (true, true) => {
                     assert!(app.beat_jump(0, 1.0));
                     let entry = crate::library_ui::UiTrackEntry { id: 7, ..Default::default() };
-                    app.load_channel.0.send((0, app.load_generation[0], entry, Ok(flat(0.0)))).unwrap();
+                    app.load_channel.0.send(DeckResult::Loaded(0, app.load_generation[0], entry, Ok(flat(0.0)))).unwrap();
                     app.finish_loads();
                     app.toggle_play(1);
                 }
@@ -5311,6 +5811,9 @@ mod sync_audio {
         };
         let run = |contended: bool, to_i16: bool| -> Run {
             let mut app = ReTraktorApp::default();
+            // The routing this test hears, whatever this machine has saved.
+            app.preferences.split_cue = false;
+            app.preferences.output_pairs.clear();
             {
                 let mut s = app.audio.shared.lock().unwrap();
                 s.loaded_tracks[0] = Some(tone(100.0, 0.3, "A"));
@@ -5376,7 +5879,7 @@ mod sync_audio {
 
             // Reopen: the new callback state carries on from the published playheads.
             let before = app.audio.shared.lock().unwrap().playhead_sec;
-            app.audio.open("", 48_000, BLOCK as u32, true);
+            app.audio.open("", 48_000, BLOCK as u32, app.preferences.output_route());
             play(&app, 1, &mut out);
             let s = app.audio.shared.lock().unwrap();
             for (d, rate) in [(0, 1.06), (1, 0.96)] {
@@ -5495,6 +5998,1049 @@ mod sync_audio {
                 eprintln!("geometry {w} x {h} {}: {} probes fixed across {} phrases, phrase slot {:.1} x {:.1} px", layout.label(), base.len(), stops.len(), slot.width(), slot.height());
             }
         }
+    }
+
+    /// A library of six tracks (1: a 0.3 s 44.1 kHz WAV, 2: a 0.2 s 48 kHz WAV, 3: a file that isn't audio,
+    /// 4: a missing file, 5: a 3 s 44.1 kHz WAV at 300 Hz then 3 kHz from halfway, 6: a 2 s 48 kHz WAV at 440 Hz),
+    /// none analysed, both decks loaded and playing, on a four-channel output with headphones on 3–4.
+    fn preview_app(name: &str) -> (PathBuf, ReTraktorApp) {
+        let dir = std::env::temp_dir().join(format!("retraktor-preview-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tone = |file: &str, hz: f32, rate: u32, secs: f32| {
+            let n = (rate as f32 * secs) as usize;
+            let samples: Vec<i16> = (0..n)
+                .flat_map(|i| {
+                    // Track 5's second half is ten times higher: a passage a listener (and a test) can tell apart.
+                    let hz = if file == "five.wav" && i >= n / 2 { hz * 10.0 } else { hz };
+                    let v = ((i as f32 * hz * std::f32::consts::TAU / rate as f32).sin() * 12_000.0) as i16;
+                    [v, v]
+                })
+                .collect();
+            AudioSystem::write_stereo_wav_file(&dir.join(file), &samples, rate).unwrap();
+            dir.join(file)
+        };
+        let files = [
+            tone("one.wav", 500.0, 44_100, 0.3),
+            tone("two.wav", 800.0, 48_000, 0.2),
+            dir.join("bad.wav"),
+            dir.join("gone.wav"),
+            tone("five.wav", 300.0, 44_100, 3.0),
+            tone("six.wav", 440.0, 48_000, 2.0),
+        ];
+        std::fs::write(&files[2], b"not audio").unwrap();
+        let mut app = ReTraktorApp::default();
+        app.library = LibraryManager::new(dir.join("collection.nml"));
+        for (i, path) in files.into_iter().enumerate() {
+            let title = format!("Track {}", i + 1);
+            app.library.tracks.push(crate::library_ui::UiTrackEntry { id: i + 1, title, file_path: Some(path), ..Default::default() });
+        }
+        app.library.rebuild_index();
+        app.preferences.split_cue = false;
+        app.preferences.output_pairs.clear(); // main 1–2, headphones 3–4, whatever this machine has saved
+        app.audio.output_channels = 4;
+        {
+            let mut s = app.audio.shared.lock().unwrap();
+            s.loaded_tracks[0] = Some(track(120.0));
+            s.loaded_tracks[1] = Some(track(126.0));
+            s.is_playing = [true, true, false, false];
+        }
+        app.deck_track_ids = [Some(90), Some(91), None, None];
+        app.sync_audio_state();
+        (dir, app)
+    }
+
+    /// Latency harness, not a regression test (no timing is asserted). For each file in `RETRAKTOR_LATENCY_DIR`
+    /// (`three-min.mp3`, `three-min.wav`), three fresh apps each time: Preview press to the first preview samples in
+    /// the headphones, the same press again in that app, a cold start three quarters in through the overview's click
+    /// path (asserting that the fixture's 1 kHz lead, from 2:00, is what is heard), and a queued deck load until the deck
+    /// is playable: after that seeked preview (not exact, so the file is decoded), after ordinary browsing (the straight
+    /// overview decode reused), with BPM/key missing, tagged, and the tagged track reloaded; plus when the missing BPM
+    /// arrives. Prints medians.
+    /// `RETRAKTOR_LATENCY_DIR=/tmp/retraktor-wave-fixtures cargo test -p retraktor-gui --locked latency_harness -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn latency_harness() {
+        use std::time::{Duration, Instant};
+        let Ok(dir) = std::env::var("RETRAKTOR_LATENCY_DIR") else { return };
+        let ms = |t: Instant| t.elapsed().as_secs_f64() * 1000.0;
+        // One real block every 5 ms, as a 256-frame callback would; a tight loop would starve the decoder.
+        let heard_where = |app: &mut ReTraktorApp, t: Instant| -> (f64, f32) {
+            let mut buf = vec![0.0f32; 256 * 4];
+            loop {
+                app.poll_preview();
+                app.audio.render_with(&mut buf, 4, 48_000, |x| x);
+                if let Some(from) = buf.chunks(4).position(|f| f[2].abs() > 1e-4) {
+                    let left: Vec<f32> = buf.chunks(4).skip(from + 1).map(|f| f[2]).collect();
+                    let slope: f32 = left.windows(2).map(|w| (w[1] - w[0]).powi(2)).sum();
+                    return (ms(t), slope / left.iter().map(|v| v * v).sum::<f32>().max(1e-9));
+                }
+                assert!(t.elapsed() < Duration::from_secs(300) && app.preview.is_some(), "the preview never played: {}", app.library.status_message);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        let heard = |app: &mut ReTraktorApp, t: Instant| heard_where(app, t).0;
+        for file in ["three-min.mp3", "three-min.wav"] {
+            let path = PathBuf::from(&dir).join(file);
+            assert!(path.is_file(), "no fixture at {}", path.display());
+            let mut rows: Vec<(&str, Vec<f64>)> = Vec::new();
+            let note = |rows: &mut Vec<(&str, Vec<f64>)>, what: &'static str, v: f64| match rows.iter_mut().find(|r| r.0 == what) {
+                Some(r) => r.1.push(v),
+                None => rows.push((what, vec![v])),
+            };
+            for _ in 0..3 {
+                let mut app = ReTraktorApp::default();
+                app.library = LibraryManager::new(std::env::temp_dir().join(format!("retraktor-latency-{}/c.nml", std::process::id())));
+                for (id, bpm, key) in [(1, 0.0, ""), (2, 124.0, "8m")] {
+                    let title = format!("Latency {id}");
+                    app.library.tracks.push(crate::library_ui::UiTrackEntry { id, title, file_path: Some(path.clone()), bpm, musical_key: key.into(), ..Default::default() });
+                }
+                app.library.rebuild_index();
+                app.preferences.split_cue = false;
+                app.audio.output_channels = 4;
+                app.sync_audio_state();
+
+                let t = Instant::now();
+                app.press_preview(Some(1));
+                let (when, bright_start) = heard_where(&mut app, t);
+                note(&mut rows, "preview: press -> first samples", when);
+                note(&mut rows, "preview: 0% brightness x1000, not ms (reference, no lead)", bright_start as f64 * 1000.0);
+                app.press_preview(None);
+                let t = Instant::now();
+                app.press_preview(Some(1));
+                note(&mut rows, "preview: same track again", heard(&mut app, t));
+                app.press_preview(None);
+                app.library.selected_track_id = Some(2); // selected, as when clicking its overview: its decode goes on after a stop
+                let t = Instant::now();
+                app.click_overview(2, 0.75); // track 2: the same file, not decoded yet for it
+                let (when, bright) = heard_where(&mut app, t);
+                note(&mut rows, "preview: cold start at 75% -> first samples", when);
+                note(&mut rows, "preview: 75% brightness x1000, not ms (1 kHz lead ~3, start ~0)", bright as f64 * 1000.0);
+                assert!(bright > 1e-3 && bright > 3.0 * bright_start, "{file}: the cold 75% start isn't the 1 kHz passage ({bright} against {bright_start} at the start)");
+                app.press_preview(None);
+
+                // Each deck load waits for what it is measured after, with nothing else decoding meanwhile.
+                let complete = |app: &mut ReTraktorApp, what: &str| {
+                    let t = Instant::now();
+                    while !app.prepared_for(2).is_some_and(|p| p.complete()) {
+                        assert!(t.elapsed() < Duration::from_secs(300), "{what} never completed");
+                        std::thread::sleep(Duration::from_millis(5));
+                        app.poll_preview();
+                    }
+                    ms(t)
+                };
+                note(&mut rows, "preview: rest of the file decoded (after the 75% start)", complete(&mut app, "the 75% decode"));
+                assert!(!app.prepared_for(2).unwrap().exact(), "a seeked decode counted as exact");
+                let loads = [
+                    ("deck: tagged after a 75% preview (seeked, so decodes the file) -> playable", 2, false),
+                    ("deck: tagged after ordinary browsing (straight overview decode reused) -> playable", 2, true),
+                    ("deck: BPM/key missing -> playable", 1, false),
+                    ("deck: tagged -> playable", 2, false),
+                    ("deck: tagged reload -> playable", 2, false),
+                ];
+                for (n, (what, id, browsed)) in loads.into_iter().enumerate() {
+                    if browsed {
+                        app.prepared.clear(); // as if track 2 were selected afresh and had rested
+                        app.browse_seen = (Some(2), Instant::now() - BROWSE_SETTLE);
+                        app.browse_looked = None;
+                        note(&mut rows, "overview: selected track decoded straight through", complete(&mut app, "the overview decode"));
+                        assert!(app.prepared_for(2).unwrap().exact(), "a straight overview decode isn't exact");
+                    } else if n > 0 {
+                        app.library.selected_track_id = None;
+                        app.prepared.clear(); // decode from the file, as before
+                        app.poll_preview();
+                    }
+                    let track = app.library.track(id).cloned().unwrap();
+                    let t = Instant::now();
+                    app.library.pending_loads.push((1, track));
+                    app.drain_pending_loads();
+                    while app.deck_loading[0] {
+                        assert!(t.elapsed() < Duration::from_secs(300), "the deck never loaded");
+                        std::thread::sleep(Duration::from_millis(2));
+                        app.finish_loads();
+                    }
+                    assert!(app.deck_load_failed[0].is_none(), "{}", app.library.status_message);
+                    note(&mut rows, what, ms(t));
+                    if id == 1 {
+                        while app.audio.shared.lock().unwrap().loaded_tracks[0].as_ref().map_or(true, |l| l.bpm <= 0.0) {
+                            assert!(t.elapsed() < Duration::from_secs(300), "the BPM never arrived");
+                            std::thread::sleep(Duration::from_millis(2));
+                            app.finish_loads();
+                        }
+                        note(&mut rows, "deck: BPM/key missing -> BPM known", ms(t));
+                    }
+                }
+            }
+            for (what, mut v) in rows {
+                v.sort_by(f64::total_cmp);
+                println!("LATENCY {file} | {what} | median {:.0} ms | runs {:?}", v[v.len() / 2], v.iter().map(|x| x.round() as i64).collect::<Vec<_>>());
+            }
+        }
+    }
+
+    /// Polls like the GUI until the preview's file is decoded (or it failed and was stopped).
+    fn settle_preview(app: &mut ReTraktorApp) {
+        let t0 = std::time::Instant::now();
+        while app.preview.as_ref().is_some_and(|p| !p.pcm.complete()) {
+            assert!(t0.elapsed() < std::time::Duration::from_secs(10), "the preview never finished loading");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            app.poll_preview();
+        }
+    }
+
+    fn previewing(app: &ReTraktorApp) -> Option<usize> {
+        app.preview.as_ref().map(|p| p.track)
+    }
+
+    /// Peaks of the main (1–2) and headphone (3–4) outputs over `blocks` 256-frame 48 kHz blocks of the real callback.
+    fn output_peaks(app: &ReTraktorApp, blocks: usize) -> (f32, f32) {
+        let (mut main, mut phones, mut buf) = (0.0f32, 0.0f32, vec![0.0f32; 256 * 4]);
+        for _ in 0..blocks {
+            app.audio.render_with(&mut buf, 4, 48_000, |x| x);
+            for f in buf.chunks(4) {
+                main = main.max(f[0].abs()).max(f[1].abs());
+                phones = phones.max(f[2].abs()).max(f[3].abs());
+            }
+        }
+        (main, phones)
+    }
+
+    /// Whatever the preview did, the decks, the history and the set are as they were.
+    fn decks_untouched(app: &ReTraktorApp, pcm: &[Arc<Vec<f32>>; 2], set: &[usize]) {
+        let s = app.audio.shared.lock().unwrap();
+        for d in 0..2 {
+            assert!(Arc::ptr_eq(&s.loaded_tracks[d].as_ref().unwrap().pcm_stereo, &pcm[d]), "deck {d} changed track");
+        }
+        assert_eq!(s.is_playing, [true, true, false, false]);
+        drop(s);
+        assert_eq!(app.deck_track_ids, [Some(90), Some(91), None, None]);
+        assert!(app.library.history.is_empty() && app.library.pending_loads.is_empty() && !app.deck_loading.iter().any(|&l| l));
+        assert_eq!(app.set_state.set_list.track_ids, set);
+    }
+
+    /// The controller's Preview button (left and right, presses only) and the shared press logic, with both
+    /// decks playing: it plays the selected WAV in the headphones and nowhere else; another selection replaces
+    /// it at once; the same press stops it. A decode that finishes after a replacement or a stop is never
+    /// heard. A preview that runs out ends, so the same track starts again. A file that isn't audio, a missing
+    /// file and an output with no headphone route are refused with a message, and losing the route stops it.
+    #[test]
+    fn library_preview_presses_replace_stop_and_end() {
+        let (dir, mut app) = preview_app("presses");
+        let pcm = { let s = app.audio.shared.lock().unwrap(); [0, 1].map(|d| Arc::clone(&s.loaded_tracks[d].as_ref().unwrap().pcm_stereo)) };
+        let set = app.set_state.set_list.track_ids.clone();
+        let press = |app: &mut ReTraktorApp, side: &str, pressed: bool| {
+            app.apply_mx2_surface_event(SurfaceEvent::Button { control: format!("surface.{side}.browse.preview"), pressed });
+        };
+        let playing = previewing;
+
+        // Left Preview on track 1: in the headphones only. A release does nothing.
+        app.library.selected_track_id = Some(1);
+        press(&mut app, "left", true);
+        press(&mut app, "left", false);
+        assert_eq!(previewing(&app), Some(1));
+        settle_preview(&mut app);
+        assert_eq!(playing(&app), Some(1), "{}", app.library.status_message);
+        let (main, phones) = output_peaks(&app, 4);
+        assert!(phones > 0.1 && main == 0.0, "headphones {phones}, main {main}");
+
+        // Right Preview on track 2 replaces it at once: track 1 is never heard again, 2 plays.
+        app.library.selected_track_id = Some(2);
+        let first = Arc::clone(&app.preview.as_ref().unwrap().pcm);
+        press(&mut app, "right", true);
+        assert_eq!(previewing(&app), Some(2));
+        let (_, phones) = output_peaks(&app, 1);
+        let p = app.audio.shared.lock().unwrap().preview_progress;
+        assert!(p.serial == app.preview.as_ref().unwrap().serial && !Arc::ptr_eq(&first, &app.preview.as_ref().unwrap().pcm), "track 1 played on");
+        assert!(phones == 0.0 || p.started, "something played before track 2 had started");
+        settle_preview(&mut app);
+        assert_eq!(playing(&app), Some(2));
+        assert!(output_peaks(&app, 2).1 > 0.1);
+
+        // The same press stops it.
+        press(&mut app, "right", true);
+        assert!(app.preview.is_none() && app.library.status_message.contains("Stopped"), "{}", app.library.status_message);
+        assert_eq!(output_peaks(&app, 1).1, 0.0);
+
+        // Replaced while still decoding, and stopped while decoding: whatever lands later is never heard.
+        app.press_preview(Some(5));
+        app.press_preview(Some(2));
+        settle_preview(&mut app);
+        assert_eq!(playing(&app), Some(2));
+        app.press_preview(Some(5));
+        app.press_preview(None);
+        std::thread::sleep(std::time::Duration::from_millis(300)); // the worker, if it got that far
+        app.poll_preview();
+        assert!(app.preview.is_none(), "{:?}", previewing(&app));
+        assert_eq!(output_peaks(&app, 2).1, 0.0, "a decode finished after the stop was heard");
+
+        // Track 1 (0.3 s) runs out: the preview ends and the same track starts again from its top.
+        app.press_preview(Some(1));
+        settle_preview(&mut app);
+        output_peaks(&app, 70); // 0.37 s
+        app.poll_preview();
+        assert!(app.preview.is_none() && app.library.status_message.contains("finished"), "{}", app.library.status_message);
+        assert_eq!(output_peaks(&app, 1).1, 0.0);
+        app.press_preview(Some(1));
+        settle_preview(&mut app);
+        assert_eq!(playing(&app), Some(1));
+        assert!(output_peaks(&app, 2).1 > 0.1, "the restarted preview is silent");
+
+        // A missing file or a track gone from the collection never replaces it: track 1 plays on, and says so.
+        for (id, why) in [(4, "File not found for 'Track 4'"), (99, "no longer in the collection")] {
+            app.press_preview(Some(id));
+            let msg = &app.library.status_message;
+            assert!(msg.contains(why) && msg.contains("still previewing 'Track 1'"), "{msg}");
+            assert_eq!(playing(&app), Some(1));
+        }
+        assert!(output_peaks(&app, 1).1 > 0.1, "a refused press silenced the preview");
+        app.press_preview(None);
+
+        // Not audio, and missing: refused with a message.
+        app.press_preview(Some(3));
+        settle_preview(&mut app);
+        assert!(app.preview.is_none() && app.library.status_message.contains("Could not preview 'Track 3'"), "{}", app.library.status_message);
+        app.press_preview(Some(4));
+        assert!(app.preview.is_none() && app.library.status_message.contains("File not found"), "{}", app.library.status_message);
+
+        // A stereo card with headphones on 3–4: refused. Split cue: the left ear. Back to 3–4 on stereo: stopped.
+        app.audio.output_channels = 2;
+        app.press_preview(Some(1));
+        assert!(app.preview.is_none() && app.library.status_message.contains("no free channels 3–4"), "{}", app.library.status_message);
+        app.preferences.split_cue = true;
+        app.apply_audio_output();
+        app.press_preview(Some(1));
+        settle_preview(&mut app);
+        let mut stereo = vec![0.0f32; 256 * 2];
+        app.audio.render_with(&mut stereo, 2, 48_000, |x| x);
+        assert!(stereo.chunks(2).any(|f| f[0].abs() > 0.05) && stereo.chunks(2).all(|f| f[1] == 0.0), "split: the preview belongs in the left ear only");
+        app.preferences.split_cue = false;
+        app.apply_audio_output();
+        app.poll_preview();
+        assert!(app.preview.is_none() && app.library.status_message.contains("Stopped the preview"), "{}", app.library.status_message);
+        app.audio.render_with(&mut stereo, 2, 48_000, |x| x);
+        assert!(stereo.iter().all(|&x| x == 0.0), "the preview reached the main output");
+
+        // A route lost while the preview is still decoding: stopped with a message, never played.
+        app.audio.output_channels = 4;
+        app.press_preview(Some(2));
+        app.audio.output_channels = 2;
+        app.poll_preview();
+        assert!(app.preview.is_none() && app.library.status_message.contains("Stopped the preview of 'Track 2'"), "{}", app.library.status_message);
+        assert_eq!(output_peaks(&app, 2).1, 0.0, "the late decode was heard");
+
+        decks_untouched(&app, &pcm, &set);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A routing change goes through the same step `update` runs, and the very first block after it is already
+    /// mapped the new way, before any later UI sync, with deck A audible on the main output and a preview live.
+    /// Split off on a stereo card reopens the output: the preview never lands in the left speaker (both
+    /// speakers carry the same main mix), then it stops with a message. Swapping main and headphone pairs on a
+    /// four-channel card, then split on, keep the stream: the preview carries on from where it had got to.
+    #[test]
+    fn reopened_output_maps_the_preview_on_its_very_first_block() {
+        let (dir, mut app) = preview_app("reroute");
+        {
+            let mut deck = track(120.0);
+            deck.duration_sec = 4.0;
+            deck.pcm_stereo = Arc::new(
+                (0..44_100 * 4)
+                    .flat_map(|i| {
+                        let v = (i as f32 * 300.0 * std::f32::consts::TAU / 44_100.0).sin() * 0.5;
+                        [v, v]
+                    })
+                    .collect(),
+            );
+            app.audio.shared.lock().unwrap().loaded_tracks[0] = Some(deck);
+        }
+        let first_block = |app: &ReTraktorApp, channels: usize| {
+            let mut buf = vec![0.0f32; 256 * channels];
+            app.audio.render_with(&mut buf, channels, 48_000, |x| x);
+            buf
+        };
+        let progress = |app: &ReTraktorApp| app.audio.shared.lock().unwrap().preview_progress;
+
+        // Split cue on a stereo card: the preview in the left ear, the main mix in the right.
+        app.preferences.split_cue = true;
+        app.audio.output_channels = 2;
+        app.apply_audio_output();
+        app.sync_audio_state();
+        app.press_preview(Some(1));
+        settle_preview(&mut app);
+        let split = first_block(&app, 2);
+        assert!(split.chunks(2).any(|f| (f[0] - f[1]).abs() > 0.05), "split: the preview isn't in the left ear");
+
+        // Split off, same stereo card: the reopened stream's first block is the main mix on both speakers.
+        app.preferences.split_cue = false;
+        app.apply_audio_output();
+        let first = first_block(&app, 2);
+        assert!(first.iter().any(|x| x.abs() > 0.05), "the main mix is silent");
+        assert!(first.chunks(2).all(|f| f[0] == f[1]), "the preview reached the left speaker in the new stream's first block");
+        app.poll_preview();
+        assert!(app.preview.is_none() && app.library.status_message.contains("no free channels 3–4"), "{}", app.library.status_message);
+
+        // 3–4 on a four-channel card, then main and headphones swapped as on a Xone:K2 (main on its rear 3–4,
+        // headphones in the front 1–2). The same stream plays on, and its very next block has the preview on
+        // 1–2 and deck A on 3–4 only, with the preview carrying on.
+        app.audio.output_channels = 4;
+        app.press_preview(Some(1));
+        settle_preview(&mut app);
+        let on_34 = first_block(&app, 4);
+        assert!(on_34.chunks(4).any(|f| f[2].abs() > 0.05), "the preview isn't on 3–4");
+        let (before, opens) = (progress(&app), app.audio.opens);
+        let device = app.preferences.audio_device_name.clone();
+        app.preferences.output_pairs.insert(device, [1, 0]);
+        app.apply_audio_output();
+        let swapped = first_block(&app, 4);
+        assert_eq!(app.audio.opens, opens, "swapping the pairs reopened the output");
+        // Deck A (main) and the preview (headphones) peak at different levels: the pairs traded places whole.
+        let peaks = |block: &[f32]| block.chunks(4).fold([0.0f32; 4], |p, f| std::array::from_fn(|c| p[c].max(f[c].abs())));
+        let (was, now) = (peaks(&on_34), peaks(&swapped));
+        assert!((was[0] - was[2]).abs() > 0.05 && was[0] == was[1] && was[2] == was[3], "deck A and the preview can't be told apart: {was:?}");
+        assert!((now[0] - was[2]).abs() < 0.01 && (now[2] - was[0]).abs() < 0.01 && now[0] == now[1] && now[2] == now[3], "the pairs didn't swap: {was:?} then {now:?}");
+        let after = progress(&app);
+        assert_eq!((after.serial, after.ended), (before.serial, false));
+        assert!((after.frame - before.frame - 256.0 * 44_100.0 / 48_000.0).abs() < 1e-6, "the preview didn't carry on: {before:?} then {after:?}");
+
+        // Then split cue on: 1–2 on the same stream, the preview going on in the left ear; stereo works too.
+        let before = progress(&app);
+        app.preferences.split_cue = true;
+        app.apply_audio_output();
+        app.audio.output_channels = 2; // as on a stereo stream
+        let first = first_block(&app, 2);
+        assert!(first.chunks(2).any(|f| (f[0] - f[1]).abs() > 0.05), "the preview dropped out of the new stream's first block");
+        let after = progress(&app);
+        assert_eq!((after.serial, after.ended), (before.serial, false));
+        assert!((after.frame - before.frame - 256.0 * 44_100.0 / 48_000.0).abs() < 1e-6, "the preview didn't carry on: {before:?} then {after:?}");
+        app.poll_preview();
+        assert_eq!(previewing(&app), Some(1));
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The output reopens only when it must. A routing the open stream has the channels for, or whose width was
+    /// already asked of these settings, plays on the stream as it is: a stereo card or a failed open isn't
+    /// retried every frame, Split cue on and off included. A new width the stream lacks reopens once, also back
+    /// to a narrower viable one; an eight-channel stream asked for four takes 5–6 and 7–8 live. Rescan tries
+    /// again once while nothing plays, and leaves a working output alone.
+    #[test]
+    fn output_reopens_only_when_a_route_needs_it() {
+        let mut app = ReTraktorApp::default();
+        app.preferences.split_cue = false;
+        app.preferences.output_pairs.clear();
+        app.preferences.audio_device_name = "pw:k2".into();
+        let set = |app: &mut ReTraktorApp, pairs: Option<[u8; 2]>, split: bool| {
+            app.preferences.output_pairs.extend(pairs.map(|p| ("pw:k2".to_string(), p)));
+            app.preferences.split_cue = split;
+            app.apply_audio_output();
+            app.apply_audio_output(); // the next frame
+            app.audio.opens
+        };
+        let first = set(&mut app, None, false);
+        app.audio.output_channels = 2; // what a stereo card gives for 1–2 and 3–4
+        assert_eq!([set(&mut app, None, true), set(&mut app, None, false)], [first; 2], "a stereo card reopened");
+        assert_eq!(set(&mut app, Some([2, 0]), false), first + 1, "main 5–6 is a new width");
+        assert_eq!(set(&mut app, Some([1, 0]), false), first + 2, "back to four channels");
+        app.audio.output_channels = 8;
+        for pairs in [[2, 0], [3, 2], [1, 3]] {
+            assert_eq!(set(&mut app, Some(pairs), false), first + 2, "{pairs:?} reopened an eight-channel stream");
+        }
+        assert_eq!(app.audio.output_route, crate::audio::OutputRoute::Pairs { main: 1, headphones: Some(3) });
+        assert_eq!(set(&mut app, Some([1, 0]), false), first + 2);
+
+        app.preferences.audio_rescanned = true;
+        assert_eq!(set(&mut app, None, false), first + 2, "Rescan reopened a working output");
+        assert!(!app.preferences.audio_rescanned);
+        app.audio.output_channels = 0; // the chosen card was missing and nothing opened
+        assert_eq!(set(&mut app, None, false), first + 2, "a failed open is retried every frame");
+        app.preferences.audio_rescanned = true;
+        assert_eq!(set(&mut app, None, false), first + 3, "Rescan didn't try the chosen card again");
+    }
+
+    /// The browser in real frames, 1024 px wide: Preview in the toolbar for the selected track (greyed out with
+    /// none), lit while that track previews. One Stop preview, in the status bar, from the press on, after the
+    /// selection moves to another track, in the Explorer, under a message far wider than the window, and
+    /// with the collection emptied; each click on it stops the preview.
+    #[test]
+    fn preview_toggle_in_the_toolbar_and_one_stop_in_every_browser_view() {
+        use egui::accesskit::Role;
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1024.0, 1000.0));
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        ctx.enable_accesskit();
+        let (dir, mut app) = preview_app("toolbar");
+        let pcm = { let s = app.audio.shared.lock().unwrap(); [0, 1].map(|d| Arc::clone(&s.loaded_tracks[d].as_ref().unwrap().pcm_stereo)) };
+        let set = app.set_state.set_list.track_ids.clone();
+        app.layout = TraktorLayout::Browser;
+        let mut time = 0.0;
+        let mut frame = |app: &mut ReTraktorApp, events: Vec<egui::Event>| -> Vec<Node> {
+            time += 0.1;
+            workspace_frame(&ctx, app, screen, time, events)
+        };
+        let button = |nodes: &[Node], name: &str| nodes.iter().find(|n| n.0 == name && n.1 == Role::Button).cloned();
+        // The only Stop preview, and on screen.
+        let stop = |nodes: &[Node], when: &str| {
+            let stops: Vec<&Node> = nodes.iter().filter(|n| n.0 == "Stop preview" && n.1 == Role::Button).collect();
+            assert!(stops.len() == 1 && screen.contains_rect(stops[0].2) && !stops[0].3, "{when}: Stop preview {stops:?}");
+            stops[0].2.center()
+        };
+        let settle = |app: &mut ReTraktorApp, frame: &mut dyn FnMut(&mut ReTraktorApp, Vec<egui::Event>) -> Vec<Node>| {
+            (0..4).map(|_| frame(app, vec![])).last().unwrap()
+        };
+        let click = |app: &mut ReTraktorApp, frame: &mut dyn FnMut(&mut ReTraktorApp, Vec<egui::Event>) -> Vec<Node>, at: egui::Pos2| {
+            let press = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+            frame(app, vec![egui::Event::PointerMoved(at)]);
+            frame(app, vec![press(true)]);
+            frame(app, vec![press(false)]);
+            frame(app, vec![])
+        };
+
+        let nodes = settle(&mut app, &mut frame);
+        assert!(button(&nodes, "Preview").expect("no Preview button").3, "Preview is enabled with nothing selected");
+        assert!(button(&nodes, "Stop preview").is_none(), "Stop preview with nothing previewing");
+        app.library.selected_track_id = Some(1);
+        let nodes = settle(&mut app, &mut frame);
+        let preview = button(&nodes, "Preview").expect("no Preview button");
+        assert!(!preview.3 && screen.contains_rect(preview.2), "Preview is greyed out or off screen: {preview:?}");
+        let nodes = click(&mut app, &mut frame, preview.2.center());
+        assert_eq!(previewing(&app), Some(1));
+        stop(&nodes, "loading");
+        settle_preview(&mut app);
+        stop(&frame(&mut app, vec![]), "playing");
+
+        // Another selection: Preview offers it, and the one Stop preview stops track 1.
+        app.library.selected_track_id = Some(2);
+        let nodes = frame(&mut app, vec![]);
+        assert!(button(&nodes, "Preview").is_some_and(|b| !b.3));
+        click(&mut app, &mut frame, stop(&nodes, "after reselecting"));
+        assert!(app.preview.is_none(), "{:?}", previewing(&app));
+        assert_eq!(output_peaks(&app, 1).1, 0.0);
+
+        // The Explorer, under a message far wider than the window: still one Stop preview, on screen.
+        app.press_preview(Some(2));
+        settle_preview(&mut app);
+        app.library.selected_nav = crate::library_ui::NavItem::Explorer;
+        app.library.status_message = "Previewing a track whose title goes on and on ".repeat(12);
+        let nodes = settle(&mut app, &mut frame);
+        click(&mut app, &mut frame, stop(&nodes, "Explorer, long message"));
+        assert!(app.preview.is_none(), "{:?}", previewing(&app));
+
+        // An emptied collection.
+        app.library.selected_nav = crate::library_ui::NavItem::Collection;
+        app.press_preview(Some(1));
+        settle_preview(&mut app);
+        app.library.tracks.clear();
+        app.library.rebuild_index();
+        let nodes = settle(&mut app, &mut frame);
+        click(&mut app, &mut frame, stop(&nodes, "empty collection"));
+        assert!(app.preview.is_none(), "{:?}", previewing(&app));
+        assert_eq!(output_peaks(&app, 1).1, 0.0);
+
+        decks_untouched(&app, &pcm, &set);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// How much of `x` is high frequency (squared slope over energy): about 0.0015 for 300 Hz at 48 kHz, 0.15 for 3 kHz.
+    fn brightness(x: &[f32]) -> f32 {
+        let slope: f32 = x.windows(2).map(|w| (w[1] - w[0]).powi(2)).sum();
+        slope / x.iter().map(|v| v * v).sum::<f32>().max(1e-9)
+    }
+
+    /// Renders 256-frame blocks (polling like the GUI) until the preview is heard on 3–4. Returns the left
+    /// headphone samples from where they start, and the preview's progress after that block.
+    fn first_heard(app: &mut ReTraktorApp) -> (Vec<f32>, crate::audio::PreviewProgress) {
+        let t0 = std::time::Instant::now();
+        let mut buf = vec![0.0f32; 256 * 4];
+        loop {
+            app.poll_preview();
+            app.audio.render_with(&mut buf, 4, 48_000, |x| x);
+            let left: Vec<f32> = buf.iter().skip(2).step_by(4).copied().collect();
+            if let Some(from) = left.iter().position(|x| x.abs() > 1e-4) {
+                return (left[from + 1..].to_vec(), app.audio.shared.lock().unwrap().preview_progress);
+            }
+            assert!(t0.elapsed() < std::time::Duration::from_secs(10) && app.preview.is_some(), "the preview was never heard: {}", app.library.status_message);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    /// The Preview column in real frames, 1024 px wide: every row's waveform sits just left of its title, about
+    /// 150 by 18 px. A plain click on track 5's waveform, never selected and with nothing decoded for it yet,
+    /// selects it and starts its preview three quarters in (its 3 kHz half); another, a quarter along, moves that
+    /// same preview (the 300 Hz half). Track 6, never selected, gets its real waveform from a peaks-only decode, and
+    /// files that can't be read are marked once and not tried again. A click halfway along track 6 replaces the
+    /// preview there. Double-clicking a waveform never loads a deck; double-clicking a title still does.
+    #[test]
+    fn row_waveforms_click_to_start_and_move_the_preview() {
+        use egui::accesskit::Role;
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1024.0, 1000.0));
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        ctx.enable_accesskit();
+        let (dir, mut app) = preview_app("rows");
+        let pcm = { let s = app.audio.shared.lock().unwrap(); [0, 1].map(|d| Arc::clone(&s.loaded_tracks[d].as_ref().unwrap().pcm_stereo)) };
+        let set = app.set_state.set_list.track_ids.clone();
+        app.layout = TraktorLayout::Browser;
+        let mut time = 0.0;
+        let mut frame = |app: &mut ReTraktorApp, events: Vec<egui::Event>| -> Vec<Node> {
+            time += 0.1;
+            workspace_frame(&ctx, app, screen, time, events)
+        };
+        // `clicks` plain clicks at one spot, a frame apart (two make a double-click), then a pause.
+        let click = |app: &mut ReTraktorApp, frame: &mut dyn FnMut(&mut ReTraktorApp, Vec<egui::Event>) -> Vec<Node>, at: egui::Pos2, clicks: usize| {
+            let press = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+            frame(app, vec![egui::Event::PointerMoved(at)]);
+            for _ in 0..clicks {
+                frame(app, vec![press(true)]);
+                frame(app, vec![press(false)]);
+            }
+            frame(app, vec![]);
+            frame(app, vec![]);
+        };
+        // Track `id`'s waveform and title, on screen and in one row.
+        let row = |nodes: &[Node], id: usize| {
+            let wave = nodes.iter().find(|n| n.0.starts_with(&format!("Waveform of 'Track {id}'")) && n.1 == Role::Button).unwrap_or_else(|| panic!("no waveform for track {id}"));
+            let title = nodes.iter().find(|n| n.0 == format!("Track {id}") && n.1 == Role::Label).unwrap_or_else(|| panic!("no title for track {id}")).2;
+            assert!(screen.contains_rect(wave.2) && screen.contains_rect(title), "track {id} is off screen: {:?} {title:?}", wave.2);
+            assert!(wave.2.right() <= title.left() + 1.0 && (wave.2.center().y - title.center().y).abs() < 2.0, "track {id}'s waveform isn't just left of its title: {:?} {title:?}", wave.2);
+            assert!((140.0..=151.0).contains(&wave.2.width()) && (wave.2.height() - 18.0).abs() < 0.5, "track {id}'s waveform is {:?}", wave.2.size());
+            (wave.0.clone(), wave.2)
+        };
+        let along = |r: egui::Rect, f: f32| egui::pos2(r.left() + f * r.width(), r.center().y);
+
+        let nodes = (0..3).map(|_| frame(&mut app, vec![])).last().unwrap();
+        let ((label5, wave5), (_, wave6)) = (row(&nodes, 5), row(&nodes, 6));
+        assert!(wave6.top() >= wave5.bottom(), "track 6's row isn't below track 5's");
+        assert!(label5.ends_with("(preparing)") && app.library.row_waveforms.is_empty() && app.library.selected_track_id.is_none(), "{label5}");
+
+        click(&mut app, &mut frame, along(wave5, 0.75), 1);
+        assert_eq!((app.library.selected_track_id, previewing(&app)), (Some(5), Some(5)));
+        let serial = app.preview.as_ref().unwrap().serial;
+        let (heard, p) = first_heard(&mut app);
+        let frames = 3.0 * 44_100.0;
+        assert!(p.started && (p.frame / frames - 0.75).abs() < 0.01, "{p:?}");
+        assert!(brightness(&heard) > 0.05, "three quarters in isn't the 3 kHz half: {}", brightness(&heard));
+
+        click(&mut app, &mut frame, along(wave5, 0.25), 1);
+        let (heard, p) = first_heard(&mut app);
+        assert!(p.serial == serial && (p.frame / frames - 0.25).abs() < 0.01, "the click restarted the preview or missed: {p:?}");
+        assert!(brightness(&heard) < 0.02, "a quarter in isn't the 300 Hz half: {}", brightness(&heard));
+        frame(&mut app, vec![]);
+        let at = app.library.preview_position.unwrap();
+        assert!((at - 0.25).abs() < 0.01, "the row shows the preview at {at}");
+
+        // The rows in view get their waveforms one at a time, unselected ones included.
+        let t0 = std::time::Instant::now();
+        let finished = |app: &ReTraktorApp, id: usize| app.library.row_waveforms.get(&id).is_some_and(|w| w.made_from.is_none());
+        while !(1..=6).all(|id| finished(&app, id)) {
+            assert!(t0.elapsed() < std::time::Duration::from_secs(20), "rows never finished: {:?}", app.library.row_waveforms.keys().collect::<Vec<_>>());
+            app.poll_preview();
+            frame(&mut app, vec![]);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let six = &app.library.row_waveforms[&6];
+        let (peaks, length) = six.peaks.as_ref().unwrap();
+        assert!(peaks.len() == crate::overview::OVERVIEW_COLUMNS && peaks.iter().all(|c| c.total > 0) && *length == Some(2.0), "track 6: {} columns, {length:?}", peaks.len());
+        assert!(app.library.row_waveforms[&3].peaks.is_err() && app.library.row_waveforms[&4].peaks.is_err(), "unreadable files have waveforms");
+        assert!(!app.prepared.iter().any(|(t, _)| *t == 6) && previewing(&app) == Some(5), "track 6 was decoded as a preview");
+        for _ in 0..3 {
+            app.poll_preview();
+            frame(&mut app, vec![]);
+        }
+        assert!(app.row_job.is_none(), "a finished or unreadable row is decoded again");
+        let nodes = frame(&mut app, vec![]);
+        assert!(row(&nodes, 6).0.ends_with("from there") && row(&nodes, 3).0.contains("Can't read this file"), "{:?}", row(&nodes, 3).0);
+
+        // A click on the unreadable row selects it and says why; track 5 plays on.
+        click(&mut app, &mut frame, along(row(&nodes, 3).1, 0.5), 1);
+        assert_eq!((app.library.selected_track_id, previewing(&app), app.preview.as_ref().unwrap().serial), (Some(3), Some(5), serial));
+        let msg = &app.library.status_message;
+        assert!(msg.contains("Can't preview 'Track 3'") && msg.contains("still previewing 'Track 5'"), "{msg}");
+        // Once the file is repaired, the selection's own decode of it replaces the error.
+        std::fs::copy(dir.join("six.wav"), dir.join("bad.wav")).unwrap();
+        let t0 = std::time::Instant::now();
+        while !app.library.row_waveforms[&3].peaks.as_ref().is_ok_and(|(_, length)| *length == Some(2.0)) {
+            assert!(t0.elapsed() < std::time::Duration::from_secs(20), "the repaired row still shows {:?}", app.library.row_waveforms[&3].peaks.as_ref().err());
+            app.poll_preview();
+            frame(&mut app, vec![]);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(previewing(&app), Some(5));
+
+        click(&mut app, &mut frame, along(wave6, 0.5), 1);
+        assert_eq!((app.library.selected_track_id, previewing(&app)), (Some(6), Some(6)));
+        let (_, p) = first_heard(&mut app);
+        assert!((p.frame / 96_000.0 - 0.5).abs() < 0.01, "{p:?}");
+
+        // A double-click on a waveform previews, and never loads a deck, even with the decks unlocked.
+        app.preferences.lock_playing_decks = false;
+        let (_, wave2) = row(&nodes, 2);
+        click(&mut app, &mut frame, along(wave2, 0.5), 2);
+        assert_eq!((app.library.selected_track_id, previewing(&app)), (Some(2), Some(2)));
+        decks_untouched(&app, &pcm, &set);
+        let title = nodes.iter().find(|n| n.0 == "Track 2" && n.1 == Role::Label).unwrap().2;
+        click(&mut app, &mut frame, title.center(), 2);
+        assert!(app.deck_loading.iter().any(|&l| l) && app.library.status_message.contains("Loading 'Track 2'"), "{}", app.library.status_message);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A row's waveform follows its track's file: relinked mid-decode, the old decode is dropped at once and the new
+    /// file decoded instead; a file replaced at the same path replaces even a finished waveform once a decode of the
+    /// new file (here the selection's) has been made.
+    #[test]
+    fn row_waveforms_follow_relinks_and_replaced_files() {
+        let (dir, mut app) = preview_app("relink");
+        let job = |app: &ReTraktorApp| app.row_job.as_ref().map(|(id, p)| (*id, p.path.clone()));
+        let length = |app: &ReTraktorApp| app.library.row_waveforms.get(&6).and_then(|w| w.peaks.as_ref().ok()?.1.filter(|_| w.made_from.is_none()));
+        let poll_until = |app: &mut ReTraktorApp, what: &str, done: &dyn Fn(&ReTraktorApp) -> bool| {
+            let t0 = std::time::Instant::now();
+            while !done(app) {
+                assert!(t0.elapsed() < std::time::Duration::from_secs(20), "{what}");
+                app.library.visible_rows = vec![6];
+                app.poll_preview();
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
+        app.library.visible_rows = vec![6];
+        app.poll_preview();
+        assert_eq!(job(&app), Some((6, dir.join("six.wav"))));
+        app.library.tracks.iter_mut().find(|t| t.id == 6).unwrap().file_path = Some(dir.join("five.wav"));
+        app.library.visible_rows = vec![6];
+        app.poll_preview();
+        assert_eq!(job(&app), Some((6, dir.join("five.wav"))), "the decode of the old path went on");
+        poll_until(&mut app, "the relinked row never finished", &|app| length(app) == Some(3.0));
+        assert_eq!(app.library.row_waveforms[&6].path, dir.join("five.wav"));
+
+        // five.wav replaced by a 2 s file: the selection's decode of it, finished before the app looks again, replaces
+        // the old finished waveform in one poll.
+        std::fs::copy(dir.join("six.wav"), dir.join("five.wav")).unwrap();
+        app.library.selected_track_id = Some(6);
+        let fresh = crate::audio::PreviewPcm::new(dir.join("five.wav"), 0.0);
+        app.remember_prepared(6, &fresh); // as `prepare_selection` does once the selection rests
+        app.update_preview_jobs();
+        let t0 = std::time::Instant::now();
+        while !fresh.complete() {
+            assert!(t0.elapsed() < std::time::Duration::from_secs(20), "the selection's decode never finished");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(length(&app), Some(3.0), "the old waveform changed before the app looked");
+        app.library.visible_rows = vec![6];
+        app.poll_preview();
+        assert_eq!(length(&app), Some(2.0), "the replaced file's finished decode didn't replace the old waveform");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// With a stripe cache: a row decoded once is kept (cold). Seen again, it draws the very same overview from the
+    /// cache without decoding: the file's audio is now unreadable, with the same time and size, so a decode would
+    /// fail. Once the file really changes, its old stripe is no longer used. Rows and decks draw one overview per
+    /// track: a deck loading a track its row kept draws that at once, and a deck loading a track first keeps it (after
+    /// it is playable) for the row. A selected track whose stripe is kept shows it while its audio is still decoded
+    /// in full, for a preview or a deck.
+    #[test]
+    fn rows_and_deck_loads_share_the_stripe_cache() {
+        let (dir, mut app) = preview_app("stripes");
+        app.stripes = crate::overview::StripeCache::at(dir.join("stripes"));
+        app.preview_loader = crate::audio::PreviewLoader::new(app.stripes.clone());
+        let wait = std::time::Duration::from_secs(20);
+        let row = |app: &ReTraktorApp, id: usize| app.library.row_waveforms.get(&id).filter(|w| w.made_from.is_none()).map(|w| w.peaks.clone());
+        let fresh_row = |app: &mut ReTraktorApp, id: usize, what: &str| {
+            app.library.row_waveforms.clear();
+            app.row_waveform_order.clear();
+            let t0 = std::time::Instant::now();
+            while row(app, id).is_none() {
+                assert!(t0.elapsed() < wait, "{what}");
+                app.library.visible_rows = vec![id];
+                app.poll_preview();
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            row(app, id).unwrap()
+        };
+        // Loads track `id` on deck `d` and returns its overview once `drawn` holds (or fails after a while).
+        let deck_overview = |app: &mut ReTraktorApp, d: usize, id: usize, drawn: &dyn Fn(&crate::overview::Overview) -> bool| {
+            app.library.pending_loads.push((d + 1, app.library.track(id).unwrap().clone()));
+            app.drain_pending_loads();
+            let t0 = std::time::Instant::now();
+            loop {
+                app.finish_loads();
+                let overview = app.audio.shared.lock().unwrap().loaded_tracks[d].as_ref().filter(|_| !app.deck_loading[d]).map(|t| t.overview.clone());
+                if let Some(overview) = overview.filter(|o| drawn(o)) {
+                    return overview;
+                }
+                assert!(t0.elapsed() < wait, "deck {d} never drew track {id}'s overview");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
+        let six = dir.join("six.wav");
+        let identity = crate::audio::file_identity(&six);
+        assert!(app.stripes.load(&six, identity).is_none());
+        let (cold, length) = fresh_row(&mut app, 6, "the cold row never finished").unwrap();
+        assert_eq!(length, Some(2.0));
+        let (kept, kept_length) = app.stripes.load(&six, identity).expect("the finished row wasn't kept");
+        assert!(kept == cold && (kept_length - 2.0).abs() < 0.03, "kept {kept_length} s, not the row's overview");
+
+        // Row first, then a deck, for track 5 (a low tone, then a high one): the deck draws the row's from the start.
+        let (row_five, _) = fresh_row(&mut app, 5, "track 5's row never finished").unwrap();
+        let deck_five = deck_overview(&mut app, 2, 5, &|_| true);
+        assert!(deck_five.len() == crate::overview::OVERVIEW_COLUMNS && deck_five == row_five, "the deck doesn't draw track 5's row");
+
+        // A deck first, for track 2: once playable it keeps the overview it then draws, and the row finds it.
+        let (two, stripes) = (dir.join("two.wav"), app.stripes.clone());
+        let deck_two = deck_overview(&mut app, 3, 2, &|o| stripes.load(&two, crate::audio::file_identity(&two)).is_some_and(|(kept, _)| kept == *o));
+        assert_eq!(fresh_row(&mut app, 2, "track 2's row never finished").unwrap().0, deck_two, "the row doesn't draw deck D's");
+
+        // Selected with a stripe kept (made up, so it can't come from the audio): shown at once, audio decoded in full.
+        let one = dir.join("one.wav");
+        let made_up: Vec<[f32; 3]> = (0..18).map(|j| [0.1 + j as f32 / 20.0, 0.3, 0.2]).collect();
+        let made_up_overview = app.stripes.store(&one, crate::audio::file_identity(&one), &made_up, 0.3).unwrap();
+        app.library.row_waveforms.clear();
+        app.library.selected_track_id = Some(1);
+        app.poll_preview();
+        std::thread::sleep(BROWSE_SETTLE + std::time::Duration::from_millis(20));
+        let t0 = std::time::Instant::now();
+        while !app.prepared_for(1).is_some_and(|p| p.complete()) || row(&app, 1).is_none() {
+            assert!(t0.elapsed() < wait, "track 1's selection never finished");
+            app.poll_preview();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(row(&app, 1).unwrap().unwrap().0, made_up_overview, "the selected row didn't draw the kept stripe");
+        let selected = Arc::clone(app.prepared_for(1).unwrap());
+        assert!(selected.failed().is_none() && selected.to_vec().is_some_and(|pcm| pcm.len() == 2 * 13_230), "the selection's audio wasn't decoded in full");
+
+        let (modified, size) = identity.unwrap();
+        std::fs::write(&six, vec![0u8; size as usize]).unwrap();
+        std::fs::File::options().write(true).open(&six).unwrap().set_modified(modified).unwrap();
+        assert_eq!(crate::audio::file_identity(&six), identity);
+        let (warm, warm_length) = fresh_row(&mut app, 6, "the warm row never finished").expect("the warm row was decoded");
+        assert!(warm == cold && warm_length == Some(kept_length));
+
+        std::fs::write(&six, vec![0u8; size as usize]).unwrap(); // a new modified time
+        assert!(fresh_row(&mut app, 6, "the changed file's row never finished").is_err(), "a changed file kept its old stripe");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Browsing quickly decodes nothing until the selection rests, then only the track it rests on; at most three
+    /// decodes are kept. A click on an overview before that track's decode has even begun lands where it pointed.
+    #[test]
+    fn browsing_waits_for_a_rest_and_early_clicks_land_where_they_point() {
+        let (dir, mut app) = preview_app("browse");
+        for id in [1, 2, 5, 6, 5, 1, 6] {
+            app.library.selected_track_id = Some(id);
+            app.poll_preview();
+        }
+        assert!(app.prepared.is_empty(), "browsing decoded before the selection rested");
+        std::thread::sleep(BROWSE_SETTLE + std::time::Duration::from_millis(50));
+        app.poll_preview();
+        assert_eq!(app.prepared.iter().map(|(t, _)| *t).collect::<Vec<_>>(), [6]);
+        assert!(app.preview.is_none(), "browsing started a preview");
+
+        app.library.selected_track_id = Some(5);
+        app.click_overview(5, 0.75);
+        let (heard, p) = first_heard(&mut app);
+        assert!((p.frame / (3.0 * 44_100.0) - 0.75).abs() < 0.005, "the early click landed at {p:?}");
+        assert!(brightness(&heard) > 0.05, "not the 3 kHz half: {}", brightness(&heard));
+        for id in [1, 2] {
+            app.library.selected_track_id = Some(id);
+            app.poll_preview();
+            std::thread::sleep(BROWSE_SETTLE + std::time::Duration::from_millis(20));
+            app.poll_preview();
+        }
+        assert!(app.prepared.len() <= 3 && app.prepared.iter().any(|(t, _)| *t == 5), "{:?}", app.prepared.iter().map(|(t, _)| *t).collect::<Vec<_>>());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Loads unanalysed track `id` on deck `d` (0-based), holding back its analysis: the load's result and then its
+    /// analysis come out of the channels, the load is applied, and the analysis is returned to apply later.
+    fn load_holding_analysis(app: &mut ReTraktorApp, d: usize, id: usize) -> Option<DeckResult> {
+        let wait = std::time::Duration::from_secs(30);
+        let track = app.library.track(id).cloned().unwrap();
+        app.library.pending_loads.push((d + 1, track));
+        app.drain_pending_loads();
+        let loaded = app.load_channel.1.recv_timeout(wait).unwrap();
+        // Past the load's overview, which comes first.
+        let analysis = std::iter::from_fn(|| app.load_channel.1.recv_timeout(wait).ok()).find(|r| !matches!(r, DeckResult::Overview(..)));
+        app.load_channel.0.send(loaded).unwrap();
+        app.finish_loads();
+        analysis
+    }
+
+    /// A deck load of a track with no BPM or key is playable before its analysis, which shows as pending. Meanwhile
+    /// sync, grid edits and loops wait (no loop sized by a made-up tempo), and play, a moved playhead and hot cues
+    /// the DJ set and then cleared all stay as they are when the analysis lands. It fills in BPM and key but keeps
+    /// the track's grid cue (at 0 s) and its phrases from the library. Analyses from an earlier load, or for other
+    /// audio, leave the deck alone. Auto hot cues follow the track's hand edits, whichever deck made them: a deck
+    /// replaced before its analysis lands still gives an unedited track its auto cues, while an edit on another deck
+    /// holding the same track keeps them out; the saved collection agrees after a reload. A tagged BPM shows at once
+    /// while only the key is pending, and stays when it lands.
+    #[test]
+    fn deck_plays_before_its_analysis_and_keeps_what_was_done_meanwhile() {
+        let (dir, mut app) = preview_app("analysis");
+        let d = 2;
+        let phrases = vec![retraktor_library::Phrase { start_sec: 0.5, kind: retraktor_library::PhraseKind::Build }];
+        if let Some(t) = app.library.tracks.iter_mut().find(|t| t.id == 5) {
+            let grid = retraktor_formats::nml::NmlCue { name: "Grid".into(), displ_order: 0, cue_type: retraktor_core::CueType::Grid, start_ms: 0.0, len_ms: 0.0, repeats: -1, hotcue: -1, grid_bpm: None };
+            t.cues.push(grid);
+            t.phrases = phrases.clone();
+        }
+        let Some(DeckResult::Analysis(_, generation, id, analysis, audio, kept)) = load_holding_analysis(&mut app, d, 5) else { panic!("no analysis") };
+        assert!(app.deck_analysing[d] && !app.deck_loading[d]);
+        assert_eq!((bpm_text(0.0, 0.0, true), key_text("", true), bpm_text(0.0, 0.0, false)), ("…".to_string(), "…", "—".to_string()));
+
+        app.toggle_play(d + 1);
+        app.audio.shared.lock().unwrap().seek_to(d, 1.0);
+        app.jump_to_cue(d + 1, 3); // sets hot cue 3 here (deck and library)...
+        app.deck_hotcues[d].clear(); // ...and the DJ clears it again, deck and library, as a right-click does
+        app.library.set_hotcues(5, &[]);
+        app.deck_sync_enabled[d] = true;
+        app.adjust_deck_grid(d, 0.1, 2.0);
+        app.toggle_loop(d + 1);
+        assert!(!app.deck_loop_active[d] && app.library.status_message.contains("wait for its BPM"), "{}", app.library.status_message);
+        app.sync_audio_state();
+        output_peaks(&app, 10);
+        let (bpm, ratio, at, looping) = {
+            let s = app.audio.shared.lock().unwrap();
+            (s.loaded_tracks[d].as_ref().unwrap().bpm, s.pitch_ratio[d], s.playhead_sec[d], s.loop_active[d])
+        };
+        assert_eq!((bpm, ratio, looping), (0.0, 1.0, false), "a grid edit, sync or loop acted on a deck with no grid");
+        assert!(at > 1.0, "the deck isn't playing on from 1 s: {at}");
+
+        let mut late = analysis.clone();
+        late.beatgrid_offset_sec = 1.23; // so a replaced grid would show
+        for stale in [DeckResult::Analysis(d, generation - 1, id, late.clone(), Arc::clone(&audio), kept), DeckResult::Analysis(d, generation, id, late.clone(), Arc::new(vec![0.0; 4]), kept)] {
+            app.load_channel.0.send(stale).unwrap();
+        }
+        app.finish_loads();
+        assert!(app.deck_analysing[d] && app.audio.shared.lock().unwrap().loaded_tracks[d].as_ref().unwrap().bpm == 0.0, "a stale analysis landed");
+
+        app.load_channel.0.send(DeckResult::Analysis(d, generation, id, late.clone(), audio, kept)).unwrap();
+        app.finish_loads();
+        let s = app.audio.shared.lock().unwrap();
+        let t = s.loaded_tracks[d].as_ref().unwrap();
+        assert!(t.bpm == late.bpm && t.bpm > 0.0 && t.key == late.key_open, "BPM {} key {}", t.bpm, t.key);
+        assert_eq!((t.grid_offset_sec, &t.phrases), (0.0, &phrases), "the library's grid cue or phrases were replaced");
+        assert!(s.is_playing[d] && s.playhead_sec[d] >= at, "the analysis moved or stopped the deck");
+        drop(s);
+        assert!(!app.deck_analysing[d]);
+        assert!(app.deck_hotcues[d].is_empty(), "hot cues the DJ cleared came back: {:?}", app.deck_hotcues[d]);
+        // Deck A loads track 2, then track 1 before track 2's analysis lands: no one edited track 2's cues, so its
+        // entry still gets the auto cues. Deck B loads track 1 too; a cue added and cleared there means deck A's
+        // pending analysis of track 1 must not bring any back.
+        let Some(DeckResult::Analysis(_, superseded, two, mut late_two, audio_two, kept_two)) = load_holding_analysis(&mut app, 0, 2) else { panic!("no analysis for track 2") };
+        late_two.cue_points_sec = vec![0.05, 0.1];
+        let Some(DeckResult::Analysis(_, on_a, one, mut late_one, audio_one, kept_one)) = load_holding_analysis(&mut app, 0, 1) else { panic!("no analysis for track 1 on A") };
+        late_one.cue_points_sec = vec![0.05, 0.1];
+        let _on_b = load_holding_analysis(&mut app, 1, 1);
+        app.jump_to_cue(2, 4);
+        app.deck_hotcues[1].clear();
+        app.library.set_hotcues(1, &[]);
+        app.load_channel.0.send(DeckResult::Analysis(0, superseded, two, late_two, audio_two, kept_two)).unwrap();
+        app.load_channel.0.send(DeckResult::Analysis(0, on_a, one, late_one, audio_one, kept_one)).unwrap();
+        app.finish_loads();
+        assert_eq!(deck_hotcues_of(&app.library.track(2).unwrap().cues).len(), 2, "the superseded, unedited track lost its auto cues");
+        assert!(deck_hotcues_of(&app.library.track(1).unwrap().cues).is_empty() && app.deck_hotcues[0].is_empty(), "deck A's analysis restored cues cleared on deck B");
+
+        // The library entries too, through normal polling, a save and a reload of the collection.
+        app.library.poll();
+        app.library.save_collection_nml(&dir.join("collection.nml")).unwrap();
+        let reloaded = LibraryManager::new(dir.join("collection.nml"));
+        let five = reloaded.tracks.iter().find(|t| t.file_path.as_ref().is_some_and(|p| p.ends_with("five.wav"))).expect("track 5 wasn't saved");
+        assert!(!five.cues.iter().any(|c| c.hotcue >= 0), "cleared hot cues came back in the library: {:?}", five.cues);
+        assert!(five.bpm == late.bpm && five.cues.iter().any(|c| c.cue_type == retraktor_core::CueType::Grid && c.start_ms == 0.0), "the analysis or the grid cue wasn't saved");
+        let saved = |file: &str| reloaded.tracks.iter().find(|t| t.file_path.as_ref().is_some_and(|p| p.ends_with(file))).map(|t| deck_hotcues_of(&t.cues).len());
+        assert_eq!((saved("one.wav"), saved("two.wav")), (Some(0), Some(2)), "saved hot cues of tracks 1 and 2");
+        app.toggle_loop(d + 1);
+        assert!(app.deck_loop_active[d], "no loop once the BPM is known");
+
+        // Track 6 with a tagged BPM and no key: the BPM shows (and loops work) at once; the key fills in later.
+        if let Some(t) = app.library.tracks.iter_mut().find(|t| t.id == 6) {
+            t.bpm = 124.0;
+        }
+        let Some(update) = load_holding_analysis(&mut app, 3, 6) else { panic!("no key analysis") };
+        let DeckResult::Analysis(_, _, _, ref key_analysis, _, _) = update else { panic!("not an analysis") };
+        let auto: Vec<(u8, f64)> = key_analysis.cue_points_sec.iter().take(8).enumerate().map(|(i, &t)| (i as u8 + 1, t)).collect();
+        assert_eq!(app.audio.shared.lock().unwrap().loaded_tracks[3].as_ref().unwrap().bpm, 124.0);
+        app.toggle_loop(4);
+        assert!(app.deck_loop_active[3], "a tagged BPM was treated as missing");
+        app.load_channel.0.send(update).unwrap();
+        app.finish_loads();
+        let s = app.audio.shared.lock().unwrap();
+        let t = s.loaded_tracks[3].as_ref().unwrap();
+        assert!(t.bpm == 124.0 && !t.key.is_empty(), "BPM {} key {:?}", t.bpm, t.key);
+        drop(s);
+        let same = |a: &[(u8, f64)], b: &[(u8, f64)]| a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.0 == y.0 && (x.1 - y.1).abs() < 1e-9);
+        assert!(same(&app.deck_hotcues[3], &auto), "an untouched, cue-less deck didn't get the auto cues: {:?}", app.deck_hotcues[3]);
+        assert!(same(&deck_hotcues_of(&app.library.track(6).unwrap().cues), &auto), "the library didn't get the same auto cues");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A deck reuses a preview's audio only when it is exactly what a fresh decode of the file as it is now would give:
+    /// after ordinary browsing (the overview decoded straight through) it is offered and is the file. A file replaced in
+    /// place (another take, same path) is never played from the old audio, on a deck or in a preview. A decode that
+    /// started three quarters in (seeked) isn't offered; the deck decodes the file itself.
+    #[test]
+    fn deck_reuses_only_an_exact_decode_of_the_file_as_it_is() {
+        let (dir, mut app) = preview_app("reuse");
+        let wait = std::time::Duration::from_secs(30);
+        let load = |app: &mut ReTraktorApp, d: usize, id: usize| -> LoadedTrackAudio {
+            app.library.pending_loads.push((d + 1, app.library.track(id).cloned().unwrap()));
+            app.drain_pending_loads();
+            loop {
+                // Skips what earlier loads send after theirs (their analysis).
+                if let DeckResult::Loaded(_, generation, _, loaded) = app.load_channel.1.recv_timeout(wait).unwrap() {
+                    if generation == app.load_generation[d] {
+                        return loaded.unwrap();
+                    }
+                }
+            }
+        };
+        let rest_on = |app: &mut ReTraktorApp, id: usize| -> Arc<crate::audio::PreviewPcm> {
+            app.library.selected_track_id = Some(id);
+            let t0 = std::time::Instant::now();
+            loop {
+                app.poll_preview();
+                if let Some(p) = app.prepared_for(id).filter(|p| p.complete()) {
+                    return Arc::clone(p);
+                }
+                assert!(t0.elapsed() < wait, "track {id}'s overview never completed");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
+        let six = app.library.track(6).unwrap().file_path.clone().unwrap();
+
+        let browsed = rest_on(&mut app, 6);
+        assert!(browsed.exact() && browsed.to_vec().is_some(), "a straight overview decode isn't offered to a deck");
+        let (expected, _) = LoadedTrackAudio::decode_file_to_pcm(&six).unwrap();
+        assert!(*load(&mut app, 3, 6).pcm_stereo == expected, "the deck doesn't play the file");
+
+        // Another take at the same path (3 s at 660 Hz instead of 2 s at 440 Hz).
+        let take: Vec<i16> = (0..3 * 48_000).flat_map(|i| {
+            let v = ((i as f32 * 660.0 * std::f32::consts::TAU / 48_000.0).sin() * 9_000.0) as i16;
+            [v, v]
+        }).collect();
+        AudioSystem::write_stereo_wav_file(&six, &take, 48_000).unwrap();
+        assert!(!browsed.same_file() && browsed.to_vec().is_none(), "the old take still counts as this file");
+        let (expected, _) = LoadedTrackAudio::decode_file_to_pcm(&six).unwrap();
+        assert!(*load(&mut app, 3, 6).pcm_stereo == expected, "the deck played the old take");
+        app.press_preview(Some(6));
+        let preview = Arc::clone(&app.preview.as_ref().unwrap().pcm);
+        assert!(!Arc::ptr_eq(&preview, &browsed), "the preview reused the old take");
+        settle_preview(&mut app);
+        assert_eq!(preview.playable_frames(), Some(3 * 48_000));
+        app.press_preview(None);
+        // Selected again, its overview is the new take too.
+        app.library.selected_track_id = Some(5);
+        app.poll_preview();
+        let overview = rest_on(&mut app, 6);
+        assert!(!Arc::ptr_eq(&overview, &browsed) && overview.playable_frames() == Some(3 * 48_000), "the overview is still the old take");
+
+        // Track 5, previewed from three quarters in: not offered; the deck decodes the file.
+        app.library.selected_track_id = Some(5);
+        app.click_overview(5, 0.75);
+        let seeked = Arc::clone(&app.preview.as_ref().unwrap().pcm);
+        settle_preview(&mut app);
+        assert!(seeked.complete() && !seeked.exact() && seeked.to_vec().is_none(), "a seeked decode was offered");
+        let five = app.library.track(5).unwrap().file_path.clone().unwrap();
+        assert!(*load(&mut app, 2, 5).pcm_stereo == LoadedTrackAudio::decode_file_to_pcm(&five).unwrap().0);
+        assert!(app.prepared.len() <= 2, "{} decodes kept", app.prepared.len());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// The real Mix and 4-Deck layouts in the smallest window (1024 x 640) with Tools open on every deck:

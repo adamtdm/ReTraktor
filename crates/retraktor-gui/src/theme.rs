@@ -364,6 +364,51 @@ impl WaveformStyle {
     }
 }
 
+/// The shape of the whole-track overviews (under each deck and in the browser rows) (Preferences > Look). All
+/// three draw the same stored overview in the same colours ([`waveform_bands`]), so switching redraws at once
+/// with nothing analysed again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OverviewLook {
+    /// Symmetrical around the centre line, a shaded body; quieter passages fall away.
+    Traktor,
+    /// ReTraktor's original look, drawn in the waveform style.
+    Native,
+    /// Layers rising from the bottom: bass, then mids, then highs on top.
+    Rekordbox,
+}
+
+impl OverviewLook {
+    pub const ALL: [Self; 3] = [Self::Traktor, Self::Native, Self::Rekordbox];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Traktor => "traktor",
+            Self::Native => "native",
+            Self::Rekordbox => "rekordbox",
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Traktor => "Traktor",
+            Self::Native => "Native",
+            Self::Rekordbox => "rekordbox",
+        }
+    }
+
+    pub const fn hint(self) -> &'static str {
+        match self {
+            Self::Traktor => "Track overviews shaped like Traktor's: a centred, shaded body; quiet breaks and transitions stand out",
+            Self::Native => "ReTraktor's original track overviews, drawn in the waveform style below",
+            Self::Rekordbox => "Track overviews shaped like rekordbox's: bass, mids and highs layered from the bottom",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|l| l.as_str() == s.trim().to_ascii_lowercase())
+    }
+}
+
 /// Theme plus the "Look" settings that travel with it.
 struct ThemeState {
     current: Palette,
@@ -372,6 +417,7 @@ struct ThemeState {
     animations: bool,
     scale: f32,
     waveform_style: WaveformStyle,
+    overview_look: OverviewLook,
 }
 
 const THEME_FADE_SECS: f32 = 0.28;
@@ -437,6 +483,33 @@ pub fn set_waveform_style(style: WaveformStyle) {
     }
 }
 
+/// Selected track overview look (Preferences > Look).
+pub fn overview_look() -> OverviewLook {
+    store().read().map(|s| s.overview_look).unwrap_or(OverviewLook::Native)
+}
+
+/// Preferences > Decks & Mixer > Waveform colours, as the app last passed it on (the preferences keep and save it).
+static WAVEFORM_COLOURS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub fn set_waveform_colours(choice: usize) {
+    WAVEFORM_COLOURS.store(choice, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The bass, mid and high colours every three-band waveform and overview is drawn in right now.
+pub fn waveform_bands() -> [Color32; 3] {
+    waveform_bands_for(WAVEFORM_COLOURS.load(std::sync::atomic::Ordering::Relaxed), &palette())
+}
+
+/// `[bass, mids, highs]` for Waveform colours `choice` (0 Spectrum, 1 Ultraviolet, 2 High contrast): Spectrum,
+/// and any choice this version doesn't know, is the theme's own `WAVEFORM_LOW/MID/HIGH`.
+fn waveform_bands_for(choice: usize, theme: &Palette) -> [Color32; 3] {
+    match choice {
+        1 => [rgb(150, 90, 255), rgb(255, 70, 200), rgb(150, 230, 255)],
+        2 => [rgb(255, 50, 50), rgb(60, 230, 90), rgb(70, 150, 255)],
+        _ => [theme.WAVEFORM_LOW, theme.WAVEFORM_MID, theme.WAVEFORM_HIGH],
+    }
+}
+
 /// Eased 0..=1 that follows `on`; call every frame with the same `id`. Snaps when animations are off.
 pub fn fade(ctx: &egui::Context, id: impl std::hash::Hash, on: bool) -> f32 {
     if !animations() {
@@ -460,7 +533,9 @@ fn theme_path() -> std::path::PathBuf {
 }
 
 impl ThemeState {
-    fn from_text(base: &Palette, text: &str) -> Self {
+    /// `returning`: ReTraktor has run here before. Without a saved overview look, a returning user keeps the
+    /// Native look they had and a first start gets Traktor's; an unknown one keeps Native.
+    fn from_text(base: &Palette, text: &str, returning: bool) -> Self {
         let setting = |key: &str| text.lines().find_map(|l| l.trim().strip_prefix(key).map(|v| v.trim().to_string()));
         Self {
             current: Palette::from_text(base, text),
@@ -471,23 +546,49 @@ impl ThemeState {
                 .or_else(|| setting("waveform="))
                 .map(|v| WaveformStyle::from_str(&v))
                 .unwrap_or_default(),
+            overview_look: match setting("overview_look=") {
+                Some(v) => OverviewLook::from_str(&v).unwrap_or(OverviewLook::Native),
+                None if returning => OverviewLook::Native,
+                None => OverviewLook::Traktor,
+            },
         }
     }
 
     fn to_text(&self) -> String {
         format!(
-            "{}animations={}\nscale={:.2}\nwaveform_style={}\n",
+            "{}animations={}\nscale={:.2}\nwaveform_style={}\noverview_look={}\n",
             self.current.to_text(),
             if self.animations { "on" } else { "off" },
             self.scale,
             self.waveform_style.as_str(),
+            self.overview_look.as_str(),
         )
     }
 }
 
 fn load() -> ThemeState {
-    let text = std::fs::read_to_string(theme_path()).unwrap_or_default();
-    ThemeState::from_text(&Palette::NIGHT, &text)
+    let path = theme_path();
+    let text = std::fs::read_to_string(&path).ok();
+    let returning = text.is_some() || path.with_file_name("preferences.json").exists();
+    ThemeState::from_text(&Palette::NIGHT, text.as_deref().unwrap_or_default(), returning)
+}
+
+/// On a first start, writes down the overview look it picked (and nothing else, so the theme's defaults stay
+/// free to change): otherwise preferences saved later would make the next start look like a returning user's.
+pub fn remember_first_overview_look() -> std::io::Result<()> {
+    use std::io::Write;
+    let path = theme_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    // Read before the file exists: loading the theme from the empty new file would count this start as a return.
+    let look = overview_look();
+    // Only a new file: a theme saved meanwhile (another window) is never overwritten.
+    match std::fs::OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(mut file) => file.write_all(format!("overview_look={}\n", look.as_str()).as_bytes()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 pub fn save() -> std::io::Result<()> {
@@ -557,10 +658,10 @@ pub fn contrast(a: Color32, b: Color32) -> f32 {
 pub fn editor(ui: &mut egui::Ui) {
     let mut p = target_palette();
     let mut changed = false;
-    let (mut animations, mut scale, mut waveform_style) = store()
+    let (mut animations, mut scale, mut waveform_style, mut overview_look) = store()
         .read()
-        .map(|s| (s.animations, s.scale, s.waveform_style))
-        .unwrap_or((true, 1.0, WaveformStyle::Classic));
+        .map(|s| (s.animations, s.scale, s.waveform_style, s.overview_look))
+        .unwrap_or((true, 1.0, WaveformStyle::Classic, OverviewLook::Native));
     let mut settings_changed = false;
     ui.label(egui::RichText::new("Theme").size(15.0).strong());
     ui.add_space(6.0);
@@ -612,54 +713,15 @@ pub fn editor(ui: &mut egui::Ui) {
         ui.label("Primary colour").on_hover_text("Re-tints every colour in the theme from this one. Fine-tune single colours in the groups below.");
     });
     ui.add_space(14.0);
+    ui.label(egui::RichText::new("Track overview").size(15.0).strong());
+    ui.label(egui::RichText::new("Each look is a shape; colours follow Preferences > Decks & Mixer > Waveform colours.").size(11.5).color(p.TEXT_MUTED));
+    ui.add_space(6.0);
+    settings_changed |= choice_cards(ui, &p, &OverviewLook::ALL, &mut overview_look, OverviewLook::label, |l| l.hint().into(), crate::widgets::paint_overview_look_preview);
+    ui.add_space(14.0);
     ui.label(egui::RichText::new("Waveform style").size(15.0).strong());
     ui.add_space(6.0);
-    ui.horizontal_wrapped(|ui| {
-        for style in WaveformStyle::ALL {
-            let (rect, r) = ui.allocate_exact_size(
-                egui::vec2(148.0, 76.0),
-                egui::Sense::click().union(egui::Sense::focusable_noninteractive()),
-            );
-            let painter = ui.painter();
-            let active = waveform_style == style;
-            painter.rect_filled(rect, 8.0, p.BG_PANEL);
-            let wave_rect = egui::Rect::from_min_size(rect.min + egui::vec2(8.0, 8.0), egui::vec2(132.0, 40.0));
-            crate::widgets::paint_waveform_style_preview(painter, wave_rect, style);
-            painter.text(
-                rect.left_bottom() + egui::vec2(10.0, -7.0),
-                egui::Align2::LEFT_BOTTOM,
-                style.label(),
-                egui::FontId::proportional(13.0),
-                if active { p.TEXT_HIGHLIGHT } else { p.TEXT_PRIMARY },
-            );
-            let ring = if active {
-                egui::Stroke::new(2.5_f32, p.ACCENT)
-            } else if r.has_focus() {
-                egui::Stroke::new(2.0_f32, p.TEXT_HIGHLIGHT)
-            } else if r.hovered() {
-                egui::Stroke::new(1.5_f32, p.TEXT_SECONDARY)
-            } else {
-                egui::Stroke::new(1.0_f32, p.BORDER_ACCENT)
-            };
-            painter.rect_stroke(rect, 8.0, ring);
-            let key_activate = r.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Space));
-            if r.has_focus() {
-                if ui.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
-                    let idx = WaveformStyle::ALL.iter().position(|&s| s == waveform_style).unwrap_or(0);
-                    waveform_style = WaveformStyle::ALL[(idx + 1) % WaveformStyle::ALL.len()];
-                    settings_changed = true;
-                } else if ui.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
-                    let idx = WaveformStyle::ALL.iter().position(|&s| s == waveform_style).unwrap_or(0);
-                    waveform_style = WaveformStyle::ALL[(idx + WaveformStyle::ALL.len() - 1) % WaveformStyle::ALL.len()];
-                    settings_changed = true;
-                }
-            }
-            if r.on_hover_text(format!("Use the {} waveform style", style.label())).clicked() || key_activate {
-                waveform_style = style;
-                settings_changed = true;
-            }
-        }
-    });
+    let style_hint = |s: WaveformStyle| format!("Use the {} waveform style", s.label());
+    settings_changed |= choice_cards(ui, &p, &WaveformStyle::ALL, &mut waveform_style, WaveformStyle::label, style_hint, crate::widgets::paint_waveform_style_preview);
     ui.add_space(14.0);
     ui.label(egui::RichText::new("Motion & size").size(15.0).strong());
     ui.add_space(6.0);
@@ -731,6 +793,7 @@ pub fn editor(ui: &mut egui::Ui) {
             st.animations = animations;
             st.scale = scale;
             st.waveform_style = waveform_style;
+            st.overview_look = overview_look;
         }
     }
     if changed || settings_changed {
@@ -738,6 +801,71 @@ pub fn editor(ui: &mut egui::Ui) {
             eprintln!("retraktor: could not save theme: {e}");
         }
     }
+}
+
+/// A row of picture cards, one per choice in `all`, the chosen one ringed; while a card has focus, Enter or Space
+/// picks it and the arrow keys move the choice. True when the choice changed.
+fn choice_cards<T: Copy + PartialEq>(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    all: &[T],
+    chosen: &mut T,
+    label: impl Fn(T) -> &'static str,
+    hint: impl Fn(T) -> String,
+    paint: impl Fn(&egui::Painter, egui::Rect, T),
+) -> bool {
+    let mut changed = false;
+    ui.horizontal_wrapped(|ui| {
+        for &choice in all {
+            let (rect, r) = ui.allocate_exact_size(
+                egui::vec2(148.0, 76.0),
+                egui::Sense::click().union(egui::Sense::focusable_noninteractive()),
+            );
+            let painter = ui.painter();
+            let active = *chosen == choice;
+            painter.rect_filled(rect, 8.0, p.BG_PANEL);
+            let wave_rect = egui::Rect::from_min_size(rect.min + egui::vec2(8.0, 8.0), egui::vec2(132.0, 40.0));
+            paint(painter, wave_rect, choice);
+            painter.text(
+                rect.left_bottom() + egui::vec2(10.0, -7.0),
+                egui::Align2::LEFT_BOTTOM,
+                label(choice),
+                egui::FontId::proportional(13.0),
+                if active { p.TEXT_HIGHLIGHT } else { p.TEXT_PRIMARY },
+            );
+            let ring = if active {
+                egui::Stroke::new(2.5_f32, p.ACCENT)
+            } else if r.has_focus() {
+                egui::Stroke::new(2.0_f32, p.TEXT_HIGHLIGHT)
+            } else if r.hovered() {
+                egui::Stroke::new(1.5_f32, p.TEXT_SECONDARY)
+            } else {
+                egui::Stroke::new(1.0_f32, p.BORDER_ACCENT)
+            };
+            painter.rect_stroke(rect, 8.0, ring);
+            r.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::RadioButton, true, active, label(choice)));
+            let key_activate = r.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Space));
+            if r.has_focus() {
+                let idx = all.iter().position(|&c| c == *chosen).unwrap_or(0);
+                let next = if ui.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
+                    Some(idx + 1)
+                } else if ui.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
+                    Some(idx + all.len() - 1)
+                } else {
+                    None
+                };
+                if let Some(next) = next {
+                    *chosen = all[next % all.len()];
+                    changed = true;
+                }
+            }
+            if r.on_hover_text(hint(choice)).clicked() || key_activate {
+                *chosen = choice;
+                changed = true;
+            }
+        }
+    });
+    changed
 }
 
 /// Font family for the dot-matrix display face (BPM, time, key).
@@ -876,17 +1004,88 @@ mod tests {
                 animations: false,
                 scale: 1.25,
                 waveform_style: style,
+                overview_look: OverviewLook::Rekordbox,
             };
             let text = st.to_text();
-            let parsed = ThemeState::from_text(&Palette::NIGHT, &text);
+            let parsed = ThemeState::from_text(&Palette::NIGHT, &text, true);
             assert_eq!(parsed.current, Palette::CHARCOAL);
             assert!(!parsed.animations);
             assert!((parsed.scale - 1.25).abs() < 1e-4);
             assert_eq!(parsed.waveform_style, style);
         }
-        let fallback = ThemeState::from_text(&Palette::NIGHT, "waveform_style=unknown_style\n");
+        let fallback = ThemeState::from_text(&Palette::NIGHT, "waveform_style=unknown_style\n", true);
         assert_eq!(fallback.waveform_style, WaveformStyle::Classic);
-        let missing = ThemeState::from_text(&Palette::NIGHT, "animations=on\n");
+        let missing = ThemeState::from_text(&Palette::NIGHT, "animations=on\n", true);
         assert_eq!(missing.waveform_style, WaveformStyle::Classic);
+    }
+
+    /// Each overview look survives a save and restart. Without one saved, a first start gets Traktor's look and
+    /// anyone who ran ReTraktor before keeps Native, in their own waveform style; an unknown one (a newer
+    /// version's) keeps Native.
+    #[test]
+    fn overview_look_round_trips_and_migrates() {
+        for look in OverviewLook::ALL {
+            let st = ThemeState { current: Palette::NIGHT, from: None, animations: true, scale: 1.0, waveform_style: WaveformStyle::Dots, overview_look: look };
+            assert_eq!(ThemeState::from_text(&Palette::NIGHT, &st.to_text(), false).overview_look, look);
+            assert_eq!(ThemeState::from_text(&Palette::NIGHT, &format!("overview_look={}\n", look.as_str()), true).overview_look, look);
+        }
+        assert_eq!(ThemeState::from_text(&Palette::NIGHT, "", false).overview_look, OverviewLook::Traktor);
+        let old = ThemeState::from_text(&Palette::NIGHT, "waveform_style=bars\n", true);
+        assert_eq!((old.overview_look, old.waveform_style), (OverviewLook::Native, WaveformStyle::Bars));
+        assert_eq!(ThemeState::from_text(&Palette::NIGHT, "", true).overview_look, OverviewLook::Native, "prefs saved, theme never");
+        assert_eq!(ThemeState::from_text(&Palette::NIGHT, "overview_look=serato\n", false).overview_look, OverviewLook::Native);
+    }
+
+    /// As the app starts, each in a new process with its own HOME: a first start writes Traktor's look down for the
+    /// next start, which keeps it; a returning user (preferences saved, no theme yet) gets Native written down.
+    #[test]
+    fn first_start_writes_down_its_overview_look() {
+        if std::env::var_os("RETRAKTOR_FIRST_START_CHILD").is_some() {
+            remember_first_overview_look().unwrap();
+            return;
+        }
+        let start = |home: &std::path::Path| {
+            let started = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "theme::tests::first_start_writes_down_its_overview_look"])
+                .env("RETRAKTOR_FIRST_START_CHILD", "1")
+                .env("HOME", home)
+                .stdout(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert!(started.success());
+            std::fs::read_to_string(home.join(".config/retraktor/theme.txt")).unwrap()
+        };
+        let dir = std::env::temp_dir().join(format!("retraktor-first-start-{}", std::process::id()));
+        let (fresh, returning) = (dir.join("fresh"), dir.join("returning"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&fresh).unwrap();
+        std::fs::create_dir_all(returning.join(".config/retraktor")).unwrap();
+        std::fs::write(returning.join(".config/retraktor/preferences.json"), "{}").unwrap();
+        assert_eq!(start(&fresh), "overview_look=traktor\n");
+        assert_eq!(start(&fresh), "overview_look=traktor\n", "the next start changed it");
+        assert_eq!(start(&returning), "overview_look=native\n");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Spectrum, and any choice this version doesn't know, is the theme's own (custom) waveform colours, so going
+    /// back to it restores them; Ultraviolet and High contrast are their own three distinct bands, legible on
+    /// every preset's waveform background.
+    #[test]
+    fn waveform_colours_choose_the_band_colours() {
+        let mut custom = Palette::CHARCOAL;
+        custom.WAVEFORM_LOW = rgb(1, 2, 3);
+        let own = [custom.WAVEFORM_LOW, custom.WAVEFORM_MID, custom.WAVEFORM_HIGH];
+        for choice in [0, 3, usize::MAX] {
+            assert_eq!(waveform_bands_for(choice, &custom), own, "choice {choice}");
+        }
+        let (ultraviolet, high_contrast) = (waveform_bands_for(1, &custom), waveform_bands_for(2, &custom));
+        assert!(ultraviolet != own && high_contrast != own && ultraviolet != high_contrast);
+        assert_eq!(ultraviolet, waveform_bands_for(1, &Palette::NIGHT), "a named choice followed the theme");
+        for bands in [ultraviolet, high_contrast] {
+            assert!(bands[0] != bands[1] && bands[1] != bands[2] && bands[0] != bands[2], "{bands:?}");
+            for (name, p) in Palette::PRESETS {
+                assert!(bands.iter().all(|&c| contrast(c, p.WAVEFORM_BG) >= 3.0), "{bands:?} on {name}");
+            }
+        }
     }
 }

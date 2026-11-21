@@ -8,7 +8,7 @@ VirtualDJ 2026, Engine DJ, djay Pro 5.6 and Mixxx 2.6 (the open-source benchmark
 | Feature | Competitors | ReTraktor |
 |---|---|---|
 | Key lock (tempo change without pitch change) | all | Yes (Nov 2026): per-deck KEY, WSOLA time-stretch, stems included |
-| Headphone cue on a second output | all | Yes (Nov 2026): outputs 3–4 or split mono; PHONES level and CUE/MIX blend |
+| Headphone cue on a second output | all | Yes (Nov 2026): any stereo pair, chosen per sound card, or split mono; PHONES level and CUE/MIX blend |
 | Real 3-band EQ / kills | all | Yes (Nov 2026): 24 dB/oct isolator (was a volume average) |
 | Beat jump / quantised cues and loops | all | Beat jump supports 4, 8, 16 and 32 beats per deck. Cue and loop quantisation is still open. |
 | Frequency-coloured waveforms with beat and bar markers | all | Single-colour waveform with beat ticks |

@@ -128,8 +128,9 @@ impl UiTrackEntry {
     }
 
     /// Applies detected values. Without `overwrite` only unknown values are filled.
-    /// Auto cues and a beatgrid are only added to tracks that have no cues of that kind.
-    pub fn apply_analysis(&mut self, a: &TrackAnalysis, overwrite: bool) {
+    /// A beatgrid is only added to a track with none; auto hot cues only with `hot_cues`, and only to a track with no
+    /// cue of any kind in a hot cue slot.
+    pub fn apply_analysis(&mut self, a: &TrackAnalysis, overwrite: bool, hot_cues: bool) {
         if overwrite || self.bpm <= 0.0 {
             self.bpm = a.bpm;
         }
@@ -156,7 +157,7 @@ impl UiTrackEntry {
         if !self.cues.iter().any(|c| c.cue_type == CueType::Grid) {
             self.cues.push(cue("AutoGrid".into(), a.beatgrid_offset_sec, CueType::Grid, -1, Some(a.bpm)));
         }
-        if !self.cues.iter().any(|c| c.cue_type == CueType::Cue && c.hotcue >= 0) {
+        if hot_cues && !self.cues.iter().any(|c| c.hotcue >= 0) {
             for (i, t) in a.cue_points_sec.iter().take(8).enumerate() {
                 self.cues.push(cue(format!("Auto {}", i + 1), *t, CueType::Cue, i as i64, None));
             }
@@ -547,6 +548,8 @@ pub struct LinkedLibrary {
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum SortColumn {
     Order,
+    /// The row's waveform: click to preview from there. Not sortable.
+    Preview,
     TrackNum,
     Title,
     Artist,
@@ -571,6 +574,7 @@ impl SortColumn {
     fn header(self) -> &'static str {
         match self {
             Self::Order => "#",
+            Self::Preview => "Preview",
             Self::TrackNum => "Trk",
             Self::Title => "Title",
             Self::Artist => "Artist",
@@ -595,6 +599,7 @@ impl SortColumn {
     fn width(self) -> f32 {
         match self {
             Self::Order | Self::Stems | Self::TrackNum => 34.0,
+            Self::Preview => 150.0,
             Self::Title => 240.0,
             Self::Artist | Self::Album => 170.0,
             Self::Genre | Self::Label | Self::Remixer | Self::Comment => 120.0,
@@ -645,6 +650,20 @@ enum Action {
     AddToSet(Vec<usize>),
 }
 
+/// A browser row's small whole-track waveform, made by the app from a decode of the file at `path` (never a deck's),
+/// or from its stripe in the cache.
+pub struct RowWaveform {
+    pub path: PathBuf,
+    /// The track's overview (blank where not decoded yet) and its length once known, or why the file can't be read.
+    pub peaks: Result<(crate::overview::Overview, Option<f64>), String>,
+    /// While the decode it comes from is unfinished: that decode and how far it had got (address, seconds decoded,
+    /// length). `None` once finished (complete or failed): nothing more to make.
+    pub made_from: Option<(usize, usize, Option<u64>)>,
+    /// The file as that decode found it (modified time, byte size): a later decode that found it changed (replaced
+    /// or repaired) replaces even a finished waveform or error.
+    pub identity: Option<(std::time::SystemTime, u64)>,
+}
+
 pub struct LibraryManager {
     pub tracks: Vec<UiTrackEntry>,
     pub playlists: Vec<UserPlaylist>,
@@ -665,6 +684,9 @@ pub struct LibraryManager {
     view_scores: Vec<f32>,
     view_stamp: Option<(u64, NavItem, String, SortColumn, bool, String)>,
     id_index: HashMap<usize, usize>,
+    /// How many times each track's hot cues were set or cleared by hand this session (not saved): a deck's late
+    /// analysis adds auto hot cues only if this hasn't moved since its load.
+    cue_revisions: HashMap<usize, u64>,
     scroll_to_selected: bool,
 
     collection_path: PathBuf,
@@ -697,6 +719,18 @@ pub struct LibraryManager {
 
     // App integration
     pub pending_loads: Vec<(usize, UiTrackEntry)>,
+    /// A Preview press for the app: `Some(id)` toggles that track's headphone preview, `None` stops it.
+    pub preview_requested: Option<Option<usize>>,
+    /// The track in the headphone preview and whether it is still loading; set by the app before drawing.
+    pub previewing: Option<(usize, bool)>,
+    /// Where that preview is, as a fraction of its track, once it has found its place; set by the app before drawing.
+    pub preview_position: Option<f64>,
+    /// Row waveforms by track, kept by the app; one made from another path (a relinked track) isn't drawn.
+    pub row_waveforms: HashMap<usize, RowWaveform>,
+    /// The tracks whose rows were drawn last, top to bottom: the app prepares their waveforms.
+    pub visible_rows: Vec<usize>,
+    /// A plain click on a row's waveform for the app: (track, where as a fraction of the track).
+    pub overview_clicked: Option<(usize, f64)>,
     /// Set by the app while help, the picker or Preferences is on top: browser keys stay inert.
     pub keys_blocked: bool,
     /// A refused load, shown on the deck itself for a few seconds.
@@ -747,6 +781,7 @@ impl LibraryManager {
             view_scores: Vec::new(),
             view_stamp: None,
             id_index: HashMap::new(),
+            cue_revisions: HashMap::new(),
             scroll_to_selected: false,
             removed: HashSet::new(),
             collection_path,
@@ -770,6 +805,12 @@ impl LibraryManager {
             explorer_dir: home,
             explorer_entries: Vec::new(),
             pending_loads: Vec::new(),
+            preview_requested: None,
+            previewing: None,
+            preview_position: None,
+            row_waveforms: HashMap::new(),
+            visible_rows: Vec::new(),
+            overview_clicked: None,
             keys_blocked: false,
             deck_refused: [None; 4],
             status_message: String::new(),
@@ -989,8 +1030,23 @@ impl LibraryManager {
     }
 
     /// Stores deck-side hotcues on the track so they survive a reload and autosave to .nml.
+    /// A deck's analysis of track `id`, done after the deck became playable: fills what is still unknown, as any
+    /// analysis does; auto hot cues only with `hot_cues` (no hand edit of its hot cues since the load).
+    pub fn apply_late_analysis(&mut self, id: usize, a: &TrackAnalysis, hot_cues: bool) {
+        if let Some(t) = self.track_mut(id) {
+            t.apply_analysis(a, false, hot_cues);
+            self.touch();
+        }
+    }
+
+    /// See `cue_revisions`.
+    pub fn cue_revision(&self, id: usize) -> u64 {
+        self.cue_revisions.get(&id).copied().unwrap_or(0)
+    }
+
     pub fn set_hotcues(&mut self, id: usize, cues: &[(u8, f64)]) {
         let Some(t) = self.tracks.iter_mut().find(|t| t.id == id) else { return };
+        *self.cue_revisions.entry(id).or_default() += 1;
         t.cues.retain(|c| c.hotcue < 0 || c.hotcue >= 8);
         for &(slot, sec) in cues {
             if (1..=8).contains(&slot) {
@@ -1494,11 +1550,6 @@ impl LibraryManager {
         });
     }
 
-    /// Sender for results produced outside the library (e.g. analysis done while loading a deck).
-    pub fn sender(&self) -> Sender<Msg> {
-        self.tx.clone()
-    }
-
     /// Tracks with a file whose BPM, key or energy is still unknown.
     pub fn unanalyzed_ids(&self) -> Vec<usize> {
         self.tracks
@@ -1591,7 +1642,7 @@ impl LibraryManager {
                 }
                 Msg::Analyzed(id, a, overwrite) => {
                     if let Some(t) = self.track_mut(id) {
-                        t.apply_analysis(&a, overwrite);
+                        t.apply_analysis(&a, overwrite, true);
                     }
                     self.touch();
                 }
@@ -1684,7 +1735,7 @@ impl LibraryManager {
         rows.sort_by(|a, b| {
             let (x, y) = (&t[a.0], &t[b.0]);
             let o = match col {
-                SortColumn::Order => std::cmp::Ordering::Equal,
+                SortColumn::Order | SortColumn::Preview => std::cmp::Ordering::Equal,
                 SortColumn::TrackNum => x.track_number.cmp(&y.track_number),
                 SortColumn::Title => lc(&x.title).cmp(&lc(&y.title)),
                 SortColumn::Artist => lc(&x.artist).cmp(&lc(&y.artist)),
@@ -2128,21 +2179,30 @@ impl LibraryManager {
         let deck_count = if four_deck_mode { 4 } else { 2 };
         // Status bar first (bottom) so the table can take the remaining height.
         egui::TopBottomPanel::bottom("library_status").show_inside(ui, |ui| {
-            ui.horizontal(|ui| {
-                if self.is_busy() {
-                    ui.spinner();
-                    ui.label(RichText::new(&self.job_status).size(11.0).color(TraktorTheme::TEXT_SECONDARY()));
+            // Right side first, so Undo and Stop preview keep their place however long the message or narrow the window.
+            ui.horizontal(|ui| ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.label(RichText::new(format!("{} shown", self.view.len())).size(11.0).color(TraktorTheme::TEXT_MUTED()));
+                // Here rather than in the track toolbar: visible in every browser view, whatever is selected.
+                if let Some((id, loading)) = self.previewing {
+                    let title = self.track(id).map_or("the track", |t| t.title.as_str());
+                    let hint = if loading { format!("Stop loading '{title}' for preview") } else { format!("Stop previewing '{title}'") };
+                    if ui.button("Stop preview").on_hover_text(hint).clicked() {
+                        self.preview_requested = Some(None);
+                    }
                 }
-                let tip = self.history.is_empty() && !self.tracks.is_empty() && self.status_message.is_empty();
-                let msg = if tip { "Double-click a track, or drag it onto a deck, to load it." } else { self.status_message.as_str() };
-                ui.label(RichText::new(msg).size(12.0).color(TraktorTheme::TEXT_PRIMARY()));
                 if self.undo.is_some() && ui.small_button("Undo").on_hover_text("Ctrl+Z").clicked() {
                     self.undo();
                 }
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(RichText::new(format!("{} shown", self.view.len())).size(11.0).color(TraktorTheme::TEXT_MUTED()));
+                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                    if self.is_busy() {
+                        ui.spinner();
+                        ui.label(RichText::new(&self.job_status).size(11.0).color(TraktorTheme::TEXT_SECONDARY()));
+                    }
+                    let tip = self.history.is_empty() && !self.tracks.is_empty() && self.status_message.is_empty();
+                    let msg = if tip { "Double-click a track, or drag it onto a deck, to load it." } else { self.status_message.as_str() };
+                    ui.add(egui::Label::new(RichText::new(msg).size(12.0).color(TraktorTheme::TEXT_PRIMARY())).truncate());
                 });
-            });
+            }));
         });
 
         if let NavItem::Playlist(i) = self.selected_nav {
@@ -2471,6 +2531,18 @@ impl LibraryManager {
                 .on_disabled_hover_text("Select a track first");
             });
             ui.separator();
+            // Lit while the selected track is the one previewing; pressing it then stops it.
+            let this_one = self.previewing.is_some_and(|(id, _)| Some(id) == sel);
+            let hint = if this_one { "Stop previewing the selected track" } else { "Hear the selected track in the headphones only. The decks and the main output are untouched" };
+            if ui
+                .add_enabled(sel.is_some_and(|id| self.track(id).is_some()), egui::Button::new("Preview").selected(this_one))
+                .on_hover_text(hint)
+                .on_disabled_hover_text("Select a track first")
+                .clicked()
+            {
+                self.preview_requested = Some(sel);
+            }
+            ui.separator();
             ui.label(
                 RichText::new(if sel.is_some() { "Double-click: first unlocked deck · Shift+double-click: B · right-click for more" } else { "Select a track to load or prepare it · double-click loads the first unlocked deck" })
                     .size(11.0)
@@ -2578,7 +2650,7 @@ impl LibraryManager {
         use SortColumn::*;
         // Row number only means something where order matters.
         let ordered = matches!(self.selected_nav, NavItem::Playlist(_) | NavItem::History);
-        let mut cols = if ordered { vec![Order, Title, Artist] } else { vec![Title, Artist] };
+        let mut cols = if ordered { vec![Order, Preview, Title, Artist] } else { vec![Preview, Title, Artist] };
         let opt = [
             (c.track_number, TrackNum),
             (c.album, Album),
@@ -2598,7 +2670,8 @@ impl LibraryManager {
         ];
         cols.extend(opt.iter().filter(|(on, _)| *on).map(|(_, col)| *col));
         if self.selected_nav == NavItem::Suggestions {
-            cols.insert(1, Match);
+            let after_title = cols.iter().position(|&c| c == Title).map_or(0, |i| i + 1);
+            cols.insert(after_title, Match);
         }
         cols
     }
@@ -2639,6 +2712,56 @@ impl LibraryManager {
             SortColumn::Match => txt(format!("{:.0}%", score * 100.0)).monospace().color(TraktorTheme::DECK_A()),
             _ => txt("–".to_string()).color(TraktorTheme::TEXT_MUTED()),
         }
+    }
+
+    /// Track `t`'s waveform in the Preview column, as far as it is decoded, with its hot cues, and the playhead
+    /// while it is the track previewing. Senses clicks only, so drags reach the row. Also returns why the track
+    /// can't be previewed, once known.
+    fn row_waveform(&self, ui: &mut Ui, t: &UiTrackEntry) -> (egui::Response, Option<String>) {
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 18.0), Sense::click());
+        let made = self.row_waveforms.get(&t.id).filter(|w| t.file_path.as_ref() == Some(&w.path)).map(|w| &w.peaks);
+        let (peaks, length, problem): (&[retraktor_formats::StripeColumn], Option<f64>, Option<String>) = match made {
+            _ if t.missing || t.file_path.is_none() => (&[], None, Some("File not found — use Relocate".into())),
+            Some(Ok((peaks, length))) => (peaks, *length, None),
+            Some(Err(e)) => (&[], None, Some(format!("Can't read this file: {e}"))),
+            None => (&[], None, None),
+        };
+        let pending = made.is_none() && problem.is_none();
+        let playhead = self.preview_position.filter(|_| self.previewing.is_some_and(|(id, _)| id == t.id));
+        if ui.is_rect_visible(rect) {
+            let painter = ui.painter_at(rect);
+            let at_x = |frac: f64| rect.left() + frac.clamp(0.0, 1.0) as f32 * rect.width();
+            crate::widgets::paint_overview_waveform(&painter, rect, peaks, playhead.map_or(f32::NEG_INFINITY, at_x));
+            if let Some(total) = length.or(Some(t.duration_sec)).filter(|d| d.is_finite() && *d > 0.0) {
+                for c in t.cues.iter().filter(|c| (0..8).contains(&c.hotcue)) {
+                    let x = at_x(c.start_ms / 1000.0 / total);
+                    painter.vline(x, rect.y_range(), Stroke::new(1.0, TraktorTheme::hotcue_color((c.hotcue + 1) as usize)));
+                }
+            }
+            let note = match (&problem, pending) {
+                (Some(_), _) => Some(("Not available", TraktorTheme::METER_RED())),
+                (None, true) => Some(("Preparing…", TraktorTheme::TEXT_MUTED())),
+                (None, false) => None,
+            };
+            if let Some((text, color)) = note {
+                painter.text(rect.center(), egui::Align2::CENTER_CENTER, text, egui::FontId::proportional(10.0), color);
+            }
+            if let Some(x) = response.hover_pos().map(|p| p.x) {
+                painter.vline(x, rect.y_range(), Stroke::new(1.0, TraktorTheme::TEXT_HIGHLIGHT().gamma_multiply(0.6)));
+            }
+            if let Some(at) = playhead {
+                painter.vline(at_x(at), rect.y_range(), Stroke::new(1.5, TraktorTheme::WAVEFORM_PLAYHEAD()));
+            }
+        }
+        let state = match (&problem, pending) {
+            (Some(why), _) => format!(" ({why})"),
+            (None, true) => " (preparing)".to_string(),
+            (None, false) => String::new(),
+        };
+        let label = format!("Waveform of '{}': click to preview from there{state}", t.title);
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &label));
+        let hint = problem.clone().unwrap_or_else(|| "Click to hear it from there in the headphones · Shift/Ctrl+click only selects".into());
+        (response.on_hover_text(hint).on_hover_cursor(egui::CursorIcon::PointingHand), problem)
     }
 
     fn show_table(&mut self, ui: &mut Ui, columns: &mut LibraryColumnsConfig, locked: [bool; 4], deck_count: usize, four_deck: bool) {
@@ -2700,20 +2823,24 @@ impl LibraryManager {
             }
         }
         for (i, c) in cols.iter().enumerate() {
-            let col = if i + 1 == cols.len() { Column::remainder().at_least(40.0) } else { Column::initial(c.width()).at_least(28.0).clip(true) };
+            let min = if *c == SortColumn::Preview { 60.0 } else { 28.0 };
+            let col = if i + 1 == cols.len() { Column::remainder().at_least(40.0) } else { Column::initial(c.width()).at_least(min).clip(true) };
             table = table.column(col);
         }
         let (sort_col, sort_asc) = (self.sort_col, self.sort_asc);
+        let (mut visible, mut preview_click, mut refused_click) = (Vec::new(), None, None);
         table
             .header(22.0, |mut header| {
                 for &c in &cols {
                     header.col(|ui| {
                         let arrow = if c == sort_col { if sort_asc { " ▲" } else { " ▼" } } else { "" };
                         let r = ui.add(egui::Label::new(RichText::new(format!("{}{arrow}", c.header())).size(11.0).strong().color(TraktorTheme::TEXT_SECONDARY())).sense(Sense::click()));
-                        if r.clicked() {
+                        let sortable = c != SortColumn::Preview;
+                        if r.clicked() && sortable {
                             actions.push(Action::Sort(c));
                         }
-                        r.on_hover_text("Click to sort · right-click to choose columns").context_menu(|ui| column_menu(ui, columns));
+                        let hint = if sortable { "Click to sort · right-click to choose columns" } else { "Click a track's waveform to hear it from there in the headphones" };
+                        r.on_hover_text(hint).context_menu(|ui| column_menu(ui, columns));
                     });
                 }
             })
@@ -2721,11 +2848,18 @@ impl LibraryManager {
                 body.rows(ROW_H, self.view.len(), |mut row| {
                     let r = row.index();
                     let t = &self.tracks[self.view[r]];
+                    visible.push(t.id);
                     let score = self.view_scores.get(r).copied().unwrap_or(0.0);
                     let selected = self.selection.contains(&t.id);
                     row.set_selected(selected);
+                    let (mut wave, mut problem) = (None, None);
                     for &c in &cols {
                         row.col(|ui| {
+                            if c == SortColumn::Preview {
+                                let (response, why) = self.row_waveform(ui, t);
+                                (wave, problem) = (Some(response), why);
+                                return;
+                            }
                             let mut text = Self::cell_text(t, c, r, score);
                             if selected {
                                 // Per-column colours (dim, key hue, missing red) vanish on the selection fill.
@@ -2734,9 +2868,20 @@ impl LibraryManager {
                             ui.add(egui::Label::new(text).truncate().selectable(false));
                         });
                     }
+                    // The waveform takes its own clicks, above the row: they select, and a plain one previews from
+                    // there, but never reach the row's double-click load. Drags pass through to the row.
                     let resp = row.response();
-                    if resp.clicked() {
+                    let wave_clicked = wave.as_ref().filter(|w| w.clicked());
+                    if resp.clicked() || wave_clicked.is_some() {
                         actions.push(Action::Select(t.id, ui_modifiers(&resp)));
+                    }
+                    if let Some(w) = wave_clicked.filter(|w| ui_modifiers(w).is_none()) {
+                        // A row known to be unplayable only says why: the preview playing carries on.
+                        match (&problem, w.interact_pointer_pos()) {
+                            (Some(why), _) => refused_click = Some(format!("Can't preview '{}': {why}", t.title)),
+                            (None, Some(pos)) => preview_click = Some((t.id, ((pos.x - w.rect.left()) / w.rect.width().max(1.0)).clamp(0.0, 1.0) as f64)),
+                            (None, None) => {}
+                        }
                     }
                     if resp.double_clicked() {
                         // Shift sends it to deck B; plain double-click takes the first free deck.
@@ -2745,6 +2890,11 @@ impl LibraryManager {
                     if resp.drag_started() {
                         resp.dnd_set_drag_payload(DragTracks(self.selected_or(t.id)));
                     }
+                    // Right-clicking the waveform opens the row's menu too.
+                    let resp = match wave {
+                        Some(w) => resp.union(w),
+                        None => resp,
+                    };
                     if resp.secondary_clicked() && !self.selection.contains(&t.id) {
                         actions.push(Action::Select(t.id, egui::Modifiers::NONE));
                     }
@@ -2814,6 +2964,14 @@ impl LibraryManager {
                     });
                 });
             });
+        self.visible_rows = visible;
+        if preview_click.is_some() {
+            self.overview_clicked = preview_click;
+        }
+        if let Some(why) = refused_click {
+            let still = self.previewing.and_then(|(id, _)| self.track(id)).map(|p| format!(" · still previewing '{}'", p.title));
+            self.status_message = why + &still.unwrap_or_default();
+        }
 
         // "Add to preparation" lives in the playlist menu; make sure the list exists for drag targets.
         if self.playlists.is_empty() {
@@ -3134,6 +3292,27 @@ mod tests {
         UiTrackEntry { title: title.into(), artist: "Artist".into(), bpm: 128.0, musical_key: "8m".into(), rating: 3, file_path: Some(path.to_path_buf()), ..Default::default() }
     }
 
+    /// The Preview column sits directly before Title in every track view: after # where order matters, before the
+    /// Match column Suggestions puts after Title.
+    #[test]
+    fn preview_column_comes_just_before_title_in_every_view() {
+        use SortColumn::*;
+        let (mut lib, dir) = temp_lib("preview-column");
+        let columns = LibraryColumnsConfig::default();
+        for (nav, start) in [
+            (NavItem::Collection, &[Preview, Title, Artist][..]),
+            (NavItem::History, &[Order, Preview, Title, Artist][..]),
+            (NavItem::Playlist(0), &[Order, Preview, Title, Artist][..]),
+            (NavItem::Suggestions, &[Preview, Title, Match, Artist][..]),
+        ] {
+            lib.selected_nav = nav;
+            let cols = lib.visible_columns(&columns);
+            assert_eq!(&cols[..start.len()], start, "{nav:?}");
+            assert_eq!(cols.iter().filter(|&&c| c == Preview).count(), 1, "{nav:?}");
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn stem_queue_skips_ready_queued_and_fileless_tracks() {
         let (mut lib, dir) = temp_lib("stemq");
@@ -3247,16 +3426,16 @@ mod tests {
     fn analysis_fills_unknowns_and_keeps_user_cues() {
         let a = TrackAnalysis { bpm: 126.0, beatgrid_offset_sec: 0.5, key_value: 21, key_open: "1m".into(), energy: 7, loudness_db: -9.0, peak_db: -0.3, cue_points_sec: vec![0.5, 31.0], phrases: Vec::new() };
         let mut fresh = UiTrackEntry::default();
-        fresh.apply_analysis(&a, false);
+        fresh.apply_analysis(&a, false, true);
         assert_eq!((fresh.bpm, fresh.musical_key.as_str(), fresh.energy), (126.0, "1m", 7));
         assert_eq!(fresh.cues.len(), 3, "grid + 2 auto cues");
 
         let mut tagged = UiTrackEntry { bpm: 128.0, musical_key: "8m".into(), ..Default::default() };
         tagged.cues.push(NmlCue { name: "Drop".into(), displ_order: 0, cue_type: retraktor_core::CueType::Cue, start_ms: 1.0, len_ms: 0.0, repeats: -1, hotcue: 0, grid_bpm: None });
-        tagged.apply_analysis(&a, false);
+        tagged.apply_analysis(&a, false, true);
         assert_eq!((tagged.bpm, tagged.musical_key.as_str(), tagged.energy), (128.0, "8m", 7));
         assert_eq!(tagged.cues.iter().filter(|c| c.name.starts_with("Auto ")).count(), 0);
-        tagged.apply_analysis(&a, true);
+        tagged.apply_analysis(&a, true, true);
         assert_eq!(tagged.bpm, 126.0);
     }
 
