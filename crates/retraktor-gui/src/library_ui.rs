@@ -3071,17 +3071,14 @@ impl LibraryManager {
                 for &c in &cols {
                     header.col(|ui| {
                         let sortable = c != SortColumn::Preview;
-                        let (rect, r) = ui.allocate_exact_size(ui.available_size_before_wrap(), Sense::click());
+                        // Plain label + whole-cell interact: a Button named "Preview" would shadow the toolbar toggle, and an exact-size allocation stops the remainder column shrinking.
+                        let r = ui.interact(ui.max_rect(), ui.id().with(("col_hdr", c)), Sense::click());
                         if r.hovered() && sortable {
-                            ui.painter().rect_filled(rect, 2.0, TraktorTheme::CONTROL_HOVER());
+                            ui.painter().rect_filled(ui.max_rect(), 2.0, TraktorTheme::CONTROL_HOVER());
                         }
                         let arrow = if c == sort_col { if sort_asc { " ▲" } else { " ▼" } } else { "" };
                         let color = if c == sort_col { TraktorTheme::TEXT_PRIMARY() } else { TraktorTheme::TEXT_SECONDARY() };
-                        let text = RichText::new(format!("{}{arrow}", c.header())).size(11.0).strong().color(color);
-                        let galley = egui::WidgetText::from(text).into_galley(ui, Some(egui::TextWrapMode::Truncate), rect.width(), egui::TextStyle::Body);
-                        let pos = egui::pos2(rect.left(), rect.center().y - galley.size().y * 0.5);
-                        ui.painter_at(rect).galley(pos, galley, color);
-                        r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, sortable, c.header()));
+                        ui.add(egui::Label::new(RichText::new(format!("{}{arrow}", c.header())).size(11.0).strong().color(color)).truncate().selectable(false).sense(Sense::hover()));
                         if r.clicked() && sortable {
                             actions.push(Action::Sort(c));
                         }

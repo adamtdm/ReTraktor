@@ -81,6 +81,19 @@ impl LibraryColumnsConfig {
     }
 }
 
+/// Mixer / deck effect names in `MixerFxKind` order: the index is the kind.
+pub const FX_NAMES: [&str; 9] = [
+    "Filter",
+    "Reverb",
+    "Dual delay",
+    "Noise sweep",
+    "Time gater",
+    "Flanger",
+    "Barber pole phaser",
+    "Dotted eighth delay",
+    "Bit crush",
+];
+
 pub struct PreferencesDialog {
     /// Set when the user asks for the folder chooser; the app opens it via the library.
     pub request_folder_pick: bool,
@@ -208,7 +221,7 @@ impl Default for PreferencesDialog {
             jog_scratch_sensitivity: 1.0,
             jog_mode_turntable: true,
             lock_playing_decks: true,
-            mixer_fx_slots: [0, 1, 2, 3], // Filter, Reverb, Delay, Noise
+            mixer_fx_slots: [1, 2, 3, 4], // MX2 FX1–FX4: Reverb, Delay, Noise, Gater (FILTER has its own button)
             neural_mix_eq_mode: false,
             demucs_install_state: crate::demucs::DemucsInstallState::NotInstalled,
             trigger_demucs_install: false,
@@ -665,8 +678,6 @@ impl PreferencesDialog {
     }
 
     /// Backwards compatibility shim
-    pub fn show(&mut self, _ctx: &egui::Context) {}
-
     fn show_audio_setup(&mut self, ui: &mut Ui) {
         Self::list_section_header(ui, "Sound card");
 
@@ -1035,24 +1046,14 @@ impl PreferencesDialog {
 
     fn show_effects_prefs(&mut self, ui: &mut Ui) {
         Self::list_section_header(ui, "Channel FX");
-        let fx_options = [
-            "Filter",
-            "Reverb",
-            "Dual delay",
-            "Noise sweep",
-            "Time gater",
-            "Barber pole phaser",
-            "Flanger",
-            "Dotted eighth delay",
-            "Bit crush",
-        ];
+        let fx_options = FX_NAMES;
 
         for idx in 0..4 {
             let mut slot_val = self.mixer_fx_slots[idx].min(fx_options.len() - 1);
             Self::list_row(
                 ui,
                 &format!("Slot {}", idx + 1),
-                "One-knob effect available on each mixer channel.",
+                "The mixer channel effect the MX2's FX button of this number picks.",
                 |ui| {
                     egui::ComboBox::from_id_salt(format!("mfx_slot_{idx}"))
                         .selected_text(fx_options[slot_val])
