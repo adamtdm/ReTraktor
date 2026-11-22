@@ -11,6 +11,11 @@
 //!   dirty rectangles into USB Bulk frames (`0x8400` header).
 //! - [`AlsaMidiTsiRouter`]: Routes raw 3-byte MIDI messages through a [`TsiFile`] into [`PropertyBus`].
 //! - [`generate_linux_udev_rules`]: Generates `/etc/udev/rules.d/99-retraktor-ni.rules`.
+//! - [`controller_rules`]: Versioned JSON controller rules (layers, Shift, macros) shared by the app and CLI.
+//! - [`mapping_import`]: Converts Traktor, Mixxx and rekordbox MIDI mappings into draft controller rules.
+
+pub mod controller_rules;
+pub mod mapping_import;
 
 use retraktor_core::{JogwheelMode, PropValue, PropertyBus, ScreenFlavor, SurfaceEvent, TraktorColor};
 use retraktor_formats::{TsiFile, WaveformStripe};
@@ -1211,38 +1216,29 @@ pub fn scan_linux_ni_hidraw_devices() -> Vec<DetectedNiHidrawDevice> {
         let Ok(uevent) = std::fs::read_to_string(&uevent_path) else {
             continue;
         };
-        let mut dev_vid = 0u16;
-        let mut dev_pid = 0u16;
-        let mut hid_name = String::new();
-        for line in uevent.lines() {
-            // Format: HID_ID=0003:000017CC:00002420
-            if let Some(rest) = line.strip_prefix("HID_ID=") {
-                let parts: Vec<&str> = rest.split(':').collect();
-                if parts.len() == 3 {
-                    dev_vid = u16::from_str_radix(parts[1].trim_start_matches('0'), 16).unwrap_or(0);
-                    dev_pid = u16::from_str_radix(parts[2].trim_start_matches('0'), 16).unwrap_or(0);
-                }
-            } else if let Some(hname) = line.strip_prefix("HID_NAME=") {
-                hid_name = hname.to_string();
-            }
-        }
-        if let Some(desc) = lookup_ni_device(dev_vid, dev_pid) {
+        // Only the USB IDs count: an unknown NI product or a name containing "mx2" is never taken for an MX2.
+        if let Some(desc) = hidraw_vid_pid(&uevent).and_then(|(vid, pid)| lookup_ni_device(vid, pid)) {
             found.push(DetectedNiHidrawDevice {
                 dev_node: format!("/dev/{name}"),
                 descriptor: desc,
             });
-        } else if dev_vid == 0x17CC || hid_name.to_lowercase().contains("mx2") {
-            // Firmware revision or custom descriptor with MX2 match
-            if let Some(desc) = lookup_ni_device(0x17CC, TRAKTOR_MX2_PID) {
-                found.push(DetectedNiHidrawDevice {
-                    dev_node: format!("/dev/{name}"),
-                    descriptor: desc,
-                });
-            }
         }
     }
     found.sort_by(|a, b| a.dev_node.cmp(&b.dev_node));
     found
+}
+
+/// USB vendor and product ID from a hidraw device's `uevent` (`HID_ID=0003:000017CC:00002420`).
+pub fn hidraw_vid_pid(uevent: &str) -> Option<(u16, u16)> {
+    let id = uevent.lines().find_map(|line| line.strip_prefix("HID_ID="))?;
+    let mut parts = id.split(':').skip(1).map(|p| u32::from_str_radix(p, 16).ok().and_then(|n| u16::try_from(n).ok()));
+    Some((parts.next()??, parts.next()??))
+}
+
+/// USB vendor and product ID of a `/dev/hidrawN` node, read from sysfs.
+pub fn hidraw_node_vid_pid(dev_node: &str) -> Option<(u16, u16)> {
+    let name = std::path::Path::new(dev_node).file_name()?.to_str()?;
+    hidraw_vid_pid(&std::fs::read_to_string(format!("/sys/class/hidraw/{name}/device/uevent")).ok()?)
 }
 
 /// Scans all connected DJ hardware across `/sys/class/hidraw`, `/sys/bus/usb/devices`,
@@ -1391,6 +1387,18 @@ pub fn scan_all_dj_hardware() -> Vec<DiscoveredHardwareItem> {
 mod tests {
     use super::*;
     use retraktor_formats::{StripeColumn, TsiControlMapping, TsiDevice};
+
+    #[test]
+    fn only_the_mx2_usb_ids_identify_an_mx2() {
+        let mx2 = "DRIVER=hid-generic\nHID_ID=0003:000017CC:00002420\nHID_NAME=Native Instruments Traktor MX2\n";
+        let x1 = "HID_ID=0003:000017CC:00002200\nHID_NAME=Native Instruments Traktor X1 MK3\n";
+        let named_mx2 = "HID_ID=0003:00001234:00002420\nHID_NAME=My MX2 clone\n";
+        assert_eq!(hidraw_vid_pid(mx2), Some((NI_USB_VID, TRAKTOR_MX2_PID)));
+        assert_eq!(hidraw_vid_pid(x1), Some((NI_USB_VID, 0x2200)));
+        assert_eq!(hidraw_vid_pid(named_mx2), Some((0x1234, TRAKTOR_MX2_PID)));
+        assert_eq!(hidraw_vid_pid("HID_NAME=no id\n"), None);
+        assert_eq!(hidraw_node_vid_pid("/dev/hidraw-does-not-exist"), None);
+    }
 
     #[test]
     fn test_hid_haptic_screen_and_midi_tsi() {

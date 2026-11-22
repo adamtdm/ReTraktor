@@ -52,6 +52,10 @@ impl XmlNode {
     }
 }
 
+/// Elements nested deeper than this are refused: real Traktor, rekordbox and Mixxx files nest a few dozen levels at
+/// most, and a deeply nested malformed file must not exhaust the stack when its tree is dropped.
+pub const MAX_DEPTH: usize = 256;
+
 /// Parsed document: the XML declaration (verbatim) plus a single root element.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct XmlDocument {
@@ -90,6 +94,12 @@ impl XmlDocument {
             }
             if input[i..].starts_with("<!--") {
                 let end = input[i..].find("-->").ok_or("Unterminated comment")? + i + 3;
+                i = end;
+                continue;
+            }
+            // `<!DOCTYPE …>` and similar declarations carry no data here (some Mixxx mappings start with one).
+            if input[i..].starts_with("<!") && !input[i..].starts_with("<![CDATA[") {
+                let end = input[i..].find('>').ok_or("Unterminated declaration")? + i + 1;
                 i = end;
                 continue;
             }
@@ -134,6 +144,8 @@ impl XmlDocument {
                     Some(parent) => parent.children.push(node),
                     None => root = Some(node),
                 }
+            } else if stack.len() >= MAX_DEPTH {
+                return Err(format!("Elements nested deeper than {MAX_DEPTH} levels at byte {tag_start}"));
             } else {
                 stack.push(node);
             }
@@ -259,6 +271,13 @@ pub fn unescape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deep_nesting_is_refused_without_exhausting_the_stack() {
+        let deep = "<a>".repeat(200_000);
+        assert!(XmlDocument::parse(&deep).unwrap_err().contains("nested deeper than 256"));
+        assert!(XmlDocument::parse(&format!("{}{}", "<a>".repeat(255), "</a>".repeat(255))).is_ok());
+    }
 
     #[test]
     fn roundtrip_traktor_style() {

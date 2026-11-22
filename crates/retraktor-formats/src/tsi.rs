@@ -36,6 +36,15 @@ impl TsiChunk {
 
     /// Parses a sequence of Big-Endian FourCC TLV chunks from `bytes`.
     pub fn parse_stream(bytes: &[u8]) -> Result<Vec<TsiChunk>, String> {
+        Self::parse_stream_at(bytes, 0)
+    }
+
+    /// `depth` counts container levels; past [`MAX_CHUNK_DEPTH`] a chunk is kept as raw payload, so a malformed blob
+    /// of nested containers can't exhaust the stack (real files nest about 8 levels).
+    fn parse_stream_at(bytes: &[u8], depth: usize) -> Result<Vec<TsiChunk>, String> {
+        if depth > MAX_CHUNK_DEPTH {
+            return Err(format!("TSI chunks nested deeper than {MAX_CHUNK_DEPTH} levels"));
+        }
         let mut chunks = Vec::new();
         let mut offset = 0;
         while offset + 8 <= bytes.len() {
@@ -64,7 +73,7 @@ impl TsiChunk {
             let slice = &bytes[offset..offset + len];
             offset += len;
 
-            let (prefix, children) = parse_container_children(&fourcc, slice);
+            let (prefix, children) = parse_container_children(&fourcc, slice, depth + 1);
             chunks.push(TsiChunk {
                 fourcc,
                 payload: prefix,
@@ -81,11 +90,13 @@ impl TsiChunk {
     }
 }
 
-fn parse_container_children(fourcc: &[u8; 4], slice: &[u8]) -> (Vec<u8>, Vec<TsiChunk>) {
+const MAX_CHUNK_DEPTH: usize = 32;
+
+fn parse_container_children(fourcc: &[u8; 4], slice: &[u8], depth: usize) -> (Vec<u8>, Vec<TsiChunk>) {
     match fourcc {
         // Pure 0-byte prefix container chunks: DIOM (-> DIOI + DEVS), DDAT, DDDC, DDCB
         b"DIOM" | b"DDAT" | b"DDDC" | b"DDCB" if slice.len() >= 8 => {
-            if let Ok(children) = TsiChunk::parse_stream(slice) {
+            if let Ok(children) = TsiChunk::parse_stream_at(slice, depth) {
                 if !children.is_empty() {
                     return (Vec::new(), children);
                 }
@@ -93,7 +104,7 @@ fn parse_container_children(fourcc: &[u8; 4], slice: &[u8]) -> (Vec<u8>, Vec<Tsi
         }
         // 4-byte count prefix container chunks: DEVS, DDCI, DDCO, CMAS, DCBM
         b"DEVS" | b"DDCI" | b"DDCO" | b"CMAS" | b"DCBM" if slice.len() >= 12 => {
-            if let Ok(children) = TsiChunk::parse_stream(&slice[4..]) {
+            if let Ok(children) = TsiChunk::parse_stream_at(&slice[4..], depth) {
                 if !children.is_empty() {
                     return (slice[..4].to_vec(), children);
                 }
@@ -103,7 +114,7 @@ fn parse_container_children(fourcc: &[u8; 4], slice: &[u8]) -> (Vec<u8>, Vec<Tsi
         b"DEVI" => {
             if let Some((_, consumed)) = decode_utf16be_string(slice) {
                 if slice.len() >= consumed + 8 {
-                    if let Ok(children) = TsiChunk::parse_stream(&slice[consumed..]) {
+                    if let Ok(children) = TsiChunk::parse_stream_at(&slice[consumed..], depth) {
                         if !children.is_empty() {
                             return (slice[..consumed].to_vec(), children);
                         }
@@ -113,7 +124,7 @@ fn parse_container_children(fourcc: &[u8; 4], slice: &[u8]) -> (Vec<u8>, Vec<Tsi
         }
         // CMAI has a 12-byte header (midi_binding_id, io_type, traktor_control_id) followed by CMAD
         b"CMAI" if slice.len() >= 20 => {
-            if let Ok(children) = TsiChunk::parse_stream(&slice[12..]) {
+            if let Ok(children) = TsiChunk::parse_stream_at(&slice[12..], depth) {
                 if !children.is_empty() {
                     return (slice[..12].to_vec(), children);
                 }
@@ -503,6 +514,28 @@ fn b64_val(b: u8) -> Result<u32, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Containers nested far deeper than any real file parse without exhausting the stack; past the limit the
+    /// inner chunks stay raw payload.
+    #[test]
+    fn deeply_nested_containers_are_bounded() {
+        let core = b"DIOI\0\0\0\x04\0\0\0\x01";
+        let levels = 200_000u32;
+        let mut bytes = Vec::with_capacity(levels as usize * 8 + core.len());
+        for inside in (0..levels).rev() {
+            bytes.extend(b"DDAT");
+            bytes.extend((core.len() as u32 + 8 * inside).to_be_bytes());
+        }
+        bytes.extend(core);
+        let chunks = TsiChunk::parse_stream(&bytes).unwrap();
+        let mut depth = 0;
+        let mut level = &chunks;
+        while let Some(c) = level.first() {
+            depth += 1;
+            level = &c.children;
+        }
+        assert!(depth <= MAX_CHUNK_DEPTH + 1, "{depth}");
+    }
 
     #[test]
     fn test_tsi_diom_roundtrip() {

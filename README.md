@@ -34,11 +34,14 @@
 * **CDJ Nudge vs Turntable Scratch**: Outer rim turning nudges pitch phase gently ($0.08\text{ s}$ scaling) without scratching. Easily switch between Vinyl Scratch (`TT`) and CDJ Pitch Bend (`JOG`) modes.
 
 ### 2. Four Workspace Layouts (`F1` – `F4`)
-* **`F1` — Mix (Default)**: Stacked Deck A & B waveforms for visual beatmatching, compact decks, a 2-channel mixer, and the library below.
-* **`F2` — 4-Deck (`A / B / C / D`)**: All four decks with a 4-channel mixer.
+* **Deck layouts**, picked with the toolbar's two choices, **Waveforms** and **Deck count**, with the library below each. Changing one keeps the other; from Browse, Timeline or Set either choice reopens the decks:
+  * **Waveforms Stacked** (`F1` with 2 Decks, default): the decks' waveforms stacked full width for visual beatmatching, then the decks either side of the mixer.
+  * **Waveforms In Deck** (`F2` with 4 Decks): each deck shows its own waveform, either side of the mixer.
+  * **2 Decks**: decks A and B and a 2-channel mixer. **4 Decks**: decks A and B over C and D and a 4-channel mixer; the library offers all four.
+  * A deck's lane stays on screen while it is empty, so the stack never shifts as tracks load.
 * **`F3` — Browser**: Mini deck strips and a full-height library for preparing sets.
 * **`F4` — Timeline**: Track A → Track B transition arranger with stem automation presets and live auditioning.
-* **Beat Jump** moves a loaded deck backward or forward by 4, 8, 16 or 32 beats. Choose a size in the `JUMP` row under the transport controls in Mix or 4-Deck. On a 120 BPM track, 32 beats moves 16 seconds through the track at any pitch setting. An active loop moves with the playhead. An arrow dims when the full jump would cross a track boundary.
+* **Beat Jump** moves a loaded deck backward or forward by 4, 8, 16 or 32 beats. Choose a size in the `JUMP` row under the transport controls in any deck layout. On a 120 BPM track, 32 beats moves 16 seconds through the track at any pitch setting. An active loop moves with the playhead. An arrow dims when the full jump would cross a track boundary.
 
 ### 3. Interactive Graphical Controller Surface Map & Remapper
 * Located in **Preferences** (`⚙ -> Controllers & MX2`).
@@ -47,6 +50,7 @@
   * **Assign Custom Actions**: Play/Pause, Cue, Sync, Stem Mutes (Drums, Bass, Instruments, Vocals), Filter Cutoff, Filter Toggle, Mixer FX (Filter, Reverb, Delay, Noise), Hotcues, and Loops.
   * **Customize RGB LED Colors**: Assign true multi-color hardware codes (Vibrant Blue `0x2E`, Emerald Green `0x1E`, Ruby Red `0x06`, Amber Yellow `0x16`, Club Orange `0x0E`, Electric Cyan `0x22`, Vocal Magenta `0x36`, Clean White `0x4A`).
   * **Hardware Jogwheel Tuning**: Adjust scratch sensitivity ($0.2\times$ to $3.0\times$) and toggle default turntable scratch vs CDJ jog pitch bend.
+* **Controller rules file** for Traktor-style creative mappings on the MX2, generic MIDI and learned NI HID controllers: held Shift and latched layers, conditions, several actions per control, macro knobs with their own (or inverted) ranges, encoders and MX2 pad colours. It is plain JSON at `~/.config/retraktor/controller-rules.json`, which you or any coding agent can write, check with `retraktor-cli validate-mapping`, then load with **Reload** in Preferences > Controllers. `retraktor-cli mapping-reference` prints the grammar, every action and every MX2 control ID; MIDI and NI HID IDs come from your hardware via **Last control** in the same panel, with stable MIDI port names such as `midi.xonek2`. Traktor `.tsi` (Generic MIDI), Mixxx `.midi.xml` and rekordbox `.midi.csv` mappings can be converted into rules, with a row-by-row coverage report, in the same panel or with `retraktor-cli import-mapping`, and added to the rules file on disk, several drafts at once and all or nothing, with `retraktor-cli apply-mapping` (then press **Reload** or restart the app). The contract is in [docs/controller-rules.md](docs/controller-rules.md).
 
 ### 4. Hybrid 4-Stem Engine & Multi-Lane Waveforms
 * **Spectrum & 4-Stem Waveform Toggle**: Switch any deck between a high-contrast **Spectrum** frequency-colored waveform (warm red sub-bass, amber low-mids, teal mids, crisp ice-blue highs) and a **4-Lane Split Stem Waveform** (`DRUMS`, `BASS`, `OTHER`, `VOCALS`) with left-hand lane headers, per-lane mute toggles, and real-time level meters.
@@ -231,7 +235,7 @@ ReTraktor/
 | `Space` | Play / Pause active deck |
 | `C` | Jump to Cue point |
 | `S` | Sync BPM and phase with Master deck |
-| `F1` – `F4` | Switch Workspace Layout (Mix, 4-Deck, Browser, Timeline) |
+| `F1` – `F5` | Switch Workspace Layout (2 Decks Stacked, 4 Decks In Deck, Browser, Timeline, Set) |
 | `1` – `4` | Trigger Hotcues / Stem Mutes (Drums, Bass, Instruments, Vocals) |
 | `Shift + 1..4` | Delete Hotcue |
 | `L` | Toggle Active Loop |

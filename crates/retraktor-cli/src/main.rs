@@ -21,7 +21,7 @@ use retraktor_formats::{
     WaveformStripe,
 };
 use retraktor_hid::{
-    generate_linux_udev_rules, KontrolScreenFramebuffer, S4Mk3HapticPlatterConfig, NI_DEVICES,
+    controller_rules, generate_linux_udev_rules, mapping_import, KontrolScreenFramebuffer, S4Mk3HapticPlatterConfig, NI_DEVICES,
 };
 use retraktor_library::{analyze_mono, KeyWheel, TrackAnalyzer, TrackLibrary};
 use std::collections::HashMap;
@@ -83,6 +83,7 @@ fn main() {
     }
 
     match args[1].as_str() {
+        "-h" | "--help" => print_usage(),
         "gui" => {
             if let Err(e) = launch_gui() {
                 eprintln!("Failed to launch GUI window: {e}");
@@ -312,6 +313,23 @@ fn main() {
         "udev-rules" => {
             print!("{}", generate_linux_udev_rules());
         }
+        "mapping-reference" => {
+            if args.get(2).map(String::as_str) == Some("--example") {
+                print!("{}", controller_rules::EXAMPLE_RULES);
+            } else {
+                print!("{}", controller_rules::reference_text());
+            }
+        }
+        "validate-mapping" => {
+            let path = args.get(2).map(PathBuf::from).unwrap_or_else(controller_rules::default_rules_path);
+            process::exit(validate_mapping(&path));
+        }
+        "import-mapping" => {
+            process::exit(import_mapping(&args[2..], &mut io::stdout(), &mut io::stderr()));
+        }
+        "apply-mapping" => {
+            process::exit(apply_mapping(&args[2..], &controller_rules::default_rules_path(), &mut io::stdout(), &mut io::stderr()));
+        }
         "simulate-mix" => {
             run_simulation();
         }
@@ -367,6 +385,301 @@ fn main() {
             print_usage();
             process::exit(1);
         }
+    }
+}
+
+/// Checks a controller rules file without hardware. Returns the exit code: 0 valid, 1 not.
+fn validate_mapping(path: &Path) -> i32 {
+    let text = match controller_rules::read_rules_file(path) {
+        Ok(text) => text,
+        Err(e) => {
+            eprintln!("{}: can't read: {e}", path.display());
+            return 1;
+        }
+    };
+    match controller_rules::parse_rules(&text) {
+        Ok(set) => {
+            println!("{}: OK, {} rules and {} pad lights. Press Reload in Preferences > Controllers to use it.", path.display(), set.rule_count(), set.led_count());
+            0
+        }
+        Err(problems) => {
+            for problem in &problems {
+                eprintln!("{}: {problem}", path.display());
+            }
+            eprintln!("{} problem(s). `retraktor-cli mapping-reference` lists the actions and control IDs.", problems.len());
+            1
+        }
+    }
+}
+
+const IMPORT_USAGE: &str = "\
+Usage: retraktor-cli import-mapping <file> --list
+       retraktor-cli import-mapping <file> [--device N] --port PORT [--out DRAFT.json | --out -] [--report REPORT.txt]
+
+Converts a Traktor .tsi (Generic MIDI devices), Mixxx .midi.xml or rekordbox .midi.csv mapping into a draft
+controller rules file. Nothing is written unless you name a file, an existing file is never overwritten, and the
+active rules file is never changed: review the draft, then add it with `retraktor-cli apply-mapping DRAFT.json`
+(several drafts at once, all or nothing) or with Preferences > Controllers > Import.
+
+  --list          List the devices in the file (a Traktor settings file can hold several).
+  --device N      Which device to convert (1-based); needed when the file holds more than one.
+  --port PORT     The MIDI port the rules are for, as ReTraktor names it: touch a control and read
+                  Last control in Preferences > Controllers (midi.<port>.ch1.note36), or use the ALSA
+                  card id from /proc/asound/cards in lowercase (XONEK2 is xonek2).
+  --out FILE      Write the draft to FILE (must not exist). With --out -, the draft goes to stdout and the
+                  report to stderr.
+  --report FILE   Also write the coverage report to FILE (must not exist).
+
+The coverage report lists every source row as translated, approximated (what differs), merged into another
+row's rule, or unsupported (why). Exit status: 0 a draft was made, 2 nothing could be converted (the report says
+why), 1 an error (unreadable file, bad option, or an output file that already exists).
+";
+
+/// `retraktor-cli import-mapping`: returns the exit status (0 draft made, 2 nothing convertible, 1 error).
+fn import_mapping(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    let mut file = None;
+    let (mut list, mut device, mut port, mut draft_to, mut report_to) = (false, None, None, None, None);
+    let mut i = 0;
+    while i < args.len() {
+        let value = args.get(i + 1).cloned();
+        match args[i].as_str() {
+            "--list" => list = true,
+            "--device" | "--port" | "--out" | "--report" if value.is_none() => {
+                let _ = writeln!(err, "{} needs a value\n\n{IMPORT_USAGE}", args[i]);
+                return 1;
+            }
+            "--device" => {
+                device = match value.as_deref().unwrap_or("").parse::<usize>() {
+                    Ok(n) if n >= 1 => Some(n),
+                    _ => {
+                        let _ = writeln!(err, "--device takes a device number from --list (1, 2, ...)");
+                        return 1;
+                    }
+                };
+                i += 1;
+            }
+            "--port" => (port, i) = (value, i + 1),
+            "--out" => (draft_to, i) = (value, i + 1),
+            "--report" => (report_to, i) = (value, i + 1),
+            "-h" | "--help" => {
+                let _ = write!(out, "{IMPORT_USAGE}");
+                return 0;
+            }
+            other if other.starts_with('-') => {
+                let _ = writeln!(err, "unknown option {other}\n\n{IMPORT_USAGE}");
+                return 1;
+            }
+            other if file.is_none() => file = Some(PathBuf::from(other)),
+            other => {
+                let _ = writeln!(err, "only one mapping file at a time ({other} is a second one)");
+                return 1;
+            }
+        }
+        i += 1;
+    }
+    let Some(file) = file else {
+        let _ = write!(err, "{IMPORT_USAGE}");
+        return 1;
+    };
+    let source = match mapping_import::read_source(&file) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = writeln!(err, "{e}");
+            return 1;
+        }
+    };
+    let devices: String = source.devices.iter().enumerate().map(|(n, d)| format!("  {}  {}  ({})\n", n + 1, d.name, d.detail)).collect();
+    if list {
+        let _ = write!(out, "{} \"{}\": {} device(s)\n{devices}", source.format, source.title, source.devices.len());
+        return 0;
+    }
+    let device = match device {
+        Some(n) => n,
+        None if source.devices.len() == 1 => 1,
+        None => {
+            let _ = write!(err, "{} holds {} devices; choose one with --device N:\n{devices}", file.display(), source.devices.len());
+            return 1;
+        }
+    };
+    let Some(port) = port else {
+        let _ = writeln!(err, "--port is required: the MIDI port as ReTraktor names it (Last control in Preferences > Controllers shows midi.<port>.…, or the lowercase ALSA card id from /proc/asound/cards). Devices:\n{devices}");
+        return 1;
+    };
+    let conversion = match mapping_import::convert(&source, device, &port) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = writeln!(err, "{e}");
+            return 1;
+        }
+    };
+    let report = conversion.report();
+    // Check both output paths before writing either, so a refusal leaves nothing half-written.
+    if let (Some(draft), Some(report)) = (draft_to.as_deref().filter(|p| *p != "-"), report_to.as_deref()) {
+        if same_target(draft, report) {
+            let _ = writeln!(err, "--out and --report name the same file ({draft}); nothing was written");
+            return 1;
+        }
+    }
+    for path in [draft_to.as_deref().filter(|p| *p != "-"), report_to.as_deref()].into_iter().flatten() {
+        if Path::new(path).exists() {
+            let _ = writeln!(err, "{path} already exists; nothing was written (choose a new file name)");
+            return 1;
+        }
+    }
+    if let Some(path) = &report_to {
+        if let Err(e) = mapping_import::write_new_file(Path::new(path), &report) {
+            let _ = writeln!(err, "can't write {path}: {e}");
+            return 1;
+        }
+    }
+    let Some(draft) = &conversion.draft else {
+        let _ = write!(out, "{report}");
+        let _ = writeln!(err, "No draft: {}", conversion.empty_reason.as_deref().unwrap_or("nothing could be converted"));
+        return 2;
+    };
+    match draft_to.as_deref() {
+        Some("-") => {
+            let _ = write!(out, "{draft}");
+            let _ = write!(err, "{report}");
+        }
+        Some(path) => {
+            if let Err(e) = mapping_import::write_new_file(Path::new(path), draft) {
+                // The report was created a moment ago by this run; don't leave it behind on its own.
+                if let Some(report) = &report_to {
+                    let _ = fs::remove_file(report);
+                }
+                let _ = writeln!(err, "can't write {path}: {e}; nothing was written");
+                return 1;
+            }
+            let _ = write!(out, "{report}\nDraft written to {path}. It is not active until you add it: `retraktor-cli apply-mapping --dry-run {path}` checks it against the rules file, and without --dry-run adds it.\n");
+        }
+        None => {
+            let _ = write!(out, "{report}\nPreview only: add --out FILE to write the draft.\n");
+        }
+    }
+    0
+}
+
+/// Whether two output paths (which may not exist yet) name the same file, e.g. `out.txt` and `./x/../out.txt`.
+fn same_target(a: &str, b: &str) -> bool {
+    let place = |p: &str| {
+        let p = Path::new(p);
+        let dir = p.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        (fs::canonicalize(dir).ok(), p.file_name().map(|n| n.to_os_string()))
+    };
+    a == b || matches!((place(a), place(b)), ((Some(x), n), (Some(y), m)) if x == y && n == m)
+}
+
+const APPLY_USAGE: &str = "\
+Usage: retraktor-cli apply-mapping [--dry-run] [--json] DRAFT.json [DRAFT.json ...]
+
+Adds draft rules files (from import-mapping, Save draft…, or written by hand) to the rules file the app reads,
+~/.config/retraktor/controller-rules.json, like Preferences > Controllers > Import > Add to rules file. The
+drafts' rules and pad lights go after the file's own, in the order given. All or nothing: if a draft can't be
+read or has problems, or collides with the rules file or an earlier draft (a control that already has rules, a
+modifier name already used on the same device, a pad that already has a colour, or a CC read another way),
+nothing is written. Nothing is written either if the file changes on disk while this runs. The file it replaces
+is kept as controller-rules.json.before-import-<time>. The app reads the rules file at startup and on Reload in
+Preferences > Controllers.
+
+  --dry-run   Check and count everything; write nothing.
+  --json      Print one JSON object on stdout with outcome (applied, preview, refused or usage), dry_run,
+              path, drafts, counts (rules_before, leds_before, rules_added, leds_added, rules_after,
+              leds_after; null unless applied or previewed), backup (path or null) and diagnostics (a list of
+              {draft, message}; draft is null for the rules file itself).
+
+Exit status: 0 applied (with --dry-run: would apply), 1 refused or failed (the messages say why), 2 bad usage.
+";
+
+/// `retraktor-cli apply-mapping` against `rules_path`: merges every draft in order in memory, then replaces the
+/// rules file once, only if it still holds what was read at the start. Returns the exit status (see APPLY_USAGE).
+fn apply_mapping(args: &[String], rules_path: &Path, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        let _ = write!(out, "{APPLY_USAGE}");
+        return 0;
+    }
+    let json = args.iter().any(|a| a == "--json");
+    let dry_run = args.iter().any(|a| a == "--dry-run");
+    let drafts: Vec<&str> = args.iter().map(String::as_str).filter(|a| !matches!(*a, "--json" | "--dry-run")).collect();
+    let finish = |out: &mut dyn Write, err: &mut dyn Write, outcome: &str, counts: Option<[usize; 4]>, backup: Option<PathBuf>, diagnostics: Vec<(Option<&str>, String)>| {
+        if json {
+            let counts = counts.map(|[rules_before, leds_before, rules_after, leds_after]| {
+                serde_json::json!({"rules_before": rules_before, "leds_before": leds_before, "rules_added": rules_after - rules_before,
+                    "leds_added": leds_after - leds_before, "rules_after": rules_after, "leds_after": leds_after})
+            });
+            let diagnostics: Vec<_> = diagnostics.iter().map(|(draft, message)| serde_json::json!({"draft": draft, "message": message})).collect();
+            let _ = writeln!(out, "{}", serde_json::json!({"outcome": outcome, "dry_run": dry_run, "path": rules_path.display().to_string(), "drafts": drafts,
+                "counts": counts, "backup": backup.map(|b| b.display().to_string()), "diagnostics": diagnostics}));
+        } else {
+            for (draft, message) in &diagnostics {
+                let _ = writeln!(err, "{}{message}", draft.map(|d| format!("{d}: ")).unwrap_or_default());
+            }
+            if outcome == "usage" {
+                let _ = write!(err, "\n{APPLY_USAGE}");
+            }
+            if let Some([rules_before, leds_before, rules_after, leds_after]) = counts {
+                let path = rules_path.display();
+                let added = format!("{} rules and {} pad lights from {} draft(s)", rules_after - rules_before, leds_after - leds_before, drafts.len());
+                let _ = match outcome {
+                    "preview" => writeln!(out, "Dry run: would add {added} to {path}, giving {rules_after} rules and {leds_after} pad lights. Nothing was written."),
+                    _ => writeln!(out, "Added {added} to {path}, now {rules_after} rules and {leds_after} pad lights.{} Press Reload in Preferences > Controllers (or restart ReTraktor) to use them.",
+                        backup.map(|b| format!(" The previous file is kept as {}.", b.display())).unwrap_or_default()),
+                };
+            }
+        }
+        match outcome {
+            "applied" | "preview" => 0,
+            "usage" => 2,
+            _ => 1,
+        }
+    };
+    if let Some(option) = drafts.iter().find(|a| a.starts_with('-')) {
+        return finish(out, err, "usage", None, None, vec![(None, format!("unknown option {option}"))]);
+    }
+    if drafts.is_empty() {
+        return finish(out, err, "usage", None, None, vec![(None, "name at least one draft file".into())]);
+    }
+    let snapshot = match controller_rules::read_rules_file(rules_path) {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => return finish(out, err, "refused", None, None, vec![(None, format!("can't read {}: {e}; nothing was written", rules_path.display()))]),
+    };
+    let count = |set: &controller_rules::RuleSet| (set.rule_count(), set.led_count());
+    let (rules_before, leds_before) = match snapshot.as_deref().map(controller_rules::parse_rules) {
+        None => (0, 0),
+        Some(Ok(set)) => count(&set),
+        Some(Err(problems)) => {
+            let path = rules_path.display();
+            let mut diagnostics: Vec<_> = problems.iter().map(|p| (None, format!("{path}: {p}"))).collect();
+            diagnostics.push((None, format!("{path} has problems; nothing was written. Fix them (retraktor-cli validate-mapping lists them), then run again.")));
+            return finish(out, err, "refused", None, None, diagnostics);
+        }
+    };
+    let mut merged = snapshot.clone();
+    for (n, draft) in drafts.iter().enumerate() {
+        let text = match controller_rules::read_rules_file(Path::new(draft)) {
+            Ok(text) => text,
+            Err(e) => return finish(out, err, "refused", None, None, vec![(Some(draft), format!("can't read: {e}")), (None, format!("nothing was written to {}", rules_path.display()))]),
+        };
+        match mapping_import::merge_draft(merged.as_deref(), &text) {
+            Ok(text) => merged = Some(text),
+            Err(problems) => {
+                let mut diagnostics: Vec<_> = problems.into_iter().map(|p| (Some(*draft), p)).collect();
+                let earlier = if n > 0 { " (here \"the rules file\" includes the drafts named before this one)" } else { "" };
+                diagnostics.push((None, format!("nothing was written to {}{earlier}. A draft that is already in the rules file is refused like this, and then there is nothing to do; otherwise fix the draft or remove the colliding entries, then run again.", rules_path.display())));
+                return finish(out, err, "refused", None, None, diagnostics);
+            }
+        }
+    }
+    let merged = merged.expect("at least one draft was merged");
+    let (rules_after, leds_after) = controller_rules::parse_rules(&merged).map_or((0, 0), |set| count(&set));
+    let counts = Some([rules_before, leds_before, rules_after, leds_after]);
+    if dry_run {
+        return finish(out, err, "preview", counts, None, Vec::new());
+    }
+    match mapping_import::replace_rules_file(rules_path, snapshot.as_deref(), &merged) {
+        Ok(backup) => finish(out, err, "applied", counts, backup, Vec::new()),
+        Err(e) => finish(out, err, "refused", None, None, vec![(None, e)]),
     }
 }
 
@@ -572,6 +885,12 @@ fn print_usage() {
     println!("  dump-prop-bus [filter]       List registered app.traktor.* state bus properties");
     println!("  list-devices                 List supported NI Kontrol USB VID/PID controllers");
     println!("  udev-rules                   Output Linux /etc/udev/rules.d/99-retraktor-ni.rules");
+    println!("  mapping-reference [--example] Controller rules grammar, actions and control IDs (or just the example file)");
+    println!("  validate-mapping [file]      Check a controller rules file (default ~/.config/retraktor/controller-rules.json)");
+    println!("  import-mapping <file> ...    Convert a Traktor .tsi, Mixxx .midi.xml or rekordbox .midi.csv mapping into a");
+    println!("                               draft rules file with a coverage report (run it without options for help)");
+    println!("  apply-mapping [--dry-run] [--json] <draft.json>...");
+    println!("                               Add draft rules files to the rules file the app reads, all or nothing (--help)");
     println!("  simulate-mix                 Run end-to-end 4-deck audio/library/CSI/screen simulation");
     println!("  analyze-bench <nml> <index>  Benchmark offline BPM/Key analysis against Traktor NML");
 }
@@ -1341,3 +1660,168 @@ fn run_analyze_bench(nml_path: &str, index_path: &str, limit: usize) {
     println!("└──────────────────────────────────────┴──────────────────────────┘");
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_mapping_accepts_the_example_and_rejects_bad_or_missing_files() {
+        let dir = std::env::temp_dir().join(format!("retraktor-cli-validate-{}", process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let good = dir.join("good.json");
+        fs::write(&good, controller_rules::EXAMPLE_RULES).unwrap();
+        assert_eq!(validate_mapping(&good), 0);
+        let bad = dir.join("bad.json");
+        fs::write(&bad, controller_rules::EXAMPLE_RULES.replace("\"deck\": 2", "\"deck\": 7")).unwrap();
+        assert_eq!(validate_mapping(&bad), 1);
+        assert_eq!(validate_mapping(&dir.join("missing.json")), 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The import command: list, refuse an ambiguous device or a missing port, preview, write a draft without
+    /// overwriting, and exit 2 with the reason when nothing converts.
+    #[test]
+    fn import_mapping_lists_previews_writes_new_files_and_reports_empty_conversions() {
+        let dir = std::env::temp_dir().join(format!("retraktor-cli-import-{}", process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let tsi = dir.join("settings.tsi");
+        fs::write(&tsi, mapping_import::fixtures::traktor_three_devices()).unwrap();
+        let run = |args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let code = import_mapping(&args, &mut out, &mut err);
+            (code, String::from_utf8(out).unwrap(), String::from_utf8(err).unwrap())
+        };
+        let t = tsi.to_str().unwrap();
+        let (code, out, _) = run(&[t, "--list"]);
+        assert_eq!(code, 0);
+        assert!(out.contains("3 device(s)") && out.contains("2  Generic MIDI: K2 layout and browser"), "{out}");
+        let (code, _, err) = run(&[t, "--port", "xonek2"]);
+        assert!(code == 1 && err.contains("choose one with --device N"), "{err}");
+        let (code, _, err) = run(&[t, "--device", "2"]);
+        assert!(code == 1 && err.contains("--port is required"), "{err}");
+        let (code, out, _) = run(&[t, "--device", "2", "--port", "xonek2"]);
+        assert!(code == 0 && out.contains("17 source assignments, 17 report entries: 4 translated, 13 approximated") && out.contains("Preview only"), "{out}");
+        let alias = dir.join("same.txt");
+        let (code, _, err) = run(&[t, "--device", "2", "--port", "xonek2", "--out", alias.to_str().unwrap(), "--report", &format!("{}/./same.txt", dir.display())]);
+        assert!(code == 1 && err.contains("name the same file") && !alias.exists(), "{err}");
+
+        let draft = dir.join("draft.json");
+        let d = draft.to_str().unwrap();
+        let (code, out, _) = run(&[t, "--device", "2", "--port", "xonek2", "--out", d]);
+        assert!(code == 0 && out.contains("Draft written to"), "{out}");
+        assert_eq!(validate_mapping(&draft), 0);
+        let before = fs::read_to_string(&draft).unwrap();
+        let (code, _, err) = run(&[t, "--device", "3", "--port", "mixer", "--out", d]);
+        assert!(code == 1 && err.contains("already exists"), "{err}");
+        assert_eq!(fs::read_to_string(&draft).unwrap(), before, "an existing draft was overwritten");
+
+        let (code, out, err) = run(&[t, "--device", "2", "--port", "xonek2", "--out", "-"]);
+        assert!(code == 0 && out.starts_with('{') && err.contains("ReTraktor mapping import"), "{out}");
+        let report = dir.join("x1.txt");
+        let (code, out, err) = run(&[t, "--device", "1", "--port", "x1", "--report", report.to_str().unwrap()]);
+        assert!(code == 2 && err.contains("No draft: ") && out.contains("Draft:       none.") && out.contains("0 source assignments, 1 report entry"), "{err}");
+        assert!(fs::read_to_string(&report).unwrap().contains("built-in QML script"));
+        let (code, _, err) = run(&[dir.join("missing.tsi").to_str().unwrap(), "--list"]);
+        assert!(code == 1 && err.contains("can't read"), "{err}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Two complementary drafts go in together, in order and with their pad lights; a repeat, a collision between
+    /// drafts, or a bad later draft writes nothing; a dry run writes nothing; usage errors exit 2.
+    #[test]
+    fn apply_mapping_adds_drafts_all_or_nothing() {
+        let dir = std::env::temp_dir().join(format!("retraktor-cli-apply-{}", process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let rules = dir.join("controller-rules.json");
+        let draft = |name: &str, note: u8, pad: u8| {
+            let path = dir.join(name);
+            fs::write(&path, format!(r#"{{"format": "retraktor-controller-rules", "version": 1, "rules": [{{"input": "midi.xonek2.ch15.note{note}", "do": [{{"action": "play", "deck": 1}}]}}], "leds": [{{"control": "surface.right.pads.{pad}", "colour": "cyan"}}]}}"#)).unwrap();
+            path.to_str().unwrap().to_string()
+        };
+        let (a, b, a_again) = (draft("a.json", 36, 1), draft("b.json", 37, 2), draft("a-again.json", 36, 3));
+        let broken = dir.join("broken.json");
+        fs::write(&broken, "{\"format\": \"retraktor-controller-rules\", \"version\": 1, \"rules\": [{\"input\": \"midi.xonek2.ch15.note40\", \"do\": [{\"action\": \"plai\"}]}]}").unwrap();
+        let broken = broken.to_str().unwrap();
+        let run = |args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let code = apply_mapping(&args, &rules, &mut out, &mut err);
+            (code, String::from_utf8(out).unwrap(), String::from_utf8(err).unwrap())
+        };
+        let parse = |text: &str| serde_json::from_str::<serde_json::Value>(text).unwrap();
+        let files = || {
+            let mut names: Vec<_> = fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+            names.sort();
+            names
+        };
+
+        let (code, out, _) = run(&["--help"]);
+        assert!(code == 0 && out.starts_with("Usage: retraktor-cli apply-mapping"), "{out}");
+        let (code, out, _) = run(&["--json"]);
+        assert_eq!((code, parse(&out)["outcome"].as_str()), (2, Some("usage")));
+        let (code, _, err) = run(&["--force", &a]);
+        assert!(code == 2 && err.contains("unknown option --force") && err.contains("Usage:"), "{err}");
+
+        // Dry run on a missing rules file: counts, nothing written.
+        let (code, out, _) = run(&["--dry-run", "--json", &a, &b]);
+        let v = parse(&out);
+        assert_eq!(code, 0);
+        assert_eq!((v["outcome"].as_str(), v["dry_run"].as_bool(), v["counts"]["rules_added"].as_u64(), v["counts"]["leds_after"].as_u64()), (Some("preview"), Some(true), Some(2), Some(2)));
+        assert!(!rules.exists());
+
+        // Both drafts at once, in order, with their pad lights.
+        let (code, out, _) = run(&["--json", &a, &b]);
+        let v = parse(&out);
+        assert_eq!(code, 0, "{out}");
+        assert_eq!((v["outcome"].as_str(), v["backup"].is_null(), v["counts"]["rules_after"].as_u64(), v["counts"]["leds_after"].as_u64()), (Some("applied"), true, Some(2), Some(2)));
+        let applied = fs::read_to_string(&rules).unwrap();
+        assert!(applied.find("note36").unwrap() < applied.find("note37").unwrap() && applied.find("pads.1").unwrap() < applied.find("pads.2").unwrap(), "{applied}");
+        assert_eq!(validate_mapping(&rules), 0);
+        let other = draft("c.json", 38, 4);
+        let before = files();
+
+        // A repeat, a collision between two drafts, and a broken later draft are all refused and write nothing.
+        let (code, out, _) = run(&["--json", &a]);
+        let v = parse(&out);
+        assert_eq!((code, v["outcome"].as_str(), v["counts"].is_null()), (1, Some("refused"), true));
+        let messages: Vec<&str> = v["diagnostics"].as_array().unwrap().iter().map(|d| d["message"].as_str().unwrap()).collect();
+        assert!(messages.contains(&"midi.xonek2.ch15.note36 already has rules in the rules file"), "{out}");
+        assert!(messages.contains(&"pad light surface.right.pads.1 is already coloured by the rules file"), "{out}");
+        assert!(messages.last().unwrap().contains("already in the rules file is refused like this"), "{out}");
+        fs::remove_file(&rules).unwrap();
+        let (code, _, err) = run(&[&a, &a_again]);
+        assert!(code == 1 && err.contains("a-again.json: midi.xonek2.ch15.note36 already has rules") && err.contains("includes the drafts named before this one"), "{err}");
+        assert!(!rules.exists(), "a refused apply created the rules file");
+        fs::write(&rules, &applied).unwrap();
+        let (code, _, err) = run(&[&other, broken]);
+        assert!(code == 1 && err.contains("broken.json: the draft has problems") && err.contains("unknown action \"plai\""), "{err}");
+        let (code, _, err) = run(&[&other, dir.join("missing.json").to_str().unwrap()]);
+        assert!(code == 1 && err.contains("missing.json: can't read"), "{err}");
+        assert_eq!(fs::read_to_string(&rules).unwrap(), applied, "a refused apply changed the rules file");
+        assert_eq!(files(), before, "a refused apply left a backup or temporary file");
+
+        // A broken rules file is refused as the file's own problem, not the draft's, and left as it is.
+        let broken_file = applied.replace("\"play\"", "\"plai\"");
+        fs::write(&rules, &broken_file).unwrap();
+        let (code, out, _) = run(&["--json", &other]);
+        let v = parse(&out);
+        assert_eq!((code, v["outcome"].as_str(), v["counts"].is_null()), (1, Some("refused"), true), "{out}");
+        let diagnostics = v["diagnostics"].as_array().unwrap();
+        assert!(diagnostics.len() >= 2 && diagnostics.iter().all(|d| d["draft"].is_null() && d["message"].as_str().unwrap().starts_with(rules.to_str().unwrap())), "{out}");
+        assert!(diagnostics.iter().any(|d| d["message"].as_str().unwrap().contains("unknown action \"plai\"")), "{out}");
+        assert_eq!(fs::read_to_string(&rules).unwrap(), broken_file, "a broken rules file was changed");
+        assert_eq!(files(), before);
+        fs::write(&rules, &applied).unwrap();
+
+        // Added after the existing rules, with the previous file kept as a backup.
+        let (code, out, _) = run(&[&other]);
+        assert!(code == 0 && out.contains("Added 1 rules and 1 pad lights from 1 draft(s)") && out.contains("now 3 rules and 3 pad lights") && out.contains("The previous file is kept as"), "{out}");
+        let backup = fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).find(|p| p.to_string_lossy().contains(".before-import-")).unwrap();
+        assert_eq!(fs::read_to_string(backup).unwrap(), applied);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+}

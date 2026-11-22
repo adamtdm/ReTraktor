@@ -603,6 +603,7 @@ pub fn scrolling_waveform(
     loop_len_sec: f64,
     deck_badge: Option<(&str, Color32)>,
     height: f32,
+    time_zoom: f32,
 ) -> Response {
     let width = ui.available_width().max(180.0);
     let (rect, response) =
@@ -618,8 +619,9 @@ pub fn scrolling_waveform(
 
     let center_y = rect.center().y;
     let center_x = rect.center().x;
-    // Drawn in heard time, so synced decks' beat lines scroll at the same speed and spacing.
-    let pixels_per_sec = 92.0 / tempo.clamp(0.25, 4.0) as f32;
+    // Drawn in heard time, so synced decks' beat lines scroll at the same speed and spacing. `time_zoom` (a
+    // controller's waveform zoom) scales time only; beats, cues and loops use the same scale, so they stay aligned.
+    let pixels_per_sec = 92.0 * time_zoom.clamp(0.25, 4.0) / tempo.clamp(0.25, 4.0) as f32;
 
     // Subtle horizontal zero-crossing baseline
     painter.line_segment(
@@ -728,18 +730,37 @@ pub fn scrolling_waveform(
 
     // Optional Subtle Deck Letter on Left Edge (used in Parallel layout)
     if let Some((badge_txt, _badge_col)) = deck_badge {
-        let badge_rect =
-            Rect::from_min_size(Pos2::new(rect.left() + 5.0, rect.top() + 5.0), Vec2::new(18.0, 16.0));
-        painter.rect_filled(badge_rect, 2.0, TraktorTheme::BG_PANEL().gamma_multiply(0.85));
-        painter.text(
-            badge_rect.center(),
-            egui::Align2::CENTER_CENTER,
-            badge_txt,
-            egui::FontId::proportional(11.0),
-            TraktorTheme::TEXT_PRIMARY(),
-        );
+        paint_lane_letter(painter, rect, badge_txt);
     }
 
+    response
+}
+
+/// The deck letter in a lane's top-left corner.
+fn paint_lane_letter(painter: &egui::Painter, rect: Rect, letter: &str) {
+    let badge_rect = Rect::from_min_size(Pos2::new(rect.left() + 5.0, rect.top() + 5.0), Vec2::new(18.0, 16.0));
+    painter.rect_filled(badge_rect, 2.0, TraktorTheme::BG_PANEL().gamma_multiply(0.85));
+    painter.text(badge_rect.center(), egui::Align2::CENTER_CENTER, letter, egui::FontId::proportional(11.0), TraktorTheme::TEXT_PRIMARY());
+}
+
+/// The lane of a deck with nothing loaded: `scrolling_waveform`'s size, frame, centre playhead and optional deck
+/// letter, so the lane keeps its place when a track loads. `hint`, if any, is written left of the playhead.
+pub fn empty_waveform_lane(ui: &mut Ui, letter: Option<&str>, hint: &str, height: f32) -> Response {
+    let width = ui.available_width().max(180.0);
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        painter.rect_filled(rect, 1.0, TraktorTheme::WAVEFORM_BG());
+        painter.rect_stroke(rect, 1.0, Stroke::new(1.0_f32, TraktorTheme::BORDER_COLOR()));
+        painter.line_segment([rect.center_top(), rect.center_bottom()], Stroke::new(1.5_f32, TraktorTheme::WAVEFORM_PLAYHEAD()));
+        if let Some(letter) = letter {
+            paint_lane_letter(painter, rect, letter);
+        }
+        if !hint.is_empty() {
+            let at = Pos2::new(rect.left() + 32.0, rect.center().y);
+            painter.text(at, egui::Align2::LEFT_CENTER, hint, egui::FontId::proportional(12.0), TraktorTheme::TEXT_SECONDARY());
+        }
+    }
     response
 }
 
@@ -760,8 +781,9 @@ pub fn scrolling_stem_waveforms(
     loop_active: bool,
     loop_start_sec: f64,
     loop_len_sec: f64,
-    _deck_badge: Option<(&str, Color32)>,
+    deck_badge: Option<(&str, Color32)>,
     height: f32,
+    time_zoom: f32,
 ) -> Response {
     let width = ui.available_width().max(220.0);
     let (rect, mut response) =
@@ -792,9 +814,12 @@ pub fn scrolling_stem_waveforms(
     painter.rect_filled(header_rect, 1.0, TraktorTheme::BG_SECTION());
     painter.rect_stroke(rect, 1.0, Stroke::new(1.0_f32, TraktorTheme::BORDER_COLOR()));
 
-    let center_x = wave_rect.center().x;
-    // Drawn in heard time, so synced decks' beat lines scroll at the same speed and spacing.
-    let pixels_per_sec = 92.0 / tempo.clamp(0.25, 4.0) as f32;
+    // A lettered (stacked) lane keeps the playhead at the lane's centre, where every other stacked lane has it,
+    // so the stem header only covers some of the past.
+    let center_x = if deck_badge.is_some() { rect.center().x } else { wave_rect.center().x };
+    // Drawn in heard time, so synced decks' beat lines scroll at the same speed and spacing. `time_zoom` (a
+    // controller's waveform zoom) scales time only; beats, cues and loops use the same scale, so they stay aligned.
+    let pixels_per_sec = 92.0 * time_zoom.clamp(0.25, 4.0) / tempo.clamp(0.25, 4.0) as f32;
 
     // Stem lane colours derived from theme tokens
     let stem_core_colors = [
@@ -1041,6 +1066,12 @@ pub fn scrolling_stem_waveforms(
         ],
         Stroke::new(1.5_f32, TraktorTheme::WAVEFORM_PLAYHEAD()),
     );
+
+    if let Some((letter, _)) = deck_badge {
+        paint_lane_letter(&painter, wave_rect, letter);
+        let label = format!("Deck {letter} stems: click a stem name to mute or unmute it");
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, true, &label));
+    }
 
     // 5. Left Stem Header Column (DRUMS / BASS / OTHER / VOCALS + Mini Knob/Mute Indicators)
     painter.line_segment(
@@ -1739,8 +1770,8 @@ pub fn render_shortcuts_hud(ctx: &egui::Context, is_open: &mut bool) {
                     ui.label(RichText::new("LAYOUTS & SYSTEM").color(TraktorTheme::TEXT_PRIMARY()).strong());
                     ui.add_space(4.0);
                     let c = TraktorTheme::ACCENT();
-                    key_row(ui, "F1", "Mix (Parallel Waveforms)", c);
-                    key_row(ui, "F2", "4-Deck Full Mix", c);
+                    key_row(ui, "F1", "2 Decks, Stacked Waveforms", c);
+                    key_row(ui, "F2", "4 Decks, Waveforms In Deck", c);
                     key_row(ui, "F3", "Browser (Full Library)", c);
                     key_row(ui, "F4", "Timeline Studio", c);
                     key_row(ui, "F5", "Set Workflow (Build)", c);

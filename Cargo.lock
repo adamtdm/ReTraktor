@@ -3265,6 +3265,7 @@ dependencies = [
  "retraktor-formats",
  "retraktor-hid",
  "retraktor-library",
+ "serde_json",
  "symphonia",
 ]
 
@@ -3314,6 +3315,8 @@ version = "0.2.0"
 dependencies = [
  "retraktor-core",
  "retraktor-formats",
+ "rustix 1.1.5",
+ "serde_json",
 ]
 
 [[package]]
