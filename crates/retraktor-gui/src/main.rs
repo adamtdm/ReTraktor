@@ -24,6 +24,7 @@ mod playlist_import;
 pub mod midi;
 mod preferences;
 mod recorder;
+mod remix;
 pub mod setlist;
 mod theme;
 mod widgets;
