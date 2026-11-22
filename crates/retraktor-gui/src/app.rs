@@ -241,7 +241,7 @@ pub struct ReTraktorApp {
     pub mx2_hidraw_file: Option<File>,
     pub mx2_dev_node: Option<String>,
     pub mx2_model_name: Option<String>,
-    pub mx2_scan_counter: u32,
+    mx2_last_scan: Option<std::time::Instant>,
     pub mx2_access_status: Option<String>,
     pub mx2_packets_received: u64,
     pub mx2_last_report_id: Option<u8>,
@@ -395,7 +395,7 @@ impl Default for ReTraktorApp {
             mx2_hidraw_file: None,
             mx2_dev_node: None,
             mx2_model_name: None,
-            mx2_scan_counter: 0,
+            mx2_last_scan: None,
             mx2_access_status: None,
             mx2_packets_received: 0,
             mx2_last_report_id: None,
@@ -1153,6 +1153,7 @@ impl ReTraktorApp {
             || generic_connected
             || self.active_cheer.is_some()
             || self.ai_rerank_runner.is_some()
+            || self.shot.is_some()
     }
 
     /// Hide-missing lives in Preferences and in the library toolbar ("Hiding missing ×", "Clear"): whichever changed wins.
@@ -1985,8 +1986,9 @@ impl ReTraktorApp {
         }
 
         if self.mx2_hidraw_file.is_none() {
-            self.mx2_scan_counter = self.mx2_scan_counter.wrapping_add(1);
-            if self.mx2_scan_counter % 90 == 1 {
+            let due = self.mx2_last_scan.is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(1500));
+            if due {
+                self.mx2_last_scan = Some(std::time::Instant::now());
                 let detected = scan_linux_ni_hidraw_devices();
                 // Prefer Traktor MX2 if multiple NI devices are attached
                 if let Some(dev) = detected
@@ -2412,15 +2414,17 @@ impl ReTraktorApp {
                         self.deck_loop_size_beats[1] = (self.deck_loop_size_beats[1] / 2).max(1);
                     }
                 }
-                "surface.left.browse.encoder" => {
-                    if delta > 0 {
-                        self.library.select_next_track();
-                    } else if delta < 0 {
-                        self.library.select_prev_track();
-                    }
-                }
-                "surface.right.browse.encoder" => {
-                    if delta > 0 {
+                "surface.left.browse.encoder" | "surface.right.browse.encoder" => {
+                    if self.show_next_track_panel {
+                        let len = self.next_track_picks.len();
+                        if len > 0 {
+                            if delta > 0 {
+                                self.next_track_selected = (self.next_track_selected + 1).min(len - 1);
+                            } else if delta < 0 {
+                                self.next_track_selected = self.next_track_selected.saturating_sub(1);
+                            }
+                        }
+                    } else if delta > 0 {
                         self.library.select_next_track();
                     } else if delta < 0 {
                         self.library.select_prev_track();
@@ -2448,8 +2452,15 @@ impl ReTraktorApp {
     }
 
     /// Platter top touched / let go: scratch on / off, in turntable mode only.
+    /// Holding SHIFT bypasses scratch engagement so SHIFT + platter top scrubs without muting playback.
     fn jog_touch(&mut self, d: usize, pressed: bool) {
         if !self.deck_turntable_mode[d] {
+            return;
+        }
+        if pressed && self.deck_shift_held[d.min(1)] {
+            return;
+        }
+        if !pressed && !self.deck_scratch_active[d] {
             return;
         }
         self.deck_scratch_active[d] = pressed;
@@ -2963,7 +2974,8 @@ impl ReTraktorApp {
         }
         let target = bpm(d) * (1.0 + pitch as f64 / 100.0);
         self.master_tempo = target;
-        for o in (0..4).filter(|&o| o != d && (self.deck_sync_enabled[o] || self.tempo_master_deck == Some(o)) && bpm(o) > 0.0) {
+        let my_leader = sync_leader(self.tempo_master_deck, d);
+        for o in (0..4).filter(|&o| o != d && (self.deck_sync_enabled[o] || self.tempo_master_deck == Some(o) || my_leader == Some(o)) && bpm(o) > 0.0) {
             self.deck_pitch_fader[o] = ((sync_ratio(bpm(o), target) - 1.0) * 100.0) as f32;
         }
     }
@@ -3094,12 +3106,15 @@ impl ReTraktorApp {
     /// in the centre, Deck B strip mirrored on the right (`ON`, `FX`, `FILTER`, `GAIN`, `B`) plus utilities.
     fn show_top_bar(&mut self, ui: &mut Ui) {
         let screen_w = ui.ctx().screen_rect().width();
-        let roomy = screen_w >= 1180.0;
-        let show_rec = screen_w >= 1080.0;
+        let roomy = screen_w >= 1320.0;
+        let show_rec = screen_w >= 1120.0;
+        let show_next = screen_w >= 1180.0;
+        let show_ctl = screen_w >= 1220.0;
+        let gap = if screen_w < 1300.0 { 4.0 } else { 6.0 };
 
         panel(TraktorTheme::BG_PANEL()).show(ui, |ui| {
             row(ui, 56.0, |ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.spacing_mut().item_spacing.x = gap;
 
                 self.deck_strip(ui, 0);
                 ui.separator();
@@ -3115,7 +3130,7 @@ impl ReTraktorApp {
                         (TraktorLayout::Set, "Set", "F5"),
                     ] {
                         let label = if roomy { lay.label() } else { short };
-                        let min_w = if roomy { 46.0 } else { 36.0 };
+                        let min_w = if roomy { 46.0 } else { 34.0 };
                         if pill(ui, label, self.layout == lay, TraktorTheme::ROW_SELECTED(), min_w)
                             .on_hover_text(format!("{} layout ({key})", lay.label()))
                             .clicked()
@@ -3158,7 +3173,7 @@ impl ReTraktorApp {
                 }
 
                 let next_fill = if self.show_next_track_panel { TraktorTheme::ACCENT() } else { TraktorTheme::ROW_SELECTED() };
-                if roomy && pill(ui, "NEXT", self.show_next_track_panel, next_fill, 0.0)
+                if show_next && pill(ui, "NEXT", self.show_next_track_panel, next_fill, 0.0)
                     .on_hover_text("Suggest next track for the idle deck (N)")
                     .clicked()
                 {
@@ -3167,7 +3182,7 @@ impl ReTraktorApp {
 
                 // ---- Right: utilities + mirrored Deck B strip (ON/OFF + FX | FILTER | GAIN | B) ----
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
+                    ui.spacing_mut().item_spacing.x = gap;
                     // Same order in a right-to-left layout mirrors the strip.
                     self.deck_strip(ui, 1);
                     ui.separator();
@@ -3237,7 +3252,7 @@ impl ReTraktorApp {
                         }
                     }
 
-                    if roomy {
+                    if show_ctl {
                         let (ctl_label, ctl_ok, ctl_tab, controller_tip) = if let Some(ref node) = self.mx2_dev_node {
                             ("MX2", true, PrefsTab::Controllers, format!("Traktor MX2 connected ({node}). Click for controller settings"))
                         } else {
@@ -3275,8 +3290,10 @@ impl ReTraktorApp {
         });
     }
 
-    /// One deck's top-bar strip: letter, then GAIN, FILTER and FX as dot rings with the FX on/off lamp.
+    /// One deck's top-bar strip: letter, then GAIN, Mixer FX (`FLT`/`REV`/…) and Deck FX (`REV`/`DLY`/…)
+    /// as dot rings with right-click effect pickers and the FX on/off lamp.
     fn deck_strip(&mut self, ui: &mut Ui, d: usize) {
+        use crate::preferences::FX_NAMES;
         let col = TraktorTheme::deck_color(d + 1);
         let letter = DECK_LETTERS[d];
         let shift = if d == 1 { "Shift+" } else { "" };
@@ -3284,26 +3301,31 @@ impl ReTraktorApp {
         let gain_txt = dot::format_db(self.channel_gain[d], 0.5);
         dot::dot_ring(ui, &mut self.channel_gain[d], 0.0, 1.0, 0.5, &gain_txt, "GAIN", col, true)
             .on_hover_text(format!("Deck {letter} input gain. {KNOB_TIP}"));
+        let mfx_idx = self.channel_fx_kind[d] as usize;
         let filter_txt = dot::format_filter_val(self.channel_filter[d], self.channel_filter_on[d]);
-        let filter = dot::dot_ring(ui, &mut self.channel_filter[d], 0.0, 1.0, 0.5, &filter_txt, "FILTER", col, self.channel_filter_on[d])
-            .on_hover_text(format!("Deck {letter} filter ({shift}F or right-click turns it on or off). {KNOB_TIP}"));
+        let filter = dot::dot_ring(ui, &mut self.channel_filter[d], 0.0, 1.0, 0.5, &filter_txt, FX_SHORT[mfx_idx], col, self.channel_filter_on[d])
+            .on_hover_text(format!("Deck {letter} mixer FX ({}). {shift}F toggles on/off · right-click to choose effect. {KNOB_TIP}", FX_NAMES[mfx_idx]));
         if filter.changed() {
             self.channel_filter_on[d] = (self.channel_filter[d] - 0.5).abs() > 0.02;
         }
-        if filter.secondary_clicked() {
-            self.channel_filter_on[d] ^= true;
-        }
-        // Stacked, so the two pickers take one pill's width: mixer effect (the FILTER knob) over the FX unit.
-        let (rect, _) = ui.allocate_exact_size(Vec2::new(32.0, 2.0 * HIT + 2.0), Sense::hover());
-        let mut stack = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(Layout::top_down(Align::Center)));
-        stack.spacing_mut().item_spacing.y = 2.0;
-        fx_pick(&mut stack, &mut self.channel_fx_kind[d], &format!("Deck {letter} mixer effect (the FILTER knob)"));
-        fx_pick(&mut stack, &mut self.fx_kind[d], &format!("FX unit {}", d + 1));
+        let mfx_kind = &mut self.channel_fx_kind[d];
+        let mfx_on = &mut self.channel_filter_on[d];
+        filter.context_menu(|ui| {
+            if ui.selectable_label(*mfx_on, if *mfx_on { "Turn mixer FX off" } else { "Turn mixer FX on" }).clicked() {
+                *mfx_on = !*mfx_on;
+                ui.close_menu();
+            }
+            ui.separator();
+            fx_menu_items(ui, mfx_kind);
+        });
         let (mix, fx_on) = if d == 0 { (&mut self.fx1_dry_wet, &mut self.fx1_on) } else { (&mut self.fx2_dry_wet, &mut self.fx2_on) };
+        let dfx_idx = self.fx_kind[d] as usize;
         let fx_txt = format!("{}", (*mix * 100.0).round() as i32);
-        dot::dot_ring(ui, mix, 0.0, 1.0, 0.3, &fx_txt, "FX", col, *fx_on)
-            .on_hover_text(format!("Deck {letter} effect amount. {KNOB_TIP}"));
-        dot::dot_lamp(ui, fx_on, col, &format!("Deck {letter} effect on or off ({shift}D)"));
+        let fx_ring = dot::dot_ring(ui, mix, 0.0, 1.0, 0.3, &fx_txt, FX_SHORT[dfx_idx], col, *fx_on)
+            .on_hover_text(format!("FX unit {} ({}) amount. Right-click to choose effect. {KNOB_TIP}", d + 1, FX_NAMES[dfx_idx]));
+        let dfx_kind = &mut self.fx_kind[d];
+        fx_ring.context_menu(|ui| fx_menu_items(ui, dfx_kind));
+        dot::dot_lamp(ui, fx_on, col, &format!("FX unit {} ({}) on or off ({shift}D)", d + 1, FX_NAMES[dfx_idx]));
     }
 
     /// 16-step pattern player (drum machine locked to the master tempo).
@@ -5103,22 +5125,14 @@ fn lamp(ui: &mut Ui, label: &str, ok: bool) -> egui::Response {
 /// Short effect names for the deck strip, in `MixerFxKind` order.
 const FX_SHORT: [&str; 9] = ["FLT", "REV", "DLY", "NOI", "GAT", "FLG", "BRB", "DOT", "CRU"];
 
-/// The effect `kind` as a short pill: click steps to the next effect, right-click lists them all.
-fn fx_pick(ui: &mut Ui, kind: &mut MixerFxKind, what: &str) {
-    use crate::preferences::FX_NAMES;
-    let resp = pill(ui, FX_SHORT[*kind as usize], false, Color32::TRANSPARENT, 30.0)
-        .on_hover_text(format!("{what}: {}. Click for the next effect, right-click to choose", FX_NAMES[*kind as usize]));
-    if resp.clicked() {
-        *kind = MixerFxKind::from_i64((*kind as i64 + 1) % FX_SHORT.len() as i64);
-    }
-    resp.context_menu(|ui| {
-        for (i, name) in FX_NAMES.iter().enumerate() {
-            if ui.selectable_label(*kind as usize == i, *name).clicked() {
-                *kind = MixerFxKind::from_i64(i as i64);
-                ui.close_menu();
-            }
+/// Lists every effect in a context menu, setting `kind` on click.
+fn fx_menu_items(ui: &mut Ui, kind: &mut MixerFxKind) {
+    for (i, name) in crate::preferences::FX_NAMES.iter().enumerate() {
+        if ui.selectable_label(*kind as usize == i, *name).clicked() {
+            *kind = MixerFxKind::from_i64(i as i64);
+            ui.close_menu();
         }
-    });
+    }
 }
 
 /// Pitch fader and its reset. Call inside a right-to-left layout: the fader takes the width that is left.
@@ -5905,7 +5919,7 @@ mod sync_audio {
         assert_eq!(s.engine.strips[0].filter.kind, MixerFxKind::TimeGater, "FX4 isn't Preferences slot 4");
     }
 
-    /// Both decks' mixer-FX and FX-unit pills fit the top bar of the smallest window, clear of every other control.
+    /// Top-bar controls stay on screen and never overlap across minimum (1024), intermediate (1180), and default (1280) widths.
     #[test]
     fn deck_strip_fx_pills_fit_the_smallest_window() {
         let ctx = egui::Context::default();
@@ -5913,16 +5927,18 @@ mod sync_audio {
         ctx.enable_accesskit();
         let mut app = ReTraktorApp::default();
         app.channel_fx_kind[1] = MixerFxKind::Crush;
-        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1024.0, 640.0));
-        let nodes = workspace_frame(&ctx, &mut app, screen, 0.0, Vec::new());
-        let top: Vec<&Node> = nodes.iter().filter(|n| n.2.bottom() < 72.0 && n.1 == egui::accesskit::Role::Button).collect();
-        for name in ["FLT", "CRU", "REV", "DLY"] {
-            assert!(top.iter().any(|n| n.0 == name), "no {name} pill in the top bar: {top:?}");
-        }
-        for (i, a) in top.iter().enumerate() {
-            assert!(screen.contains_rect(a.2), "{} off screen at {:?}", a.0, a.2);
-            for b in &top[i + 1..] {
-                assert!(!a.2.shrink(0.5).intersects(b.2.shrink(0.5)), "{} overlaps {}", a.0, b.0);
+        for width in [1024.0_f32, 1180.0, 1280.0] {
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(width, 640.0));
+            let nodes = workspace_frame(&ctx, &mut app, screen, 0.0, Vec::new());
+            let top: Vec<&Node> = nodes
+                .iter()
+                .filter(|n| n.2.bottom() < 72.0 && matches!(n.1, egui::accesskit::Role::Button | egui::accesskit::Role::Label))
+                .collect();
+            for (i, a) in top.iter().enumerate() {
+                assert!(screen.contains_rect(a.2), "w={width}: {} off screen at {:?}", a.0, a.2);
+                for b in &top[i + 1..] {
+                    assert!(!a.2.shrink(0.5).intersects(b.2.shrink(0.5)), "w={width}: {} ({:?}) overlaps {} ({:?})", a.0, a.2, b.0, b.2);
+                }
             }
         }
     }

@@ -314,9 +314,20 @@ impl FxCore {
     /// once the FX is off and its tail has died, so callers pass dry audio without running anything.
     fn run(&mut self, kind: MixerFxKind, send: f32, x: (f32, f32), p: [f32; 3], sr: f32, bpm: f32) -> Option<(f32, f32)> {
         if kind != self.last_kind {
-            // Avoid feeding stale delay-line audio into a newly selected delay/flanger effect.
+            // Avoid feeding stale delay/reverb audio into a newly selected effect.
             for d in &mut self.delay {
                 d.clear();
+            }
+            for ch in &mut self.combs {
+                for c in ch {
+                    c.clear();
+                }
+            }
+            self.comb_lp = [[0.0; 4]; 2];
+            for ch in &mut self.allpass {
+                for ap in ch {
+                    ap.clear();
+                }
             }
             self.svf = Default::default();
             self.tone = Default::default();
