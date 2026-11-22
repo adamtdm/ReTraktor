@@ -1530,7 +1530,7 @@ pub fn deck_transport_bar(
                 .stroke(Stroke::new(0.5_f32, TraktorTheme::BORDER_COLOR()))
                 .min_size(Vec2::new(46.0, H)),
             )
-            .on_hover_text(format!("Jump to cue 1{}", key("C")))
+            .on_hover_text(format!("Cue{}. When paused it sets the cue point. When playing it returns to the cue point and stops.", key("C")))
             .clicked()
         {
             action = Some(TransportAction::Cue);
@@ -1547,7 +1547,7 @@ pub fn deck_transport_bar(
                 .stroke(Stroke::new(0.5_f32, TraktorTheme::BORDER_COLOR()))
                 .min_size(Vec2::new(34.0, H)),
             )
-            .on_hover_text("Cue Play (Jump to Cue 1 & Play)")
+            .on_hover_text("Cue Play. Plays from the cue point.")
             .clicked()
         {
             action = Some(TransportAction::Cup);
@@ -1708,7 +1708,7 @@ pub fn render_shortcuts_hud(ctx: &egui::Context, is_open: &mut bool) {
                     ui.add_space(4.0);
                     let c = TraktorTheme::PLAY_ACTIVE();
                     key_row(ui, "Space / Shift+Space", "Play / Pause A / B", c);
-                    key_row(ui, "C / Shift+C", "Cue 1 Deck A / B", c);
+                    key_row(ui, "C / Shift+C", "Set cue / return and stop", c);
                     key_row(ui, "S / Shift+S", "Sync BPM & Phase A / B", c);
                     key_row(ui, "L / Shift+L", "Loop On / Off A / B", c);
                     key_row(ui, "1..4 / 5..8", "Hotcues 1..4 A / B", c);

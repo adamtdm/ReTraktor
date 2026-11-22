@@ -55,6 +55,30 @@ pub struct UiTrackEntry {
     pub phrases: Vec<retraktor_library::Phrase>,
 }
 
+/// One filled hotcue pad as a deck plays it: a cue, or a saved loop with its length as stored (checked only when
+/// it is played, so odd metadata is kept untouched).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HotcuePad {
+    /// 1..=8.
+    pub slot: u8,
+    pub start_sec: f64,
+    /// A saved loop's length; `None` for a cue (or a grid marker on a pad).
+    pub loop_sec: Option<f64>,
+}
+
+impl HotcuePad {
+    /// A cue pad (no loop).
+    pub fn cue(slot: u8, start_sec: f64) -> Self {
+        Self { slot, start_sec, loop_sec: None }
+    }
+
+    /// The pad a track cue fills, if it is in one of the first eight hot cue slots.
+    pub fn of(c: &NmlCue) -> Option<Self> {
+        let loop_sec = (c.cue_type == retraktor_core::CueType::Loop).then_some(c.len_ms / 1000.0);
+        (0..8).contains(&c.hotcue).then(|| Self { slot: (c.hotcue + 1) as u8, start_sec: c.start_ms / 1000.0, loop_sec })
+    }
+}
+
 impl UiTrackEntry {
     fn from_nml(e: &NmlEntry) -> Self {
         let path = PathBuf::from(e.location.to_posix_path());
@@ -127,9 +151,14 @@ impl UiTrackEntry {
         })
     }
 
+    /// The filled hotcue pads, in the track's cue order.
+    pub fn hotcue_pads(&self) -> Vec<HotcuePad> {
+        self.cues.iter().filter_map(HotcuePad::of).collect()
+    }
+
     /// The filled hotcue pads as (pad 1..=8, seconds), in the track's cue order.
     pub fn hotcue_slots(&self) -> Vec<(u8, f64)> {
-        self.cues.iter().filter(|c| (0..8).contains(&c.hotcue)).map(|c| ((c.hotcue + 1) as u8, c.start_ms / 1000.0)).collect()
+        self.hotcue_pads().iter().map(|p| (p.slot, p.start_sec)).collect()
     }
 
     /// Applies detected values. Without `overwrite` only unknown values are filled.
@@ -1027,13 +1056,30 @@ impl LibraryManager {
         }
     }
 
-    /// Stores a deck-side beatgrid or tempo correction on the track so it survives a reload.
-    pub fn set_grid(&mut self, id: usize, offset_sec: f64, bpm: f64) {
+    /// Stores a deck-side beatgrid or tempo correction on the track so it survives a reload. A tempo fix changes only
+    /// the tempo. `phase_moved` (the DJ moved where the beats are) also sets the grid marker's position, keeping its
+    /// pad, or adds an unnumbered marker beside every cue the track has.
+    pub fn set_grid(&mut self, id: usize, offset_sec: f64, bpm: f64, phase_moved: bool) {
         let Some(t) = self.tracks.iter_mut().find(|t| t.id == id) else { return };
         t.bpm = bpm;
-        if let Some(grid) = t.cues.iter_mut().find(|c| c.cue_type == retraktor_core::CueType::Grid) {
-            grid.start_ms = offset_sec * 1000.0;
-            grid.grid_bpm = Some(bpm);
+        match t.cues.iter_mut().find(|c| c.cue_type == retraktor_core::CueType::Grid) {
+            Some(grid) => {
+                if phase_moved {
+                    grid.start_ms = offset_sec * 1000.0;
+                }
+                grid.grid_bpm = Some(bpm);
+            }
+            None if phase_moved => t.cues.push(NmlCue {
+                name: "Grid".into(),
+                displ_order: 0,
+                cue_type: retraktor_core::CueType::Grid,
+                start_ms: offset_sec * 1000.0,
+                len_ms: 0.0,
+                repeats: -1,
+                hotcue: -1,
+                grid_bpm: Some(bpm),
+            }),
+            None => {}
         }
         self.touch();
     }

@@ -31,6 +31,8 @@ pub struct LoadedTrackAudio {
     pub bpm: f64,
     /// Time of the first beat; every beat is `grid_offset_sec + n * 60 / bpm`.
     pub grid_offset_sec: f64,
+    /// `grid_offset_sec` is a real grid (imported, analysed or set by hand), not the 0 a tagged BPM alone leaves.
+    pub grid_known: bool,
     pub key: String,
     pub duration_sec: f64,
     /// Interleaved [L, R, L, R, ...]. Shared, never copied: the audio callback holds its own reference.
@@ -249,6 +251,7 @@ impl LoadedTrackAudio {
             artist: artist.to_string(),
             bpm,
             grid_offset_sec: 0.0,
+            grid_known: false,
             key: key.to_string(),
             duration_sec,
             pcm_stereo: Arc::new(pcm_stereo),
@@ -551,8 +554,14 @@ impl AudioFile {
 
 /// Whether a playhead has reached the end of a track `duration_sec` long (its decoded length). The nanosecond of
 /// slack absorbs the roundoff of a playhead summed frame by frame, far less than any output frame.
-fn at_track_end(playhead_sec: f64, duration_sec: f64) -> bool {
+pub(crate) fn at_track_end(playhead_sec: f64, duration_sec: f64) -> bool {
     playhead_sec >= duration_sec - 1e-9
+}
+
+/// Whether a deck plays its loop: active and at least one source frame long, so a hand-cut loop far shorter
+/// than a beat still loops. The one rule for the callback, key lock, the fallback clock and Play.
+pub(crate) fn loop_plays(active: bool, len_sec: f64, sample_rate: u32) -> bool {
+    active && len_sec.is_finite() && len_sec * f64::from(sample_rate) >= 1.0
 }
 
 /// Mixxx / xwax-based Alpha-Beta tracking filter for authentic turntable physics simulation.
@@ -792,6 +801,10 @@ pub struct AudioSharedState {
     pub loop_active: [bool; 4],
     pub loop_start_sec: [f64; 4],
     pub loop_len_sec: [f64; 4],
+    /// Shared side: the loop just placed, and whether its start is ahead of the playhead
+    /// ([`AudioSharedState::place_loop`]); every placement says, so nothing carries over from the loop before.
+    /// Callback side: that start is still ahead, so the deck plays on up to it instead of wrapping back into the loop.
+    loop_approach: [Option<bool>; 4],
     pub channel_gain: [f32; 4],
     pub loaded_tracks: [Option<LoadedTrackAudio>; 4],
     pub channel_peaks: [f32; 4],
@@ -917,6 +930,7 @@ impl Default for AudioSharedState {
             loop_active: [false, false, false, false],
             loop_start_sec: [0.0, 0.0, 0.0, 0.0],
             loop_len_sec: [8.0, 8.0, 8.0, 8.0],
+            loop_approach: [None; 4],
             channel_gain: [0.5, 0.5, 0.5, 0.5],
             loaded_tracks: [None, None, None, None],
             channel_peaks: [0.0, 0.0, 0.0, 0.0],
@@ -990,6 +1004,12 @@ impl AudioSharedState {
         self.pending_seek[d] = Some(Seek::To(sec));
     }
 
+    /// Deck `d` has a newly placed loop (set in the same lock). With `ahead` its start is ahead of the playhead: play
+    /// on into it rather than wrapping back to its tail now; once the playhead reaches the start it loops as usual.
+    pub fn place_loop(&mut self, d: usize, ahead: bool) {
+        self.loop_approach[d] = Some(ahead);
+    }
+
     /// Moves deck `d` by `delta_sec` from wherever it has got to when the callback applies it, so a move
     /// worked out from a playhead the callback has since played past still keeps its beat phase.
     pub fn seek_by(&mut self, d: usize, delta_sec: f64) {
@@ -1009,12 +1029,12 @@ impl AudioSharedState {
     /// starts again from the top; one moved off the end first (a cue, a click on the track) starts there, and one
     /// in an active loop that runs past the end carries on round the loop.
     pub fn start_playing(&mut self, d: usize) {
-        let Some(duration) = self.loaded_tracks[d].as_ref().map(|t| t.duration_sec) else {
+        let Some((duration, sample_rate)) = self.loaded_tracks[d].as_ref().map(|t| (t.duration_sec, t.sample_rate)) else {
             self.is_playing[d] = false;
             return;
         };
         self.play_requests[d] = self.play_requests[d].wrapping_add(1);
-        let looping = self.loop_active[d] && self.loop_len_sec[d] > 0.05; // as the callback judges a loop
+        let looping = loop_plays(self.loop_active[d], self.loop_len_sec[d], sample_rate);
         if !looping && at_track_end(self.playhead_sec[d], duration) {
             self.seek_to(d, 0.0);
         }
@@ -1624,7 +1644,8 @@ fn fallback_tick(state: &mut AudioSharedState, dt: f64) {
             let ratio = if scratching { state.scratch_rate[d] } else { state.pitch_ratio[d] };
             state.playhead_sec[d] += dt * ratio;
             let duration = state.loaded_tracks[d].as_ref().map(|t| t.duration_sec);
-            if state.loop_active[d] && state.loop_len_sec[d] > 0.05 {
+            let sample_rate = state.loaded_tracks[d].as_ref().map_or(0, |t| t.sample_rate);
+            if loop_plays(state.loop_active[d], state.loop_len_sec[d], sample_rate) {
                 let end = state.loop_start_sec[d] + state.loop_len_sec[d];
                 if state.playhead_sec[d] >= end {
                     state.playhead_sec[d] = state.loop_start_sec[d];
@@ -2203,6 +2224,12 @@ impl Renderer {
                 mine.auto_gain = theirs.auto_gain;
             }
             apply_seek(&mut r.playhead_sec[d], s, d);
+            if let Some(ahead) = s.loop_approach[d].take() {
+                r.loop_approach[d] = Some(ahead);
+            }
+            if !s.loop_active[d] {
+                r.loop_approach[d] = Some(false);
+            }
             if std::mem::take(&mut s.jump_ease_reset[d]) {
                 r.jump_ease[d] = JumpEase::default();
             }
@@ -2274,6 +2301,8 @@ impl Drop for Renderer {
                 settle_end(&mut self.state, &self.tracks[d], &mut s, d);
                 apply_seek(&mut self.state.playhead_sec[d], &mut s, d);
                 s.playhead_sec[d] = self.state.playhead_sec[d];
+                // A deck still on its way into a loop stays so, unless a newer placement is waiting.
+                s.loop_approach[d] = s.loop_approach[d].or(self.state.loop_approach[d]);
             }
             s.pattern_phase_sec = self.state.pattern_phase_sec;
             s.preview_progress = self.preview.progress();
@@ -2417,7 +2446,7 @@ impl Renderer {
 
                 let mut true_stems = None;
                 let scratching = state.scratch_active[d] || state.scratch_ramping[d];
-                let looping = state.loop_active[d] && state.loop_len_sec[d] > 0.05;
+                let looping = tracks[d].as_ref().is_some_and(|t| loop_plays(state.loop_active[d], state.loop_len_sec[d], t.sample_rate));
                 // Plain playback ends after the last decoded frame; a loop or a hand on the platter carries on as before.
                 let track_end = tracks[d].as_ref().filter(|_| !scratching && !looping).map(|t| t.duration_sec);
                 if let Some(end) = track_end.filter(|&end| at_track_end(state.playhead_sec[d], end)) {
@@ -2445,8 +2474,9 @@ impl Renderer {
                             srcs[i + 1] = s.as_deref().map_or(&[], |v| v.as_slice());
                         }
                         let n = if has_stems { 5 } else { 1 };
-                        let lp = (state.loop_active[d] && state.loop_len_sec[d] > 0.05)
-                            .then(|| (state.loop_start_sec[d] * tsr, state.loop_len_sec[d] * tsr));
+                        // On the way into a loop placed ahead the stretcher reads the track as it is; inside, only the loop.
+                        let approaching = state.loop_approach[d] == Some(true) && state.playhead_sec[d] < state.loop_start_sec[d];
+                        let lp = (looping && !approaching).then(|| (state.loop_start_sec[d] * tsr, state.loop_len_sec[d] * tsr));
                         state.keylocks[d].next(&srcs[..n], sample_pos, tsr / sr as f64, lp, state.keylock_hq)
                     });
                     let (mut s_l, mut s_r) = match locked {
@@ -2579,8 +2609,14 @@ impl Renderer {
                     let loop_start = state.loop_start_sec[d];
                     let loop_len = state.loop_len_sec[d];
                     let loop_end = loop_start + loop_len;
-                    if state.playhead_sec[d] >= loop_end || state.playhead_sec[d] < loop_start {
-                        state.playhead_sec[d] = loop_start + (state.playhead_sec[d] - loop_start).rem_euclid(loop_len);
+                    if state.loop_approach[d] == Some(true) && state.playhead_sec[d] < loop_start {
+                        // Still on the way to a loop placed ahead: play the music in between as it is.
+                        state.playhead_sec[d] = state.playhead_sec[d].max(0.0);
+                    } else {
+                        state.loop_approach[d] = Some(false);
+                        if state.playhead_sec[d] >= loop_end || state.playhead_sec[d] < loop_start {
+                            state.playhead_sec[d] = loop_start + (state.playhead_sec[d] - loop_start).rem_euclid(loop_len);
+                        }
                     }
                 } else if let Some(end) = track_end.filter(|&end| at_track_end(state.playhead_sec[d], end)) {
                     stop_at_track_end(state, d, end);
@@ -3061,6 +3097,7 @@ mod tests {
             duration_sec: secs as f64,
             bpm: 120.0,
             grid_offset_sec: 0.0,
+            grid_known: false,
             key: String::new(),
             sample_rate: sr,
             waveform_peaks: Vec::new().into(),
@@ -3101,6 +3138,36 @@ mod tests {
             }
         }
         peaks
+    }
+
+    /// Each loop placement says whether its start is ahead, so a deck still on its way into one loop doesn't carry
+    /// that over to the next: released and replaced in one UI turn by a loop that doesn't ask for it, the deck goes
+    /// straight into the new loop as an ordinary loop does.
+    #[test]
+    fn a_new_loop_never_inherits_the_way_into_the_last() {
+        let shared = Arc::new(Mutex::new(AudioSharedState::default()));
+        {
+            let mut s = shared.lock().unwrap();
+            s.loaded_tracks[0] = Some(tone_track(440.0, 48_000, 4.0));
+            s.seek_to(0, 0.5);
+            s.is_playing[0] = true;
+            (s.loop_active[0], s.loop_start_sec[0], s.loop_len_sec[0]) = (true, 1.0, 0.25);
+            s.place_loop(0, true);
+        }
+        let mut renderer = Renderer::new(Arc::clone(&shared), Arc::default(), Arc::default());
+        let mut buf = vec![0.0f32; 480 * 2];
+        renderer.render(&mut buf, 2, 48_000, |x| x);
+        let at = shared.lock().unwrap().playhead_sec[0];
+        assert!(at > 0.5 && at < 1.0, "not on its way into the loop: {at}");
+        {
+            let mut s = shared.lock().unwrap();
+            s.loop_active[0] = false;
+            (s.loop_active[0], s.loop_start_sec[0]) = (true, 2.0);
+            s.place_loop(0, false);
+        }
+        renderer.render(&mut buf, 2, 48_000, |x| x);
+        let at = shared.lock().unwrap().playhead_sec[0];
+        assert!((2.0..2.25).contains(&at), "the new loop played on from the old one's way in: {at}");
     }
 
     /// `cargo test --release -p retraktor-gui keylock_cpu -- --ignored --nocapture`
@@ -3706,6 +3773,17 @@ mod tests {
         (s.scratch_active[0], s.scratch_rate[0]) = (true, 1.0);
         fallback_tick(&mut s, 0.016);
         assert!(s.is_playing[0] && s.playhead_sec[0] == 0.0, "a held platter past the end");
+
+        // A hand-cut loop far shorter than 50 ms is still a loop on this clock.
+        let mut s = AudioSharedState::default();
+        s.loaded_tracks[0] = Some(tone_track(440.0, 48_000, 2.0));
+        s.seek_to(0, 1.0);
+        (s.loop_active[0], s.loop_start_sec[0], s.loop_len_sec[0]) = (true, 1.0, 0.02);
+        s.start_playing(0);
+        for _ in 0..20 {
+            fallback_tick(&mut s, 0.016);
+            assert!(s.is_playing[0] && (1.0..1.02).contains(&s.playhead_sec[0]), "left the 20 ms loop at {}", s.playhead_sec[0]);
+        }
     }
 
     /// With no sound card, a jog released while the deck plays eases up to the pitched speed and the ramp ends;

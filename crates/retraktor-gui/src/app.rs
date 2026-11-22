@@ -1,6 +1,6 @@
 use crate::audio::{AudioSystem, LoadedTrackAudio, PEAKS_PER_SEC};
 use crate::dot;
-use crate::library_ui::LibraryManager;
+use crate::library_ui::{HotcuePad, LibraryManager};
 use crate::preferences::{PreferencesDialog, PrefsTab};
 use crate::theme::TraktorTheme;
 use crate::widgets::{
@@ -166,9 +166,14 @@ pub struct ReTraktorApp {
     pub deck_loop_active: [bool; 4],
     pub deck_loop_start_sec: [f64; 4],
     pub deck_loop_size_beats: [u32; 4],
+    /// A recalled saved loop's exact length, used instead of `deck_loop_size_beats` until the loop is released or
+    /// the track replaced (halve and double scale it; a size picked by number replaces it).
+    pub deck_loop_exact_sec: [Option<f64>; 4],
     /// Beat jump size per deck, one of `JUMP_SIZES`.
     pub deck_jump_beats: [u32; 4],
-    pub deck_hotcues: [Vec<(u8, f64)>; 4],
+    pub deck_hotcues: [Vec<HotcuePad>; 4],
+    /// The transport CUE point per deck (seconds): temporary, not a numbered hotcue; 0 on each new load.
+    pub deck_temp_cue_sec: [f64; 4],
     pub deck_pad_mode: [DeckPadMode; 4],
     pub deck_sync_enabled: [bool; 4],
     /// Play state last frame, so a synced deck can snap onto the bar when either deck starts.
@@ -261,7 +266,9 @@ pub struct ReTraktorApp {
 
 impl Default for ReTraktorApp {
     fn default() -> Self {
-        let bus = PropertyBus::new_traktor_pro4_default();
+        let mut bus = PropertyBus::new_traktor_pro4_default();
+        // Snap starts off: new hot cues and loops land exactly where they are pressed until it is switched on.
+        bus.set("app.traktor.snap", PropValue::Bool(false));
         let mut default_steps = [[false; 16]; 4];
         // Default 4x4 Kick + Offbeat Hat + Clap on 5 & 13
         for s in (0..16).step_by(4) {
@@ -327,13 +334,15 @@ impl Default for ReTraktorApp {
             deck_loop_active: [false, false, false, false],
             deck_loop_start_sec: [0.0, 0.0, 0.0, 0.0],
             deck_loop_size_beats: [4, 4, 4, 4],
+            deck_loop_exact_sec: [None; 4],
             deck_jump_beats: [4; 4],
             deck_hotcues: [
-                vec![(1, 0.0), (2, 15.0), (3, 30.0), (4, 60.0)],
-                vec![(1, 0.0), (2, 16.0), (3, 32.0), (4, 64.0)],
-                vec![(1, 0.0), (2, 15.0)],
-                vec![(1, 0.0), (2, 15.0)],
+                vec![HotcuePad::cue(1, 0.0), HotcuePad::cue(2, 15.0), HotcuePad::cue(3, 30.0), HotcuePad::cue(4, 60.0)],
+                vec![HotcuePad::cue(1, 0.0), HotcuePad::cue(2, 16.0), HotcuePad::cue(3, 32.0), HotcuePad::cue(4, 64.0)],
+                vec![HotcuePad::cue(1, 0.0), HotcuePad::cue(2, 15.0)],
+                vec![HotcuePad::cue(1, 0.0), HotcuePad::cue(2, 15.0)],
             ],
+            deck_temp_cue_sec: [0.0; 4],
             deck_pad_mode: [
                 DeckPadMode::Hotcues,
                 DeckPadMode::Hotcues,
@@ -768,6 +777,7 @@ impl ReTraktorApp {
                                 title: if d == 0 { "Solaris (Extended Mix)".into() } else { "Midnight Sun (Original)".into() },
                                 artist: if d == 0 { "Articuno".into() } else { "Helios".into() },
                                 bpm: if d == 0 { 124.0 } else { 125.0 },
+                                grid_known: false,
                                 grid_offset_sec: 0.0,
                                 key: if d == 0 { "8m".into() } else { "9m".into() },
                                 duration_sec: 384.0,
@@ -902,6 +912,7 @@ impl ReTraktorApp {
                         duration_sec: 240.0,
                         bpm: 128.0,
                         grid_offset_sec: 0.0,
+                        grid_known: false,
                         key: if d == 0 { "8m".into() } else { "9m".into() },
                         sample_rate: 44100,
                         overview: overview.clone(),
@@ -1049,20 +1060,18 @@ impl ReTraktorApp {
         let d = deck.clamp(1, 4) - 1;
         let n: usize = arg.parse().unwrap_or(1);
         match verb {
+            // A saved mapping naming no real deck (play:0, cue:0, cueplay:9, loop:5, hotcue:5:2) does nothing rather
+            // than act on the wrong deck or index past the four decks.
+            "play" | "cue" | "cueplay" | "loop" | "hotcue" if !(1..=4).contains(&deck) => {}
             "play" => self.toggle_play(deck),
-            "cue" => self.jump_to_cue(deck, 1),
-            "cueplay" => {
-                self.jump_to_cue(deck, 1);
-                if let Ok(mut st) = self.audio.shared.lock() {
-                    st.start_playing(d);
-                }
-            }
+            "cue" => self.transport_cue(deck, false),
+            "cueplay" => self.transport_cue(deck, true),
             "sync" => self.sync_deck(deck),
             "flux" => self.deck_flux_active[d] = !self.deck_flux_active[d],
             "loop" => self.toggle_loop(deck),
-            "loop_half" => self.deck_loop_size_beats[d] = (self.deck_loop_size_beats[d] / 2).max(1),
-            "loop_double" => self.deck_loop_size_beats[d] = (self.deck_loop_size_beats[d] * 2).min(32),
-            "hotcue" => self.jump_to_cue(deck, n.clamp(1, 8) as u8),
+            "loop_half" => self.resize_loop(d, false),
+            "loop_double" => self.resize_loop(d, true),
+            "hotcue" => self.press_hotcue(deck, n.clamp(1, 8) as u8),
             "stem" => self.deck_stem_muted[d][n.clamp(1, 4) - 1] ^= true,
             "stem_view" => self.deck_stem_view[d] ^= true,
             "pads" => {
@@ -1180,8 +1189,10 @@ impl ReTraktorApp {
                         return;
                     }
                 };
-                if let Some(grid) = track.cues.iter().find(|c| c.cue_type == retraktor_core::CueType::Grid) {
+                // A grid cue with no real position counts as no grid.
+                if let Some(grid) = track.cues.iter().find(|c| c.cue_type == retraktor_core::CueType::Grid && c.start_ms.is_finite()) {
                     loaded.grid_offset_sec = grid.start_ms / 1000.0;
+                    loaded.grid_known = true;
                 }
                 let unanalysed = track.bpm <= 0.0 || track.musical_key.is_empty();
                 if !track.phrases.is_empty() {
@@ -1384,12 +1395,14 @@ impl ReTraktorApp {
                         state.is_playing[d] = false;
                         state.reset_jump_ease(d);
                     } else { continue; }
+                    self.deck_temp_cue_sec[d] = 0.0;
                     self.deck_track_ids[d] = Some(track.id);
                     self.deck_analysing[d] = track.bpm <= 0.0 || track.musical_key.is_empty();
                     self.deck_auto_cue_status[d] = None;
                     // The library entry may have changed while the file decoded; the queued copy is the fallback.
-                    self.deck_hotcues[d] = self.deck_library_track(d).unwrap_or(&track).hotcue_slots();
+                    self.deck_hotcues[d] = self.deck_library_track(d).unwrap_or(&track).hotcue_pads();
                     self.deck_loop_active[d] = false;
+                    self.deck_loop_exact_sec[d] = None;
                     self.library.finish_deck_load(d, track.id, stems_ready);
                     self.set_state.on_track_loaded(d, track.id);
                     self.library.status_message = format!("Loaded '{}' on deck {}", track.title, DECK_LETTERS[d]);
@@ -1420,13 +1433,18 @@ impl ReTraktorApp {
             return;
         }
         let Ok(mut state) = self.audio.shared.lock() else { return };
+        let playing = state.is_playing[d];
         let Some(t) = state.loaded_tracks[d].as_mut() else { return };
         self.deck_analysing[d] = false;
-        if !kept.bpm && t.bpm <= 0.0 {
+        let filled_bpm = !kept.bpm && t.bpm <= 0.0;
+        if filled_bpm {
             t.bpm = a.bpm;
-            if !kept.grid {
-                t.grid_offset_sec = a.beatgrid_offset_sec;
-            }
+        }
+        // The grid the library takes now (it adds one only to a track with none); a grid set by hand meanwhile stays.
+        // A deck playing at its tagged BPM keeps its beat ticks and sync phase; the library has the grid for next load.
+        if !kept.grid && !t.grid_known && (filled_bpm || !playing) {
+            t.grid_offset_sec = a.beatgrid_offset_sec;
+            t.grid_known = true;
         }
         if t.key.is_empty() {
             t.key = a.key_open.clone();
@@ -1804,7 +1822,7 @@ impl ReTraktorApp {
                     .unwrap_or(128.0);
                 state.loop_active[d] = self.deck_loop_active[d];
                 state.loop_start_sec[d] = self.deck_loop_start_sec[d];
-                state.loop_len_sec[d] = self.deck_loop_size_beats[d] as f64 * (60.0 / bpm.max(30.0));
+                state.loop_len_sec[d] = self.deck_loop_len(d, bpm);
             }
 
             self.sync_was_playing = state.is_playing;
@@ -2069,10 +2087,8 @@ impl ReTraktorApp {
                     }
                     "loop_size:1" | "loop_size:2" => {
                         let d = if act == "loop_size:2" { 1 } else { 0 };
-                        if delta > 0 {
-                            self.deck_loop_size_beats[d] = (self.deck_loop_size_beats[d] * 2).min(32);
-                        } else if delta < 0 {
-                            self.deck_loop_size_beats[d] = (self.deck_loop_size_beats[d] / 2).max(1);
+                        if delta != 0 {
+                            self.resize_loop(d, delta > 0);
                         }
                         return;
                     }
@@ -2229,8 +2245,8 @@ impl ReTraktorApp {
                 match control.as_str() {
                     "surface.left.play" => self.toggle_play(1),
                     "surface.right.play" => self.toggle_play(2),
-                    "surface.left.cue" => self.jump_to_cue(1, 1),
-                    "surface.right.cue" => self.jump_to_cue(2, 1),
+                    "surface.left.cue" => self.transport_cue(1, false),
+                    "surface.right.cue" => self.transport_cue(2, false),
                     "surface.left.sync" => self.sync_deck(1),
                     "surface.right.sync" => self.sync_deck(2),
                     "surface.left.key_lock" => self.deck_keylock[0] ^= true,
@@ -2384,17 +2400,13 @@ impl ReTraktorApp {
                     }
                 }
                 "surface.left.loop_size" => {
-                    if delta > 0 {
-                        self.deck_loop_size_beats[0] = (self.deck_loop_size_beats[0] * 2).min(32);
-                    } else if delta < 0 {
-                        self.deck_loop_size_beats[0] = (self.deck_loop_size_beats[0] / 2).max(1);
+                    if delta != 0 {
+                        self.resize_loop(0, delta > 0);
                     }
                 }
                 "surface.right.loop_size" => {
-                    if delta > 0 {
-                        self.deck_loop_size_beats[1] = (self.deck_loop_size_beats[1] * 2).min(32);
-                    } else if delta < 0 {
-                        self.deck_loop_size_beats[1] = (self.deck_loop_size_beats[1] / 2).max(1);
+                    if delta != 0 {
+                        self.resize_loop(1, delta > 0);
                     }
                 }
                 "surface.left.browse.encoder" => {
@@ -2421,7 +2433,7 @@ impl ReTraktorApp {
         let pad_idx = (pad_num.saturating_sub(1) as usize).min(7);
         match self.deck_pad_mode[d] {
             DeckPadMode::Hotcues => {
-                self.jump_to_cue(deck_idx, pad_num);
+                self.press_hotcue(deck_idx, pad_num);
             }
             DeckPadMode::Stems => {
                 if pad_idx < 4 {
@@ -2446,7 +2458,7 @@ impl ReTraktorApp {
             }
             DeckPadMode::FluxLoop => {
                 let sizes = [1, 1, 2, 4, 8, 16, 32, 32];
-                self.deck_loop_size_beats[d] = sizes[pad_idx];
+                self.select_loop_size(d, sizes[pad_idx]);
                 self.deck_flux_active[d] = true;
                 self.toggle_loop(deck_idx);
             }
@@ -2560,7 +2572,7 @@ impl ReTraktorApp {
                     self.toggle_play(deck);
                 }
                 if i.key_pressed(Key::C) {
-                    self.jump_to_cue(deck, 1);
+                    self.transport_cue(deck, false);
                 }
                 if i.key_pressed(Key::S) {
                     self.sync_deck(deck);
@@ -2581,7 +2593,7 @@ impl ReTraktorApp {
                     (Key::Num8, 2, 4),
                 ] {
                     if !shift && i.key_pressed(key) {
-                        self.jump_to_cue(d_idx, cue);
+                        self.press_hotcue(d_idx, cue);
                     }
                 }
 
@@ -2741,19 +2753,168 @@ impl ReTraktorApp {
         }
     }
 
-    fn jump_to_cue(&mut self, deck_idx: usize, cue_num: u8) {
+    /// Tap CUE (`play` false) and CUP (`play` true) on deck `deck_idx`, around its temporary cue point, never a
+    /// numbered hotcue. CUE paused away from the track's end puts the cue at the playhead; CUE playing, or parked at
+    /// the end, stops back on it. CUP starts from it, playing or not. No track, no action.
+    fn transport_cue(&mut self, deck_idx: usize, play: bool) {
         let d = deck_idx - 1;
-        if !(1..=8).contains(&cue_num) {
+        let Ok(mut state) = self.audio.shared.lock() else { return };
+        let Some((duration, bpm, sample_rate)) = state.loaded_tracks[d].as_ref().map(|t| (t.duration_sec, t.bpm, t.sample_rate)) else { return };
+        let was_playing = state.is_playing[d];
+        // The cue goes exactly where the playhead is: Snap only places new hot cues and loops.
+        if !play && !was_playing && !crate::audio::at_track_end(state.playhead_sec[d], duration) {
+            self.deck_temp_cue_sec[d] = state.playhead_sec[d];
             return;
         }
-        if let Some(&(_, cue_sec)) = self.deck_hotcue_slots(d).iter().find(|(id, _)| *id == cue_num) {
-            if let Ok(mut state) = self.audio.shared.lock() {
-                state.seek_to(d, cue_sec);
+        let cue = self.deck_temp_cue_sec[d];
+        // A loop the cue lies outside would wrap the deck straight back in once it plays, so it ends, in this lock.
+        // The loop is the one the callback plays: a recalled saved loop's exact length, judged as the callback judges.
+        let (loop_start, loop_len) = (self.deck_loop_start_sec[d], self.deck_loop_len(d, bpm));
+        if crate::audio::loop_plays(self.deck_loop_active[d], loop_len, sample_rate) && !(loop_start..loop_start + loop_len).contains(&cue) {
+            self.deck_loop_active[d] = false;
+            self.deck_loop_exact_sec[d] = None;
+            state.loop_active[d] = false;
+            state.place_loop(d, false); // no way in pending to a loop that is gone
+        }
+        state.seek_to(d, cue);
+        if play && was_playing {
+            state.ease_jump(d);
+        } else {
+            state.is_playing[d] = false;
+            state.reset_jump_ease(d);
+        }
+        if play {
+            state.start_playing(d);
+        }
+    }
+
+    /// Hot cue pad `slot` (1..=8) pressed on deck `deck_idx`, from any numbered input (screen, keys, mapped or MIDI,
+    /// the controller's hot cue pads). A saved loop plays exactly as saved, a cue is jumped to, and an empty pad
+    /// takes a new cue at the playhead, on the nearest beat while Snap is on.
+    fn press_hotcue(&mut self, deck_idx: usize, slot: u8) {
+        let d = deck_idx - 1;
+        if !(1..=8).contains(&slot) {
+            return;
+        }
+        let letter = DECK_LETTERS[d];
+        let Some(pad) = self.deck_hotcue_pads(d).into_iter().find(|p| p.slot == slot) else {
+            let Ok(state) = self.audio.shared.lock() else { return };
+            let target = self.snap_target(state.loaded_tracks[d].as_ref(), state.playhead_sec[d], 0.0);
+            drop(state);
+            match target {
+                Some(at) => self.add_deck_hotcue(d, slot, at),
+                None => self.library.status_message = format!("Hot cue {slot} not set: no beat inside the track on deck {letter}"),
             }
             return;
+        };
+        let Ok(mut state) = self.audio.shared.lock() else { return };
+        let track = state.loaded_tracks[d].as_ref().map(|t| (t.duration_sec, t.sample_rate));
+        match (pad.loop_sec, track) {
+            // A cue, as the pad always did.
+            (None, _) if pad.start_sec.is_finite() && pad.start_sec >= 0.0 => state.seek_to(d, pad.start_sec),
+            (None, _) => {
+                drop(state);
+                self.library.status_message = format!("Hot cue {slot} on deck {letter} has no usable position");
+            }
+            (Some(len), Some((duration, sample_rate))) if saved_loop_plays(pad.start_sec, len, duration, sample_rate) => {
+                self.deck_loop_active[d] = true;
+                self.deck_loop_start_sec[d] = pad.start_sec;
+                self.deck_loop_exact_sec[d] = Some(len);
+                // Playhead and loop in one lock, so the callback never plays the old loop from the new spot.
+                state.seek_to(d, pad.start_sec);
+                state.loop_active[d] = true;
+                state.loop_start_sec[d] = pad.start_sec;
+                state.loop_len_sec[d] = len;
+                state.place_loop(d, false);
+                if state.is_playing[d] {
+                    state.ease_jump(d);
+                } else {
+                    state.reset_jump_ease(d);
+                }
+            }
+            // A saved loop that can't play here: only a start inside the decoded audio is somewhere to go.
+            (Some(_), track) => {
+                let inside = track.is_some_and(|(duration, _)| pad.start_sec >= 0.0 && pad.start_sec < duration);
+                if inside {
+                    state.seek_to(d, pad.start_sec);
+                }
+                drop(state);
+                let moved = if inside { "; jumped to its start" } else { "" };
+                self.library.status_message = format!("The saved loop on hot cue {slot} doesn't fit this track on deck {letter}{moved}");
+            }
         }
-        let Some(current) = self.audio.shared.lock().ok().map(|state| state.playhead_sec[d]) else { return };
-        self.add_deck_hotcue(d, cue_num, current);
+    }
+
+    /// Where a new hot cue (`span` 0) or loop `span` seconds long placed at `at` on a deck playing `track` starts:
+    /// exactly `at`, unless Snap is on and the track has a real grid and tempo; then the nearest beat that keeps it
+    /// inside the decoded track, or `None` when no beat does.
+    fn snap_target(&self, track: Option<&LoadedTrackAudio>, at: f64, span: f64) -> Option<f64> {
+        let snap = self.bus.get("app.traktor.snap").and_then(PropValue::as_bool).unwrap_or(false);
+        match track.filter(|t| snap && t.grid_known && t.grid_offset_sec.is_finite() && t.bpm.is_finite() && t.bpm > 0.0) {
+            Some(t) => nearest_beat(at, t.bpm, t.grid_offset_sec, t.duration_sec, span),
+            None => Some(at),
+        }
+    }
+
+    /// The loop length deck `d` plays at `bpm`: a recalled saved loop's exact length, or its beat size.
+    fn deck_loop_len(&self, d: usize, bpm: f64) -> f64 {
+        self.deck_loop_exact_sec[d].unwrap_or(self.deck_loop_size_beats[d] as f64 * (60.0 / bpm.max(30.0)))
+    }
+
+    /// Halves (`grow` false) or doubles the loop size. A recalled saved loop halves or doubles with it, unless that
+    /// would make it shorter than one sample or run past the end of the track; then nothing changes. The saved pad
+    /// never changes, and pressing it again restores it.
+    fn resize_loop(&mut self, d: usize, grow: bool) {
+        let size = self.deck_loop_size_beats[d];
+        let beats = if grow { size * 2 } else { size / 2 }.clamp(1, 32);
+        if let Some(len) = self.deck_loop_exact_sec[d] {
+            let len = if grow { len * 2.0 } else { len / 2.0 };
+            let start = self.deck_loop_start_sec[d];
+            let fits = self.audio.shared.lock().ok().and_then(|s| s.loaded_tracks[d].as_ref().map(|t| saved_loop_plays(start, len, t.duration_sec, t.sample_rate)));
+            if fits != Some(true) {
+                let way = if grow { "longer" } else { "shorter" };
+                self.library.status_message = format!("The loop on deck {} can't get any {way} here", DECK_LETTERS[d]);
+                return;
+            }
+            self.deck_loop_exact_sec[d] = Some(len);
+        }
+        self.deck_loop_size_beats[d] = beats;
+    }
+
+    /// A loop size picked by number: that many beats at the deck's tempo. A recalled saved loop becomes that beat loop
+    /// from its start if it fits in the track there; otherwise, or while the tempo is unknown, nothing changes.
+    fn select_loop_size(&mut self, d: usize, beats: u32) {
+        let beats = beats.clamp(1, 32);
+        if self.deck_loop_exact_sec[d].is_some() {
+            let start = self.deck_loop_start_sec[d];
+            let fits = self.audio.shared.lock().ok().and_then(|s| {
+                let t = s.loaded_tracks[d].as_ref().filter(|t| t.bpm.is_finite() && t.bpm > 0.0)?;
+                Some(saved_loop_plays(start, beats as f64 * (60.0 / t.bpm.max(30.0)), t.duration_sec, t.sample_rate))
+            });
+            match fits {
+                None => self.library.status_message = format!("Loops on deck {} wait for its BPM", DECK_LETTERS[d]),
+                Some(false) => self.library.status_message = format!("A {beats}-beat loop doesn't fit from the loop's start on deck {}", DECK_LETTERS[d]),
+                Some(true) => self.deck_loop_exact_sec[d] = None,
+            }
+            if fits != Some(true) {
+                return;
+            }
+        }
+        self.deck_loop_size_beats[d] = beats;
+    }
+
+    /// A loop size button: the size already picked turns its loop on or off, another size is picked (and its loop
+    /// turned on). On a recalled saved loop every size, the one picked before too, makes it that many beats.
+    fn pick_loop_size(&mut self, deck_idx: usize, beats: u32) {
+        let d = deck_idx - 1;
+        if self.deck_loop_size_beats[d] == beats && self.deck_loop_exact_sec[d].is_none() {
+            self.toggle_loop(deck_idx);
+        } else {
+            self.select_loop_size(d, beats);
+            if !self.deck_loop_active[d] {
+                self.toggle_loop(deck_idx);
+            }
+        }
     }
 
     /// The library track a deck plays, if it is still in the library; its cues are the deck's cues.
@@ -2766,14 +2927,19 @@ impl ReTraktorApp {
     /// load that finished after an edit, agree. Tracks outside the library keep deck-only pads.
     /// Each read also updates the deck's own copy, so the pads it last showed (pad edits, analysis)
     /// stay if the track is removed from the library while loaded.
-    fn deck_hotcue_slots(&mut self, d: usize) -> Vec<(u8, f64)> {
-        if let Some(slots) = self.deck_library_track(d).map(|t| t.hotcue_slots()) {
-            if self.deck_hotcues[d] != slots {
-                self.deck_hotcues[d] = slots.clone();
+    fn deck_hotcue_pads(&mut self, d: usize) -> Vec<HotcuePad> {
+        if let Some(pads) = self.deck_library_track(d).map(|t| t.hotcue_pads()) {
+            if self.deck_hotcues[d] != pads {
+                self.deck_hotcues[d] = pads.clone();
             }
-            return slots;
+            return pads;
         }
         self.deck_hotcues[d].clone()
+    }
+
+    /// `deck_hotcue_pads` as (pad, seconds), for the views and auto cues.
+    fn deck_hotcue_slots(&mut self, d: usize) -> Vec<(u8, f64)> {
+        self.deck_hotcue_pads(d).iter().map(|p| (p.slot, p.start_sec)).collect()
     }
 
     /// Sets an empty pad (1..=8); a filled pad is never overwritten.
@@ -2784,8 +2950,8 @@ impl ReTraktorApp {
                 self.refresh_deck_hotcue_copies(id);
             }
             None => {
-                if (1..=8).contains(&slot) && !self.deck_hotcues[d].iter().any(|&(s, _)| s == slot) {
-                    self.deck_hotcues[d].push((slot, sec));
+                if (1..=8).contains(&slot) && !self.deck_hotcues[d].iter().any(|p| p.slot == slot) {
+                    self.deck_hotcues[d].push(HotcuePad::cue(slot, sec));
                 }
             }
         }
@@ -2797,7 +2963,7 @@ impl ReTraktorApp {
                 self.library.clear_hotcue(id, slot);
                 self.refresh_deck_hotcue_copies(id);
             }
-            None => self.deck_hotcues[d].retain(|&(s, _)| s != slot),
+            None => self.deck_hotcues[d].retain(|p| p.slot != slot),
         }
     }
 
@@ -2874,34 +3040,56 @@ impl ReTraktorApp {
         let Some(t) = state.loaded_tracks[d].as_mut().filter(|t| t.bpm > 0.0) else { return };
         t.grid_offset_sec += shift_sec;
         t.bpm = (t.bpm * bpm_factor).clamp(20.0, 400.0);
+        // Moving the grid says where the beats are; halving or doubling the tempo alone doesn't.
+        let moved = shift_sec != 0.0;
+        t.grid_known |= moved;
         let (offset, bpm) = (t.grid_offset_sec, t.bpm);
         drop(state);
         if let Some(id) = self.deck_track_ids[d] {
-            self.library.set_grid(id, offset, bpm);
+            self.library.set_grid(id, offset, bpm, moved);
         }
     }
 
     fn toggle_loop(&mut self, deck_idx: usize) {
         let d = deck_idx - 1;
-        // A loop is a number of beats: with no BPM yet it would be a guess, and change length when it arrives.
-        let no_bpm = self.audio.shared.lock().map_or(true, |s| s.loaded_tracks[d].as_ref().is_some_and(|t| t.bpm <= 0.0));
-        if !self.deck_loop_active[d] && no_bpm {
-            self.library.status_message = format!("Loops on deck {} wait for its BPM", DECK_LETTERS[d]);
+        let letter = DECK_LETTERS[d];
+        // One lock: the loop is placed against the playhead and tempo it was worked out from.
+        let Ok(mut state) = self.audio.shared.lock() else { return };
+        if self.deck_loop_active[d] {
+            self.deck_loop_active[d] = false;
+            self.deck_loop_exact_sec[d] = None;
+            state.loop_active[d] = false;
             return;
         }
-        self.deck_loop_active[d] = !self.deck_loop_active[d];
-        if self.deck_loop_active[d] {
-            if let Ok(state) = self.audio.shared.lock() {
-                self.deck_loop_start_sec[d] = state.playhead_sec[d];
-            }
+        let track = state.loaded_tracks[d].as_ref();
+        // A loop is a number of beats: with no BPM yet it would be a guess, and change length when it arrives.
+        if track.is_some_and(|t| !(t.bpm.is_finite() && t.bpm > 0.0)) {
+            drop(state);
+            self.library.status_message = format!("Loops on deck {letter} wait for its BPM");
+            return;
         }
+        self.deck_loop_exact_sec[d] = None;
+        let len = self.deck_loop_len(d, track.map_or(128.0, |t| t.bpm));
+        let at = state.playhead_sec[d];
+        let Some(start) = self.snap_target(track, at, len) else {
+            drop(state);
+            self.library.status_message = format!("No whole {}-beat loop fits inside the track on deck {letter}", self.deck_loop_size_beats[d]);
+            return;
+        };
+        self.deck_loop_active[d] = true;
+        self.deck_loop_start_sec[d] = start;
+        state.loop_active[d] = true;
+        state.loop_start_sec[d] = start;
+        state.loop_len_sec[d] = len;
+        // A start snapped ahead is reached by playing on, never by wrapping back into the loop first.
+        state.place_loop(d, start > at);
     }
 
     /// Where deck `d`'s beat jump lands from `playhead` (`dir` -1 back, 1 forward), plus the loop length
     /// the audio uses for this deck (as in sync_audio_state). The one check behind both the arrows and the jump.
     fn plan_beat_jump(&self, d: usize, dir: f64, playhead: f64, bpm: f64, duration: f64) -> Option<(f64, Option<f64>, f64)> {
-        let loop_len = self.deck_loop_size_beats[d] as f64 * (60.0 / bpm.max(30.0));
-        let active_loop = (self.deck_loop_active[d] && loop_len > 0.05).then_some((self.deck_loop_start_sec[d], loop_len));
+        let loop_len = self.deck_loop_len(d, bpm);
+        let active_loop = (self.deck_loop_active[d] && loop_len > 0.0).then_some((self.deck_loop_start_sec[d], loop_len));
         let (to, loop_start) = beat_jump_target(playhead, bpm, duration, dir * self.deck_jump_beats[d] as f64, active_loop)?;
         Some((to, loop_start, loop_len))
     }
@@ -2986,67 +3174,83 @@ impl ReTraktorApp {
                 self.deck_strip(ui, 0);
                 ui.separator();
 
-                // ---- Centre-left: compact layout tabs ----
-                ui.scope(|ui| {
-                    ui.spacing_mut().item_spacing.x = 2.0;
-                    for (lay, short, key) in [
-                        (TraktorLayout::Parallel, "Mix", "F1"),
-                        (TraktorLayout::FourDeck, "4-Deck", "F2"),
-                        (TraktorLayout::Browser, "Browse", "F3"),
-                        (TraktorLayout::Timeline, "Timeline", "F4"),
-                        (TraktorLayout::Set, "Set", "F5"),
-                    ] {
-                        let label = if roomy { lay.label() } else { short };
-                        let min_w = if roomy { 46.0 } else { 36.0 };
-                        if pill(ui, label, self.layout == lay, TraktorTheme::ROW_SELECTED(), min_w)
-                            .on_hover_text(format!("{} layout ({key})", lay.label()))
+                // ---- Centre-left: compact layout tabs, with the global switches in the row under them ----
+                // That row keeps SNAP, PATTERN, NEXT, the tempo nudge and (when narrow) REC clear of the knobs at every width.
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing = Vec2::new(2.0, 2.0);
+                    ui.add_space(3.0);
+                    ui.horizontal(|ui| {
+                        for (lay, short, key) in [
+                            (TraktorLayout::Parallel, "Mix", "F1"),
+                            (TraktorLayout::FourDeck, "4-Deck", "F2"),
+                            (TraktorLayout::Browser, "Browse", "F3"),
+                            (TraktorLayout::Timeline, "Timeline", "F4"),
+                            (TraktorLayout::Set, "Set", "F5"),
+                        ] {
+                            let label = if roomy { lay.label() } else { short };
+                            let min_w = if roomy { 46.0 } else { 36.0 };
+                            if pill(ui, label, self.layout == lay, TraktorTheme::ROW_SELECTED(), min_w)
+                                .on_hover_text(format!("{} layout ({key})", lay.label()))
+                                .clicked()
+                            {
+                                self.layout = lay;
+                                self.preferences.four_deck_mode = lay == TraktorLayout::FourDeck;
+                            }
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        // Global Snap: new hot cues and loops land on the nearest beat of the deck's grid.
+                        let snap = self.bus.get("app.traktor.snap").and_then(PropValue::as_bool).unwrap_or(false);
+                        let snap_resp = pill(ui, "SNAP", snap, TraktorTheme::ACCENT(), 0.0)
+                            .on_hover_text("Snap: new hot cues and loops start on the nearest beat (tracks with a beatgrid). Saved cues and loops never move");
+                        snap_resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, true, snap, "Snap to beat"));
+                        if snap_resp.clicked() {
+                            self.bus.set("app.traktor.snap", PropValue::Bool(!snap));
+                        }
+
+                        let pat_label = if roomy { "PATTERN" } else { "PAT" };
+                        let pattern_fill = if self.pattern_enabled { TraktorTheme::ACCENT() } else { TraktorTheme::ROW_SELECTED() };
+                        if pill(ui, pat_label, self.show_pattern_player || self.pattern_enabled, pattern_fill, 0.0)
+                            .on_hover_text("Show or hide the 16-step pattern player (drum machine)")
                             .clicked()
                         {
-                            self.layout = lay;
-                            self.preferences.four_deck_mode = lay == TraktorLayout::FourDeck;
+                            self.show_pattern_player = !self.show_pattern_player;
                         }
-                    }
+
+                        let next_fill = if self.show_next_track_panel { TraktorTheme::ACCENT() } else { TraktorTheme::ROW_SELECTED() };
+                        if roomy && pill(ui, "NEXT", self.show_next_track_panel, next_fill, 0.0)
+                            .on_hover_text("Suggest next track for the idle deck (N)")
+                            .clicked()
+                        {
+                            self.toggle_next_track_panel();
+                        }
+
+                        // Master tempo nudge, just left of the tempo readout.
+                        if pill(ui, "−", false, Color32::TRANSPARENT, HIT)
+                            .on_hover_text("Master tempo down 0.5 BPM")
+                            .clicked()
+                        {
+                            self.tempo_master_deck = None;
+                            self.master_tempo = (self.master_tempo - 0.5).max(40.0);
+                        }
+                        if pill(ui, "+", false, Color32::TRANSPARENT, HIT)
+                            .on_hover_text("Master tempo up 0.5 BPM")
+                            .clicked()
+                        {
+                            self.tempo_master_deck = None;
+                            self.master_tempo = (self.master_tempo + 0.5).min(240.0);
+                        }
+                        // A narrow bar has no room for REC beside the knobs on the right.
+                        if !roomy {
+                            self.rec_button(ui, show_rec);
+                        }
+                    });
                 });
 
                 // ---- Centre: Master tempo readout in dot font ----
                 display(ui, |ui, ink| {
                     readout(ui, "MASTER BPM", &format!("{:.1}", self.master_tempo), 20.0, ink);
                 });
-                ui.scope(|ui| {
-                    ui.spacing_mut().item_spacing.x = 2.0;
-                    if pill(ui, "−", false, Color32::TRANSPARENT, HIT)
-                        .on_hover_text("Master tempo down 0.5 BPM")
-                        .clicked()
-                    {
-                        self.tempo_master_deck = None;
-                        self.master_tempo = (self.master_tempo - 0.5).max(40.0);
-                    }
-                    if pill(ui, "+", false, Color32::TRANSPARENT, HIT)
-                        .on_hover_text("Master tempo up 0.5 BPM")
-                        .clicked()
-                    {
-                        self.tempo_master_deck = None;
-                        self.master_tempo = (self.master_tempo + 0.5).min(240.0);
-                    }
-                });
-
-                let pat_label = if roomy { "PATTERN" } else { "PAT" };
-                let pattern_fill = if self.pattern_enabled { TraktorTheme::ACCENT() } else { TraktorTheme::ROW_SELECTED() };
-                if pill(ui, pat_label, self.show_pattern_player || self.pattern_enabled, pattern_fill, 0.0)
-                    .on_hover_text("Show or hide the 16-step pattern player (drum machine)")
-                    .clicked()
-                {
-                    self.show_pattern_player = !self.show_pattern_player;
-                }
-
-                let next_fill = if self.show_next_track_panel { TraktorTheme::ACCENT() } else { TraktorTheme::ROW_SELECTED() };
-                if roomy && pill(ui, "NEXT", self.show_next_track_panel, next_fill, 0.0)
-                    .on_hover_text("Suggest next track for the idle deck (N)")
-                    .clicked()
-                {
-                    self.toggle_next_track_panel();
-                }
-
                 // ---- Right: utilities + mirrored Deck B strip (ON/OFF + FX | FILTER | GAIN | B) ----
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
@@ -3081,42 +3285,8 @@ impl ReTraktorApp {
                     dot::dot_ring(ui, &mut self.cue_mix, 0.0, 1.0, 0.0, &mix_txt, "CUE/MIX", TraktorTheme::TEXT_PRIMARY(), true)
                         .on_hover_text(format!("Headphones hear the cued decks (left) or the main mix (right). {KNOB_TIP}"));
 
-                    let rec_state = self.recording.as_ref().map(|r| (r.is_active(), r.is_unsaved(), r.seconds()));
-                    let is_rec = matches!(rec_state, Some((true, _, _)));
-                    if show_rec || rec_state.is_some() {
-                        let rec_label = match rec_state {
-                            Some((true, _, sec)) => format!("REC {:02}:{:02}", (sec / 60.0).floor() as u32, (sec % 60.0).floor() as u32),
-                            Some((_, true, _)) => "RETRY SAVE".to_string(),
-                            Some(_) => "SAVING…".to_string(),
-                            None => "REC".to_string(),
-                        };
-                        let (rec_fill, rec_fg) = if is_rec {
-                            (TraktorTheme::ACCENT(), on(TraktorTheme::ACCENT()))
-                        } else {
-                            (TraktorTheme::CONTROL(), TraktorTheme::TEXT_SECONDARY())
-                        };
-                        if icon_pill(ui, Icon::Dot, &rec_label, rec_fill, rec_fg, Vec2::new(0.0, HIT))
-                            .on_hover_text(if is_rec {
-                                "Stop and save recording, CUE & tracklist to ~/Music/ReTraktor"
-                            } else {
-                                "Record master mix to ~/Music/ReTraktor (WAV, CUE & TXT)"
-                            })
-                            .clicked()
-                        {
-                            match rec_state {
-                                None => {
-                                    let home = env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("."));
-                                    self.start_recording(&home.join("Music").join("ReTraktor"));
-                                }
-                                Some((true, _, _)) => self.stop_recording(),
-                                Some((_, true, _)) => {
-                                    if let Some(outcome) = self.recording.as_mut().map(|r| r.retry()) {
-                                        self.finish_recording(outcome);
-                                    }
-                                }
-                                Some(_) => {} // the writer is still finishing the file
-                            }
-                        }
+                    if roomy {
+                        self.rec_button(ui, show_rec);
                     }
 
                     if roomy {
@@ -3155,6 +3325,48 @@ impl ReTraktorApp {
                 });
             });
         });
+    }
+
+    /// The REC button: starts, stops and saves the master recording. Shown from `show_rec` widths, and always
+    /// while a recording runs or saves.
+    fn rec_button(&mut self, ui: &mut Ui, show_rec: bool) {
+        let rec_state = self.recording.as_ref().map(|r| (r.is_active(), r.is_unsaved(), r.seconds()));
+        let is_rec = matches!(rec_state, Some((true, _, _)));
+        if show_rec || rec_state.is_some() {
+            let rec_label = match rec_state {
+                Some((true, _, sec)) => format!("REC {:02}:{:02}", (sec / 60.0).floor() as u32, (sec % 60.0).floor() as u32),
+                Some((_, true, _)) => "RETRY SAVE".to_string(),
+                Some(_) => "SAVING…".to_string(),
+                None => "REC".to_string(),
+            };
+            let (rec_fill, rec_fg) = if is_rec {
+                (TraktorTheme::ACCENT(), on(TraktorTheme::ACCENT()))
+            } else {
+                (TraktorTheme::CONTROL(), TraktorTheme::TEXT_SECONDARY())
+            };
+            if icon_pill(ui, Icon::Dot, &rec_label, rec_fill, rec_fg, Vec2::new(0.0, HIT))
+                .on_hover_text(if is_rec {
+                    "Stop and save recording, CUE & tracklist to ~/Music/ReTraktor"
+                } else {
+                    "Record master mix to ~/Music/ReTraktor (WAV, CUE & TXT)"
+                })
+                .clicked()
+            {
+                match rec_state {
+                    None => {
+                        let home = env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("."));
+                        self.start_recording(&home.join("Music").join("ReTraktor"));
+                    }
+                    Some((true, _, _)) => self.stop_recording(),
+                    Some((_, true, _)) => {
+                        if let Some(outcome) = self.recording.as_mut().map(|r| r.retry()) {
+                            self.finish_recording(outcome);
+                        }
+                    }
+                    Some(_) => {} // the writer is still finishing the file
+                }
+            }
+        }
     }
 
     /// One deck's top-bar strip: letter, then GAIN, FILTER and FX as dot rings with the FX on/off lamp.
@@ -3560,7 +3772,7 @@ impl ReTraktorApp {
         }
 
         let cues = self.deck_hotcue_slots(d);
-        let loop_len = self.deck_loop_size_beats[d] as f64 * (60.0 / deck.bpm.max(30.0));
+        let loop_len = self.deck_loop_len(d, deck.bpm);
         let wave_resp = if self.deck_stem_view[d] {
             scrolling_stem_waveforms(
                 ui,
@@ -3714,8 +3926,8 @@ impl ReTraktorApp {
             self.toggle_play(deck_idx);
         }
         let cue_key = ["(C)", "(Shift+C)", "", ""][d.min(3)];
-        if pill(ui, "CUE", false, TraktorTheme::CUE_ACTIVE(), 40.0).on_hover_text(format!("Jump to cue 1 on deck {letter} {cue_key}")).clicked() {
-            self.jump_to_cue(deck_idx, 1);
+        if pill(ui, "CUE", false, TraktorTheme::CUE_ACTIVE(), 40.0).on_hover_text(format!("Cue deck {letter} {cue_key}. When paused it sets the cue point. When playing it returns to the cue point and stops.")).clicked() {
+            self.transport_cue(deck_idx, false);
         }
         self.deck_notice(ui, d);
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -3952,7 +4164,7 @@ impl ReTraktorApp {
 
             // 4. Scrolling waveform (4-Deck; Mix draws them full width above).
             let cues = self.deck_hotcue_slots(d);
-            let loop_len_sec = self.deck_loop_size_beats[d] as f64 * (60.0 / bpm.max(30.0));
+            let loop_len_sec = self.deck_loop_len(d, bpm);
             if include_scrolling_waveform && waveform_height > 10.0 {
                 let wave_resp = if self.deck_stem_view[d] {
                     scrolling_stem_waveforms(
@@ -4051,32 +4263,14 @@ impl ReTraktorApp {
                 ) {
                     match action {
                         TransportAction::TogglePlay => self.toggle_play(deck_idx),
-                        TransportAction::Cue => self.jump_to_cue(deck_idx, 1),
-                        TransportAction::Cup => {
-                            self.jump_to_cue(deck_idx, 1);
-                            if let Ok(mut state) = self.audio.shared.lock() {
-                                state.start_playing(d);
-                            }
-                        }
+                        TransportAction::Cue => self.transport_cue(deck_idx, false),
+                        TransportAction::Cup => self.transport_cue(deck_idx, true),
                         TransportAction::ToggleFlux => {
                             self.deck_flux_active[d] = !self.deck_flux_active[d];
                         }
-                        TransportAction::HalveLoop => {
-                            self.deck_loop_size_beats[d] = (self.deck_loop_size_beats[d] / 2).max(1);
-                        }
-                        TransportAction::DoubleLoop => {
-                            self.deck_loop_size_beats[d] = (self.deck_loop_size_beats[d] * 2).min(32);
-                        }
-                        TransportAction::SelectLoop(beats) => {
-                            if self.deck_loop_size_beats[d] == beats {
-                                self.toggle_loop(deck_idx);
-                            } else {
-                                self.deck_loop_size_beats[d] = beats;
-                                if !self.deck_loop_active[d] {
-                                    self.toggle_loop(deck_idx);
-                                }
-                            }
-                        }
+                        TransportAction::HalveLoop => self.resize_loop(d, false),
+                        TransportAction::DoubleLoop => self.resize_loop(d, true),
+                        TransportAction::SelectLoop(beats) => self.pick_loop_size(deck_idx, beats),
                     }
                 }
                 pitch_inline = ui.available_width() >= 120.0;
@@ -4104,29 +4298,15 @@ impl ReTraktorApp {
             let hotcues = self.deck_hotcue_slots(d);
             ui.horizontal(|ui| {
                 let w = (ui.available_width() - 7.0 * gap) / 8.0;
-                // Always hotcues on screen; the other pad modes belong to the hardware pads.
-                let mode = DeckPadMode::Hotcues;
+                // Always hotcues on screen, whatever mode the hardware pads are in.
                 for i in 1..=8usize {
-                    let (lit, fill, tip) = match mode {
-                        DeckPadMode::Hotcues => (
-                            hotcues.iter().any(|(c, _)| *c == i as u8),
-                            TraktorTheme::hotcue_color(i),
-                            "Jump to this hotcue, or set it here if empty. Right-click to clear",
-                        ),
-                        DeckPadMode::Stems if i <= 4 => (!self.deck_stem_muted[d][i - 1], TraktorTheme::ACCENT(), "Mute or unmute a stem"),
-                        DeckPadMode::Stems => (self.deck_stem_fx_send[d][i - 5], TraktorTheme::ACCENT(), "Send a stem to the FX"),
-                        DeckPadMode::Pattern => {
-                            let v = self.pattern_selected_voice.min(3);
-                            let step_offset = if deck_idx == 2 { 8 } else { 0 };
-                            (self.pattern_steps[v][(step_offset + i - 1).min(15)], TraktorTheme::ACCENT(), "Toggle a pattern step")
-                        }
-                        DeckPadMode::FluxLoop => (self.deck_loop_active[d], TraktorTheme::ACCENT(), "Loop roll"),
-                    };
-                    let pad = pill(ui, &i.to_string(), lit, fill, w).on_hover_text(tip);
+                    let lit = hotcues.iter().any(|(c, _)| *c == i as u8);
+                    let pad = pill(ui, &i.to_string(), lit, TraktorTheme::hotcue_color(i), w)
+                        .on_hover_text("Jump to this hotcue, or set it here if empty. Right-click to clear");
                     if pad.clicked() {
-                        self.trigger_performance_pad(deck_idx, i as u8);
+                        self.press_hotcue(deck_idx, i as u8);
                     }
-                    if pad.secondary_clicked() && mode == DeckPadMode::Hotcues {
+                    if pad.secondary_clicked() {
                         self.clear_deck_hotcue(d, i as u8);
                     }
                 }
@@ -4620,7 +4800,30 @@ fn beat_jump_target(playhead: f64, bpm: f64, duration: f64, beats: f64, active_l
 /// Playback ratio that brings `bpm` to `target`, folding the target by octaves so 70 follows 140 at half time.
 /// A deck's hot cues (slot 1..=8, seconds) from a library entry's cues, of any kind, in its first eight slots.
 fn deck_hotcues_of(cues: &[retraktor_formats::nml::NmlCue]) -> Vec<(u8, f64)> {
-    cues.iter().filter(|c| (0..8).contains(&c.hotcue)).map(|c| ((c.hotcue + 1) as u8, c.start_ms / 1000.0)).collect()
+    cues.iter().filter_map(HotcuePad::of).map(|p| (p.slot, p.start_sec)).collect()
+}
+
+/// Whether a saved loop can play on a track `duration` seconds long: a real start inside the track, an end after
+/// it and no later than the track's decoded end, and at least one source frame long (hand-cut loops can be tiny).
+fn saved_loop_plays(start: f64, len: f64, duration: f64, sample_rate: u32) -> bool {
+    // A loop cut to the very end, stored as decimals, can add up a hair past it (0.1 + 0.2 > 0.3): a few roundings.
+    let end_slack = 4.0 * f64::EPSILON * duration.abs();
+    start.is_finite() && start >= 0.0 && start < duration && crate::audio::loop_plays(true, len, sample_rate) && start + len <= duration + end_slack
+}
+
+/// The beat nearest `at` on the grid (`bpm`, first beat at `offset`) where a cue (`span` 0) or a loop `span` seconds
+/// long starts inside a track `duration` long and ends by its end; `None` when the tempo is unusable or no beat fits.
+fn nearest_beat(at: f64, bpm: f64, offset: f64, duration: f64, span: f64) -> Option<f64> {
+    if !(at.is_finite() && bpm.is_finite() && bpm > 0.0 && offset.is_finite() && duration.is_finite() && span.is_finite() && span >= 0.0) {
+        return None;
+    }
+    let beat = 60.0 / bpm;
+    let fits = |t: f64| t >= 0.0 && t < duration && t + span <= duration;
+    // The beats that fit are those from the first at or after 0 to the last with room for `span`; the nearest of them
+    // to `at` is `at`'s own beat moved into that range, give or take one for rounding.
+    let (first, last) = ((-offset / beat).ceil(), ((duration - span - offset) / beat).floor());
+    let n = ((at - offset) / beat).round().max(first).min(last);
+    [n - 1.0, n, n + 1.0].into_iter().map(|n| offset + n * beat).filter(|&t| fits(t)).min_by(|a, b| (a - at).abs().total_cmp(&(b - at).abs()))
 }
 
 /// A deck's tempo as its readout shows it: still being worked out, or unknown, rather than 0.00.
@@ -5103,6 +5306,7 @@ mod tests {
             duration_sec: 10.0,
             bpm: 120.0,
             grid_offset_sec: 0.0,
+            grid_known: false,
             key: String::new(),
             sample_rate: 44100,
             waveform_peaks: Vec::new().into(),
@@ -5161,7 +5365,7 @@ mod tests {
             id: 12, title: "Real WAV".into(), file_path: Some(wav.clone()),
             bpm: 128.0, musical_key: "1d".into(), ..Default::default()
         };
-        app.deck_hotcues[0] = vec![(1, 42.0)];
+        app.deck_hotcues[0] = vec![HotcuePad::cue(1, 42.0)];
         app.library.pending_loads.push((1, track.clone()));
         app.drain_pending_loads();
         // A pad set in the library while the file decodes wins over the queued copy's empty pads.
@@ -5176,7 +5380,7 @@ mod tests {
         app.load_channel.0.send(result).unwrap();
         app.finish_loads();
         assert_eq!(app.deck_track_ids[0], Some(12));
-        assert_eq!(app.deck_hotcues[0], [(6, 3.0)]);
+        assert_eq!(app.deck_hotcues[0], [HotcuePad::cue(6, 3.0)]);
         let view = app.deck_view(0).unwrap();
         assert!(Arc::ptr_eq(&view.peaks, &app.audio.shared.lock().unwrap().loaded_tracks[0].as_ref().unwrap().waveform_peaks));
 
@@ -5343,14 +5547,14 @@ mod tests {
         let playhead = |app: &ReTraktorApp, d: usize| app.audio.shared.lock().unwrap().playhead_sec[d];
 
         set_playhead(&app, 0, 12.0);
-        app.jump_to_cue(1, 1);
+        app.press_hotcue(1, 1);
         set_playhead(&app, 1, 20.0);
-        app.jump_to_cue(2, 2);
-        app.jump_to_cue(2, 1);
+        app.press_hotcue(2, 2);
+        app.press_hotcue(2, 1);
         assert_eq!(playhead(&app, 1), 12.0, "B jumps to A's pad 1 instead of overwriting it");
         assert_eq!(app.deck_hotcue_slots(0), [(1, 12.0), (2, 20.0)]);
         assert_eq!(app.deck_hotcue_slots(1), app.deck_hotcue_slots(0));
-        app.jump_to_cue(1, 9);
+        app.press_hotcue(1, 9);
         assert_eq!(app.library.track(40).unwrap().cues.len(), 3, "pad 9 does not exist");
 
         app.clear_deck_hotcue(0, 2);
@@ -5368,8 +5572,8 @@ mod tests {
         app.library.rebuild_index();
         assert_eq!(app.deck_hotcue_slots(1), [(1, 12.0), (4, 45.0)]);
         set_playhead(&app, 1, 30.0);
-        app.jump_to_cue(2, 3);
-        app.jump_to_cue(2, 1);
+        app.press_hotcue(2, 3);
+        app.press_hotcue(2, 1);
         assert_eq!(playhead(&app, 1), 12.0);
         assert_eq!(app.deck_hotcue_slots(1), [(1, 12.0), (4, 45.0), (3, 30.0)]);
         app.clear_deck_hotcue(1, 1);
@@ -5533,7 +5737,7 @@ mod sync_audio {
 
     fn track(bpm: f64) -> crate::audio::LoadedTrackAudio {
         crate::audio::LoadedTrackAudio {
-            title: "t".into(), artist: String::new(), duration_sec: 100.0, bpm, grid_offset_sec: 0.0, key: String::new(),
+            title: "t".into(), artist: String::new(), duration_sec: 100.0, bpm, grid_offset_sec: 0.0, grid_known: false, key: String::new(),
             sample_rate: 44100, waveform_peaks: Vec::new().into(), stem_peaks: Vec::new().into(), overview: Vec::new().into(), pcm_stereo: Arc::new(vec![0.0; 44100 * 200]),
             stems_ready: false, pcm_drums: None, pcm_bass: None, pcm_other: None, pcm_vocals: None, phrases: Vec::new(),
             auto_gain: 1.0, played_peaks: Vec::new().into(), played_stem_peaks: Vec::new().into(), played_overview: Vec::new().into(),
@@ -7094,7 +7298,7 @@ mod sync_audio {
 
         app.toggle_play(d + 1);
         app.audio.shared.lock().unwrap().seek_to(d, 1.0);
-        app.jump_to_cue(d + 1, 3); // sets hot cue 3 here (deck and library)...
+        app.press_hotcue(d + 1, 3); // sets hot cue 3 here (deck and library)...
         app.clear_deck_hotcue(d, 3); // ...and the DJ clears it again, deck and library, as a right-click does
         app.deck_sync_enabled[d] = true;
         app.adjust_deck_grid(d, 0.1, 2.0);
@@ -7123,6 +7327,7 @@ mod sync_audio {
         let t = s.loaded_tracks[d].as_ref().unwrap();
         assert!(t.bpm == late.bpm && t.bpm > 0.0 && t.key == late.key_open, "BPM {} key {}", t.bpm, t.key);
         assert_eq!((t.grid_offset_sec, &t.phrases), (0.0, &phrases), "the library's grid cue or phrases were replaced");
+        assert!(t.grid_known, "an imported grid cue at 0 s is a real grid");
         assert!(s.is_playing[d] && s.playhead_sec[d] >= at, "the analysis moved or stopped the deck");
         drop(s);
         assert!(!app.deck_analysing[d]);
@@ -7135,13 +7340,14 @@ mod sync_audio {
         let Some(DeckResult::Analysis(_, on_a, one, mut late_one, audio_one, kept_one)) = load_holding_analysis(&mut app, 0, 1) else { panic!("no analysis for track 1 on A") };
         late_one.cue_points_sec = vec![0.05, 0.1];
         let _on_b = load_holding_analysis(&mut app, 1, 1);
-        app.jump_to_cue(2, 4);
+        app.press_hotcue(2, 4);
         app.clear_deck_hotcue(1, 4);
         app.load_channel.0.send(DeckResult::Analysis(0, superseded, two, late_two, audio_two, kept_two)).unwrap();
         app.load_channel.0.send(DeckResult::Analysis(0, on_a, one, late_one, audio_one, kept_one)).unwrap();
         app.finish_loads();
         assert_eq!(deck_hotcues_of(&app.library.track(2).unwrap().cues).len(), 2, "the superseded, unedited track lost its auto cues");
         assert!(deck_hotcues_of(&app.library.track(1).unwrap().cues).is_empty() && app.deck_hotcues[0].is_empty(), "deck A's analysis restored cues cleared on deck B");
+        assert!(app.audio.shared.lock().unwrap().loaded_tracks[0].as_ref().unwrap().grid_known, "an analysed grid is a real grid");
 
         // The library entries too, through normal polling, a save and a reload of the collection.
         app.library.poll();
@@ -7159,20 +7365,34 @@ mod sync_audio {
         if let Some(t) = app.library.tracks.iter_mut().find(|t| t.id == 6) {
             t.bpm = 124.0;
         }
-        let Some(update) = load_holding_analysis(&mut app, 3, 6) else { panic!("no key analysis") };
-        let DeckResult::Analysis(_, _, _, ref key_analysis, _, _) = update else { panic!("not an analysis") };
+        let Some(DeckResult::Analysis(_, generation6, six, key_analysis, audio6, kept6)) = load_holding_analysis(&mut app, 3, 6) else { panic!("no key analysis") };
         let auto: Vec<(u8, f64)> = key_analysis.cue_points_sec.iter().take(8).enumerate().map(|(i, &t)| (i as u8 + 1, t)).collect();
+        let late_grid = key_analysis.beatgrid_offset_sec;
+        assert!(!app.audio.shared.lock().unwrap().loaded_tracks[3].as_ref().unwrap().grid_known, "a tagged BPM alone is no grid");
         assert_eq!(app.audio.shared.lock().unwrap().loaded_tracks[3].as_ref().unwrap().bpm, 124.0);
         app.toggle_loop(4);
         assert!(app.deck_loop_active[3], "a tagged BPM was treated as missing");
-        app.load_channel.0.send(update).unwrap();
+        // On air when the key lands: the beat ticks and sync phase stay; the library keeps the grid for the next load.
+        app.audio.shared.lock().unwrap().start_playing(3);
+        let send6 = |app: &ReTraktorApp| app.load_channel.0.send(DeckResult::Analysis(3, generation6, six, key_analysis.clone(), Arc::clone(&audio6), kept6)).unwrap();
+        send6(&app);
         app.finish_loads();
         let s = app.audio.shared.lock().unwrap();
         let t = s.loaded_tracks[3].as_ref().unwrap();
         assert!(t.bpm == 124.0 && !t.key.is_empty(), "BPM {} key {:?}", t.bpm, t.key);
+        assert!(!t.grid_known && t.grid_offset_sec == 0.0, "the analysis moved a playing deck's beats to {}", t.grid_offset_sec);
         drop(s);
+        let grid6 = app.library.track(6).unwrap().cues.iter().find(|c| c.cue_type == retraktor_core::CueType::Grid).map(|c| c.start_ms);
+        assert_eq!(grid6, Some(late_grid * 1000.0), "the library didn't keep the analysed grid");
+        // Paused, the deck may take it.
+        app.toggle_play(4);
+        send6(&app);
+        app.finish_loads();
+        let t = app.audio.shared.lock().unwrap().loaded_tracks[3].clone().unwrap();
+        assert!(t.grid_known && t.grid_offset_sec == late_grid, "a paused deck didn't take the grid its library entry got");
         let same = |a: &[(u8, f64)], b: &[(u8, f64)]| a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.0 == y.0 && (x.1 - y.1).abs() < 1e-9);
-        assert!(same(&app.deck_hotcues[3], &auto), "an untouched, cue-less deck didn't get the auto cues: {:?}", app.deck_hotcues[3]);
+        let deck_slots: Vec<(u8, f64)> = app.deck_hotcues[3].iter().map(|p| (p.slot, p.start_sec)).collect();
+        assert!(same(&deck_slots, &auto), "an untouched, cue-less deck didn't get the auto cues: {:?}", app.deck_hotcues[3]);
         assert!(same(&deck_hotcues_of(&app.library.track(6).unwrap().cues), &auto), "the library didn't get the same auto cues");
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -7367,5 +7587,964 @@ mod sync_audio {
         app.finish_loads();
         assert!(!app.deck_analysing[0]);
         assert_eq!(app.audio.shared.lock().unwrap().loaded_tracks[0].as_ref().unwrap().bpm, 126.0);
+    }
+
+    /// 30 s of quiet noise at 44.1 kHz on a grid (`bpm`, first beat at `offset`): every spot sounds different, so a
+    /// wrong read position shows in the output.
+    fn noise_track(bpm: f64, offset: f64, grid_known: bool) -> crate::audio::LoadedTrackAudio {
+        let mut x = 1u32;
+        let pcm: Vec<f32> = (0..44_100 * 30 * 2)
+            .map(|_| {
+                x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                ((x >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 0.1
+            })
+            .collect();
+        crate::audio::LoadedTrackAudio { duration_sec: 30.0, grid_offset_sec: offset, grid_known, pcm_stereo: Arc::new(pcm), ..track(bpm) }
+    }
+
+    fn set_snap(app: &mut ReTraktorApp, on: bool) {
+        app.bus.set("app.traktor.snap", PropValue::Bool(on));
+        assert_eq!(app.bus.get("app.traktor.snap").and_then(PropValue::as_bool), Some(on));
+    }
+
+    fn pad(app: &ReTraktorApp, d: usize, slot: u8) -> Option<HotcuePad> {
+        app.deck_hotcues[d].iter().copied().find(|p| p.slot == slot)
+    }
+
+    /// Snap at 120 BPM with the first beat at 0.1 s: a pad pressed at 10.18 s lands at 10.18 with Snap off and on the
+    /// 10.10 beat with Snap on, and so does a new loop's start. A tagged BPM without a grid or an unknown BPM keeps the
+    /// exact spot (and an unknown BPM still refuses loops); a real grid at 0 s snaps. Track edges pick the nearest beat
+    /// that keeps the cue or loop inside. Switching Snap moves nothing already placed, and pressing a set pad goes to
+    /// its exact spot.
+    #[test]
+    fn snap_places_only_new_cues_and_loops_on_the_beat() {
+        let close = |got: Option<f64>, want: f64| got.is_some_and(|g| (g - want).abs() < 1e-9);
+        assert!(close(nearest_beat(10.18, 120.0, 0.1, 100.0, 0.0), 10.1));
+        assert!(close(nearest_beat(10.4, 120.0, 0.1, 100.0, 0.0), 10.6));
+        assert!(close(nearest_beat(0.05, 120.0, 0.3, 100.0, 0.0), 0.3), "before the first beat");
+        assert!(close(nearest_beat(99.9, 120.0, 0.0, 100.0, 0.0), 99.5), "a cue on the very end is outside the track");
+        assert!(close(nearest_beat(98.4, 120.0, 0.0, 100.0, 2.0), 98.0), "the nearer beat would run the loop past the end");
+        assert!(close(nearest_beat(98.0, 120.0, 0.0, 100.0, 2.0), 98.0), "a loop ending exactly at the end fits");
+        assert_eq!(nearest_beat(1.0, 120.0, 0.0, 3.0, 4.0), None, "no beat fits a loop longer than the track");
+        assert!(close(nearest_beat(99.8, 120.0, 0.0, 100.0, 2.0), 98.0), "the last start with room is beats away");
+        assert!(close(nearest_beat(100.0, 120.0, 0.0, 100.0, 0.0), 99.5), "a cue at the very end");
+        assert_eq!(nearest_beat(0.2, 120.0, 0.4, 0.3, 0.0), None, "no beat inside a 0.3 s track");
+        assert!(saved_loop_plays(0.1, 0.2, 0.3, 44_100) && 0.1 + 0.2 > 0.3, "a loop cut to the end, in decimals");
+        assert!(!saved_loop_plays(0.1, 0.21, 0.3, 44_100) && !saved_loop_plays(0.3, 0.1, 0.3, 44_100));
+        assert!(!saved_loop_plays(0.1, 0.2 + 1e-12, 0.3, 44_100), "past the end by more than rounding");
+        for bpm in [0.0, -120.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(nearest_beat(10.18, bpm, 0.1, 100.0, 0.0), None, "bpm {bpm}");
+        }
+        assert_eq!(nearest_beat(f64::NAN, 120.0, 0.1, 100.0, 0.0), None);
+
+        let mut app = ReTraktorApp::default();
+        assert_eq!(app.bus.get("app.traktor.snap").and_then(PropValue::as_bool), Some(false), "Snap starts off");
+        app.deck_hotcues[0].clear();
+        // (BPM, first beat, real grid, Snap, where pad 5 and a new loop start, or None for a refused loop)
+        let cases = [
+            (120.0, 0.1, true, false, 10.18, Some(10.18)),
+            (120.0, 0.1, true, true, 10.1, Some(10.1)),
+            (120.0, 0.0, false, true, 10.18, Some(10.18)), // a tagged BPM alone: its 0 s is no grid
+            (120.0, 0.0, true, true, 10.0, Some(10.0)),    // a real grid at 0 s
+            (0.0, 0.0, false, true, 10.18, None),          // tempo unknown
+            (f64::NAN, 0.0, true, true, 10.18, None),      // a tempo that is no number: unknown too
+            (120.0, f64::NAN, true, true, 10.18, Some(10.18)), // a grid that is no position: no grid
+        ];
+        for (bpm, offset, known, snap, cue_at, loop_at) in cases {
+            let case = format!("{bpm} BPM, beat at {offset}, grid {known}, snap {snap}");
+            set_snap(&mut app, snap);
+            {
+                let mut s = app.audio.shared.lock().unwrap();
+                s.loaded_tracks[0] = Some(crate::audio::LoadedTrackAudio { grid_offset_sec: offset, grid_known: known, ..track(bpm) });
+                s.playhead_sec[0] = 10.18;
+            }
+            app.press_hotcue(1, 5);
+            assert_eq!(pad(&app, 0, 5), Some(HotcuePad::cue(5, cue_at)), "{case}");
+            app.clear_deck_hotcue(0, 5);
+            app.toggle_loop(1);
+            match loop_at {
+                Some(at) => {
+                    let s = app.audio.shared.lock().unwrap();
+                    assert!(app.deck_loop_active[0] && s.loop_active[0], "{case}: no loop");
+                    assert!((app.deck_loop_start_sec[0] - at).abs() < 1e-9 && (s.loop_start_sec[0] - at).abs() < 1e-9, "{case}: loop at {}", s.loop_start_sec[0]);
+                    drop(s);
+                    app.toggle_loop(1);
+                    assert!(!app.deck_loop_active[0] && app.deck_loop_exact_sec[0].is_none());
+                }
+                None => assert!(!app.deck_loop_active[0] && app.library.status_message.contains("wait for its BPM"), "{case}"),
+            }
+        }
+
+        // Placed with Snap off, then Snap on: the pad and the running loop stay where they are, and the pad's
+        // press goes to its exact spot.
+        set_snap(&mut app, false);
+        app.audio.shared.lock().unwrap().loaded_tracks[0] = Some(crate::audio::LoadedTrackAudio { grid_offset_sec: 0.1, grid_known: true, ..track(120.0) });
+        app.audio.shared.lock().unwrap().playhead_sec[0] = 10.18;
+        app.press_hotcue(1, 5);
+        app.toggle_loop(1);
+        let placed = (app.deck_hotcues[0].clone(), app.deck_loop_start_sec[0]);
+        set_snap(&mut app, true);
+        app.sync_audio_state();
+        app.audio.shared.lock().unwrap().playhead_sec[0] = 30.0;
+        app.press_hotcue(1, 5);
+        assert_eq!((app.deck_hotcues[0].clone(), app.deck_loop_start_sec[0]), placed, "Snap moved what was already placed");
+        let s = app.audio.shared.lock().unwrap();
+        assert_eq!((s.playhead_sec[0], s.loop_start_sec[0]), (10.18, 10.18));
+        drop(s);
+
+        // Track edges, pressed for real on a 100 s track at 120 BPM: a 4-beat loop at 99.8 s starts on the last beat
+        // that leaves room for it (98 s), a cue pressed at the very end goes to the last beat inside (99.5 s); a loop
+        // longer than the track, or a cue with no beat inside it, isn't placed. Snap off keeps the exact spot.
+        app.toggle_loop(1);
+        app.deck_hotcues[0].clear();
+        let edge = |app: &mut ReTraktorApp, duration: f64, offset: f64, at: f64| {
+            let mut s = app.audio.shared.lock().unwrap();
+            s.loaded_tracks[0] = Some(crate::audio::LoadedTrackAudio { duration_sec: duration, grid_offset_sec: offset, grid_known: true, ..track(120.0) });
+            s.playhead_sec[0] = at;
+        };
+        edge(&mut app, 100.0, 0.0, 99.8);
+        app.toggle_loop(1);
+        assert!(app.deck_loop_active[0] && app.deck_loop_start_sec[0] == 98.0, "loop at {}", app.deck_loop_start_sec[0]);
+        app.toggle_loop(1);
+        set_snap(&mut app, false);
+        app.toggle_loop(1);
+        assert!(app.deck_loop_active[0] && app.deck_loop_start_sec[0] == 99.8, "Snap off moved the loop");
+        app.toggle_loop(1);
+        set_snap(&mut app, true);
+        edge(&mut app, 100.0, 0.0, 100.0);
+        app.press_hotcue(1, 6);
+        assert_eq!(pad(&app, 0, 6), Some(HotcuePad::cue(6, 99.5)));
+        app.deck_loop_size_beats[0] = 8;
+        edge(&mut app, 3.0, 0.0, 1.0);
+        app.toggle_loop(1);
+        assert!(!app.deck_loop_active[0] && !app.audio.shared.lock().unwrap().loop_active[0], "an 8-beat loop in a 3 s track");
+        assert!(app.library.status_message.contains("No whole 8-beat loop fits"), "{}", app.library.status_message);
+        edge(&mut app, 0.3, 0.4, 0.2);
+        app.press_hotcue(1, 7);
+        assert!(pad(&app, 0, 7).is_none() && app.library.status_message.contains("not set"), "{}", app.library.status_message);
+        // A saved loop cut to the end of that 0.3 s track (0.1 s + 0.2 s, a hair past 0.3 in floating point) plays.
+        app.deck_hotcues[0].push(HotcuePad { slot: 8, start_sec: 0.1, loop_sec: Some(0.2) });
+        app.press_hotcue(1, 8);
+        assert!(app.deck_loop_active[0] && app.deck_loop_exact_sec[0] == Some(0.2), "{}", app.library.status_message);
+        app.toggle_loop(1);
+        app.deck_loop_size_beats[0] = 4;
+
+        // Grids set by hand: a tempo fix alone gives a tagged BPM no grid; moving the grid does, back to exactly 0 s
+        // too, and the library keeps it as a new unnumbered marker beside its other cues.
+        let dir = std::env::temp_dir().join(format!("retraktor-hand-grid-{}", std::process::id()));
+        app.library = LibraryManager::new(dir.join("collection.nml"));
+        let memory = retraktor_formats::nml::NmlCue { name: "Intro".into(), displ_order: 0, cue_type: retraktor_core::CueType::Cue, start_ms: 1500.0, len_ms: 0.0, repeats: -1, hotcue: -1, grid_bpm: None };
+        app.library.tracks.push(crate::library_ui::UiTrackEntry { id: 90, bpm: 120.0, cues: vec![memory.clone()], ..Default::default() });
+        app.library.rebuild_index();
+        app.deck_track_ids[0] = Some(90);
+        app.audio.shared.lock().unwrap().loaded_tracks[0] = Some(track(120.0));
+        app.adjust_deck_grid(0, 0.0, 2.0);
+        app.adjust_deck_grid(0, 0.0, 0.5);
+        assert!(!app.audio.shared.lock().unwrap().loaded_tracks[0].as_ref().unwrap().grid_known, "a tempo fix set a phase");
+        assert_eq!(app.library.track(90).unwrap().cues, [memory.clone()]);
+        app.adjust_deck_grid(0, 0.005, 1.0);
+        app.adjust_deck_grid(0, -0.005, 1.0);
+        let t = app.audio.shared.lock().unwrap().loaded_tracks[0].clone().unwrap();
+        assert!(t.grid_known && t.grid_offset_sec == 0.0, "grid at {}", t.grid_offset_sec);
+        let cues = app.library.track(90).unwrap().cues.clone();
+        assert!(cues.len() == 2 && cues[0] == memory, "{cues:?}");
+        assert!(cues[1].cue_type == retraktor_core::CueType::Grid && cues[1].hotcue == -1 && cues[1].start_ms == 0.0 && cues[1].grid_bpm == Some(120.0), "{:?}", cues[1]);
+        app.audio.shared.lock().unwrap().playhead_sec[0] = 10.18;
+        app.press_hotcue(1, 6);
+        assert_eq!(app.library.track(90).unwrap().hotcue_pads(), [HotcuePad::cue(6, 10.0)], "a hand-set grid at 0 s doesn't snap");
+        // The library's marker at 0.25 s, on pad 3, while this deck's copy says 0 s (as after analysis on another
+        // deck): a tempo fix updates only its tempo, and a move only its position, keeping its pad.
+        let marker = app.library.tracks.iter_mut().find(|t| t.id == 90).unwrap().cues.iter_mut().find(|c| c.cue_type == retraktor_core::CueType::Grid).unwrap();
+        (marker.start_ms, marker.hotcue) = (250.0, 2);
+        app.adjust_deck_grid(0, 0.0, 2.0);
+        let grid_of = |app: &ReTraktorApp| app.library.track(90).unwrap().cues.iter().find(|c| c.cue_type == retraktor_core::CueType::Grid).cloned().unwrap();
+        let g = grid_of(&app);
+        assert!(g.start_ms == 250.0 && g.hotcue == 2 && g.grid_bpm == Some(240.0) && app.library.track(90).unwrap().bpm == 240.0, "{g:?}");
+        app.adjust_deck_grid(0, 0.005, 1.0);
+        let g = grid_of(&app);
+        assert!((g.start_ms - 5.0).abs() < 1e-9 && g.hotcue == 2 && g.grid_bpm == Some(240.0), "{g:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Snap puts a new 1-beat loop on the beat ahead (10.6 s, from 10.4 s at 120 BPM, first beat 0.1 s). Through the
+    /// real callback, in blocks of several sizes, at 44.1, 48 and 96 kHz, with and without key lock and with the UI
+    /// handing over only every seventh block: the deck plays straight on to 10.6 (sample for sample what plain
+    /// playback gives, up to 11.0) and then loops in [10.6, 11.1), coming round with the same audio each pass.
+    #[test]
+    fn a_loop_snapped_ahead_plays_on_into_its_start_then_loops() {
+        let tr = noise_track(120.0, 0.1, true);
+        for (rate, block, keylock) in [(44_100u32, 333usize, false), (48_000, 64, true), (96_000, 512, false)] {
+            let make = || {
+                let mut app = ReTraktorApp::default();
+                set_snap(&mut app, true);
+                app.deck_loop_size_beats[0] = 1;
+                app.deck_keylock[0] = keylock;
+                {
+                    let mut s = app.audio.shared.lock().unwrap();
+                    s.loaded_tracks[0] = Some(tr.clone());
+                    s.seek_to(0, 10.4);
+                    s.is_playing[0] = true;
+                }
+                app.sync_audio_state();
+                app
+            };
+            let mut straight = make();
+            let mut app = make();
+            app.toggle_loop(1);
+            assert!((app.deck_loop_start_sec[0] - 10.6).abs() < 1e-9, "{rate} Hz: snapped to {}", app.deck_loop_start_sec[0]);
+            let (mut out, mut straight_out, mut buf) = (Vec::new(), Vec::new(), vec![0.0f32; block * 2]);
+            let (mut last, mut entered, mut wrapped) = (10.4, false, false);
+            for i in 0..(2.0 * rate as f64 / block as f64) as usize {
+                if i % 7 == 6 {
+                    app.sync_audio_state();
+                    straight.sync_audio_state();
+                }
+                app.audio.render_f32(&mut buf, 2, rate);
+                out.extend_from_slice(&buf);
+                straight.audio.render_f32(&mut buf, 2, rate);
+                straight_out.extend_from_slice(&buf);
+                let p = playhead(&app, 0);
+                if entered {
+                    assert!((10.6..11.1).contains(&p), "{rate} Hz: left the loop at {p}");
+                    wrapped |= p < last;
+                } else {
+                    assert!(p >= last && p < 11.1, "{rate} Hz: jumped from {last} to {p} before reaching the loop");
+                    entered = p >= 10.6;
+                }
+                last = p;
+            }
+            assert!(entered && wrapped, "{rate} Hz: entered {entered}, wrapped {wrapped}");
+            let frames = |sec: f64| (sec * rate as f64) as usize * 2;
+            assert!(out[..frames(0.6)] == straight_out[..frames(0.6)], "{rate} Hz: the way into the loop isn't the track as it plays");
+            assert!(out[frames(0.75)..frames(0.85)] != straight_out[frames(0.75)..frames(0.85)], "{rate} Hz: the audio never came round");
+            if !keylock {
+                // Second pass against the third, past the filters' settling: the same audio each time round.
+                let (a, b, n) = (frames(0.8), frames(1.3), frames(0.4));
+                let worst = (0..n).map(|i| (out[a + i] - out[b + i]).abs()).fold(0.0f32, f32::max);
+                let level = (out[a..a + n].iter().map(|x| x * x).sum::<f32>() / n as f32).sqrt();
+                assert!(level > 0.005 && worst < level * 0.02, "{rate} Hz: passes differ by {worst} at level {level}");
+            }
+        }
+    }
+
+    /// Loads `id` on `deck` (1..=4) the way the library does, polling as the UI does until that load lands (results
+    /// from earlier loads, such as an overview, may come first).
+    fn load_now(app: &mut ReTraktorApp, deck: usize, id: usize) {
+        app.library.load_to_deck(deck, id, [false; 4]);
+        app.drain_pending_loads();
+        let (d, t0) = (deck - 1, std::time::Instant::now());
+        while app.deck_loaded_generation[d] != app.load_generation[d] {
+            assert!(app.deck_load_failed[d].is_none() && t0.elapsed() < std::time::Duration::from_secs(30), "deck {deck} didn't load");
+            app.finish_loads();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// Saved loops from a Traktor collection and a rekordbox XML, read by their real readers into the library and
+    /// loaded on decks the normal way. A numbered press, from the keys, a mapped (MIDI) control, the controller's hot
+    /// cue pads or the screen pads (whatever mode the hardware pads are in), plays the loop exactly as saved, paused or
+    /// playing, again on every press, keeping play state and the beat size: a 3.17 s hand-cut loop that is no whole
+    /// number of beats, and a 20 ms one. It survives the UI's handovers, key lock, other output rates and a beat
+    /// jump; loop size actions scale it and a press restores it; release and a new track clear it. Loops that can't
+    /// play only move to their start (never to a NaN); cue pads and the transport CUE work as before, CUE never
+    /// starting a loop. The library's cues never change, a saved and reloaded collection keeps them, and a deck
+    /// whose track left the library still plays its loops.
+    #[test]
+    fn saved_loops_play_exactly_from_every_numbered_pad() {
+        use retraktor_core::CueType;
+        use retraktor_formats::nml::{NmlCollection, NmlCue, NmlEntry, NmlLocation, NmlTempo};
+        let dir = std::env::temp_dir().join(format!("retraktor-saved-loops-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut x = 7u32;
+        let noise: Vec<i16> = (0..44_100 * 12 * 2)
+            .map(|_| {
+                x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (x >> 20) as i16 - 2048
+            })
+            .collect();
+        let (wav_a, wav_b) = (dir.join("traktor.wav"), dir.join("rekordbox.wav"));
+        AudioSystem::write_stereo_wav_file(&wav_a, &noise, 44_100).unwrap();
+        AudioSystem::write_stereo_wav_file(&wav_b, &noise, 44_100).unwrap();
+
+        // Traktor: 126 BPM; pad 1 a cue, pad 3 a hand-cut 3.17 s loop, pad 4 a 20 ms loop, pads 5 and 6 loops that
+        // can't play (negative length, past the end of the 12 s track).
+        let cue = |name: &str, cue_type, start_ms, len_ms, hotcue| NmlCue { name: name.into(), displ_order: 0, cue_type, start_ms, len_ms, repeats: -1, hotcue, grid_bpm: None };
+        let mut grid = cue("AutoGrid", CueType::Grid, 250.0, 0.0, -1);
+        grid.grid_bpm = Some(126.0);
+        let mut col = NmlCollection::new(19);
+        col.entries.push(NmlEntry {
+            title: "Traktor loops".into(),
+            location: NmlLocation::from_posix_path(&wav_a.to_string_lossy(), "linux-root"),
+            playtime_sec: Some(12.0),
+            tempo: Some(NmlTempo { bpm: 126.0, bpm_quality: 100.0 }),
+            musical_key_value: Some(21),
+            cues: vec![
+                grid,
+                cue("Intro", CueType::Cue, 1500.0, 0.0, 0),
+                cue("Hand cut", CueType::Loop, 4000.0, 3170.0, 2),
+                cue("Stutter", CueType::Loop, 6000.0, 20.0, 3),
+                cue("Backwards", CueType::Loop, 5000.0, -1000.0, 4),
+                cue("Past the end", CueType::Loop, 11000.0, 5000.0, 5),
+                cue("After the end", CueType::Loop, 13000.0, 1000.0, 7),
+            ],
+            ..Default::default()
+        });
+        let nml = dir.join("traktor.nml");
+        std::fs::write(&nml, col.to_xml()).unwrap();
+        // rekordbox: pad 1 holds a loop, pad 2 a loop ending before it starts.
+        let rb = dir.join("rekordbox.xml");
+        std::fs::write(&rb, format!(r#"<?xml version="1.0" encoding="UTF-8"?>
+<DJ_PLAYLISTS Version="1.0.0">
+  <COLLECTION Entries="1">
+    <TRACK TrackID="1" Name="Rekordbox loops" Artist="B" TotalTime="12" AverageBpm="120.00" Tonality="Am" Location="file://localhost{}">
+      <TEMPO Inizio="0.000" Bpm="120.00" Metro="4/4" Battito="1"/>
+      <POSITION_MARK Name="Roll" Type="4" Start="2.000" End="2.750" Num="0"/>
+      <POSITION_MARK Name="Broken" Type="4" Start="3.000" End="2.500" Num="1"/>
+    </TRACK>
+  </COLLECTION>
+</DJ_PLAYLISTS>"#, wav_b.display()))
+        .unwrap();
+
+        let mut app = ReTraktorApp::default();
+        app.library = LibraryManager::new(dir.join("collection.nml"));
+        app.library.import_nml_file(&nml).unwrap();
+        app.library.link_library(crate::library_ui::LibKind::Rekordbox, rb);
+        let id_of = |app: &ReTraktorApp, wav: &std::path::Path| app.library.tracks.iter().find(|t| t.file_path.as_deref() == Some(wav)).map(|t| t.id);
+        let t0 = std::time::Instant::now();
+        while id_of(&app, &wav_b).is_none() {
+            assert!(t0.elapsed() < std::time::Duration::from_secs(10), "the rekordbox library was never read");
+            app.library.poll();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let (id_a, id_b) = (id_of(&app, &wav_a).unwrap(), id_of(&app, &wav_b).unwrap());
+        let saved_a = app.library.track(id_a).unwrap().cues.clone();
+        let saved_b = app.library.track(id_b).unwrap().cues.clone();
+        load_now(&mut app, 1, id_a);
+        load_now(&mut app, 2, id_b);
+        assert!(app.audio.shared.lock().unwrap().loaded_tracks[0].as_ref().unwrap().grid_known, "an imported grid is a real grid");
+        assert_eq!(pad(&app, 0, 3).and_then(|p| p.loop_sec).map(|l| (l * 1000.0).round()), Some(3170.0));
+        assert_eq!(pad(&app, 1, 1).and_then(|p| p.loop_sec).map(|l| (l * 1000.0).round()), Some(750.0));
+
+        let state = |app: &ReTraktorApp| {
+            let s = app.audio.shared.lock().unwrap();
+            (s.playhead_sec[0], s.is_playing[0], s.loop_active[0], s.loop_start_sec[0], s.loop_len_sec[0])
+        };
+        let recalled = |app: &ReTraktorApp, playing: bool, start: f64, len: f64, how: &str| {
+            let (at, is_playing, active, loop_start, loop_len) = state(app);
+            assert!(at == start && is_playing == playing && active && loop_start == start && (loop_len - len).abs() < 1e-9, "{how}: at {at}, playing {is_playing}, loop {active} {loop_start} + {loop_len}");
+            assert!(app.deck_loop_active[0] && app.deck_loop_exact_sec[0].is_some_and(|l| (l - len).abs() < 1e-9), "{how}: the UI loop differs");
+        };
+        let reset = |app: &mut ReTraktorApp| {
+            if app.deck_loop_active[0] {
+                app.toggle_loop(1);
+            }
+            app.sync_audio_state();
+            app.audio.shared.lock().unwrap().seek_to(0, 0.5);
+        };
+
+        // Every numbered input, paused: keys, a mapped (MIDI) control, the controller's hot cue pads.
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        ctx.enable_accesskit();
+        app.custom_mappings.insert("midi.test.note3".into(), "hotcue:1:3".into());
+        let key3 = vec![egui::Event::Key { key: Key::Num3, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }];
+        for how in ["keys", "mapped", "controller pads"] {
+            reset(&mut app);
+            match how {
+                "keys" => drop(ctx.run(egui::RawInput { events: key3.clone(), ..Default::default() }, |ctx| app.handle_keyboard_shortcuts(ctx))),
+                "mapped" => app.apply_mx2_surface_event(SurfaceEvent::Button { control: "midi.test.note3".into(), pressed: true }),
+                _ => app.apply_mx2_surface_event(SurfaceEvent::Button { control: "surface.left.pads.3".into(), pressed: true }),
+            }
+            recalled(&app, false, 4.0, 3.17, how);
+            assert_eq!(app.deck_loop_size_beats[0], 4, "{how}: the beat size changed");
+        }
+        // The screen pads, with the hardware pads in stems mode; and the SNAP switch beside them.
+        reset(&mut app);
+        app.deck_pad_mode[0] = DeckPadMode::Stems;
+        app.layout = TraktorLayout::Parallel;
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1280.0, 800.0));
+        let mut time = 0.0;
+        let mut frame = |app: &mut ReTraktorApp, events: Vec<egui::Event>| {
+            time += 0.1;
+            workspace_frame(&ctx, app, screen, time, events)
+        };
+        let click = |app: &mut ReTraktorApp, frame: &mut dyn FnMut(&mut ReTraktorApp, Vec<egui::Event>) -> Vec<Node>, at: egui::Pos2| {
+            let button = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+            frame(app, vec![egui::Event::PointerMoved(at)]);
+            frame(app, vec![button(true)]);
+            frame(app, vec![button(false)]);
+        };
+        let nodes = (0..6).map(|_| frame(&mut app, vec![])).last().unwrap();
+        let deck_a_pad3 = nodes.iter().filter(|n| n.0 == "3" && n.1 == egui::accesskit::Role::Button).min_by(|a, b| a.2.left().total_cmp(&b.2.left())).expect("no screen pad 3").2;
+        click(&mut app, &mut frame, deck_a_pad3.center());
+        recalled(&app, false, 4.0, 3.17, "screen pad");
+        assert_eq!(app.deck_stem_muted[0], [false; 4], "the screen pad followed the hardware pad mode");
+        let snap = nodes.iter().find(|n| n.0 == "Snap to beat" && n.1 == egui::accesskit::Role::CheckBox).expect("no SNAP switch").2;
+        click(&mut app, &mut frame, snap.center());
+        assert_eq!(app.bus.get("app.traktor.snap").and_then(PropValue::as_bool), Some(true));
+        click(&mut app, &mut frame, snap.center());
+        assert_eq!(app.bus.get("app.traktor.snap").and_then(PropValue::as_bool), Some(false));
+        app.deck_pad_mode[0] = DeckPadMode::Hotcues;
+
+        // Playing, with Snap on (the saved 4.0 s start is off the 126 BPM grid and stays exact): it keeps playing, and
+        // the callback loops it at every rate, with key lock too, while the UI hands over every fifth block; each
+        // press, even mid-loop, starts it again from the saved start.
+        set_snap(&mut app, true);
+        reset(&mut app);
+        app.audio.shared.lock().unwrap().start_playing(0);
+        app.run_button_action("hotcue", 1, "3");
+        recalled(&app, true, 4.0, 3.17, "playing");
+        for (rate, block, keylock) in [(44_100u32, 512usize, false), (48_000, 333, true), (96_000, 64, false)] {
+            app.deck_keylock[0] = keylock;
+            app.deck_pitch_fader[0] = if keylock { 3.5 } else { 0.0 }; // key lock at a pitched-up tempo
+            app.sync_audio_state();
+            let (mut buf, mut last, mut wrapped) = (vec![0.0f32; block * 2], 4.0, false);
+            for i in 0..(3.5 * rate as f64 / block as f64) as usize {
+                if i % 5 == 4 {
+                    app.sync_audio_state();
+                }
+                app.audio.render_f32(&mut buf, 2, rate);
+                let p = playhead(&app, 0);
+                assert!((4.0..7.17).contains(&p), "{rate} Hz: left the saved loop at {p}");
+                wrapped |= p < last;
+                last = p;
+            }
+            assert!(wrapped && buf.iter().any(|x| x.abs() > 1e-3), "{rate} Hz: never came round, or silent");
+            app.run_button_action("hotcue", 1, "3");
+            recalled(&app, true, 4.0, 3.17, "pressed again");
+        }
+        (app.deck_keylock[0], app.deck_pitch_fader[0]) = (false, 0.0);
+        assert!((app.deck_loop_len(0, 126.0) - 3.17).abs() < 1e-9, "the waveforms draw another length");
+
+        // A beat jump carries the exact loop. Double doubles it, never the saved pad, and refuses to run past the end;
+        // a press restores it. A size picked by number means that many beats at the deck's tempo.
+        assert!(app.beat_jump(0, 1.0));
+        let (_, _, active, start, len) = state(&app);
+        assert!(active && (start - (4.0 + 4.0 * 60.0 / 126.0)).abs() < 1e-9 && (len - 3.17).abs() < 1e-9, "jumped loop {start} + {len}");
+        app.run_button_action("hotcue", 1, "3");
+        app.run_button_action("loop_double", 1, "");
+        app.sync_audio_state();
+        assert_eq!(app.deck_loop_size_beats[0], 8);
+        assert!((state(&app).4 - 6.34).abs() < 1e-9, "doubled to {}", state(&app).4);
+        app.run_button_action("loop_double", 1, "");
+        app.sync_audio_state();
+        assert!(app.deck_loop_size_beats[0] == 8 && (state(&app).4 - 6.34).abs() < 1e-9, "doubled past the end of the track");
+        assert!(app.library.status_message.contains("can't get any longer"), "{}", app.library.status_message);
+        app.run_button_action("hotcue", 1, "3");
+        recalled(&app, true, 4.0, 3.17, "after resizing");
+        assert_eq!(app.deck_loop_size_beats[0], 8, "a press reset the beat size");
+        // At 126 BPM 32 beats from 4 s would run past the 12 s track: refused, loop and size kept. The size picked
+        // before the recall (8) makes it 8 beats, though the saved loop isn't 8 beats long.
+        app.pick_loop_size(1, 32);
+        assert!(app.deck_loop_exact_sec[0] == Some(3.17) && app.deck_loop_size_beats[0] == 8 && app.deck_loop_active[0], "32 beats past the end");
+        assert!(app.library.status_message.contains("doesn't fit"), "{}", app.library.status_message);
+        app.pick_loop_size(1, 8);
+        app.sync_audio_state();
+        let (_, _, active, start, len) = state(&app);
+        assert!(active && start == 4.0 && (len - 8.0 * 60.0 / 126.0).abs() < 1e-9 && app.deck_loop_exact_sec[0].is_none(), "8 beats: {start} + {len}");
+        app.run_button_action("hotcue", 1, "3");
+        app.pick_loop_size(1, 2);
+        app.sync_audio_state();
+        let (_, _, active, start, len) = state(&app);
+        assert!(active && start == 4.0 && (len - 2.0 * 60.0 / 126.0).abs() < 1e-9 && app.deck_loop_exact_sec[0].is_none(), "2 beats: {start} + {len}");
+        app.run_button_action("hotcue", 1, "3");
+        recalled(&app, true, 4.0, 3.17, "after picking a size");
+        assert_eq!(app.deck_loop_size_beats[0], 2);
+
+        // The 20 ms loop plays as a loop.
+        app.press_hotcue(1, 4);
+        recalled(&app, true, 6.0, 0.02, "20 ms loop");
+        let mut buf = vec![0.0f32; 256 * 2];
+        for _ in 0..40 {
+            app.audio.render_f32(&mut buf, 2, 48_000);
+            let p = playhead(&app, 0);
+            assert!((6.0..6.02).contains(&p), "left the 20 ms loop at {p}");
+        }
+        // Halving stops before the loop gets shorter than one sample (882 samples at 44.1 kHz: nine halvings).
+        for _ in 0..12 {
+            app.run_button_action("loop_half", 1, "");
+        }
+        app.sync_audio_state();
+        assert_eq!(state(&app).4, 0.02 / 512.0);
+        assert!(app.library.status_message.contains("can't get any shorter"), "{}", app.library.status_message);
+
+        // Release clears it. A saved loop that can't play says so and only moves to its start if that is inside the
+        // decoded audio; a cue pad is a cue.
+        app.toggle_loop(1);
+        assert!(!app.deck_loop_active[0] && app.deck_loop_exact_sec[0].is_none());
+        app.sync_audio_state();
+        app.library.tracks.iter_mut().find(|t| t.id == id_a).unwrap().cues.push(cue("Nowhere", CueType::Loop, f64::NAN, 1000.0, 6));
+        for (slot, at, said) in [(5, 5.0, "jumped to its start"), (6, 11.0, "jumped to its start"), (8, 11.0, "doesn't fit"), (7, 11.0, "doesn't fit"), (1, 1.5, "")] {
+            app.library.status_message.clear();
+            app.press_hotcue(1, slot);
+            let (now, playing, active, ..) = state(&app);
+            assert!(now == at && playing && !active && !app.deck_loop_active[0], "pad {slot}: at {now}, loop {active}");
+            assert!(app.library.status_message.contains(said) && (slot != 8 || !app.library.status_message.contains("jumped")), "pad {slot}: {}", app.library.status_message);
+        }
+        app.library.tracks.iter_mut().find(|t| t.id == id_a).unwrap().cues.pop();
+        // The transport alone never starts a numbered pad's saved loop (pad 1 on deck B): CUE, CUP and CUE again work
+        // from the deck's temporary cue. Pad 2 there ends before it starts.
+        for (verb, playing) in [("cue", false), ("cueplay", true), ("cue", false)] {
+            app.run_button_action(verb, 2, "");
+            let s = app.audio.shared.lock().unwrap();
+            assert!(!app.deck_loop_active[1] && !s.loop_active[1], "{verb}: the transport started a saved loop");
+            assert_eq!((s.playhead_sec[1], s.is_playing[1]), (app.deck_temp_cue_sec[1], playing), "{verb}");
+        }
+        app.press_hotcue(2, 2);
+        {
+            let s = app.audio.shared.lock().unwrap();
+            assert!(!s.loop_active[1] && !app.deck_loop_active[1] && s.playhead_sec[1] == 3.0, "deck B at {}", s.playhead_sec[1]);
+        }
+        app.press_hotcue(2, 1);
+        assert!(app.deck_loop_active[1] && app.deck_loop_exact_sec[1].is_some_and(|l| (l - 0.75).abs() < 1e-9));
+
+        // The library's cues are as read, and a saved and reloaded collection still has the loops.
+        assert_eq!(app.library.track(id_a).unwrap().cues, saved_a);
+        assert_eq!(app.library.track(id_b).unwrap().cues, saved_b);
+        app.library.save_collection_nml(&dir.join("collection.nml")).unwrap();
+        let reloaded = LibraryManager::new(dir.join("collection.nml"));
+        let again = reloaded.tracks.iter().find(|t| t.file_path.as_deref() == Some(wav_a.as_path())).unwrap();
+        assert_eq!(again.hotcue_pads(), app.library.track(id_a).unwrap().hotcue_pads());
+
+        // Removed from the library while loaded: the deck still plays its loops. A new track clears the loop.
+        app.library.tracks.retain(|t| t.id != id_a);
+        app.library.rebuild_index();
+        app.press_hotcue(1, 3);
+        recalled(&app, true, 4.0, 3.17, "track removed from the library");
+        load_now(&mut app, 1, id_b);
+        assert!(!app.deck_loop_active[0] && app.deck_loop_exact_sec[0].is_none(), "the new track kept the old loop");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Tap CUE and CUP work from each deck's temporary cue, never a numbered hotcue: two decks of one library
+    /// track keep hotcue 1, the track's cues and its cue revision exactly as they were.
+    #[test]
+    fn transport_cue_sets_returns_to_and_plays_from_a_temporary_cue() {
+        let dir = std::env::temp_dir().join(format!("retraktor-transport-cue-{}", std::process::id()));
+        let mut app = ReTraktorApp::default();
+        app.library = LibraryManager::new(dir.join("collection.nml"));
+        let pad1 = retraktor_formats::nml::NmlCue {
+            name: "Hotcue 1".into(), displ_order: 0, cue_type: retraktor_core::CueType::Cue,
+            start_ms: 12_000.0, len_ms: 0.0, repeats: -1, hotcue: 0, grid_bpm: None,
+        };
+        app.library.tracks.push(crate::library_ui::UiTrackEntry { id: 40, title: "Shared".into(), cues: vec![pad1], ..Default::default() });
+        app.library.rebuild_index();
+        app.deck_track_ids = [Some(40), Some(40), None, None];
+        {
+            let mut s = app.audio.shared.lock().unwrap();
+            s.loaded_tracks[0] = Some(track(120.0)); // 100 s long
+            s.loaded_tracks[1] = Some(track(120.0));
+        }
+        let (cues, revision) = (app.library.track(40).unwrap().cues.clone(), app.library.cue_revision(40));
+        let seek = |app: &ReTraktorApp, d: usize, sec: f64| app.audio.shared.lock().unwrap().seek_to(d, sec);
+        let playing = |app: &ReTraktorApp, d: usize| app.audio.shared.lock().unwrap().is_playing[d];
+
+        // No track on deck C: neither button does anything.
+        app.transport_cue(3, false);
+        app.transport_cue(3, true);
+        assert!(!playing(&app, 2) && app.deck_temp_cue_sec[2] == 0.0 && playhead(&app, 2) == 0.0);
+
+        // Paused: CUE puts the cue at the exact playhead; pressing again there changes nothing.
+        seek(&app, 0, 30.5);
+        app.transport_cue(1, false);
+        app.transport_cue(1, false);
+        assert_eq!((app.deck_temp_cue_sec[0], playhead(&app, 0), playing(&app, 0)), (30.5, 30.5, false));
+        assert_eq!(app.deck_temp_cue_sec[1], 0.0, "deck B keeps its own cue");
+
+        // Playing: CUE stops back on the cue, and the deck stays there.
+        app.toggle_play(1);
+        render(&app, 1.0, 512, 48_000);
+        assert!(playhead(&app, 0) > 31.0);
+        app.transport_cue(1, false);
+        assert_eq!((playhead(&app, 0), playing(&app, 0)), (30.5, false));
+        render(&app, 0.5, 512, 48_000);
+        assert_eq!((playhead(&app, 0), playing(&app, 0)), (30.5, false));
+
+        // CUP from paused and from playing both start at the cue and play on.
+        for _ in 0..2 {
+            app.transport_cue(1, true);
+            assert_eq!((playhead(&app, 0), playing(&app, 0)), (30.5, true));
+            render(&app, 1.0, 512, 48_000);
+            assert!((playhead(&app, 0) - 31.5).abs() < 0.02, "CUP played on from {}", playhead(&app, 0));
+        }
+
+        // Parked at the natural end: CUE returns to the cue rather than setting one at the end.
+        seek(&app, 0, 99.5);
+        render(&app, 1.0, 512, 48_000);
+        assert_eq!((playhead(&app, 0), playing(&app, 0)), (100.0, false), "not parked at the end");
+        app.transport_cue(1, false);
+        assert_eq!((app.deck_temp_cue_sec[0], playhead(&app, 0), playing(&app, 0)), (30.5, 30.5, false));
+
+        // Deck B, playing, returns to its own cue (0 s) and leaves deck A alone.
+        app.toggle_play(2);
+        render(&app, 0.5, 512, 48_000);
+        app.transport_cue(2, false);
+        assert_eq!((playhead(&app, 1), playing(&app, 1)), (0.0, false));
+        assert_eq!((app.deck_temp_cue_sec[0], playhead(&app, 0)), (30.5, 30.5));
+
+        // Hotcue 1 and the library entry are untouched, and pad 1 still jumps to 12 s.
+        assert_eq!(app.library.track(40).unwrap().cues, cues);
+        assert_eq!(app.library.cue_revision(40), revision);
+        assert_eq!(app.deck_hotcue_slots(0), [(1, 12.0)]);
+        assert_eq!(app.deck_hotcue_slots(1), [(1, 12.0)]);
+        app.press_hotcue(1, 1);
+        assert_eq!(playhead(&app, 0), 12.0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The original failure: CUE on a library track with an empty pad 1 filled that pad. Through the mapped CUE and
+    /// CUP inputs it now sets, returns to and plays from the temporary cue, pad 1 stays empty and the cue revision
+    /// stays put. Mappings naming no real deck, for play, CUE, CUP, loop or a hot cue pad, do nothing to any deck.
+    #[test]
+    fn mapped_cue_leaves_an_empty_library_pad_empty() {
+        let dir = std::env::temp_dir().join(format!("retraktor-mapped-cue-{}", std::process::id()));
+        let mut app = ReTraktorApp::default();
+        app.library = LibraryManager::new(dir.join("collection.nml"));
+        app.library.tracks.push(crate::library_ui::UiTrackEntry { id: 41, title: "No pads".into(), ..Default::default() });
+        app.library.rebuild_index();
+        app.deck_track_ids[0] = Some(41);
+        app.audio.shared.lock().unwrap().loaded_tracks[0] = Some(track(120.0));
+        let revision = app.library.cue_revision(41);
+        let playing = |app: &ReTraktorApp, d: usize| app.audio.shared.lock().unwrap().is_playing[d];
+
+        app.audio.shared.lock().unwrap().seek_to(0, 20.0);
+        app.run_button_action("cue", 1, "");
+        assert_eq!(app.deck_temp_cue_sec[0], 20.0);
+        app.toggle_play(1);
+        render(&app, 1.0, 512, 48_000);
+        app.run_button_action("cue", 1, "");
+        assert_eq!((playhead(&app, 0), playing(&app, 0)), (20.0, false));
+        app.run_button_action("cueplay", 1, "");
+        assert_eq!((playhead(&app, 0), playing(&app, 0)), (20.0, true));
+        assert!(app.deck_hotcue_slots(0).is_empty(), "CUE filled a pad: {:?}", app.deck_hotcue_slots(0));
+        assert!(app.library.track(41).unwrap().cues.is_empty());
+        assert_eq!(app.library.cue_revision(41), revision);
+
+        for (verb, deck) in [("cue", 0), ("cueplay", 0), ("cue", 5), ("cueplay", 9)] {
+            app.run_button_action(verb, deck, "");
+        }
+        // Hot cue pads addressed to no real deck, pressed through the mapped control path as a controller does.
+        let pads_before = app.deck_hotcues.clone();
+        let loops_before = (app.deck_loop_active, app.audio.shared.lock().unwrap().loop_active);
+        for (control, action) in [
+            ("midi.bad.zero", "hotcue:0:2"), ("midi.bad.five", "hotcue:5:2"), ("midi.bad.nine", "hotcue:9:1"),
+            ("midi.bad.play", "play:0"), ("midi.bad.loop0", "loop:0"), ("midi.bad.loop5", "loop:5"),
+        ] {
+            app.custom_mappings.insert(control.into(), action.into());
+            app.apply_mx2_surface_event(SurfaceEvent::Button { control: control.into(), pressed: true });
+        }
+        assert_eq!(app.deck_hotcues, pads_before, "an invalid hot cue mapping set or changed a pad");
+        assert_eq!((app.deck_loop_active, app.audio.shared.lock().unwrap().loop_active), loops_before, "an invalid loop mapping changed a loop");
+        assert_eq!((playhead(&app, 0), playing(&app, 0), app.deck_temp_cue_sec), (20.0, true, [20.0, 0.0, 0.0, 0.0]));
+        assert!((1..4).all(|d| !playing(&app, d) && playhead(&app, d) == 0.0), "an invalid mapping moved another deck");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Returning to a cue outside an active loop ends the loop, or playing on would wrap straight back into it;
+    /// a cue inside the loop keeps it.
+    #[test]
+    fn transport_cue_outside_an_active_loop_ends_it() {
+        let mut app = ReTraktorApp::default();
+        app.audio.shared.lock().unwrap().loaded_tracks[0] = Some(track(120.0));
+        app.audio.shared.lock().unwrap().seek_to(0, 30.5);
+        app.transport_cue(1, false);
+        // A 4-beat loop at 60 s (2 s at 120 BPM), playing inside it.
+        app.deck_loop_active[0] = true;
+        app.deck_loop_start_sec[0] = 60.0;
+        app.audio.shared.lock().unwrap().seek_to(0, 61.0);
+        app.sync_audio_state();
+        app.transport_cue(1, true);
+        assert!(!app.deck_loop_active[0] && !app.audio.shared.lock().unwrap().loop_active[0]);
+        render(&app, 1.0, 512, 48_000);
+        assert!((playhead(&app, 0) - 31.5).abs() < 0.02, "wrapped into the old loop: {}", playhead(&app, 0));
+
+        // Cue inside the loop: the loop stays and the deck plays round it.
+        app.toggle_play(1);
+        app.audio.shared.lock().unwrap().seek_to(0, 60.5);
+        app.transport_cue(1, false);
+        app.deck_loop_active[0] = true;
+        app.sync_audio_state();
+        app.toggle_play(1);
+        render(&app, 1.0, 512, 48_000);
+        app.transport_cue(1, false);
+        assert!(app.deck_loop_active[0]);
+        assert_eq!(playhead(&app, 0), 60.5);
+    }
+
+    /// Only a successful load of the current request puts the cue back at 0; a failed or stale load keeps it.
+    #[test]
+    fn temporary_cue_resets_only_on_a_successful_current_load() {
+        let mut app = ReTraktorApp::default();
+        let entry = crate::library_ui::UiTrackEntry { id: 7, title: "Next".into(), bpm: 120.0, ..Default::default() };
+        app.library.tracks.push(entry.clone());
+        app.library.rebuild_index();
+        app.deck_temp_cue_sec = [42.0, 7.0, 0.0, 0.0];
+
+        app.load_generation[0] = 2;
+        app.load_channel.0.send(DeckResult::Loaded(0, 2, entry.clone(), Err("corrupt".into()))).unwrap();
+        app.load_channel.0.send(DeckResult::Loaded(0, 1, entry.clone(), Ok(track(120.0)))).unwrap(); // stale
+        app.finish_loads();
+        assert_eq!(app.deck_temp_cue_sec, [42.0, 7.0, 0.0, 0.0]);
+
+        app.load_generation[0] = 3;
+        app.load_channel.0.send(DeckResult::Loaded(0, 3, entry, Ok(track(120.0)))).unwrap();
+        app.finish_loads();
+        assert_eq!(app.deck_temp_cue_sec, [0.0, 7.0, 0.0, 0.0], "only deck A's cue goes back to the start");
+    }
+
+    /// The on-screen pads are always hotcues: a real click in Stems pad mode jumps to, sets and clears hotcues and
+    /// never mutes a stem, while the hardware pad path in that mode still plays stems.
+    #[test]
+    fn on_screen_pads_play_hotcues_whatever_the_hardware_pad_mode() {
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1280.0, 900.0));
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        ctx.enable_accesskit();
+        let mut app = ReTraktorApp::default();
+        {
+            let mut s = app.audio.shared.lock().unwrap();
+            s.loaded_tracks[0] = Some(track(120.0));
+            s.loaded_tracks[1] = Some(track(120.0));
+            s.playhead_sec[0] = 50.0;
+        }
+        app.layout = TraktorLayout::Parallel;
+        app.deck_pad_mode[0] = DeckPadMode::Stems;
+        let mut time = 0.0;
+        let mut frame = |app: &mut ReTraktorApp, events: Vec<egui::Event>| -> Vec<Node> {
+            time += 0.1;
+            workspace_frame(&ctx, app, screen, time, events)
+        };
+        let click = |app: &mut ReTraktorApp, frame: &mut dyn FnMut(&mut ReTraktorApp, Vec<egui::Event>) -> Vec<Node>, at: egui::Pos2, button: egui::PointerButton| {
+            let press = |pressed| egui::Event::PointerButton { pos: at, button, pressed, modifiers: egui::Modifiers::NONE };
+            frame(app, vec![egui::Event::PointerMoved(at)]);
+            frame(app, vec![press(true)]);
+            frame(app, vec![press(false)]);
+        };
+        // Deck A's pad is the leftmost of the two decks' pads with that number (loop sizes are 1, 2, 4, 8, 16).
+        let deck_a_pad = |nodes: &[Node], n: &str| {
+            nodes.iter().filter(|node| node.0 == n).min_by(|a, b| a.2.min.x.total_cmp(&b.2.min.x)).map(|node| node.2.center()).unwrap_or_else(|| panic!("no pad {n}"))
+        };
+        (0..12).for_each(|_| { frame(&mut app, vec![]); });
+        let nodes = frame(&mut app, vec![]);
+        let (pad3, pad5) = (deck_a_pad(&nodes, "3"), deck_a_pad(&nodes, "5"));
+        assert!(screen.contains(pad3) && screen.contains(pad5));
+
+        click(&mut app, &mut frame, pad3, egui::PointerButton::Primary);
+        assert_eq!(playhead(&app, 0), 30.0, "pad 3 jumps to deck A's hotcue 3");
+        app.audio.shared.lock().unwrap().seek_to(0, 44.0);
+        click(&mut app, &mut frame, pad5, egui::PointerButton::Primary);
+        assert!(app.deck_hotcue_slots(0).contains(&(5, 44.0)), "empty pad 5 sets a hotcue");
+        click(&mut app, &mut frame, pad5, egui::PointerButton::Secondary);
+        assert!(!app.deck_hotcue_slots(0).iter().any(|&(s, _)| s == 5), "right-click clears it");
+        assert_eq!(app.deck_stem_muted[0], [false; 4]);
+        assert_eq!(app.deck_stem_fx_send[0], [false; 4]);
+        assert_eq!(app.deck_hotcue_slots(1), [(1, 0.0), (2, 16.0), (3, 32.0), (4, 64.0)], "deck B's pads untouched");
+
+        // The hardware pad in Stems mode still mutes a stem and leaves the playhead alone.
+        app.trigger_performance_pad(1, 3);
+        assert_eq!((app.deck_stem_muted[0], playhead(&app, 0)), ([false, false, true, false], 44.0));
+    }
+
+    /// The GUI run's fixture at 120 BPM, first beat 0.1 s: pad 1 a saved 0.75 s loop off the grid at [20.223, 20.973),
+    /// pads 2 and 3 set from one playhead (21.437 s) with Snap off and on, and the transport cue at that exact spot,
+    /// outside the saved loop but inside the 4-beat selector's 2 s. Through the keys, a mapped control, the screen's CUP
+    /// and the real callback: the saved loop repeats; CUE outside it releases the loop, exact length too, stops on the
+    /// cue and leaves the pads, the loop's start and the selector alone; CUP plays straight on from the exact cue. A
+    /// cue inside a saved loop longer than the selector keeps it; a cue outside a 20 ms loop, or on a loop's right
+    /// edge, ends it.
+    #[test]
+    fn temporary_cue_leaves_and_returns_into_saved_loops_by_their_real_length() {
+        let (start, len, at) = (20.223, 0.75, 21.437);
+        let mut app = ReTraktorApp::default();
+        app.layout = TraktorLayout::Parallel;
+        app.deck_expanded[0] = true; // TOOLS open: the transport row shows CUP
+        app.audio.shared.lock().unwrap().loaded_tracks[0] = Some(noise_track(120.0, 0.1, true));
+        app.deck_hotcues[0] = vec![
+            HotcuePad { slot: 1, start_sec: start, loop_sec: Some(len) },
+            HotcuePad { slot: 4, start_sec: 25.0, loop_sec: Some(0.02) },
+        ];
+        app.custom_mappings.insert("midi.test.cue".into(), "cue:1".into());
+        app.custom_mappings.insert("midi.test.cup".into(), "cueplay:1".into());
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        ctx.enable_accesskit();
+        let key = |app: &mut ReTraktorApp, key: Key| {
+            let events = vec![egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }];
+            drop(ctx.run(egui::RawInput { events, ..Default::default() }, |ctx| app.handle_keyboard_shortcuts(ctx)));
+        };
+        let mapped = |app: &mut ReTraktorApp, control: &str| app.apply_mx2_surface_event(SurfaceEvent::Button { control: control.into(), pressed: true });
+        let state = |app: &ReTraktorApp| {
+            let s = app.audio.shared.lock().unwrap();
+            (s.playhead_sec[0], s.is_playing[0], s.loop_active[0], s.loop_len_sec[0])
+        };
+        // The callback at 48 kHz in 333-frame blocks, the UI handing over every fifth block; the playhead after each.
+        let run = |app: &mut ReTraktorApp, secs: f64| -> Vec<f64> {
+            let mut buf = vec![0.0f32; 333 * 2];
+            (0..(secs * 48_000.0 / 333.0) as usize)
+                .map(|i| {
+                    if i % 5 == 4 {
+                        app.sync_audio_state();
+                    }
+                    app.audio.render_f32(&mut buf, 2, 48_000);
+                    playhead(app, 0)
+                })
+                .collect()
+        };
+        let wraps = |ps: &[f64]| ps.windows(2).filter(|w| w[1] < w[0]).count();
+        let paused_at = |app: &mut ReTraktorApp, sec: f64| {
+            if state(app).1 {
+                key(app, Key::Space);
+            }
+            app.audio.shared.lock().unwrap().seek_to(0, sec);
+        };
+
+        // Pads 2 and 3 from one playhead, Snap off then on; the transport cue there stays exact with Snap on.
+        paused_at(&mut app, at);
+        key(&mut app, Key::Num2);
+        set_snap(&mut app, true);
+        key(&mut app, Key::Num3);
+        key(&mut app, Key::C);
+        assert_eq!(pad(&app, 0, 2), Some(HotcuePad::cue(2, at)));
+        assert!(pad(&app, 0, 3).is_some_and(|p| (p.start_sec - 21.6).abs() < 1e-9 && p.loop_sec.is_none()), "{:?}", pad(&app, 0, 3));
+        assert_eq!((app.deck_temp_cue_sec[0], state(&app).0), (at, at), "Snap moved the transport cue");
+        let pads = app.deck_hotcues[0].clone();
+
+        // Pad 1 from the keys and play: the saved loop repeats.
+        key(&mut app, Key::Num1);
+        key(&mut app, Key::Space);
+        assert_eq!(state(&app), (start, true, true, len));
+        let ps = run(&mut app, 2.0);
+        assert!(ps.iter().all(|p| (start..start + len).contains(p)) && wraps(&ps) >= 2, "the saved loop didn't repeat");
+
+        // Mapped CUE while it plays: the cue is outside the saved loop (inside the selector's 2 s), so the loop ends,
+        // exact length too, and the deck stops on the cue; nothing saved or selected changes.
+        mapped(&mut app, "midi.test.cue");
+        let (p, playing, active, _) = state(&app);
+        assert!(p == at && !playing && !active && !app.deck_loop_active[0] && app.deck_loop_exact_sec[0].is_none(), "at {p}, playing {playing}, loop {active}");
+        assert_eq!((app.deck_loop_size_beats[0], app.deck_loop_start_sec[0], &app.deck_hotcues[0]), (4, start, &pads));
+        assert!(run(&mut app, 0.3).iter().all(|&p| p == at), "the stopped deck moved");
+
+        // The screen's CUP plays straight on from the exact cue, past where the 4-beat selector's loop would end.
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1280.0, 900.0));
+        let mut time = 0.0;
+        let mut frame = |app: &mut ReTraktorApp, events: Vec<egui::Event>| {
+            time += 0.1;
+            workspace_frame(&ctx, app, screen, time, events)
+        };
+        let nodes = (0..12).map(|_| frame(&mut app, vec![])).last().unwrap();
+        let cup = nodes.iter().filter(|n| n.0 == "CUP" && n.1 == egui::accesskit::Role::Button).min_by(|a, b| a.2.left().total_cmp(&b.2.left())).expect("no CUP button").2.center();
+        let button = |pressed| egui::Event::PointerButton { pos: cup, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+        for events in [vec![egui::Event::PointerMoved(cup)], vec![button(true)], vec![button(false)]] {
+            frame(&mut app, events);
+        }
+        let (p, playing, active, _) = state(&app);
+        assert!(p == at && playing && !active, "CUP: at {p}, playing {playing}, loop {active}");
+        let ps = run(&mut app, 1.0);
+        assert!(wraps(&ps) == 0 && (ps[ps.len() - 1] - (at + 1.0)).abs() < 0.01, "CUP didn't play straight on: {:?}", ps.last());
+
+        // A saved loop longer than a 1-beat selector: a cue inside it, past the selector's half second, keeps it.
+        mapped(&mut app, "midi.test.cue");
+        for _ in 0..2 {
+            app.run_button_action("loop_half", 1, "");
+        }
+        paused_at(&mut app, start + 0.6);
+        key(&mut app, Key::C);
+        key(&mut app, Key::Num1);
+        key(&mut app, Key::Space);
+        run(&mut app, 0.3);
+        key(&mut app, Key::C);
+        assert_eq!(state(&app), (start + 0.6, false, true, len), "CUE inside the saved loop");
+        mapped(&mut app, "midi.test.cup");
+        let ps = run(&mut app, 1.0);
+        assert!(ps.iter().all(|p| (start..start + len).contains(p)) && wraps(&ps) >= 1, "CUP inside didn't loop the saved length");
+        assert_eq!((app.deck_loop_size_beats[0], app.deck_loop_exact_sec[0]), (1, Some(len)));
+
+        // A 20 ms saved loop: a cue on its start keeps it, one 10 ms past its end releases it.
+        paused_at(&mut app, 25.0);
+        key(&mut app, Key::C);
+        key(&mut app, Key::Num4);
+        key(&mut app, Key::Space);
+        assert!(run(&mut app, 0.1).iter().all(|p| (25.0..25.02).contains(p)), "the 20 ms loop didn't hold");
+        key(&mut app, Key::C);
+        assert_eq!(state(&app), (25.0, false, true, 0.02));
+        paused_at(&mut app, 25.03);
+        key(&mut app, Key::C);
+        mapped(&mut app, "midi.test.cup");
+        assert!(!state(&app).2 && !app.deck_loop_active[0] && app.deck_loop_exact_sec[0].is_none(), "a cue outside the 20 ms loop kept it");
+        assert!(run(&mut app, 0.2).iter().all(|&p| p > 25.03), "played back into the 20 ms loop");
+
+        // The right edge is outside: a cue exactly where the saved loop ends releases it.
+        paused_at(&mut app, start + len);
+        key(&mut app, Key::C);
+        key(&mut app, Key::Num1);
+        key(&mut app, Key::Space);
+        run(&mut app, 0.2);
+        key(&mut app, Key::C);
+        let (p, playing, active, _) = state(&app);
+        assert!(p == start + len && !playing && !active && app.deck_loop_exact_sec[0].is_none(), "right edge: at {p}, loop {active}");
+        assert_eq!(&app.deck_hotcues[0], &pads, "the pads changed");
+    }
+
+    /// The top bar from the 1024 px minimum window across its breakpoints (REC from 1080 px, full labels, NEXT and
+    /// the controller lamp from 1180 px) to the 1280 px default and 1440 px, at rest and while recording: no two of
+    /// its controls overlap, buttons or knobs alike (every rectangle egui lets a click or drag reach), and SNAP,
+    /// PAT(TERN), the tempo nudge, REC and, from 1180 px, NEXT and the lamp are all on screen to press.
+    #[test]
+    fn top_bar_controls_never_overlap() {
+        let mut failures = Vec::new();
+        for width in [1024.0, 1079.0, 1080.0, 1179.0, 1180.0, 1280.0, 1440.0] {
+            for recording in [false, true] {
+                let ctx = egui::Context::default();
+                crate::theme::install_fonts(&ctx);
+                ctx.enable_accesskit();
+                let mut app = ReTraktorApp::default();
+                app.layout = TraktorLayout::Parallel;
+                let dir = super::tests::recording_test_dir("top-bar");
+                if recording {
+                    app.start_recording(&dir);
+                    assert!(app.recording.is_some(), "{}", app.library.status_message);
+                }
+                let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(width, 640.0));
+                let nodes = (0..6).map(|i| workspace_frame(&ctx, &mut app, screen, 0.1 * i as f64, vec![])).last().unwrap();
+                let case = format!("{width} px, recording {recording}");
+                // The bar's controls as egui laid them out in that frame; identical rectangles are one control.
+                let mut controls: Vec<egui::Rect> = ctx.viewport(|vp| {
+                    vp.prev_pass.widgets.layers().flat_map(|(_, w)| w.iter())
+                        .filter(|w| (w.sense.click || w.sense.drag) && w.rect.center().y < 72.0 && w.rect.height() < 60.0)
+                        .map(|w| w.rect)
+                        .collect()
+                });
+                controls.dedup_by(|a, b| a == b);
+                // GAIN, FILTER and FX per deck and the three master knobs, 42 px each: the check sees the knobs too.
+                let knobs = controls.iter().filter(|r| (r.width() - 42.0).abs() < 1.0 && (r.height() - 42.0).abs() < 1.0).count();
+                if knobs < 9 {
+                    failures.push(format!("{case}: only {knobs} knobs found"));
+                }
+                let named = |r: &egui::Rect| nodes.iter().find(|n| n.2 == *r).map_or("an unnamed knob or lamp".to_string(), |n| n.0.trim().to_string());
+                for (i, a) in controls.iter().enumerate() {
+                    for b in &controls[i + 1..] {
+                        let both = a.intersect(*b);
+                        if both.width() > 0.5 && both.height() > 0.5 {
+                            failures.push(format!("{case}: '{}' {a:?} overlaps '{}' {b:?}", named(a), named(b)));
+                        }
+                    }
+                }
+                let wanted = ["Snap to beat", "PAT", "−", "+"].into_iter()
+                    .chain((width >= 1080.0 || recording).then_some("REC"))
+                    .chain((width >= 1180.0).then_some(["NEXT", "MX2"]).into_iter().flatten());
+                for name in wanted {
+                    if !nodes.iter().any(|n| n.0.trim_start().starts_with(name) && n.2.max.y < 72.0 && screen.contains_rect(n.2)) {
+                        failures.push(format!("{case}: no {name}"));
+                    }
+                }
+                if recording {
+                    app.stop_recording();
+                    super::tests::poll_until_finished(&mut app);
+                }
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
     }
 }

@@ -229,7 +229,7 @@ ReTraktor/
 | Shortcut | Action |
 | :--- | :--- |
 | `Space` | Play / Pause active deck |
-| `C` | Jump to Cue point |
+| `C` | Cue. When paused it sets the cue point. When playing it returns to the cue point and stops. CUP plays from that cue point. |
 | `S` | Sync BPM and phase with Master deck |
 | `F1` – `F4` | Switch Workspace Layout (Mix, 4-Deck, Browser, Timeline) |
 | `1` – `4` | Trigger Hotcues / Stem Mutes (Drums, Bass, Instruments, Vocals) |
@@ -244,6 +244,12 @@ ReTraktor/
 | `Ctrl + A` | Select all tracks in the current view |
 | `Delete` | Remove selected tracks from the current playlist |
 | Double-click | Load track to the first deck that isn't playing |
+
+### Snap and saved loops
+
+**Beatgrid Snap** starts off. Turn on **SNAP** in the top bar to place new hotcues and loop starts on the nearest beat where they fit. At 120 BPM, a press at 10.18 seconds lands on a beat at 10.10 seconds. With Snap off or the grid unknown, the cue stays at 10.18. Beat-sized loops need a known tempo. Existing markers stay where you placed them. The transport **CUE** point is never snapped: CUE sets it at the exact playhead, and CUE or CUP return to that exact spot. Returning to a CUE point outside the playing loop releases the loop.
+
+**Saved loops** keep their original endpoints. Press a numbered hotcue pad to jump to an imported Traktor or rekordbox loop and engage it. A paused deck stays paused. You can resize the loop during playback and press the pad again to restore the saved cut.
 
 ---
 
