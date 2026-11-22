@@ -226,7 +226,7 @@ impl LoadedTrackAudio {
         let pcm_stereo = file.decode_all(&|| false)?;
         let cache_key = cache_key.filter(|(_, identity)| file_identity(path) == Some(*identity));
         let cached_gain = cache_key.as_ref().and_then(|(path, identity)| {
-            let (cached_identity, gain) = AUTOGAIN_CACHE.lock().unwrap().get(path).copied()?;
+            let (cached_identity, gain) = AUTOGAIN_CACHE.lock().unwrap_or_else(PoisonError::into_inner).get(path).copied()?;
             (cached_identity == *identity).then_some(gain)
         });
         let mut loaded = Self::from_pcm_with_gain(
@@ -234,7 +234,11 @@ impl LoadedTrackAudio {
             if autogain { cached_gain } else { Some(1.0) },
         );
         if let Some((key, identity)) = cache_key.filter(|(_, identity)| cached_gain.is_none() && file_identity(path) == Some(*identity)) {
-            AUTOGAIN_CACHE.lock().unwrap().insert(key, (identity, loaded.auto_gain));
+            let mut cache = AUTOGAIN_CACHE.lock().unwrap_or_else(PoisonError::into_inner);
+            if cache.len() >= 2048 {
+                cache.clear();
+            }
+            cache.insert(key, (identity, loaded.auto_gain));
         }
         loaded.title = tag_title.unwrap_or(loaded.title);
         loaded.artist = tag_artist.unwrap_or(loaded.artist);
@@ -858,6 +862,10 @@ pub struct AudioSharedState {
     pub scratch_rate: [f64; 4],
     scratch_target_rate: [f64; 4],
     scratch_last_tick_at: [Option<Instant>; 4],
+    scratch_burst_ticks: [i64; 4],
+    scratch_burst_dt: [f64; 4],
+    scratch_burst_base: [f64; 4],
+    scratch_tick_serial: [u64; 4],
     scratch_idle_sec: [f64; 4],
     pub scratch_dx_per_tick: [f64; 4],
     pub scratch_ramping: [bool; 4],
@@ -982,6 +990,10 @@ impl Default for AudioSharedState {
             scratch_rate: [0.0; 4],
             scratch_target_rate: [0.0; 4],
             scratch_last_tick_at: [None; 4],
+            scratch_burst_ticks: [0; 4],
+            scratch_burst_dt: [0.016; 4],
+            scratch_burst_base: [0.0; 4],
+            scratch_tick_serial: [0; 4],
             scratch_idle_sec: [0.0; 4],
             scratch_dx_per_tick: [1.0 / 568.888889; 4],
             scratch_ramping: [false; 4],
@@ -1120,6 +1132,9 @@ impl AudioSharedState {
         self.scratch_rate[d] = init_v;
         self.scratch_target_rate[d] = init_v;
         self.scratch_last_tick_at[d] = None;
+        self.scratch_burst_ticks[d] = 0;
+        self.scratch_burst_dt[d] = 0.016;
+        self.scratch_burst_base[d] = init_v;
         self.scratch_idle_sec[d] = 0.0;
         self.scratch_active[d] = true;
         self.scratch_ramping[d] = false;
@@ -1132,13 +1147,24 @@ impl AudioSharedState {
             return;
         }
         let now = Instant::now();
-        let elapsed = self.scratch_last_tick_at[d].map_or(0.016, |last| (now - last).as_secs_f64());
-        let velocity = (ticks as f64 * self.scratch_dx_per_tick[d] / elapsed.clamp(0.004, 0.050)).clamp(-6.0, 6.0);
-        let already_held = self.scratch_idle_sec[d].max(0.045);
-        let old_target = self.scratch_target_rate[d] * (-(elapsed - already_held).max(0.0) / 0.035).exp();
-        self.scratch_target_rate[d] = old_target * 0.45 + velocity * 0.55;
-        self.scratch_last_tick_at[d] = Some(now);
+        // Coalesce multi-report HID bursts drained in the same UI frame (<4 ms apart) so N reports
+        // of +1 tick yield the exact same velocity as 1 report of +N ticks.
+        let same_burst = self.scratch_last_tick_at[d]
+            .is_some_and(|last| now.saturating_duration_since(last).as_secs_f64() < 0.004);
+        if same_burst {
+            self.scratch_burst_ticks[d] = self.scratch_burst_ticks[d].saturating_add(ticks);
+        } else {
+            let elapsed = self.scratch_last_tick_at[d].map_or(0.016, |last| now.saturating_duration_since(last).as_secs_f64());
+            let already_held = self.scratch_idle_sec[d].max(0.045);
+            self.scratch_burst_base[d] = self.scratch_target_rate[d] * (-(elapsed - already_held).max(0.0) / 0.035).exp();
+            self.scratch_burst_dt[d] = elapsed.clamp(0.004, 0.050);
+            self.scratch_burst_ticks[d] = ticks;
+            self.scratch_last_tick_at[d] = Some(now);
+        }
+        let velocity = (self.scratch_burst_ticks[d] as f64 * self.scratch_dx_per_tick[d] / self.scratch_burst_dt[d]).clamp(-6.0, 6.0);
+        self.scratch_target_rate[d] = self.scratch_burst_base[d] * 0.45 + velocity * 0.55;
         self.scratch_idle_sec[d] = 0.0;
+        self.scratch_tick_serial[d] = self.scratch_tick_serial[d].wrapping_add(1);
     }
 
     pub fn jog_nudge(&mut self, d: usize, delta_ticks: i64, sensitivity: f64) {
@@ -2146,6 +2172,8 @@ impl Renderer {
         renderer.state.pattern_phase_sec = s.pattern_phase_sec;
         renderer.state.scratch_active = s.scratch_active;
         renderer.state.scratch_rate = s.scratch_rate;
+        renderer.state.scratch_target_rate = s.scratch_target_rate;
+        renderer.state.scratch_tick_serial = s.scratch_tick_serial;
         renderer.state.scratch_ramping = s.scratch_ramping;
         renderer.state.scratch_ramp_target = s.scratch_ramp_target;
         renderer.state.jog_nudge_rate = s.jog_nudge_rate;
@@ -2249,9 +2277,9 @@ impl Renderer {
                     r.scratch_rate[d] = s.scratch_rate[d];
                 }
             }
-            if changed || r.scratch_last_tick_at[d] != s.scratch_last_tick_at[d] {
+            if changed || r.scratch_tick_serial[d] != s.scratch_tick_serial[d] {
                 r.scratch_target_rate[d] = s.scratch_target_rate[d];
-                r.scratch_last_tick_at[d] = s.scratch_last_tick_at[d];
+                r.scratch_tick_serial[d] = s.scratch_tick_serial[d];
                 r.scratch_idle_sec[d] = s.scratch_idle_sec[d];
             }
             let delta = std::mem::take(&mut s.jog_nudge_delta[d]);
@@ -2330,6 +2358,12 @@ impl Renderer {
         s.pattern_phase_sec = r.pattern_phase_sec;
         s.scratch_rate = r.scratch_rate;
         s.scratch_ramping = r.scratch_ramping;
+        for d in 0..4 {
+            if !s.scratch_changed[d] && r.scratch_tick_serial[d] == s.scratch_tick_serial[d] {
+                s.scratch_target_rate[d] = r.scratch_target_rate[d];
+                s.scratch_idle_sec[d] = r.scratch_idle_sec[d];
+            }
+        }
         s.jog_nudge_rate = r.jog_nudge_rate;
         s.preview_progress = self.preview.progress();
     }
@@ -2723,6 +2757,14 @@ impl Renderer {
             let bpm = state.engine.clock.bpm as f32;
             let (mut ml, mut mr, cl, cr) = state.engine.process_frame_with_fx(deck_samples, |post_fader| {
                 let (mut delta_l, mut delta_r) = (0.0, 0.0);
+                let (mut both_l, mut both_r) = (0.0, 0.0);
+                for (d, (l, r)) in post_fader.into_iter().enumerate() {
+                    if state.deck_fx_assign[d][0] && state.deck_fx_assign[d][1] {
+                        both_l += l;
+                        both_r += r;
+                    }
+                }
+                let mut mix = [0.0f32; 2];
                 for (u, fx) in self.deck_fx.iter_mut().enumerate() {
                     let (mut in_l, mut in_r) = (0.0, 0.0);
                     for (d, (l, r)) in post_fader.into_iter().enumerate() {
@@ -2732,10 +2774,13 @@ impl Renderer {
                         }
                     }
                     let (out_l, out_r) = fx.process(in_l, in_r, sr as f32, bpm);
+                    mix[u] = fx.active_mix();
                     delta_l += out_l - in_l;
                     delta_r += out_r - in_r;
                 }
-                (delta_l, delta_r)
+                // Decks assigned to both units had dry attenuated twice (-m0 - m1); restore m0*m1 so dry stays (1-m0)(1-m1) >= 0.
+                let comp = mix[0] * mix[1];
+                (delta_l + both_l * comp, delta_r + both_r * comp)
             });
             ml = (ml + pat_sample).clamp(-1.0, 1.0);
             mr = (mr + pat_sample).clamp(-1.0, 1.0);

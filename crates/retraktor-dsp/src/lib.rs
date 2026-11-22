@@ -584,6 +584,17 @@ impl DeckFxUnit {
             (in_l + (wl - in_l) * m, in_r + (wr - in_r) * m)
         }
     }
+
+    /// Fraction of dry input replaced by this unit on the current sample (`0..=1`).
+    pub fn active_mix(&self) -> f32 {
+        let dw = if self.dry_wet.is_finite() { self.dry_wet.clamp(0.0, 1.0) } else { 0.0 };
+        let mut m = self.on * dw;
+        if self.kind == MixerFxKind::Filter {
+            let p0 = if self.params[0].is_finite() { self.params[0].clamp(0.0, 1.0) } else { 0.5 };
+            m *= (((p0 - 0.5) * 2.0).abs() * 4.0).min(1.0);
+        }
+        m
+    }
 }
 
 /// Deck timeline processor supporting **Flux / Slip Mode**, **Loop / Loop Roll**, **Beatjump**,
