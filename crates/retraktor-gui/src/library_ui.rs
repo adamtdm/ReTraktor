@@ -639,6 +639,98 @@ pub enum Msg {
     Done(String),
 }
 
+#[derive(Clone, Default, Debug, PartialEq)]
+pub struct QuickFilter {
+    pub bpm_center: Option<f64>,
+    pub key_center: Option<String>,
+    pub energy_center: Option<u8>,
+    pub genre_exact: Option<String>,
+}
+
+impl QuickFilter {
+    pub fn is_empty(&self) -> bool {
+        self.bpm_center.is_none() && self.key_center.is_none() && self.energy_center.is_none() && self.genre_exact.is_none()
+    }
+
+    pub fn active_count(&self) -> usize {
+        usize::from(self.bpm_center.is_some())
+            + usize::from(self.key_center.is_some())
+            + usize::from(self.energy_center.is_some())
+            + usize::from(self.genre_exact.is_some())
+    }
+
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    pub fn matches(&self, t: &UiTrackEntry) -> bool {
+        if let Some(center) = self.bpm_center {
+            if !(t.bpm > 0.0 && (t.bpm - center).abs() <= 10.0) {
+                return false;
+            }
+        }
+        if let Some(ref center) = self.key_center {
+            if !KeyWheel::are_harmonically_compatible(center, &t.musical_key) {
+                return false;
+            }
+        }
+        if let Some(center) = self.energy_center {
+            if !(t.energy > 0 && t.energy.abs_diff(center) <= 1) {
+                return false;
+            }
+        }
+        if let Some(ref genre) = self.genre_exact {
+            if t.genre.is_empty() || !t.genre.eq_ignore_ascii_case(genre) {
+                return false;
+            }
+        }
+        true
+    }
+
+    pub fn toggle_bpm(&mut self, bpm: f64) {
+        if bpm > 0.0 && bpm.is_finite() {
+            self.bpm_center = if self.bpm_center == Some(bpm) { None } else { Some(bpm) };
+        }
+    }
+
+    pub fn toggle_key(&mut self, key: &str) {
+        if KeyWheel::parse_open_key(key).is_some() {
+            self.key_center = if self.key_center.as_deref().is_some_and(|k| k.eq_ignore_ascii_case(key)) {
+                None
+            } else {
+                Some(key.to_string())
+            };
+        }
+    }
+
+    pub fn toggle_energy(&mut self, energy: u8) {
+        if energy > 0 {
+            self.energy_center = if self.energy_center == Some(energy) { None } else { Some(energy) };
+        }
+    }
+
+    pub fn toggle_genre(&mut self, genre: &str) {
+        if !genre.is_empty() {
+            self.genre_exact = if self.genre_exact.as_deref().is_some_and(|g| g.eq_ignore_ascii_case(genre)) {
+                None
+            } else {
+                Some(genre.to_string())
+            };
+        }
+    }
+}
+
+fn cmp_ignore_case(a: &str, b: &str) -> std::cmp::Ordering {
+    a.chars().flat_map(char::to_lowercase).cmp(b.chars().flat_map(char::to_lowercase))
+}
+
+enum QuickFilterAction {
+    Bpm(f64),
+    Key(String),
+    Energy(u8),
+    Genre(String),
+}
+
 enum Action {
     Select(usize, egui::Modifiers),
     Load(usize, usize),
@@ -653,6 +745,7 @@ enum Action {
     RemoveFromCollection(Vec<usize>),
     Sort(SortColumn),
     AddToSet(Vec<usize>),
+    QuickFilter(QuickFilterAction),
 }
 
 /// A browser row's small whole-track waveform, made by the app from a decode of the file at `path` (never a deck's),
@@ -683,11 +776,13 @@ pub struct LibraryManager {
     selection: BTreeSet<usize>,
     pub sort_col: SortColumn,
     pub sort_asc: bool,
+    pub hide_missing_files: bool,
+    pub quick_filter: QuickFilter,
 
     version: u64,
     view: Vec<usize>,
     view_scores: Vec<f32>,
-    view_stamp: Option<(u64, NavItem, String, SortColumn, bool, String)>,
+    view_stamp: Option<(u64, NavItem, String, SortColumn, bool, String, bool, QuickFilter)>,
     id_index: HashMap<usize, usize>,
     /// How many times each track's hot cues were set or cleared by hand this session (not saved): a deck's late
     /// analysis adds auto hot cues only if this hasn't moved since its load.
@@ -697,6 +792,8 @@ pub struct LibraryManager {
     collection_path: PathBuf,
     /// Files the user removed from the collection; linked libraries must not bring them back on the next read.
     removed: HashSet<PathBuf>,
+    /// Lowercased basenames of `removed` for O(1) fallback lookup when a linked library has another folder path.
+    removed_names: HashSet<String>,
     dirty_since: Option<Instant>,
     saving: bool,
     tx: Sender<Msg>,
@@ -759,6 +856,7 @@ pub struct LibraryManager {
     pub ai_playlist_runner: Option<crate::ai::AiPlaylistRunner>,
     pub ai_playlist_status: Option<String>,
     pub ai_playlist_sent_info: Option<(usize, usize)>,
+    ai_settings_cache: Option<crate::ai::AiSettings>,
 }
 
 impl Default for LibraryManager {
@@ -784,6 +882,8 @@ impl LibraryManager {
             selection: BTreeSet::new(),
             sort_col: SortColumn::Order,
             sort_asc: true,
+            hide_missing_files: false,
+            quick_filter: QuickFilter::default(),
             version: 0,
             view: Vec::new(),
             view_scores: Vec::new(),
@@ -792,6 +892,7 @@ impl LibraryManager {
             cue_revisions: HashMap::new(),
             scroll_to_selected: false,
             removed: HashSet::new(),
+            removed_names: HashSet::new(),
             collection_path,
             dirty_since: None,
             saving: false,
@@ -837,6 +938,7 @@ impl LibraryManager {
             ai_playlist_runner: None,
             ai_playlist_status: None,
             ai_playlist_sent_info: None,
+            ai_settings_cache: None,
         };
         let path = mgr.collection_path.clone();
         if path.is_file() {
@@ -848,6 +950,7 @@ impl LibraryManager {
         }
         mgr.load_missing_sidecar();
         mgr.removed = fs::read_to_string(mgr.removed_file()).unwrap_or_default().lines().map(PathBuf::from).collect();
+        mgr.rebuild_removed_names();
         // Linked libraries are re-read on every start so their playlists stay current.
         for line in fs::read_to_string(mgr.libraries_file()).unwrap_or_default().lines() {
             let kind = match line.split_once('\t') {
@@ -873,7 +976,17 @@ impl LibraryManager {
         self.collection_path.with_file_name("removed.txt")
     }
 
+    fn rebuild_removed_names(&mut self) {
+        self.removed_names = self
+            .removed
+            .iter()
+            .filter_map(|r| r.file_name())
+            .map(|n| n.to_string_lossy().to_ascii_lowercase())
+            .collect();
+    }
+
     fn save_removed(&mut self) {
+        self.rebuild_removed_names();
         let text: String = self.removed.iter().map(|p| format!("{}\n", p.display())).collect();
         if let Err(e) = write_atomic(&self.removed_file(), &text) {
             self.status_message = format!("Could not save the list of removed tracks: {e}");
@@ -883,7 +996,7 @@ impl LibraryManager {
     /// Whether a linked library's entry is a track the user removed (also when the library knows it by another folder).
     fn was_removed(&self, p: &Path) -> bool {
         self.removed.contains(p)
-            || !p.is_file() && p.file_name().is_some_and(|n| self.removed.iter().any(|r| r.file_name().is_some_and(|m| m.eq_ignore_ascii_case(n))))
+            || !p.is_file() && p.file_name().is_some_and(|n| self.removed_names.contains(&n.to_string_lossy().to_ascii_lowercase()))
     }
 
     fn save_libraries(&mut self) {
@@ -1754,7 +1867,16 @@ impl LibraryManager {
     fn ensure_view(&mut self) {
         let reference = self.reference();
         let ref_s = reference.as_ref().map(|r| format!("{}@{}@{:.2}@{}", r.id, r.musical_key, r.bpm, r.energy)).unwrap_or_default();
-        let stamp = (self.version, self.selected_nav, self.search_query.clone(), self.sort_col, self.sort_asc, ref_s);
+        let stamp = (
+            self.version,
+            self.selected_nav,
+            self.search_query.clone(),
+            self.sort_col,
+            self.sort_asc,
+            ref_s,
+            self.hide_missing_files,
+            self.quick_filter.clone(),
+        );
         if self.view_stamp.as_ref() == Some(&stamp) {
             return;
         }
@@ -1769,43 +1891,47 @@ impl LibraryManager {
             NavItem::Stems => self.tracks.iter().filter(|t| t.stems_ready).map(|t| t.id).collect(),
             _ => self.tracks.iter().map(|t| t.id).collect(),
         };
+        let hide_missing = self.hide_missing_files && self.selected_nav != NavItem::Missing;
         let terms: Vec<String> = self.search_query.to_lowercase().split_whitespace().map(str::to_string).collect();
         let mut rows: Vec<(usize, f32)> = ids
             .into_iter()
             .filter_map(|id| self.id_index.get(&id).map(|&i| i))
+            .filter(|&i| !(hide_missing && self.tracks[i].missing))
+            .filter(|&i| self.quick_filter.matches(&self.tracks[i]))
             .filter(|&i| terms.is_empty() || matches_query(&self.tracks[i], &terms))
             .map(|i| (i, reference.as_ref().map_or(0.0, |r| match_score(r, &self.tracks[i]))))
             .collect();
         if self.selected_nav == NavItem::Suggestions {
             rows.retain(|&(i, s)| s >= 0.6 && reference.as_ref().is_some_and(|r| r.id != self.tracks[i].id));
         }
-        let col = if self.selected_nav == NavItem::Suggestions && self.sort_col == SortColumn::Order { SortColumn::Match } else { self.sort_col };
+        let default_suggestions = self.selected_nav == NavItem::Suggestions && self.sort_col == SortColumn::Order;
+        let col = if default_suggestions { SortColumn::Match } else { self.sort_col };
+        let sort_asc = if default_suggestions { false } else { self.sort_asc };
         let t = &self.tracks;
-        let lc = |s: &str| s.to_lowercase();
         rows.sort_by(|a, b| {
             let (x, y) = (&t[a.0], &t[b.0]);
             let o = match col {
                 SortColumn::Order | SortColumn::Preview => std::cmp::Ordering::Equal,
                 SortColumn::TrackNum => x.track_number.cmp(&y.track_number),
-                SortColumn::Title => lc(&x.title).cmp(&lc(&y.title)),
-                SortColumn::Artist => lc(&x.artist).cmp(&lc(&y.artist)),
-                SortColumn::Album => lc(&x.album).cmp(&lc(&y.album)),
+                SortColumn::Title => cmp_ignore_case(&x.title, &y.title),
+                SortColumn::Artist => cmp_ignore_case(&x.artist, &y.artist),
+                SortColumn::Album => cmp_ignore_case(&x.album, &y.album),
                 SortColumn::Bpm => x.bpm.total_cmp(&y.bpm),
                 SortColumn::Key => KeyWheel::parse_open_key(&x.musical_key).cmp(&KeyWheel::parse_open_key(&y.musical_key)),
                 SortColumn::Energy => x.energy.cmp(&y.energy),
                 SortColumn::Duration => x.duration_sec.total_cmp(&y.duration_sec),
-                SortColumn::Genre => lc(&x.genre).cmp(&lc(&y.genre)),
+                SortColumn::Genre => cmp_ignore_case(&x.genre, &y.genre),
                 SortColumn::Rating => x.rating.cmp(&y.rating),
-                SortColumn::Comment => lc(&x.comment).cmp(&lc(&y.comment)),
-                SortColumn::Remixer => lc(&x.remixer).cmp(&lc(&y.remixer)),
-                SortColumn::Label => lc(&x.label).cmp(&lc(&y.label)),
+                SortColumn::Comment => cmp_ignore_case(&x.comment, &y.comment),
+                SortColumn::Remixer => cmp_ignore_case(&x.remixer, &y.remixer),
+                SortColumn::Label => cmp_ignore_case(&x.label, &y.label),
                 SortColumn::Year => x.year.cmp(&y.year),
                 SortColumn::Bitrate => x.bitrate_kbps.cmp(&y.bitrate_kbps),
                 SortColumn::Format => x.format.cmp(&y.format),
                 SortColumn::Stems => x.stems_ready.cmp(&y.stems_ready),
-                SortColumn::Match => b.1.total_cmp(&a.1),
+                SortColumn::Match => a.1.total_cmp(&b.1),
             };
-            if self.sort_asc || col == SortColumn::Match { o } else { o.reverse() }
+            if sort_asc { o } else { o.reverse() }
         });
         self.view = rows.iter().map(|r| r.0).collect();
         self.view_scores = rows.iter().map(|r| r.1).collect();
@@ -2006,9 +2132,15 @@ impl LibraryManager {
                     self.sort_asc = !self.sort_asc;
                 } else {
                     self.sort_col = col;
-                    self.sort_asc = true;
+                    self.sort_asc = col != SortColumn::Match;
                 }
             }
+            Action::QuickFilter(f) => match f {
+                QuickFilterAction::Bpm(v) => self.quick_filter.toggle_bpm(v),
+                QuickFilterAction::Key(k) => self.quick_filter.toggle_key(&k),
+                QuickFilterAction::Energy(e) => self.quick_filter.toggle_energy(e),
+                QuickFilterAction::Genre(g) => self.quick_filter.toggle_genre(&g),
+            },
         }
     }
 
@@ -2141,6 +2273,7 @@ impl LibraryManager {
             .min_size(egui::vec2(ui.available_width(), 22.0));
             if ui.add(ai_btn).on_hover_text("Build a playlist from a sentence with AI").clicked() {
                 self.show_ai_playlist_panel = !self.show_ai_playlist_panel;
+                self.ai_settings_cache = self.show_ai_playlist_panel.then(crate::ai::AiSettings::load);
             }
 
             let mut delete = None;
@@ -2266,6 +2399,9 @@ impl LibraryManager {
         }
 
         ui.vertical(|ui| {
+            if !self.show_ai_playlist_panel || self.keys_blocked {
+                self.ai_settings_cache = None;
+            }
             if self.show_ai_playlist_panel {
                 self.show_ai_playlist_panel_ui(ui);
                 ui.add_space(6.0);
@@ -2325,7 +2461,7 @@ impl LibraryManager {
             }
         }
 
-        let ai_settings = crate::ai::AiSettings::load();
+        let ai_settings = self.ai_settings_cache.get_or_insert_with(crate::ai::AiSettings::load).clone();
 
         egui::Frame::none()
             .fill(TraktorTheme::BG_PANEL_ALT())
@@ -2539,6 +2675,57 @@ impl LibraryManager {
                 }
             });
         });
+
+        // Active filter pills (Shift+click on BPM, Key, Energy, Genre cells or Hide missing files).
+        let hiding_missing = self.hide_missing_files && self.selected_nav != NavItem::Missing;
+        let active_filters = self.quick_filter.active_count() + usize::from(hiding_missing);
+        if active_filters > 0 {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 5.0;
+                let chip = |ui: &mut Ui, label: String, tip: &str| {
+                    ui.add(
+                        egui::Button::new(RichText::new(label).size(11.0).color(crate::theme::on(TraktorTheme::ROW_SELECTED())))
+                            .fill(TraktorTheme::ROW_SELECTED())
+                            .rounding(10.0),
+                    )
+                    .on_hover_text(tip)
+                    .clicked()
+                };
+                if let Some(c) = self.quick_filter.bpm_center {
+                    let lo = (c - 10.0).max(0.0).round() as i32;
+                    let hi = (c + 10.0).round() as i32;
+                    if chip(ui, format!("BPM {lo}–{hi} ×"), "Click to clear BPM filter") {
+                        self.quick_filter.bpm_center = None;
+                    }
+                }
+                if let Some(k) = self.quick_filter.key_center.clone() {
+                    if chip(ui, format!("Key {k} ±1 ×"), "Click to clear key filter") {
+                        self.quick_filter.key_center = None;
+                    }
+                }
+                if let Some(e) = self.quick_filter.energy_center {
+                    let lo = e.saturating_sub(1).max(1);
+                    let hi = (e + 1).min(10);
+                    if chip(ui, format!("Energy {lo}–{hi} ×"), "Click to clear energy filter") {
+                        self.quick_filter.energy_center = None;
+                    }
+                }
+                if let Some(g) = self.quick_filter.genre_exact.clone() {
+                    if chip(ui, format!("Genre: {g} ×"), "Click to clear genre filter") {
+                        self.quick_filter.genre_exact = None;
+                    }
+                }
+                if hiding_missing && chip(ui, "Hiding missing ×".to_string(), "Click to show missing tracks") {
+                    self.hide_missing_files = false;
+                }
+                if active_filters > 1 && ui.small_button("Clear").on_hover_text("Clear all active filters").clicked() {
+                    self.quick_filter.clear();
+                    if hiding_missing {
+                        self.hide_missing_files = false;
+                    }
+                }
+            });
+        }
 
         // Second row: what to do with the selection, always in the same place.
         ui.horizontal_wrapped(|ui| {
@@ -2883,13 +3070,23 @@ impl LibraryManager {
             .header(22.0, |mut header| {
                 for &c in &cols {
                     header.col(|ui| {
-                        let arrow = if c == sort_col { if sort_asc { " ▲" } else { " ▼" } } else { "" };
-                        let r = ui.add(egui::Label::new(RichText::new(format!("{}{arrow}", c.header())).size(11.0).strong().color(TraktorTheme::TEXT_SECONDARY())).sense(Sense::click()));
                         let sortable = c != SortColumn::Preview;
+                        let (rect, r) = ui.allocate_exact_size(ui.available_size_before_wrap(), Sense::click());
+                        if r.hovered() && sortable {
+                            ui.painter().rect_filled(rect, 2.0, TraktorTheme::CONTROL_HOVER());
+                        }
+                        let arrow = if c == sort_col { if sort_asc { " ▲" } else { " ▼" } } else { "" };
+                        let color = if c == sort_col { TraktorTheme::TEXT_PRIMARY() } else { TraktorTheme::TEXT_SECONDARY() };
+                        let text = RichText::new(format!("{}{arrow}", c.header())).size(11.0).strong().color(color);
+                        let galley = egui::WidgetText::from(text).into_galley(ui, Some(egui::TextWrapMode::Truncate), rect.width(), egui::TextStyle::Body);
+                        let pos = egui::pos2(rect.left(), rect.center().y - galley.size().y * 0.5);
+                        ui.painter_at(rect).galley(pos, galley, color);
+                        r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, sortable, c.header()));
                         if r.clicked() && sortable {
                             actions.push(Action::Sort(c));
                         }
                         let hint = if sortable { "Click to sort · right-click to choose columns" } else { "Click a track's waveform to hear it from there in the headphones" };
+                        let r = if sortable { r.on_hover_cursor(egui::CursorIcon::PointingHand) } else { r };
                         r.on_hover_text(hint).context_menu(|ui| column_menu(ui, columns));
                     });
                 }
@@ -2903,6 +3100,7 @@ impl LibraryManager {
                     let selected = self.selection.contains(&t.id);
                     row.set_selected(selected);
                     let (mut wave, mut problem) = (None, None);
+                    let mut filter_cells: Vec<(egui::Response, QuickFilterAction)> = Vec::new();
                     for &c in &cols {
                         row.col(|ui| {
                             if c == SortColumn::Preview {
@@ -2915,15 +3113,53 @@ impl LibraryManager {
                                 // Per-column colours (dim, key hue, missing red) vanish on the selection fill.
                                 text = text.color(crate::theme::on(TraktorTheme::ROW_SELECTED()));
                             }
-                            ui.add(egui::Label::new(text).truncate().selectable(false));
+                            let qf = match c {
+                                SortColumn::Bpm if t.bpm > 0.0 => Some((QuickFilterAction::Bpm(t.bpm), "Shift+click to filter ±10 BPM")),
+                                SortColumn::Key if KeyWheel::parse_open_key(&t.musical_key).is_some() => Some((QuickFilterAction::Key(t.musical_key.clone()), "Shift+click to filter ±1 key")),
+                                SortColumn::Energy if t.energy > 0 => Some((QuickFilterAction::Energy(t.energy), "Shift+click to filter ±1 energy")),
+                                SortColumn::Genre if !t.genre.is_empty() => Some((QuickFilterAction::Genre(t.genre.clone()), "Shift+click to filter this genre")),
+                                _ => None,
+                            };
+                            if let Some((action, tip)) = qf {
+                                let mut cr = ui.add(egui::Label::new(text).truncate().selectable(false).sense(Sense::click())).on_hover_text(tip);
+                                if ui.input(|i| i.modifiers.shift) {
+                                    cr = cr.on_hover_cursor(egui::CursorIcon::PointingHand);
+                                }
+                                filter_cells.push((cr, action));
+                            } else {
+                                ui.add(egui::Label::new(text).truncate().selectable(false));
+                            }
                         });
                     }
                     // The waveform takes its own clicks, above the row: they select, and a plain one previews from
                     // there, but never reach the row's double-click load. Drags pass through to the row.
-                    let resp = row.response();
+                    let row_resp = row.response();
+                    let mut resp = row_resp.clone();
                     let wave_clicked = wave.as_ref().filter(|w| w.clicked());
-                    if resp.clicked() || wave_clicked.is_some() {
-                        actions.push(Action::Select(t.id, ui_modifiers(&resp)));
+                    let mut filter_clicked = false;
+                    let mut cell_plain_click = None;
+                    let mut cell_double_click = false;
+                    for (cr, action) in filter_cells {
+                        if cr.clicked() {
+                            let mods = ui_modifiers(&cr);
+                            if mods.shift {
+                                actions.push(Action::QuickFilter(action));
+                                filter_clicked = true;
+                            } else {
+                                cell_plain_click = Some(mods);
+                            }
+                        }
+                        if cr.double_clicked() && !ui_modifiers(&cr).shift {
+                            cell_double_click = true;
+                        }
+                        resp = resp.union(cr);
+                    }
+                    if !filter_clicked {
+                        if let Some(mods) = cell_plain_click {
+                            actions.push(Action::Select(t.id, mods));
+                        } else if row_resp.clicked() || wave_clicked.is_some() {
+                            actions.push(Action::Select(t.id, ui_modifiers(&row_resp)));
+                        }
                     }
                     if let Some(w) = wave_clicked.filter(|w| ui_modifiers(w).is_none()) {
                         // A row known to be unplayable only says why: the preview playing carries on.
@@ -2933,12 +3169,14 @@ impl LibraryManager {
                             (None, None) => {}
                         }
                     }
-                    if resp.double_clicked() {
+                    if cell_double_click {
+                        actions.push(Action::LoadAuto(t.id));
+                    } else if row_resp.double_clicked() {
                         // Shift sends it to deck B; plain double-click takes the first free deck.
-                        actions.push(if ui_modifiers(&resp).shift { Action::Load(2, t.id) } else { Action::LoadAuto(t.id) });
+                        actions.push(if ui_modifiers(&row_resp).shift { Action::Load(2, t.id) } else { Action::LoadAuto(t.id) });
                     }
-                    if resp.drag_started() {
-                        resp.dnd_set_drag_payload(DragTracks(self.selected_or(t.id)));
+                    if row_resp.drag_started() {
+                        row_resp.dnd_set_drag_payload(DragTracks(self.selected_or(t.id)));
                     }
                     // Right-clicking the waveform opens the row's menu too.
                     let resp = match wave {
@@ -3688,5 +3926,118 @@ mod tests {
             assert!(missing, "{name}");
             assert_eq!(status, "Relocated 0 of 1 missing tracks. Multiple matches for 1. Use Search another folder…", "{name}");
         }
+    }
+
+    #[test]
+    fn hide_missing_files_hides_in_collection_but_keeps_missing_view() {
+        let (mut lib, dir) = temp_lib("hide-missing");
+        let present = track("Present", &dir.join("ok.flac"));
+        let mut gone = track("Gone", &dir.join("gone.flac"));
+        gone.missing = true;
+        lib.push_track(present);
+        lib.push_track(gone);
+
+        lib.ensure_view();
+        assert_eq!(lib.view.len(), 2);
+
+        lib.hide_missing_files = true;
+        lib.ensure_view();
+        assert_eq!(lib.view.len(), 1);
+        assert_eq!(lib.tracks[lib.view[0]].title, "Present");
+
+        lib.selected_nav = NavItem::Missing;
+        lib.ensure_view();
+        assert_eq!(lib.view.len(), 1);
+        assert_eq!(lib.tracks[lib.view[0]].title, "Gone");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn quick_filters_bpm_key_energy_genre() {
+        let (mut lib, dir) = temp_lib("quick-filters");
+        let make = |title: &str, bpm: f64, key: &str, energy: u8, genre: &str| UiTrackEntry {
+            title: title.into(),
+            bpm,
+            musical_key: key.into(),
+            energy,
+            genre: genre.into(),
+            file_path: Some(dir.join(format!("{title}.flac"))),
+            ..Default::default()
+        };
+        lib.push_track(make("A", 128.0, "12d", 7, "House"));
+        lib.push_track(make("B", 138.0, "1d", 8, "house"));
+        lib.push_track(make("C", 118.0, "12m", 6, "Techno"));
+        lib.push_track(make("D", 145.0, "8d", 9, "House"));
+        lib.push_track(make("E", 128.0, "8m", 5, "House"));
+        lib.push_track(make("F", 0.0, "", 0, ""));
+
+        let titles = |lib: &mut LibraryManager| -> Vec<String> {
+            lib.ensure_view();
+            lib.view.iter().map(|&i| lib.tracks[i].title.clone()).collect()
+        };
+
+        // BPM ±10 (inclusive boundaries 118..=138, excludes 0 and 145)
+        lib.quick_filter.toggle_bpm(128.0);
+        assert_eq!(titles(&mut lib), vec!["A", "B", "C", "E"]);
+        lib.quick_filter.toggle_bpm(128.0);
+        assert!(lib.quick_filter.bpm_center.is_none());
+
+        // Key ±1 with 12d <-> 1d wrap and 12d <-> 12m relative
+        lib.quick_filter.toggle_key("12d");
+        assert_eq!(titles(&mut lib), vec!["A", "B", "C"]);
+        lib.quick_filter.toggle_key("8d");
+        assert_eq!(titles(&mut lib), vec!["D", "E"]);
+        lib.quick_filter.clear();
+
+        // Energy ±1 (center 7 matches 6, 7, 8)
+        lib.quick_filter.toggle_energy(7);
+        assert_eq!(titles(&mut lib), vec!["A", "B", "C"]);
+        lib.quick_filter.clear();
+
+        // Genre exact case-insensitive
+        lib.quick_filter.toggle_genre("HOUSE");
+        assert_eq!(titles(&mut lib), vec!["A", "B", "D", "E"]);
+        lib.quick_filter.toggle_genre("house");
+        assert!(lib.quick_filter.genre_exact.is_none());
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn match_sort_toggles_ascending_and_descending() {
+        let (mut lib, dir) = temp_lib("match-sort");
+        let mut exact = track("Exact", &dir.join("exact.flac"));
+        exact.bpm = 128.0;
+        exact.musical_key = "8m".into();
+        let mut close = track("Close", &dir.join("close.flac"));
+        close.bpm = 126.0;
+        close.musical_key = "9m".into();
+        let mut ref_t = track("Ref", &dir.join("ref.flac"));
+        ref_t.bpm = 128.0;
+        ref_t.musical_key = "8m".into();
+        lib.push_track(close);
+        lib.push_track(exact);
+        lib.deck_tracks[0] = Some(lib.push_track(ref_t));
+        lib.selected_nav = NavItem::Suggestions;
+
+        // Default Suggestions view sorts best match first.
+        lib.ensure_view();
+        assert_eq!(lib.tracks[lib.view[0]].title, "Exact");
+        assert_eq!(lib.tracks[lib.view[1]].title, "Close");
+
+        // Clicking Match starts descending (best first), clicking again flips to ascending.
+        lib.apply(Action::Sort(SortColumn::Match), [false; 4], 2);
+        lib.ensure_view();
+        assert!(!lib.sort_asc);
+        assert_eq!(lib.tracks[lib.view[0]].title, "Exact");
+
+        lib.apply(Action::Sort(SortColumn::Match), [false; 4], 2);
+        lib.ensure_view();
+        assert!(lib.sort_asc);
+        assert_eq!(lib.tracks[lib.view[0]].title, "Close");
+        assert_eq!(lib.tracks[lib.view[1]].title, "Exact");
+
+        let _ = fs::remove_dir_all(dir);
     }
 }

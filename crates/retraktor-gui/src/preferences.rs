@@ -5,8 +5,6 @@ use eframe::egui::{self, Color32, Pos2, RichText, Sense, Stroke, Ui, Vec2};
 pub enum PrefsTab {
     AudioSetup,
     OutputRouting,
-    InputRouting,
-    ExternalSync,
     Mixer,
     Decks,
     TrackDecks,
@@ -15,7 +13,6 @@ pub enum PrefsTab {
     Recording,
     BrowserColumns,
     FileManagement,
-    AnalyzeOptions,
     Controllers,
     OtherControllers,
     Look,
@@ -107,91 +104,50 @@ pub struct PreferencesDialog {
     pub buffer_size: u32,
     pub audio_device_name: String,
 
-    // Output & Input Routing
-    pub mixing_mode: usize, // 0: Internal (Software), 1: External (Hardware Mixer)
+    // Output Routing
     /// Main and headphone pair indices (0 = channels 1–2) per output ID the user set them for; others use
     /// main 1–2, headphones 3–4. Two distinct pairs below [`crate::audio::MAX_OUTPUT_PAIRS`].
     pub output_pairs: std::collections::BTreeMap<String, [u8; 2]>,
-    pub booth_out_l: String,
-    pub booth_out_r: String,
     pub split_cue: bool,
-    pub deck_a_in_l: String,
-    pub deck_a_in_r: String,
-    pub deck_b_in_l: String,
-    pub deck_b_in_r: String,
-    pub aux_in_l: String,
-    pub aux_in_r: String,
 
-    // External Sync & MIDI Clock
-    pub clock_mode: usize, // 0: Auto Master, 1: Manual
-    pub send_midi_clock: bool,
-    pub midi_clock_offset_ms: f32,
-    pub ableton_link_enabled: bool,
-
-    // Mixer & EQ
-    pub eq_model_idx: usize,
-    pub filter_model_idx: usize,
-    pub filter_resonance: f32,
+    // Mixer
     pub xfader_curve_idx: usize,
     pub autogain: bool,
     pub limiter_enabled: bool,
-    pub limiter_headroom: usize, // 0: None (0.0 dB), 1: -3.0 dB, 2: -6.0 dB
     pub neural_mix_eq_mode: bool,
 
     // Decks & Waveforms
     pub four_deck_mode: bool,
     pub waveform_color_mode: usize, // 0: Spectrum 4-Band, 1: Ultraviolet, 2: High-Contrast RGB
-    pub show_minute_markers: bool,
-    pub show_beatgrid_ticks: bool,
-    pub stripe_fit_full: bool,
 
     // Track Decks & Scratch
-    pub pitch_range_idx: usize, // 0: ±8%, 1: ±16%, 2: ±32%, 3: ±50%, 4: ±100%
     pub keylock_quality: usize, // 0: HiQ (Scratch-Preserving), 1: ECO
-    pub play_marker_pos: usize, // 0: Centered 50%, 1: 30% Left-Weighted
-    pub auto_cue_on_load: bool,
     pub jog_scratch_sensitivity: f32,
     pub jog_mode_turntable: bool,
     pub lock_playing_decks: bool,
 
-    // Effects & Mixer FX
-    pub fx_units_count: usize, // 0: 2 FX Units, 1: 4 FX Units
-    pub fx_panel_mode: usize,  // 0: Group (3-FX), 1: Single (Deep)
+    // Mixer FX
     pub mixer_fx_slots: [usize; 4],
 
     // Stems & AI
-    pub stems_engine_mode: usize, // 0: Hybrid (Real-time DSP + Demucs AI Cache), 1: Real-Time DSP, 2: Offline AI
     pub demucs_install_state: crate::demucs::DemucsInstallState,
     pub trigger_demucs_install: bool,
     pub demucs_active_separation: Option<String>,
 
-    // Recording & Broadcast
+    // Recording
     pub recording_dir: std::path::PathBuf,
-    pub recording_format: usize, // 0: 16-bit 48kHz WAV, 1: 24-bit 48kHz WAV
-    pub broadcast_host: String,
-    pub broadcast_port: u16,
-    pub broadcast_mount: String,
-    pub broadcast_password: String,
-    pub broadcast_connected: bool,
 
     // File Management & Folders
     pub music_folders: Vec<std::path::PathBuf>,
     pub scan_on_startup: bool,
     pub analyze_new_tracks: bool,
+    pub hide_missing_files: bool,
     pub trigger_music_rescan: bool,
     pub file_management_status: String,
     pub library_columns: LibraryColumnsConfig,
     pub collection_save_format: usize, // 0: Traktor .nml (v20), 1: Extended .m3u8, 2: Both (.nml + .m3u8)
-    pub prompt_save_on_exit: bool,
-
-    // Analyze Options
-    pub bpm_detection_range: usize, // 0: 70..140 BPM, 1: 60..120 BPM, 2: 90..180 BPM, 3: 110..220 BPM
-    pub key_notation_idx: usize,    // 0: Open Key (4m), 1: Camelot (8A), 2: Musical (Am)
 
     // Controller Manager & Surface Remapper
-    pub tsi_path_input: String,
-    pub loaded_tsi_summary: Option<String>,
-    pub mx2_bottom_led_brightness: f32,
     pub mx2_connected_node: Option<String>,
     pub mx2_access_status: Option<String>,
     pub mx2_packets_count: u64,
@@ -241,69 +197,32 @@ impl Default for PreferencesDialog {
             sample_rate: 48000,
             buffer_size: 128,
             audio_device_name: String::new(),
-            mixing_mode: 0,
             output_pairs: Default::default(),
-            booth_out_l: "Channel 5 (Booth Out L)".to_string(),
-            booth_out_r: "Channel 6 (Booth Out R)".to_string(),
             split_cue: false,
-            deck_a_in_l: "In 1 (Line / Phono A-L)".to_string(),
-            deck_a_in_r: "In 2 (Line / Phono A-R)".to_string(),
-            deck_b_in_l: "In 3 (Line / Phono B-L)".to_string(),
-            deck_b_in_r: "In 4 (Line / Phono B-R)".to_string(),
-            aux_in_l: "In 5 (Mic / Aux L)".to_string(),
-            aux_in_r: "In 6 (Mic / Aux R)".to_string(),
-            clock_mode: 0,
-            send_midi_clock: false,
-            midi_clock_offset_ms: 0.0,
-            ableton_link_enabled: false,
-            eq_model_idx: 0,     // Z ISO
-            filter_model_idx: 0, // Ladder
-            filter_resonance: 0.3,
             xfader_curve_idx: 0, // Smooth
             autogain: true,
             limiter_enabled: true,
-            limiter_headroom: 1, // -3dB
             four_deck_mode: false,
             waveform_color_mode: 0,
-            show_minute_markers: true,
-            show_beatgrid_ticks: true,
-            stripe_fit_full: true,
-            pitch_range_idx: 0, // ±8%
             keylock_quality: 0, // HiQ
-            play_marker_pos: 0, // Centered 50%
-            auto_cue_on_load: true,
             jog_scratch_sensitivity: 1.0,
             jog_mode_turntable: true,
             lock_playing_decks: true,
-            fx_units_count: 0, // 2 FX units
-            fx_panel_mode: 0,  // Group
             mixer_fx_slots: [0, 1, 2, 3], // Filter, Reverb, Delay, Noise
             neural_mix_eq_mode: false,
-            stems_engine_mode: 0,
             demucs_install_state: crate::demucs::DemucsInstallState::NotInstalled,
             trigger_demucs_install: false,
             demucs_active_separation: None,
             recording_dir: home.join("Music"),
-            recording_format: 0,
-            broadcast_host: "localhost".to_string(),
-            broadcast_port: 8000,
-            broadcast_mount: "/retraktor.mp3".to_string(),
-            broadcast_password: "hackme".to_string(),
-            broadcast_connected: false,
             music_folders: default_music.into_iter().collect(),
             request_folder_pick: false,
             scan_on_startup: true,
             analyze_new_tracks: true,
+            hide_missing_files: false,
             trigger_music_rescan: false,
             file_management_status: "Ready".to_string(),
             library_columns: LibraryColumnsConfig::default(),
             collection_save_format: 0, // Traktor .nml (v20)
-            prompt_save_on_exit: true,
-            bpm_detection_range: 0, // 70..140
-            key_notation_idx: 0,    // Open Key
-            tsi_path_input: String::new(),
-            loaded_tsi_summary: None,
-            mx2_bottom_led_brightness: 1.0,
             mx2_connected_node: None,
             mx2_access_status: None,
             mx2_packets_count: 0,
@@ -353,116 +272,121 @@ impl PreferencesDialog {
     }
 
     pub fn to_json_str(&self) -> String {
-        let folders_json = self
-            .music_folders
-            .iter()
-            .map(|f| format!("\"{}\"", f.display()))
-            .collect::<Vec<_>>()
-            .join(", ");
         let c = &self.library_columns;
-        format!(
-            "{{\n  \"sample_rate\": {},\n  \"buffer_size\": {},\n  \"audio_device_name\": {},\n  \"split_cue\": {},\n  \"output_pairs\": {},\n  \"keylock_quality\": {},\n  \"four_deck_mode\": {},\n  \"waveform_color_mode\": {},\n  \"eq_model_idx\": {},\n  \"filter_model_idx\": {},\n  \"filter_resonance\": {},\n  \"xfader_curve_idx\": {},\n  \"autogain\": {},\n  \"limiter_enabled\": {},\n  \"lock_playing_decks\": {},\n  \"scan_on_startup\": {},\n  \"analyze_new_tracks\": {},\n  \"key_notation_idx\": {},\n  \"collection_save_format\": {},\n  \"prompt_save_on_exit\": {},\n  \"col_album\": {},\n  \"col_bpm\": {},\n  \"col_key\": {},\n  \"col_stems\": {},\n  \"col_duration\": {},\n  \"col_genre\": {},\n  \"col_rating\": {},\n  \"col_comment\": {},\n  \"col_remixer\": {},\n  \"col_label\": {},\n  \"col_year\": {},\n  \"col_bitrate\": {},\n  \"col_format\": {},\n  \"col_track_number\": {},\n  \"col_energy\": {},\n  \"music_folders\": [{}]\n}}",
-            self.sample_rate,
-            self.buffer_size,
-            serde_json::json!(self.audio_device_name),
-            self.split_cue,
-            output_pairs_json(&self.output_pairs),
-            self.keylock_quality,
-            self.four_deck_mode,
-            self.waveform_color_mode,
-            self.eq_model_idx,
-            self.filter_model_idx,
-            self.filter_resonance,
-            self.xfader_curve_idx,
-            self.autogain,
-            self.limiter_enabled,
-            self.lock_playing_decks,
-            self.scan_on_startup,
-            self.analyze_new_tracks,
-            self.key_notation_idx,
-            self.collection_save_format,
-            self.prompt_save_on_exit,
-            c.album,
-            c.bpm,
-            c.key,
-            c.stems,
-            c.duration,
-            c.genre,
-            c.rating,
-            c.comment,
-            c.remixer,
-            c.label,
-            c.year,
-            c.bitrate,
-            c.format,
-            c.track_number,
-            c.energy,
-            folders_json,
-        )
+        let folders: Vec<String> = self.music_folders.iter().map(|f| f.to_string_lossy().into_owned()).collect();
+        let doc = serde_json::json!({
+            "sample_rate": self.sample_rate,
+            "buffer_size": self.buffer_size,
+            "audio_device_name": self.audio_device_name,
+            "split_cue": self.split_cue,
+            "output_pairs": output_pairs_value(&self.output_pairs),
+            "keylock_quality": self.keylock_quality,
+            "four_deck_mode": self.four_deck_mode,
+            "waveform_color_mode": self.waveform_color_mode,
+            "xfader_curve_idx": self.xfader_curve_idx,
+            "autogain": self.autogain,
+            "limiter_enabled": self.limiter_enabled,
+            "lock_playing_decks": self.lock_playing_decks,
+            "scan_on_startup": self.scan_on_startup,
+            "analyze_new_tracks": self.analyze_new_tracks,
+            "hide_missing_files": self.hide_missing_files,
+            "neural_mix_eq_mode": self.neural_mix_eq_mode,
+            "recording_dir": self.recording_dir.to_string_lossy(),
+            "mixer_fx_slots": self.mixer_fx_slots,
+            "collection_save_format": self.collection_save_format,
+            "col_album": c.album,
+            "col_bpm": c.bpm,
+            "col_key": c.key,
+            "col_stems": c.stems,
+            "col_duration": c.duration,
+            "col_genre": c.genre,
+            "col_rating": c.rating,
+            "col_comment": c.comment,
+            "col_remixer": c.remixer,
+            "col_label": c.label,
+            "col_year": c.year,
+            "col_bitrate": c.bitrate,
+            "col_format": c.format,
+            "col_track_number": c.track_number,
+            "col_energy": c.energy,
+            "music_folders": folders,
+        });
+        serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".to_string())
     }
 
     pub fn apply_json_str(&mut self, text: &str) {
-        // The pairs from the whole file when it is valid JSON (also once another tool re-indented it), else
-        // from their own line, as for the rest of an older or hand-broken file.
-        let mut pairs = serde_json::from_str::<serde_json::Value>(text).map(|doc| doc["output_pairs"].clone()).unwrap_or_default();
-        for line in text.lines() {
-            let trimmed = line.trim().trim_end_matches(',');
-            if let Some((k, v)) = trimmed.split_once(':') {
-                let key = k.trim().trim_matches('"');
-                let val = v.trim().trim_matches('"');
-                match key {
-                    "sample_rate" => if let Ok(n) = val.parse() { self.sample_rate = n; },
-                    "buffer_size" => if let Ok(n) = val.parse() { self.buffer_size = n; },
-                    "audio_device_name" => self.audio_device_name = serde_json::from_str(v.trim()).unwrap_or_else(|_| val.to_string()),
-                    "split_cue" => self.split_cue = val == "true",
-                    "output_pairs" if pairs.is_null() => pairs = serde_json::from_str(v.trim()).unwrap_or_default(),
-                    "keylock_quality" => if let Ok(n) = val.parse() { self.keylock_quality = n; },
-                    "four_deck_mode" => self.four_deck_mode = val == "true",
-                    "waveform_color_mode" => if let Ok(n) = val.parse() { self.waveform_color_mode = n; },
-                    "eq_model_idx" => if let Ok(n) = val.parse() { self.eq_model_idx = n; },
-                    "filter_model_idx" => if let Ok(n) = val.parse() { self.filter_model_idx = n; },
-                    "filter_resonance" => if let Ok(n) = val.parse() { self.filter_resonance = n; },
-                    "xfader_curve_idx" => if let Ok(n) = val.parse() { self.xfader_curve_idx = n; },
-                    "autogain" => self.autogain = val == "true",
-                    "limiter_enabled" => self.limiter_enabled = val == "true",
-                    "lock_playing_decks" => self.lock_playing_decks = val == "true",
-                    "scan_on_startup" => self.scan_on_startup = val == "true",
-                    "analyze_new_tracks" => self.analyze_new_tracks = val == "true",
-                    "key_notation_idx" => if let Ok(n) = val.parse() { self.key_notation_idx = n; },
-                    "collection_save_format" => if let Ok(n) = val.parse() { self.collection_save_format = n; },
-                    "prompt_save_on_exit" => self.prompt_save_on_exit = val == "true",
-                    "col_album" => self.library_columns.album = val == "true",
-                    "col_bpm" => self.library_columns.bpm = val == "true",
-                    "col_key" => self.library_columns.key = val == "true",
-                    "col_stems" => self.library_columns.stems = val == "true",
-                    "col_duration" => self.library_columns.duration = val == "true",
-                    "col_genre" => self.library_columns.genre = val == "true",
-                    "col_rating" => self.library_columns.rating = val == "true",
-                    "col_comment" => self.library_columns.comment = val == "true",
-                    "col_remixer" => self.library_columns.remixer = val == "true",
-                    "col_label" => self.library_columns.label = val == "true",
-                    "col_year" => self.library_columns.year = val == "true",
-                    "col_bitrate" => self.library_columns.bitrate = val == "true",
-                    "col_format" => self.library_columns.format = val == "true",
-                    "col_track_number" => self.library_columns.track_number = val == "true",
-                    "music_folders" => {
-                        self.music_folders = v
-                            .trim()
-                            .trim_start_matches('[')
-                            .trim_end_matches(']')
-                            .split("\",")
-                            .map(|f| f.trim().trim_matches('"'))
-                            .filter(|f| !f.is_empty())
-                            .map(std::path::PathBuf::from)
-                            .collect();
+        let doc: serde_json::Value = match serde_json::from_str(text) {
+            Ok(v) => v,
+            Err(_) => {
+                // Legacy fallback: recover valid JSON key/value lines from an older file with an unescaped path.
+                let mut map = serde_json::Map::new();
+                for line in text.lines() {
+                    let trimmed = line.trim().trim_end_matches(',');
+                    if let Some((k, v)) = trimmed.split_once(':') {
+                        if let (Ok(key), Ok(val)) = (
+                            serde_json::from_str::<String>(k.trim()),
+                            serde_json::from_str::<serde_json::Value>(v.trim()),
+                        ) {
+                            map.insert(key, val);
+                        }
                     }
-                    "col_energy" => self.library_columns.energy = val == "true",
-                    _ => {}
+                }
+                serde_json::Value::Object(map)
+            }
+        };
+        let Some(obj) = doc.as_object() else { return };
+        let b = |k: &str| obj.get(k).and_then(|v| v.as_bool());
+        let u = |k: &str| obj.get(k).and_then(|v| v.as_u64());
+        if let Some(v) = u("sample_rate") { self.sample_rate = v as u32; }
+        if let Some(v) = u("buffer_size") { self.buffer_size = v as u32; }
+        if let Some(v) = obj.get("audio_device_name").and_then(|v| v.as_str()) { self.audio_device_name = v.to_string(); }
+        if let Some(v) = b("split_cue") { self.split_cue = v; }
+        if let Some(v) = obj.get("output_pairs") { self.output_pairs = output_pairs_from(v); }
+        if let Some(v) = u("keylock_quality") { self.keylock_quality = v as usize; }
+        if let Some(v) = b("four_deck_mode") { self.four_deck_mode = v; }
+        if let Some(v) = u("waveform_color_mode") { self.waveform_color_mode = v as usize; }
+        if let Some(v) = u("xfader_curve_idx") { self.xfader_curve_idx = v as usize; }
+        if let Some(v) = b("autogain") { self.autogain = v; }
+        if let Some(v) = b("limiter_enabled") { self.limiter_enabled = v; }
+        if let Some(v) = b("lock_playing_decks") { self.lock_playing_decks = v; }
+        if let Some(v) = b("scan_on_startup") { self.scan_on_startup = v; }
+        if let Some(v) = b("analyze_new_tracks") { self.analyze_new_tracks = v; }
+        if let Some(v) = b("hide_missing_files") { self.hide_missing_files = v; }
+        if let Some(v) = b("neural_mix_eq_mode") { self.neural_mix_eq_mode = v; }
+        if let Some(v) = obj.get("recording_dir").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            self.recording_dir = std::path::PathBuf::from(v);
+        }
+        if let Some(arr) = obj.get("mixer_fx_slots").and_then(|v| v.as_array()) {
+            for (i, item) in arr.iter().take(4).enumerate() {
+                if let Some(n) = item.as_u64() {
+                    self.mixer_fx_slots[i] = n as usize;
                 }
             }
         }
-        if !pairs.is_null() {
-            self.output_pairs = output_pairs_from(&pairs);
+        if let Some(v) = u("collection_save_format") { self.collection_save_format = v as usize; }
+        let c = &mut self.library_columns;
+        if let Some(v) = b("col_album") { c.album = v; }
+        if let Some(v) = b("col_bpm") { c.bpm = v; }
+        if let Some(v) = b("col_key") { c.key = v; }
+        if let Some(v) = b("col_stems") { c.stems = v; }
+        if let Some(v) = b("col_duration") { c.duration = v; }
+        if let Some(v) = b("col_genre") { c.genre = v; }
+        if let Some(v) = b("col_rating") { c.rating = v; }
+        if let Some(v) = b("col_comment") { c.comment = v; }
+        if let Some(v) = b("col_remixer") { c.remixer = v; }
+        if let Some(v) = b("col_label") { c.label = v; }
+        if let Some(v) = b("col_year") { c.year = v; }
+        if let Some(v) = b("col_bitrate") { c.bitrate = v; }
+        if let Some(v) = b("col_format") { c.format = v; }
+        if let Some(v) = b("col_track_number") { c.track_number = v; }
+        if let Some(v) = b("col_energy") { c.energy = v; }
+        if let Some(arr) = obj.get("music_folders").and_then(|v| v.as_array()) {
+            self.music_folders = arr
+                .iter()
+                .filter_map(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(std::path::PathBuf::from)
+                .collect();
         }
     }
 
@@ -470,34 +394,6 @@ impl PreferencesDialog {
     pub fn output_route(&self) -> crate::audio::OutputRoute {
         let [main, headphones] = self.output_pairs.get(&self.audio_device_name).copied().unwrap_or([0, 1]);
         if self.split_cue { crate::audio::OutputRoute::Split } else { crate::audio::OutputRoute::Pairs { main, headphones: Some(headphones) } }
-    }
-
-    /// Renders an accessible, high-contrast settings card container with consistent border and padding.
-    pub fn render_card<R>(
-        ui: &mut Ui,
-        title: &str,
-        description: &str,
-        content: impl FnOnce(&mut Ui) -> R,
-    ) -> R {
-        egui::Frame::none()
-            .fill(TraktorTheme::BG_PANEL_ALT())
-            .stroke(Stroke::new(1.0_f32, TraktorTheme::BORDER_COLOR()))
-            .rounding(4.0)
-            .inner_margin(12.0)
-            .show(ui, |ui| {
-                ui.vertical(|ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(title).strong().color(TraktorTheme::TEXT_PRIMARY()));
-                        if !description.is_empty() {
-                            ui.label(RichText::new(format!("— {description}")).size(12.0).color(TraktorTheme::TEXT_MUTED()));
-                        }
-                    });
-                    ui.add_space(8.0);
-                    content(ui)
-                })
-                .inner
-            })
-            .inner
     }
 
     /// Renders a single option row in a vertical list-type view: Label + Description on the left, Control on the right.
@@ -565,17 +461,14 @@ impl PreferencesDialog {
         match tab {
             PrefsTab::AudioSetup => ("AUDIO & ROUTING", "Audio Setup"),
             PrefsTab::OutputRouting => ("AUDIO & ROUTING", "Output Routing"),
-            PrefsTab::InputRouting => ("AUDIO & ROUTING", "Input Routing"),
-            PrefsTab::ExternalSync => ("AUDIO & ROUTING", "External Sync & Clock"),
-            PrefsTab::Mixer => ("DECKS & MIXER", "Mixer & EQ"),
+            PrefsTab::Mixer => ("DECKS & MIXER", "Mixer"),
             PrefsTab::Decks => ("DECKS & MIXER", "Decks Layout & Waveforms"),
             PrefsTab::TrackDecks => ("DECKS & MIXER", "Track Decks & Vinyl Scratch"),
-            PrefsTab::Effects => ("DECKS & MIXER", "Effects & Mixer FX"),
+            PrefsTab::Effects => ("DECKS & MIXER", "Channel FX"),
             PrefsTab::StemsAndAi => ("STEMS & RECORDING", "Stems & Demucs AI"),
-            PrefsTab::Recording => ("STEMS & RECORDING", "Recording & Broadcast"),
+            PrefsTab::Recording => ("STEMS & RECORDING", "Recording"),
             PrefsTab::BrowserColumns => ("COLLECTION & HARDWARE", "Browser & Metadata Columns"),
             PrefsTab::FileManagement => ("COLLECTION & HARDWARE", "File Management & Folders"),
-            PrefsTab::AnalyzeOptions => ("COLLECTION & HARDWARE", "Analyze & Musical Key"),
             PrefsTab::Controllers => ("COLLECTION & HARDWARE", "Controller Manager & Remapper"),
             PrefsTab::OtherControllers => ("COLLECTION & HARDWARE", "Other Controllers"),
             PrefsTab::Look => ("LOOK", "Theme & colours"),
@@ -586,9 +479,9 @@ impl PreferencesDialog {
 
     /// Settings pages grouped into the top-level tabs.
     pub const GROUPS: [(&'static str, &'static [PrefsTab]); 8] = [
-        ("Audio", &[PrefsTab::AudioSetup, PrefsTab::OutputRouting, PrefsTab::InputRouting, PrefsTab::ExternalSync]),
+        ("Audio", &[PrefsTab::AudioSetup, PrefsTab::OutputRouting]),
         ("Decks & Mixer", &[PrefsTab::Decks, PrefsTab::TrackDecks, PrefsTab::Mixer, PrefsTab::Effects]),
-        ("Library", &[PrefsTab::FileManagement, PrefsTab::BrowserColumns, PrefsTab::AnalyzeOptions]),
+        ("Library", &[PrefsTab::FileManagement, PrefsTab::BrowserColumns]),
         ("Stems & Recording", &[PrefsTab::StemsAndAi, PrefsTab::Recording]),
         ("Controllers", &[PrefsTab::Controllers, PrefsTab::OtherControllers]),
         ("Look", &[PrefsTab::Look]),
@@ -642,8 +535,6 @@ impl PreferencesDialog {
         match tab {
             PrefsTab::AudioSetup => self.show_audio_setup(ui),
             PrefsTab::OutputRouting => self.show_output_routing(ui),
-            PrefsTab::InputRouting => self.show_input_routing(ui),
-            PrefsTab::ExternalSync => self.show_external_sync(ui),
             PrefsTab::Mixer => self.show_mixer_prefs(ui),
             PrefsTab::Decks => self.show_deck_prefs(ui),
             PrefsTab::TrackDecks => self.show_track_decks_prefs(ui),
@@ -652,7 +543,6 @@ impl PreferencesDialog {
             PrefsTab::Recording => self.show_recording_prefs(ui),
             PrefsTab::BrowserColumns => self.show_browser_columns_prefs(ui),
             PrefsTab::FileManagement => self.show_file_management(ui),
-            PrefsTab::AnalyzeOptions => self.show_analyze_prefs(ui),
             PrefsTab::Controllers => self.show_controller_prefs(ui),
             PrefsTab::OtherControllers => self.show_other_controllers_prefs(ui),
             PrefsTab::Look => crate::theme::editor(ui),
@@ -865,25 +755,6 @@ impl PreferencesDialog {
     fn show_output_routing(&mut self, ui: &mut Ui) {
         Self::list_section_header(ui, "Outputs");
 
-        Self::list_row(
-            ui,
-            "Mixing mode",
-            "Mix inside ReTraktor or send each deck to an external hardware mixer. Not applied yet: ReTraktor always mixes internally.",
-            |ui| {
-                let modes = [
-                    "Internal mixer",
-                    "External mixer",
-                ];
-                egui::ComboBox::from_id_salt("mixing_mode_combo")
-                    .selected_text(modes[self.mixing_mode.min(1)])
-                    .width(220.0)
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.mixing_mode, 0, modes[0]);
-                        ui.selectable_value(&mut self.mixing_mode, 1, modes[1]);
-                    });
-            },
-        );
-
         // The pairs the chosen output has, however wide the open stream is: as listed, else as the open stream
         // when that is the chosen output. The system default, whose wiring is unknown, stays stereo; Split cue
         // uses 1–2 and keeps the pairs for when it is turned off.
@@ -958,18 +829,6 @@ impl PreferencesDialog {
 
         Self::list_row(
             ui,
-            "Booth output",
-            "Second stereo output for booth speakers with its own volume. Not applied yet.",
-            |ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.booth_out_r).desired_width(170.0));
-                ui.label("R:");
-                ui.add(egui::TextEdit::singleline(&mut self.booth_out_l).desired_width(170.0));
-                ui.label("L:");
-            },
-        );
-
-        Self::list_row(
-            ui,
             "Split cue",
             "For a stereo-only output with a splitter cable: cue in the left ear, main mix in the right, both mono.",
             |ui| {
@@ -978,166 +837,8 @@ impl PreferencesDialog {
         );
     }
 
-    fn show_input_routing(&mut self, ui: &mut Ui) {
-        Self::list_section_header(ui, "Inputs");
-
-        Self::list_row(
-            ui,
-            "Deck A input",
-            "Stereo input channels for a turntable or CDJ on Deck A. Not applied yet.",
-            |ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.deck_a_in_r).desired_width(170.0));
-                ui.label("R:");
-                ui.add(egui::TextEdit::singleline(&mut self.deck_a_in_l).desired_width(170.0));
-                ui.label("L:");
-            },
-        );
-
-        Self::list_row(
-            ui,
-            "Deck B input",
-            "Stereo input channels for a turntable or CDJ on Deck B. Not applied yet.",
-            |ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.deck_b_in_r).desired_width(170.0));
-                ui.label("R:");
-                ui.add(egui::TextEdit::singleline(&mut self.deck_b_in_l).desired_width(170.0));
-                ui.label("L:");
-            },
-        );
-
-        Self::list_row(
-            ui,
-            "Aux or microphone",
-            "Extra stereo or mic input sent straight to the main mix. Not applied yet.",
-            |ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.aux_in_r).desired_width(170.0));
-                ui.label("R:");
-                ui.add(egui::TextEdit::singleline(&mut self.aux_in_l).desired_width(170.0));
-                ui.label("L:");
-            },
-        );
-
-        Self::list_row(
-            ui,
-            "Timecode vinyl",
-            "Control playback speed and position with timecode records or CDs.",
-            |ui| {
-                ui.label(
-                    RichText::new("Not available yet")
-                        .color(TraktorTheme::TEXT_SECONDARY())
-                        .font(egui::FontId::monospace(11.0))
-                        .strong(),
-                );
-            },
-        );
-    }
-
-    fn show_external_sync(&mut self, ui: &mut Ui) {
-        Self::list_section_header(ui, "Sync");
-
-        Self::list_row(
-            ui,
-            "Tempo leader",
-            "Follow the playing deck automatically or hold a fixed master tempo.",
-            |ui| {
-                let modes = ["Follow playing deck", "Manual tempo"];
-                egui::ComboBox::from_id_salt("clock_mode_combo")
-                    .selected_text(modes[self.clock_mode.min(1)])
-                    .width(220.0)
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.clock_mode, 0, modes[0]);
-                        ui.selectable_value(&mut self.clock_mode, 1, modes[1]);
-                    });
-            },
-        );
-
-        Self::list_row(
-            ui,
-            "Send MIDI clock",
-            "Keep external drum machines and synths in time over MIDI.",
-            |ui| {
-                crate::dot::dot_toggle(ui, &mut self.send_midi_clock, TraktorTheme::PLAY_ACTIVE(), "Send MIDI clock");
-            },
-        );
-
-        Self::list_row(
-            ui,
-            "MIDI clock offset",
-            "Nudge the MIDI clock early or late to line up external gear.",
-            |ui| {
-                let txt = format!("{:.1} ms", self.midi_clock_offset_ms);
-                crate::dot::dot_slider(ui, &mut self.midi_clock_offset_ms, -50.0, 50.0, 0.0, &txt, TraktorTheme::ACCENT())
-                    .on_hover_text("Compensate for hardware or USB latency in milliseconds");
-            },
-        );
-
-        Self::list_row(
-            ui,
-            "Ableton Link",
-            "Share tempo and beat phase with other music apps on your network.",
-            |ui| {
-                crate::dot::dot_toggle(ui, &mut self.ableton_link_enabled, TraktorTheme::PLAY_ACTIVE(), "Ableton Link");
-            },
-        );
-    }
-
     fn show_mixer_prefs(&mut self, ui: &mut Ui) {
         Self::list_section_header(ui, "Mixer");
-
-        let models = [
-            "Z ISO (full kill)",
-            "Classic",
-            "P600 (club)",
-            "Nuo (warm lows)",
-            "Xone:92 (4-band)",
-        ];
-        Self::list_row(
-            ui,
-            "EQ style",
-            "How the high, mid, and low knobs shape and cut each frequency band.",
-            |ui| {
-                egui::ComboBox::from_id_salt("eq_model_combo")
-                    .selected_text(models[self.eq_model_idx.min(models.len() - 1)])
-                    .width(220.0)
-                    .show_ui(ui, |ui| {
-                        for (i, m) in models.iter().enumerate() {
-                            ui.selectable_value(&mut self.eq_model_idx, i, *m);
-                        }
-                    });
-            },
-        );
-
-        let filters = [
-            "Ladder (warm, resonant)",
-            "Clean",
-            "Synth (Pro-53)",
-        ];
-        Self::list_row(
-            ui,
-            "Filter style",
-            "Character of the channel filter knob.",
-            |ui| {
-                egui::ComboBox::from_id_salt("filter_model_combo")
-                    .selected_text(filters[self.filter_model_idx.min(filters.len() - 1)])
-                    .width(220.0)
-                    .show_ui(ui, |ui| {
-                        for (i, f) in filters.iter().enumerate() {
-                            ui.selectable_value(&mut self.filter_model_idx, i, *f);
-                        }
-                    });
-            },
-        );
-
-        Self::list_row(
-            ui,
-            "Filter resonance",
-            "How sharp the filter sounds around its cutoff point.",
-            |ui| {
-                let txt = format!("{:.2}", self.filter_resonance);
-                crate::dot::dot_slider(ui, &mut self.filter_resonance, 0.0, 1.0, 0.5, &txt, TraktorTheme::ACCENT())
-                    .on_hover_text("How sharp the filter sounds around its cutoff point.");
-            },
-        );
 
         let curves = [
             "Smooth blend",
@@ -1175,38 +876,6 @@ impl PreferencesDialog {
             "Keep loud peaks on the main output from clipping.",
             |ui| {
                 crate::dot::dot_toggle(ui, &mut self.limiter_enabled, TraktorTheme::PLAY_ACTIVE(), "Master limiter");
-            },
-        );
-
-        if self.limiter_enabled {
-            let headrooms = [
-                "None (0 dB)",
-                "-3 dB (recommended)",
-                "-6 dB (extra headroom)",
-            ];
-            Self::list_row(
-                ui,
-                "Headroom",
-                "Leave breathing room before the limiter kicks in.",
-                |ui| {
-                    egui::ComboBox::from_id_salt("limiter_headroom_combo")
-                        .selected_text(headrooms[self.limiter_headroom.min(2)])
-                        .width(220.0)
-                        .show_ui(ui, |ui| {
-                            for (i, h) in headrooms.iter().enumerate() {
-                                ui.selectable_value(&mut self.limiter_headroom, i, *h);
-                            }
-                        });
-                },
-            );
-        }
-
-        Self::list_row(
-            ui,
-            "EQ controls stems",
-            "Hardware EQ knobs (MX2 or MIDI) set vocal, instrument and drum levels instead of EQ. On screen, the deck STEMS button turns the mixer into stem controls either way.",
-            |ui| {
-                crate::dot::dot_toggle(ui, &mut self.neural_mix_eq_mode, TraktorTheme::PLAY_ACTIVE(), "EQ controls stems");
             },
         );
     }
@@ -1269,27 +938,6 @@ impl PreferencesDialog {
                 });
         }
 
-        let stem_modes = [
-            "Automatic (Demucs + live fallback)",
-            "Live frequency split only",
-            "Saved stem files only",
-        ];
-        Self::list_row(
-            ui,
-            "Separation mode",
-            "Use Demucs when available, live frequency splitting, or saved stem files.",
-            |ui| {
-                egui::ComboBox::from_id_salt("stem_engine_mode_combo")
-                    .selected_text(stem_modes[self.stems_engine_mode.min(2)])
-                    .width(240.0)
-                    .show_ui(ui, |ui| {
-                        for (i, m) in stem_modes.iter().enumerate() {
-                            ui.selectable_value(&mut self.stems_engine_mode, i, *m);
-                        }
-                    });
-            },
-        );
-
         Self::list_row(
             ui,
             "EQ controls stems",
@@ -1333,33 +981,6 @@ impl PreferencesDialog {
                     });
             },
         );
-
-        Self::list_row(
-            ui,
-            "Minute markers",
-            "Draw a tick every minute along the full-track overview bar.",
-            |ui| {
-                crate::dot::dot_toggle(ui, &mut self.show_minute_markers, TraktorTheme::PLAY_ACTIVE(), "Minute markers");
-            },
-        );
-
-        Self::list_row(
-            ui,
-            "Beat markers",
-            "Draw beat and bar lines on the scrolling waveform.",
-            |ui| {
-                crate::dot::dot_toggle(ui, &mut self.show_beatgrid_ticks, TraktorTheme::PLAY_ACTIVE(), "Beat markers");
-            },
-        );
-
-        Self::list_row(
-            ui,
-            "Fit full track in overview",
-            "Always fit the entire song into the small overview stripe.",
-            |ui| {
-                crate::dot::dot_toggle(ui, &mut self.stripe_fit_full, TraktorTheme::PLAY_ACTIVE(), "Fit full track in overview");
-            },
-        );
     }
 
     fn show_track_decks_prefs(&mut self, ui: &mut Ui) {
@@ -1371,29 +992,6 @@ impl PreferencesDialog {
             "Stop a new track from loading onto a deck that is currently playing.",
             |ui| {
                 crate::dot::dot_toggle(ui, &mut self.lock_playing_decks, TraktorTheme::PLAY_ACTIVE(), "Lock playing decks");
-            },
-        );
-
-        let ranges = [
-            "±8%",
-            "±16%",
-            "±32%",
-            "±50%",
-            "±100%",
-        ];
-        Self::list_row(
-            ui,
-            "Tempo fader range",
-            "How far the tempo slider can speed up or slow down a track.",
-            |ui| {
-                egui::ComboBox::from_id_salt("pitch_range_combo")
-                    .selected_text(ranges[self.pitch_range_idx.min(4)])
-                    .width(180.0)
-                    .show_ui(ui, |ui| {
-                        for (i, r) in ranges.iter().enumerate() {
-                            ui.selectable_value(&mut self.pitch_range_idx, i, *r);
-                        }
-                    });
             },
         );
 
@@ -1411,32 +1009,6 @@ impl PreferencesDialog {
                             ui.selectable_value(&mut self.keylock_quality, i, *m);
                         }
                     });
-            },
-        );
-
-        let positions = ["Centre", "Left of centre"];
-        Self::list_row(
-            ui,
-            "Playhead position",
-            "Where the playhead sits on the scrolling waveform.",
-            |ui| {
-                egui::ComboBox::from_id_salt("play_marker_combo")
-                    .selected_text(positions[self.play_marker_pos.min(1)])
-                    .width(200.0)
-                    .show_ui(ui, |ui| {
-                        for (i, p) in positions.iter().enumerate() {
-                            ui.selectable_value(&mut self.play_marker_pos, i, *p);
-                        }
-                    });
-            },
-        );
-
-        Self::list_row(
-            ui,
-            "Auto cue on load",
-            "Park newly loaded tracks at their first cue point.",
-            |ui| {
-                crate::dot::dot_toggle(ui, &mut self.auto_cue_on_load, TraktorTheme::PLAY_ACTIVE(), "Jump to cue on load");
             },
         );
 
@@ -1462,43 +1034,6 @@ impl PreferencesDialog {
     }
 
     fn show_effects_prefs(&mut self, ui: &mut Ui) {
-        Self::list_section_header(ui, "Effects");
-
-        let unit_counts = ["2 units", "4 units"];
-        Self::list_row(
-            ui,
-            "FX units",
-            "How many effect units appear at the top of the screen.",
-            |ui| {
-                egui::ComboBox::from_id_salt("fx_units_count_combo")
-                    .selected_text(unit_counts[self.fx_units_count.min(1)])
-                    .width(200.0)
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.fx_units_count, 0, unit_counts[0]);
-                        ui.selectable_value(&mut self.fx_units_count, 1, unit_counts[1]);
-                    });
-            },
-        );
-
-        let panel_modes = [
-            "Group (3 effects)",
-            "Single (detailed)",
-        ];
-        Self::list_row(
-            ui,
-            "FX unit mode",
-            "Chain three simple effects together or control one effect in detail.",
-            |ui| {
-                egui::ComboBox::from_id_salt("fx_panel_mode_combo")
-                    .selected_text(panel_modes[self.fx_panel_mode.min(1)])
-                    .width(200.0)
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.fx_panel_mode, 0, panel_modes[0]);
-                        ui.selectable_value(&mut self.fx_panel_mode, 1, panel_modes[1]);
-                    });
-            },
-        );
-
         Self::list_section_header(ui, "Channel FX");
         let fx_options = [
             "Filter",
@@ -1546,76 +1081,6 @@ impl PreferencesDialog {
                 let home = std::env::var("HOME").unwrap_or_default();
                 let shown = if home.is_empty() { path_str.to_string() } else { path_str.replacen(&home, "~", 1) };
                 ui.add(egui::Label::new(RichText::new(shown).monospace().color(TraktorTheme::TEXT_PRIMARY())).truncate()).on_hover_text(path_str);
-            },
-        );
-
-        let formats = [
-            "16-bit WAV (CD quality)",
-            "24-bit WAV (studio)",
-        ];
-        Self::list_row(
-            ui,
-            "Recording quality",
-            "Bit depth for recorded WAV files.",
-            |ui| {
-                egui::ComboBox::from_id_salt("rec_format_combo")
-                    .selected_text(formats[self.recording_format.min(1)])
-                    .width(220.0)
-                    .show_ui(ui, |ui| {
-                        for (i, f) in formats.iter().enumerate() {
-                            ui.selectable_value(&mut self.recording_format, i, *f);
-                        }
-                    });
-            },
-        );
-
-        Self::list_section_header(ui, "Live stream");
-
-        Self::list_row(
-            ui,
-            "Stream server",
-            "Address of your Icecast or Shoutcast server.",
-            |ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.broadcast_host).desired_width(200.0));
-            },
-        );
-
-        Self::list_row(
-            ui,
-            "Port",
-            "Server port (usually 8000).",
-            |ui| {
-                let mut port_str = self.broadcast_port.to_string();
-                if ui
-                    .add(egui::TextEdit::singleline(&mut port_str).desired_width(100.0))
-                    .changed()
-                {
-                    if let Ok(p) = port_str.parse::<u16>() {
-                        self.broadcast_port = p;
-                    }
-                }
-            },
-        );
-
-        Self::list_row(
-            ui,
-            "Mount path",
-            "Stream path on the server, such as /retraktor.mp3.",
-            |ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.broadcast_mount).desired_width(200.0));
-            },
-        );
-
-        Self::list_row(
-            ui,
-            "Password",
-            "Source password for your streaming server.",
-            |ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.broadcast_password)
-                        .password(true)
-                        .desired_width(200.0),
-                );
             },
         );
     }
@@ -1762,62 +1227,6 @@ impl PreferencesDialog {
             "Estimated dancefloor intensity from 1 to 10.",
             |ui| {
                 crate::dot::dot_toggle(ui, &mut self.library_columns.energy, TraktorTheme::PLAY_ACTIVE(), "Energy");
-            },
-        );
-    }
-
-    fn show_analyze_prefs(&mut self, ui: &mut Ui) {
-        Self::list_section_header(ui, "Analysis");
-
-        let ranges = [
-            "70–140 BPM (house, techno, pop)",
-            "60–120 BPM (hip-hop, downtempo)",
-            "90–180 BPM (drum & bass, jungle)",
-            "110–220 BPM (hardcore, fast)",
-        ];
-        Self::list_row(
-            ui,
-            "BPM range",
-            "Expected tempo range so half-time and double-time tracks read accurately.",
-            |ui| {
-                egui::ComboBox::from_id_salt("bpm_range_combo")
-                    .selected_text(ranges[self.bpm_detection_range.min(3)])
-                    .width(240.0)
-                    .show_ui(ui, |ui| {
-                        for (i, r) in ranges.iter().enumerate() {
-                            ui.selectable_value(&mut self.bpm_detection_range, i, *r);
-                        }
-                    });
-            },
-        );
-
-        let keys = [
-            "Open Key (1d / 1m)",
-            "Camelot (8A / 8B)",
-            "Musical (Am, C)",
-        ];
-        Self::list_row(
-            ui,
-            "Key format",
-            "How musical keys are written in the library and on the decks.",
-            |ui| {
-                egui::ComboBox::from_id_salt("key_notation_combo")
-                    .selected_text(keys[self.key_notation_idx.min(2)])
-                    .width(220.0)
-                    .show_ui(ui, |ui| {
-                        for (i, k) in keys.iter().enumerate() {
-                            ui.selectable_value(&mut self.key_notation_idx, i, *k);
-                        }
-                    });
-            },
-        );
-
-        Self::list_row(
-            ui,
-            "Analyse on import",
-            "Find BPM, beatgrid, and key automatically when you add files.",
-            |ui| {
-                crate::dot::dot_toggle(ui, &mut self.analyze_new_tracks, TraktorTheme::PLAY_ACTIVE(), "Analyse on import");
             },
         );
     }
@@ -2056,24 +1465,6 @@ impl PreferencesDialog {
                         }
                     });
             });
-
-        Self::list_row(
-            ui,
-            "Under-glow brightness",
-            "Adjust base LED intensity on Traktor MX2.",
-            |ui| {
-                let disp = format!("{:.0}%", self.mx2_bottom_led_brightness * 100.0);
-                crate::dot::dot_slider(
-                    ui,
-                    &mut self.mx2_bottom_led_brightness,
-                    0.1,
-                    1.0,
-                    0.5,
-                    &disp,
-                    TraktorTheme::ACCENT(),
-                );
-            },
-        );
     }
 
     fn show_file_management(&mut self, ui: &mut Ui) {
@@ -2088,6 +1479,15 @@ impl PreferencesDialog {
                     self.collection_save_format = if m3u { 2 } else { 0 };
                 }
                 ui.label(RichText::new("Also export collection.m3u8 on exit").size(11.0).color(TraktorTheme::TEXT_SECONDARY()));
+            },
+        );
+
+        Self::list_row(
+            ui,
+            "Hide missing files",
+            "Hide tracks whose files cannot be found — handy when switching external drives. They remain visible under Missing.",
+            |ui| {
+                crate::dot::dot_toggle(ui, &mut self.hide_missing_files, TraktorTheme::PLAY_ACTIVE(), "Hide missing files");
             },
         );
 
@@ -2367,11 +1767,11 @@ fn choose_pair(mut pairs: [u8; 2], bus: usize, pair: u8) -> [u8; 2] {
     pairs
 }
 
-/// The saved pairs as one JSON line, by first channel: `{"pw:k2": {"main": 3, "headphones": 1}}`.
-fn output_pairs_json(pairs: &std::collections::BTreeMap<String, [u8; 2]>) -> String {
+/// The saved pairs as a JSON object by first channel: `{"pw:k2": {"main": 3, "headphones": 1}}`.
+fn output_pairs_value(pairs: &std::collections::BTreeMap<String, [u8; 2]>) -> serde_json::Value {
     let first_channel = |pair: u8| 2 * pair as u16 + 1;
     let saved = pairs.iter().map(|(id, [main, phones])| (id.clone(), serde_json::json!({ "main": first_channel(*main), "headphones": first_channel(*phones) })));
-    serde_json::Value::Object(saved.collect()).to_string()
+    serde_json::Value::Object(saved.collect())
 }
 
 /// Saved pairs back as pair indices. An entry that isn't two different odd first channels on the first
@@ -2405,39 +1805,12 @@ fn error_summary(error: &str) -> String {
     s
 }
 
-/// "SCAN & IMPORT OPTIONS" -> "Scan & import options", keeping acronyms upper-case.
-fn sentence_case(title: &str) -> String {
-    const KEEP: [&str; 12] = ["MX2", "AI", "EQ", "FX", "MIDI", "HID", "USB", "BPM", "NML", "ALSA", "DJ", "LED"];
-    title
-        .split(' ')
-        .enumerate()
-        .map(|(i, w)| {
-            if KEEP.iter().any(|k| w.trim_matches(|c: char| !c.is_alphanumeric()).eq_ignore_ascii_case(k)) {
-                w.to_uppercase()
-            } else if i == 0 {
-                let lower = w.to_lowercase();
-                let mut c = lower.chars();
-                c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
-            } else {
-                w.to_lowercase()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 #[cfg(test)]
 mod tests {
     #[test]
     fn error_summary_takes_last_line() {
         let e = "Demucs verification failed: Traceback (most recent call last):\n  File x\nModuleNotFoundError: No module named 'numpy'\n";
         assert_eq!(super::error_summary(e), "ModuleNotFoundError: No module named 'numpy'");
-    }
-
-    #[test]
-    fn sentence_case_keeps_acronyms() {
-        assert_eq!(super::sentence_case("SCAN & IMPORT OPTIONS"), "Scan & import options");
-        assert_eq!(super::sentence_case("MX2 MAIN EQ (HI)"), "MX2 main EQ (hi)");
     }
 
     use super::*;
@@ -2489,8 +1862,7 @@ mod tests {
 
         assert_eq!(prefs.buffer_size, 128);
         assert_eq!(prefs.sample_rate, 48000);
-        assert_eq!(prefs.mixing_mode, 0);
-        assert_eq!(prefs.limiter_headroom, 1);
+        assert!(!prefs.hide_missing_files);
     }
 
     #[test]
@@ -2506,9 +1878,18 @@ mod tests {
         original.library_columns.bitrate = true;
         original.collection_save_format = 2;
         original.waveform_color_mode = 1;
-        original.music_folders = vec!["/DATA/Media/Music".into(), "/home/dj/My Music, Old".into()];
+        original.hide_missing_files = true;
+        original.neural_mix_eq_mode = true;
+        original.recording_dir = PathBuf::from(r#"/mnt/usb:1/Sets "Live"\2026"#);
+        original.mixer_fx_slots = [4, 2, 7, 1];
+        original.music_folders = vec![
+            "/DATA/Media/Music".into(),
+            "/home/dj/My Music, Old".into(),
+            r#"/mnt/drive:a/Best "Club" Mixes\Techno"#.into(),
+        ];
 
         let json = original.to_json_str();
+        assert!(serde_json::from_str::<serde_json::Value>(&json).is_ok(), "must emit valid JSON: {json}");
         let mut restored = PreferencesDialog::default();
         restored.apply_json_str(&json);
 
@@ -2522,6 +1903,10 @@ mod tests {
         assert!(restored.library_columns.bitrate);
         assert_eq!(restored.collection_save_format, 2);
         assert_eq!(restored.waveform_color_mode, 1);
+        assert!(restored.hide_missing_files);
+        assert!(restored.neural_mix_eq_mode);
+        assert_eq!(restored.recording_dir, original.recording_dir);
+        assert_eq!(restored.mixer_fx_slots, [4, 2, 7, 1]);
         assert_eq!(restored.music_folders, original.music_folders);
     }
 
@@ -2552,11 +1937,15 @@ mod tests {
         let mut restored = PreferencesDialog::default();
         restored.apply_json_str(&json);
         assert_eq!((restored.audio_device_name.as_str(), &restored.output_pairs), (odd_id, &prefs.output_pairs), "{json}");
-        let broken_folder = json.replace("\"music_folders\": [", "\"music_folders\": [\"/a\"b\\c\", ");
-        assert!(serde_json::from_str::<serde_json::Value>(&broken_folder).is_err(), "{broken_folder}");
+        let broken_legacy = format!(
+            "{{\n  \"audio_device_name\": {},\n  \"output_pairs\": {},\n  \"music_folders\": [\"/a\"b\\c\"]\n}}",
+            serde_json::json!(odd_id),
+            output_pairs_value(&prefs.output_pairs),
+        );
+        assert!(serde_json::from_str::<serde_json::Value>(&broken_legacy).is_err(), "{broken_legacy}");
         let mut legacy = PreferencesDialog::default();
-        legacy.apply_json_str(&broken_folder);
-        assert_eq!((legacy.audio_device_name.as_str(), &legacy.output_pairs), (odd_id, &prefs.output_pairs), "line by line: {broken_folder}");
+        legacy.apply_json_str(&broken_legacy);
+        assert_eq!((legacy.audio_device_name.as_str(), &legacy.output_pairs), (odd_id, &prefs.output_pairs), "line by line: {broken_legacy}");
         let pretty = serde_json::to_string_pretty(&serde_json::from_str::<serde_json::Value>(&json).unwrap()).unwrap();
         let mut reindented = PreferencesDialog::default();
         reindented.apply_json_str(&pretty);
