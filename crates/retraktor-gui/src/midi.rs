@@ -85,7 +85,7 @@ impl MidiParserState {
                 history.remove(0);
             }
             let mode = if history.contains(&63) && history.contains(&65)
-                && history.iter().all(|&v| (60..=68).contains(&v))
+                && history.iter().all(|&v| (60..=68).contains(&v) && v != 64)
             {
                 CcMode::Centered
             } else if history.contains(&1) && history.contains(&127)

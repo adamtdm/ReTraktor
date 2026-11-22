@@ -57,6 +57,8 @@ if command -v dpkg-deb >/dev/null 2>&1; then
     mkdir -p "$DEB_ROOT/etc/security/limits.d"
     mkdir -p "$DEB_ROOT/usr/share/applications"
     mkdir -p "$DEB_ROOT/usr/share/icons/hicolor/scalable/apps"
+    mkdir -p "$DEB_ROOT/usr/share/icons/hicolor/256x256/apps"
+    mkdir -p "$DEB_ROOT/usr/share/pixmaps"
 
     cp target/release/retraktor-gui "$DEB_ROOT/usr/bin/retraktor-gui"
     cp target/release/retraktor-cli "$DEB_ROOT/usr/bin/retraktor-cli"
@@ -70,6 +72,14 @@ if command -v dpkg-deb >/dev/null 2>&1; then
     cp assets/99-retraktor-realtime.conf "$DEB_ROOT/etc/security/limits.d/"
     cp assets/retraktor.desktop "$DEB_ROOT/usr/share/applications/"
     cp assets/retraktor.svg "$DEB_ROOT/usr/share/icons/hicolor/scalable/apps/"
+    cp assets/retraktor.png "$DEB_ROOT/usr/share/icons/hicolor/256x256/apps/retraktor.png"
+    cp assets/retraktor.png "$DEB_ROOT/usr/share/pixmaps/retraktor.png"
+    if command -v rsvg-convert >/dev/null 2>&1; then
+        for sz in 48 128 512; do
+            mkdir -p "$DEB_ROOT/usr/share/icons/hicolor/${sz}x${sz}/apps"
+            rsvg-convert -w "$sz" -h "$sz" assets/retraktor.svg -o "$DEB_ROOT/usr/share/icons/hicolor/${sz}x${sz}/apps/retraktor.png"
+        done
+    fi
 
     cat > "$DEB_ROOT/DEBIAN/control" << EOF
 Package: retraktor
@@ -107,6 +117,7 @@ rm -rf "$APPDIR"
 mkdir -p "$APPDIR/usr/bin"
 mkdir -p "$APPDIR/usr/share/applications"
 mkdir -p "$APPDIR/usr/share/icons/hicolor/scalable/apps"
+mkdir -p "$APPDIR/usr/share/icons/hicolor/256x256/apps"
 
 cp target/release/retraktor-gui "$APPDIR/usr/bin/retraktor-gui"
 cp target/release/retraktor-cli "$APPDIR/usr/bin/retraktor-cli"
@@ -115,7 +126,9 @@ chmod 0755 "$APPDIR/usr/bin/retraktor-gui" "$APPDIR/usr/bin/retraktor-cli" "$APP
 cp assets/retraktor.desktop "$APPDIR/retraktor.desktop"
 cp assets/retraktor.desktop "$APPDIR/usr/share/applications/"
 cp assets/retraktor.svg "$APPDIR/retraktor.svg"
+cp assets/retraktor.png "$APPDIR/retraktor.png"
 cp assets/retraktor.svg "$APPDIR/usr/share/icons/hicolor/scalable/apps/"
+cp assets/retraktor.png "$APPDIR/usr/share/icons/hicolor/256x256/apps/retraktor.png"
 
 cat > "$APPDIR/AppRun" << 'EOF'
 #!/bin/sh

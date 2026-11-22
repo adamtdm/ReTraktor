@@ -164,8 +164,8 @@ impl FourDeckAudioEngine {
     /// (`< 0.55` Smooth, `0.55..0.9` Steep, `>= 0.9` Scratch cut). Every curve is a flat-top DJ blend:
     /// both sides sit at unity from their own end through the center and fade only across the far half.
     pub fn crossfader_gains(&self) -> (f32, f32) {
-        let x = self.crossfader.clamp(0.0, 1.0);
-        let curve = self.crossfader_curve;
+        let x = if self.crossfader.is_finite() { self.crossfader.clamp(0.0, 1.0) } else { 0.5 };
+        let curve = if self.crossfader_curve.is_finite() { self.crossfader_curve } else { 0.5 };
         if curve >= 0.9 {
             // Scratch: cut in over the outer 5% of travel.
             return (((1.0 - x) * 20.0).clamp(0.0, 1.0), (x * 20.0).clamp(0.0, 1.0));

@@ -330,7 +330,9 @@ pub fn cue_sheet(entries: &[(f64, &str, &str)], wav_file_name: &str) -> String {
     let wav_base = Path::new(wav_file_name)
         .file_name()
         .and_then(|n| n.to_str())
-        .unwrap_or(wav_file_name);
+        .unwrap_or(wav_file_name)
+        .replace('"', "'")
+        .replace(['\r', '\n'], " ");
 
     let mut out = format!("FILE \"{wav_base}\" WAVE\n");
     for (i, &(start_sec, artist, title)) in entries.iter().enumerate() {

@@ -120,12 +120,14 @@ impl Svf {
 
     /// Same, with damping `k = 1/Q` (smaller = more resonant).
     fn tick_k(&mut self, x: f32, g: f32, k: f32) -> (f32, f32, f32) {
+        let x = if x.is_finite() { x } else { 0.0 };
         let a1 = 1.0 / (1.0 + g * (g + k));
         let v3 = x - self.ic2;
         let v1 = a1 * self.ic1 + g * a1 * v3;
         let v2 = self.ic2 + g * v1;
-        self.ic1 = 2.0 * v1 - self.ic1;
-        self.ic2 = 2.0 * v2 - self.ic2;
+        let flush = |v: f32| if !v.is_finite() || v.abs() < 1e-15 { 0.0 } else { v };
+        self.ic1 = flush(2.0 * v1 - self.ic1);
+        self.ic2 = flush(2.0 * v2 - self.ic2);
         (v2, v1, x - k * v1 - v2)
     }
 }
@@ -205,7 +207,7 @@ impl DelayLine {
     /// The sample written `d` writes ago (linear interpolation, clamped to the buffer).
     fn read(&self, d: f32) -> f32 {
         let len = self.buf.len();
-        let d = d.clamp(1.0, (len - 2) as f32);
+        let d = if d.is_finite() { d.clamp(1.0, (len - 2) as f32) } else { 1.0 };
         let i = d as usize;
         let a = self.buf[(self.pos + len - i) % len];
         let b = self.buf[(self.pos + len - i - 1) % len];
@@ -213,14 +215,22 @@ impl DelayLine {
     }
 
     fn write(&mut self, x: f32) {
-        // Flush near-silence so decaying feedback never lands on slow subnormals.
-        self.buf[self.pos] = if x.abs() < 1e-15 { 0.0 } else { x };
+        // Flush near-silence and non-finite inputs so decaying feedback never stalls or poisons the buffer.
+        self.buf[self.pos] = if !x.is_finite() || x.abs() < 1e-15 { 0.0 } else { x };
         self.pos = (self.pos + 1) % self.buf.len();
+    }
+
+    fn clear(&mut self) {
+        self.buf.fill(0.0);
+        self.pos = 0;
     }
 }
 
 /// Cubic soft clip: near-linear for small signals, saturates smoothly at ±1.
 fn soft_clip(x: f32) -> f32 {
+    if !x.is_finite() {
+        return 0.0;
+    }
     let x = x.clamp(-1.5, 1.5);
     x - x * x * x * (4.0 / 27.0)
 }
@@ -270,6 +280,7 @@ struct FxCore {
     hold_count: f32,
     rng: u32,
     quiet: usize,
+    last_kind: MixerFxKind,
 }
 
 impl Default for FxCore {
@@ -288,6 +299,7 @@ impl Default for FxCore {
             hold_count: 0.0,
             rng: 0x9E37_79B9,
             quiet: DELAY_FRAMES,
+            last_kind: MixerFxKind::Filter,
         }
     }
 }
@@ -301,12 +313,25 @@ impl FxCore {
     /// Feeds sends at `send` level (`0` = off, so tails ring out) and returns the wet frame, or `None`
     /// once the FX is off and its tail has died, so callers pass dry audio without running anything.
     fn run(&mut self, kind: MixerFxKind, send: f32, x: (f32, f32), p: [f32; 3], sr: f32, bpm: f32) -> Option<(f32, f32)> {
+        if kind != self.last_kind {
+            // Avoid feeding stale delay-line audio into a newly selected delay/flanger effect.
+            for d in &mut self.delay {
+                d.clear();
+            }
+            self.svf = Default::default();
+            self.tone = Default::default();
+            self.last_kind = kind;
+            self.quiet = DELAY_FRAMES;
+        }
         let is_send = Self::is_send(kind);
+        let send = if send.is_finite() { send.clamp(0.0, 1.0) } else { 0.0 };
         if send <= 0.0 && (!is_send || self.quiet >= DELAY_FRAMES) {
             return None;
         }
         let s = if is_send { send } else { 1.0 };
-        let (a, b) = self.process(kind, (x.0 * s, x.1 * s), p, sr, bpm);
+        let in_l = if x.0.is_finite() { x.0 * s } else { 0.0 };
+        let in_r = if x.1.is_finite() { x.1 * s } else { 0.0 };
+        let (a, b) = self.process(kind, (in_l, in_r), p, sr, bpm);
         // Noise ignores its input, so the send level scales its output instead.
         let y = if kind == MixerFxKind::Noise { (a * s, b * s) } else { (a, b) };
         self.quiet = if y.0.abs().max(y.1.abs()) > 1e-5 { 0 } else { (self.quiet + 1).min(DELAY_FRAMES) };
@@ -318,9 +343,15 @@ impl FxCore {
     /// (Filter: LPF..HPF cutoff, Flanger: polarity, BarberPole: falling..rising).
     fn process(&mut self, kind: MixerFxKind, x: (f32, f32), p: [f32; 3], sr: f32, bpm: f32) -> (f32, f32) {
         use std::f32::consts::{FRAC_1_SQRT_2, TAU};
-        let sr = sr.max(8_000.0);
-        let [amount, feedback, tone] = [p[0].clamp(0.0, 1.0), p[1].clamp(0.0, 1.0), p[2].clamp(-1.0, 1.0)];
-        let beat = 60.0 * sr / bpm.clamp(20.0, 300.0); // samples per beat
+        let sr = if sr.is_finite() { sr.max(8_000.0) } else { 48_000.0 };
+        let bpm = if bpm.is_finite() { bpm.clamp(20.0, 300.0) } else { 128.0 };
+        let clamp_or = |v: f32, lo: f32, hi: f32, def: f32| if v.is_finite() { v.clamp(lo, hi) } else { def };
+        let [amount, feedback, tone] = [
+            clamp_or(p[0], 0.0, 1.0, 0.5),
+            clamp_or(p[1], 0.0, 1.0, 0.5),
+            clamp_or(p[2], -1.0, 1.0, 0.0),
+        ];
+        let beat = 60.0 * sr / bpm; // samples per beat
         self.beats = (self.beats + 1.0 / beat as f64) % 256.0;
         let mult = sync_mult(amount);
         let tg = if matches!(kind, MixerFxKind::Reverb | MixerFxKind::DualDelay | MixerFxKind::DottedDelay | MixerFxKind::Crush) {
@@ -328,7 +359,7 @@ impl FxCore {
         } else {
             0.0
         };
-        let x = [x.0, x.1];
+        let x = [if x.0.is_finite() { x.0 } else { 0.0 }, if x.1.is_finite() { x.1 } else { 0.0 }];
         let mut y = [0.0f32; 2];
         match kind {
             MixerFxKind::Filter => {
@@ -342,23 +373,29 @@ impl FxCore {
             }
             MixerFxKind::Reverb => {
                 let scale = (0.5 + amount) * sr / 44_100.0;
-                let room = 0.7 + 0.28 * feedback;
-                let input = (x[0] + x[1]) * 0.5 * 0.1;
+                let room = 0.72 + 0.24 * feedback;
+                let damp_a = (1.0 - (-TAU * 12_000.0 / sr).exp()).clamp(0.1, 0.95);
+                let input = (x[0] + x[1]) * 0.5 * 0.25;
                 for c in 0..2 {
                     let spread = c as f32 * STEREO_SPREAD;
                     let mut acc = 0.0;
                     for (i, len) in COMB_LENS.iter().enumerate() {
-                        let out = self.combs[c][i].read(((len + spread) * scale).round());
+                        let out = self.combs[c][i].read((len + spread) * scale);
                         let lp = &mut self.comb_lp[c][i];
-                        *lp = out * 0.8 + *lp * 0.2;
-                        self.combs[c][i].write(input + *lp * room);
+                        *lp += (out - *lp) * damp_a;
+                        if lp.abs() < 1e-15 {
+                            *lp = 0.0;
+                        }
+                        self.combs[c][i].write(soft_clip(input + *lp * room));
                         acc += out;
                     }
                     for (i, len) in ALLPASS_LENS.iter().enumerate() {
                         let ap = &mut self.allpass[c][i];
-                        let b = ap.read(((len + spread) * sr / 44_100.0).round());
-                        ap.write(acc + b * 0.5);
-                        acc = b - acc;
+                        let b = ap.read((len + spread) * sr / 44_100.0);
+                        // Unity-magnitude Schroeder allpass: H(z) = (z^-M - g) / (1 - g z^-M), g = 0.5.
+                        let v = acc + b * 0.5;
+                        ap.write(v);
+                        acc = b - 0.5 * v;
                     }
                     y[c] = tone_tick(&mut self.tone[c], acc, tone, tg);
                 }
@@ -426,7 +463,7 @@ impl FxCore {
             }
             MixerFxKind::Crush => {
                 let steps = 2f32.powf(16.0 - 13.0 * amount); // 16 -> 3 bits
-                let period = 1.0 + 31.0 * amount; // sample-and-hold decimation
+                let period = 1.0 + 31.0 * amount * (sr / 48_000.0); // sample-and-hold decimation, rate-normalized
                 self.hold_count += 1.0;
                 if self.hold_count >= period {
                     self.hold_count -= period;
@@ -449,12 +486,13 @@ pub struct BipolarFilter {
     pub knob: f32,
     pub enabled: bool,
     pos: f32,
+    last_sign: f32,
     core: FxCore,
 }
 
 impl Default for BipolarFilter {
     fn default() -> Self {
-        Self { kind: MixerFxKind::Filter, knob: 0.5, enabled: false, pos: 0.0, core: FxCore::default() }
+        Self { kind: MixerFxKind::Filter, knob: 0.5, enabled: false, pos: 0.0, last_sign: 1.0, core: FxCore::default() }
     }
 }
 
@@ -467,13 +505,21 @@ impl BipolarFilter {
     }
 
     pub fn process_at(&mut self, in_l: f32, in_r: f32, sample_rate: f32, bpm: f32) -> (f32, f32) {
-        let target = if self.enabled && (self.knob - 0.5).abs() >= 0.01 { ((self.knob - 0.5) * 2.0).clamp(-1.0, 1.0) } else { 0.0 };
-        self.pos = approach(self.pos, target, sample_rate);
+        let in_l = if in_l.is_finite() { in_l } else { 0.0 };
+        let in_r = if in_r.is_finite() { in_r } else { 0.0 };
+        let knob = if self.knob.is_finite() { self.knob } else { 0.5 };
+        let target = if self.enabled && (knob - 0.5).abs() >= 0.01 { ((knob - 0.5) * 2.0).clamp(-1.0, 1.0) } else { 0.0 };
+        self.pos = approach(self.pos, target, if sample_rate.is_finite() { sample_rate } else { 48_000.0 });
         let (pos, d) = (self.pos, self.pos.abs());
-        let side = |below: f32, above: f32| if pos < 0.0 { below } else { above };
+        if pos.abs() > 0.01 {
+            self.last_sign = pos.signum();
+        }
+        // Keep the active tap side while a send tail rings out back through center.
+        let side = |below: f32, above: f32| if self.last_sign < 0.0 { below } else { above };
         let [amount, feedback] = match self.kind {
             MixerFxKind::Filter => [0.5, 0.35],
-            MixerFxKind::Reverb => [0.3 + 0.5 * d, d],
+            // Fixed room size avoids pitch-scrubbing comb delays as the knob returns to center.
+            MixerFxKind::Reverb => [0.6, 0.25 + 0.7 * d],
             MixerFxKind::DualDelay => [0.5, 0.3 + 0.55 * d],
             MixerFxKind::DottedDelay => [side(0.5, 0.75), 0.3 + 0.55 * d], // dotted 1/8 or dotted 1/4
             MixerFxKind::Noise => [1.0, 0.5],
@@ -515,15 +561,22 @@ impl Default for DeckFxUnit {
 
 impl DeckFxUnit {
     pub fn process(&mut self, in_l: f32, in_r: f32, sample_rate: f32, bpm: f32) -> (f32, f32) {
-        let target = if self.enabled && self.dry_wet > 0.001 { 1.0 } else { 0.0 };
-        self.on = approach(self.on, target, sample_rate);
-        let [p0, p1, p2] = self.params;
-        let tone = (if self.kind == MixerFxKind::Filter { p0 } else { p2 }.clamp(0.0, 1.0) - 0.5) * 2.0;
-        let Some((wl, wr)) = self.core.run(self.kind, self.on, (in_l, in_r), [p0, p1, tone], sample_rate, bpm) else {
+        let in_l = if in_l.is_finite() { in_l } else { 0.0 };
+        let in_r = if in_r.is_finite() { in_r } else { 0.0 };
+        let dw = if self.dry_wet.is_finite() { self.dry_wet.clamp(0.0, 1.0) } else { 0.0 };
+        let sr = if sample_rate.is_finite() { sample_rate } else { 48_000.0 };
+        let target = if self.enabled && dw > 0.001 { 1.0 } else { 0.0 };
+        self.on = approach(self.on, target, sr);
+        let [p0, p1, p2] = self.params.map(|v| if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.5 });
+        let tone = (if self.kind == MixerFxKind::Filter { p0 } else { p2 } - 0.5) * 2.0;
+        let Some((wl, wr)) = self.core.run(self.kind, self.on, (in_l, in_r), [p0, p1, tone], sr, bpm) else {
             return (in_l, in_r);
         };
-        let dw = self.dry_wet.clamp(0.0, 1.0);
-        let m = self.on * dw;
+        let mut m = self.on * dw;
+        if self.kind == MixerFxKind::Filter {
+            // Smoothly pass dry through center so crossing LPF <-> HPF never clicks.
+            m *= (tone.abs() * 4.0).min(1.0);
+        }
         if FxCore::is_send(self.kind) {
             // The tail keeps its level after switching off so it rings out instead of cutting.
             (in_l * (1.0 - m) + wl * dw, in_r * (1.0 - m) + wr * dw)
@@ -722,14 +775,19 @@ impl OzoneMaximizerDsp {
     }
 
     pub fn process_stereo_at(&mut self, left: f32, right: f32, sample_rate: f32) -> (f32, f32) {
+        let left = if left.is_finite() { left } else { 0.0 };
+        let right = if right.is_finite() { right } else { 0.0 };
         if !self.enabled {
             return (left, right);
         }
-        let key = (self.boost_db, self.ceiling_db, sample_rate);
+        let boost_db = if self.boost_db.is_finite() { self.boost_db } else { 0.0 };
+        let ceiling_db = if self.ceiling_db.is_finite() { self.ceiling_db } else { -0.3 };
+        let sr = if sample_rate.is_finite() { sample_rate.max(1.0) } else { 48_000.0 };
+        let key = (boost_db, ceiling_db, sr);
         if key != self.cache_key {
             // Release is 0.995 per sample at 48 kHz (~4 ms), kept the same length in time at other rates.
-            let release = 0.995_f32.powf(48_000.0 / sample_rate.max(1.0));
-            self.cache = (10.0_f32.powf(self.boost_db / 20.0), 10.0_f32.powf(self.ceiling_db / 20.0), release);
+            let release = 0.995_f32.powf(48_000.0 / sr);
+            self.cache = (10.0_f32.powf(boost_db / 20.0), 10.0_f32.powf(ceiling_db / 20.0), release);
             self.cache_key = key;
         }
         let (pre_gain, ceiling, release) = self.cache;
@@ -740,6 +798,9 @@ impl OzoneMaximizerDsp {
             self.envelope = peak;
         } else {
             self.envelope = self.envelope * release + peak * (1.0 - release);
+            if self.envelope < 1e-15 {
+                self.envelope = 0.0;
+            }
         }
         let atten = if self.envelope > ceiling {
             ceiling / self.envelope
@@ -892,6 +953,28 @@ mod tests {
             assert!(rest.iter().all(|(l, r)| l.is_finite() && r.is_finite()));
             assert_eq!(fx.process(0.25, -0.25, SR, 128.0), (0.25, -0.25), "{kind:?} not dry after tail");
         }
+    }
+
+    #[test]
+    fn dsp_guards_nan_and_filter_center_crossing_is_click_free() {
+        let mut fx = DeckFxUnit { enabled: true, kind: MixerFxKind::Filter, dry_wet: 1.0, params: [0.5, 0.5, 0.5], ..Default::default() };
+        let mut prev = 0.0f32;
+        for i in 0..4800 {
+            let x = (i as f32 * 440.0 * std::f32::consts::TAU / SR).sin();
+            fx.params[0] = 0.45 + 0.10 * (i as f32 / 4800.0);
+            let (l, r) = fx.process(x, x, SR, 128.0);
+            assert!(l.is_finite() && r.is_finite());
+            if i > 100 {
+                assert!((l - prev).abs() < 0.15, "click across Filter center at step {i}: {} -> {}", prev, l);
+            }
+            prev = l;
+        }
+        let mut bf = BipolarFilter { enabled: true, kind: MixerFxKind::Reverb, knob: f32::NAN, ..Default::default() };
+        let (l, r) = bf.process_at(f32::NAN, 0.5, f32::NAN, f32::NAN);
+        assert!(l.is_finite() && r.is_finite());
+        let mut oz = OzoneMaximizerDsp { boost_db: f32::NAN, ceiling_db: f32::NAN, ..Default::default() };
+        let (l, r) = oz.process_stereo_at(f32::NAN, 0.5, f32::NAN);
+        assert!(l.is_finite() && r.is_finite());
     }
 
     #[test]
