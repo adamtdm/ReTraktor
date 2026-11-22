@@ -186,15 +186,26 @@ impl StripeCache {
         static WRITES: AtomicU64 = AtomicU64::new(0);
         let unique = format!("tmp-{}-{}", std::process::id(), WRITES.fetch_add(1, Ordering::Relaxed));
         let temp = file.with_extension(unique);
+        let built = stripe(peaks, duration_sec);
+        let mut kept = None;
         let written = file
             .parent()
             .map_or(Ok(()), std::fs::create_dir_all)
-            .and_then(|_| std::fs::write(&temp, stripe(peaks, duration_sec).to_bytes()))
+            .and_then(|_| std::fs::write(&temp, built.to_bytes()))
             // A link never replaces a stripe another writer just kept; a damaged entry (or a folder without links) is renamed over.
-            .and_then(|_| std::fs::hard_link(&temp, &file).or_else(|_| if read(&file).is_some() { Ok(()) } else { std::fs::rename(&temp, &file) }));
+            .and_then(|_| {
+                std::fs::hard_link(&temp, &file).or_else(|_| {
+                    if let Some((existing, _)) = read(&file) {
+                        kept = Some(existing);
+                        Ok(())
+                    } else {
+                        std::fs::rename(&temp, &file)
+                    }
+                })
+            });
         let _ = std::fs::remove_file(&temp);
         written.ok()?;
-        self.load(path, Some(identity)).map(|(kept, _)| kept)
+        Some(reduce(&kept.as_ref().unwrap_or(&built).columns))
     }
 }
 

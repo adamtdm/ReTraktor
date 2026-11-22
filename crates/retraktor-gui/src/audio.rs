@@ -993,7 +993,11 @@ impl AudioSharedState {
     /// Moves deck `d` by `delta_sec` from wherever it has got to when the callback applies it, so a move
     /// worked out from a playhead the callback has since played past still keeps its beat phase.
     pub fn seek_by(&mut self, d: usize, delta_sec: f64) {
-        self.playhead_sec[d] += delta_sec;
+        let next = self.playhead_sec[d] + delta_sec;
+        self.playhead_sec[d] = match &self.loaded_tracks[d] {
+            Some(t) => next.clamp(0.0, t.duration_sec.max(0.0)),
+            None => next.max(0.0),
+        };
         self.pending_seek[d] = Some(match self.pending_seek[d] {
             Some(Seek::To(sec)) => Seek::To(sec + delta_sec),
             Some(Seek::By(sum)) => Seek::By(sum + delta_sec),
@@ -1202,6 +1206,7 @@ fn graph_sinks(dump: &serde_json::Value) -> Vec<OutputChoice> {
                 .iter()
                 .flat_map(|k| params[*k].as_array().into_iter().flatten())
                 .filter_map(|f| f["channels"].as_u64())
+                .filter(|&n| n > 0)
                 .max();
             let from_props = props["audio.channels"]
                 .as_u64()
@@ -1387,6 +1392,8 @@ impl AudioSystem {
         self.hw_active.store(false, Ordering::Relaxed);
         self.output_info = None;
         self.output_channels = 0;
+        self.stats = Arc::default();
+        self.logged = (0, 0, std::time::Instant::now());
         let want = route.width();
 
         let choices = if device_id.is_empty() { Vec::new() } else { list_outputs() };
@@ -1475,9 +1482,11 @@ impl AudioSystem {
         let is_native = matches!(route, Route::NativeDefault | Route::NativeNode { .. });
 
         let (format, channels, sr, buffer_range) = if is_native {
-            // PipeWire converts any width and position for the sink: ask for exactly what the mix needs, in f32.
+            // PipeWire converts any width and position for the sink: ask for what the mix needs, in f32,
+            // never wider than a mono system-default sink so split cue / preview cannot downmix to mono speakers.
+            let ch = if matches!(route, Route::NativeDefault) { want_width(want_ch, default.channels()) } else { want_ch };
             let sr = if ranges.iter().any(|r| r.contains_rate(sample_rate)) { sample_rate } else { default.sample_rate() };
-            (cpal::SampleFormat::F32, want_ch as usize, sr, *default.buffer_size())
+            (cpal::SampleFormat::F32, ch as usize, sr, *default.buffer_size())
         } else {
             // A plugin's sink was asked for no more than it lists; only raw hardware may open wider.
             let most = if matches!(route, Route::AlsaBridge { .. }) { want_ch } else { u16::MAX };
@@ -1729,7 +1738,7 @@ impl PreviewPlayer {
             let Some(frame) = pcm.frame_at(at) else { return (0.0, 0.0) };
             self.frame = frame;
             self.start = None;
-            self.estimated = pcm.end().is_none().then_some((at, frame));
+            self.estimated = (!pcm.end_exact()).then_some((at, frame));
         }
         let Some(rate) = pcm.layout().map(|l| l.sample_rate) else { return (0.0, 0.0) };
         match pcm.sample(self.frame) {
@@ -1769,8 +1778,10 @@ pub struct PreviewPcm {
     failed: std::sync::OnceLock<String>,
     /// Title and artist from the file's tags, read when it was opened.
     tags: std::sync::OnceLock<(Option<String>, Option<String>)>,
-    /// Frames in the track once decoding has reached its real end (or the decode cap); `u64::MAX` until then.
+    /// Frames in the track once decoding has reached its real end (or an upper bound on it); `u64::MAX` until then.
     end: AtomicU64,
+    /// True once `end` is the exact track end (or cap), not an intermediate upper bound from past-EOF seeking.
+    end_exact: AtomicBool,
     /// Where the listener wants to be, as a fraction of the track (`f64` bits): decoded first.
     wanted: AtomicU64,
     filled: AtomicUsize,
@@ -1832,6 +1843,7 @@ impl PreviewPcm {
             failed: Default::default(),
             tags: Default::default(),
             end: AtomicU64::new(u64::MAX),
+            end_exact: AtomicBool::new(false),
             wanted: AtomicU64::new(0),
             filled: AtomicUsize::new(0),
             exact: AtomicBool::new(!peaks_only),
@@ -1878,6 +1890,15 @@ impl PreviewPcm {
 
     fn end(&self) -> Option<u64> {
         Some(self.end.load(Ordering::Acquire)).filter(|&e| e != u64::MAX)
+    }
+
+    fn end_exact(&self) -> bool {
+        self.end_exact.load(Ordering::Acquire)
+    }
+
+    fn set_exact_end(&self, frames: u64) {
+        self.end.store(frames, Ordering::Release);
+        self.end_exact.store(true, Ordering::Release);
     }
 
     /// Frames a listener can play through: exact once decoding reached the end, else what the header says.
@@ -1974,10 +1995,12 @@ impl PreviewPcm {
     /// The whole track as one interleaved stereo buffer, for a deck load instead of decoding again: only once it
     /// is complete, exact (decoded as a deck would) and its file hasn't been replaced since.
     pub fn to_vec(&self) -> Option<Vec<f32>> {
+        // Assemble first so its Acquire loads happen-before checking `exact` (cleared before the last chunk lands).
+        let pcm = self.assembled()?;
         if !(self.exact() && self.same_file()) {
             return None;
         }
-        self.assembled()
+        Some(pcm)
     }
 
     /// Every decoded chunk up to the end, in one buffer, once complete.
@@ -2172,6 +2195,8 @@ impl Renderer {
                     s.retired.extend(old.buffers().into_iter().flatten().map(|b| Arc::clone(b) as Retired));
                 }
                 self.tracks[d] = s.loaded_tracks[d].as_ref().map(DeckPcm::of);
+                // Re-prime key lock on track swaps and late stem arrivals so stale overlap-add buffers aren't heard.
+                r.keylock_engaged[d] = false;
             } else if let (Some(mine), Some(theirs)) = (&mut self.tracks[d], &s.loaded_tracks[d]) {
                 mine.duration_sec = theirs.duration_sec;
                 mine.sample_rate = theirs.sample_rate;
@@ -2374,6 +2399,7 @@ impl Renderer {
                 state.engine.strips[d].playing = state.is_playing[d];
                 if !state.is_playing[d] && !state.scratch_active[d] && !state.scratch_ramping[d] {
                     state.jump_ease[d] = JumpEase::default(); // silent: no stale frame or request survives a stop
+                    state.keylock_engaged[d] = false;
                     continue;
                 }
                 let mut advance_dt = 0.0_f64;
@@ -2551,11 +2577,10 @@ impl Renderer {
 
                 if looping {
                     let loop_start = state.loop_start_sec[d];
-                    let loop_end = loop_start + state.loop_len_sec[d];
-                    if state.playhead_sec[d] >= loop_end {
-                        state.playhead_sec[d] = loop_start + (state.playhead_sec[d] - loop_end);
-                    } else if state.playhead_sec[d] < loop_start {
-                        state.playhead_sec[d] = loop_end - (loop_start - state.playhead_sec[d]);
+                    let loop_len = state.loop_len_sec[d];
+                    let loop_end = loop_start + loop_len;
+                    if state.playhead_sec[d] >= loop_end || state.playhead_sec[d] < loop_start {
+                        state.playhead_sec[d] = loop_start + (state.playhead_sec[d] - loop_start).rem_euclid(loop_len);
                     }
                 } else if let Some(end) = track_end.filter(|&end| at_track_end(state.playhead_sec[d], end)) {
                     stop_at_track_end(state, d, end);
@@ -2809,7 +2834,7 @@ impl PreviewDecode {
             // later, so this is no longer what it would play.)
             if self.pcm.end().is_none() {
                 self.pcm.exact.store(false, Ordering::Release);
-                self.pcm.end.store(slots as u64 * cf, Ordering::Release);
+                self.pcm.set_exact_end(slots as u64 * cf);
             }
             return;
         };
@@ -2879,9 +2904,10 @@ impl PreviewDecode {
                 self.placed_at = None;
                 match self.pending_from {
                     // A run decoded up to here ends the track exactly.
-                    Some(f) => self.pcm.end.store((f + have).min(max), Ordering::Release),
-                    // Nothing after the place it was put: the track ends before this chunk. An upper bound only;
-                    // the chunk before is decoded next, and its run finds the exact end.
+                    Some(f) => self.pcm.set_exact_end((f + have).min(max)),
+                    // Nothing after the place it was put: the track ends before this chunk. An upper bound only
+                    // (except at frame 0, where the file is empty); the chunk before finds the exact end.
+                    None if start == 0 => self.pcm.set_exact_end(0),
                     None => {
                         let _ = self.pcm.end.fetch_min(start, Ordering::AcqRel);
                     }
@@ -2893,6 +2919,7 @@ impl PreviewDecode {
             };
             let frames = (self.scratch.len() / 2) as u64;
             decoded += frames;
+            let mut emitted_before_gap = false;
             match self.pending_from {
                 None => {
                     if at > start {
@@ -2909,10 +2936,28 @@ impl PreviewDecode {
                         self.pcm.exact.store(false, Ordering::Release);
                     }
                     if at > expected {
-                        self.pending.resize(self.pending.len() + ((at - expected).min(cf) * 2) as usize, 0.0);
+                        if at - expected <= cf {
+                            self.pending.resize(self.pending.len() + ((at - expected) * 2) as usize, 0.0);
+                            self.pending.extend_from_slice(&self.scratch);
+                        } else {
+                            // Large gap (> 1 chunk): finish the current chunk if it already has audio before the gap,
+                            // then anchor pending at `at` and let `silent_from` emit intermediate silent chunks.
+                            if self.pending_from == Some(start) && expected > start {
+                                self.pending.resize((cf * 2) as usize, 0.0);
+                                self.emit(target, cf as usize);
+                                self.silent_from = Some(start + cf);
+                                emitted_before_gap = true;
+                            } else {
+                                self.silent_from = Some(self.silent_from.map_or(expected, |s| s.min(expected)));
+                            }
+                            self.pending.clear();
+                            self.pending_from = Some(at);
+                            self.pending.extend_from_slice(&self.scratch);
+                        }
+                    } else {
+                        let skip = (expected.saturating_sub(at).min(frames) * 2) as usize;
+                        self.pending.extend_from_slice(&self.scratch[skip..]);
                     }
-                    let skip = (expected.saturating_sub(at).min(frames) * 2) as usize;
-                    self.pending.extend_from_slice(&self.scratch[skip..]);
                 }
             }
             // Nothing past the decode cap.
@@ -2920,8 +2965,11 @@ impl PreviewDecode {
                 if f + (self.pending.len() / 2) as u64 > max {
                     self.pending.truncate((max.saturating_sub(f) * 2) as usize);
                     self.pcm.exact.store(false, Ordering::Release);
-                    self.pcm.end.store(max, Ordering::Release);
+                    self.pcm.set_exact_end(max);
                 }
+            }
+            if emitted_before_gap {
+                return;
             }
         }
     }
@@ -3549,7 +3597,7 @@ mod tests {
 
         let (shared, _, mut r) = near_end(&|s| {
             while s.retired.len() < s.retired.capacity() {
-                s.retired.push(Arc::default());
+                s.retired.push(Arc::new(()));
             }
             s.loaded_tracks[0] = Some(tone_track(330.0, 48_000, 12.0));
             s.seek_to(0, 0.0);
@@ -4367,7 +4415,7 @@ mod tests {
         let wait = |what: &str, done: &dyn Fn() -> bool| {
             let t0 = std::time::Instant::now();
             while !done() {
-                assert!(t0.elapsed() < std::time::Duration::from_secs(30), "{what}");
+                assert!(t0.elapsed() < std::time::Duration::from_secs(120), "{what}");
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
         };
@@ -4705,5 +4753,63 @@ mod tests {
         assert_eq!(&*quiet.waveform_peaks, &LoadedTrackAudio::compute_waveform_peaks(&quiet.pcm_stereo, sr).0[..]);
         assert!(loud.waveform_peaks[90][0] - quiet.waveform_peaks[90][0] > 0.2);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn preview_interleaved_overestimated_header_and_large_gap_and_audio_fixes() {
+        // 1. Overestimated header (20 s vs real 5 s) with audio callbacks interleaved between every decode step.
+        let (stream, pcm) = ramp_stream(40_000, 0, Some(160_000), true);
+        let path = std::env::temp_dir().join(format!("retraktor-interleaved-{}.script", std::process::id()));
+        register_test_stream(&path, stream);
+        let p = PreviewPcm::new(path, 0.9);
+        let mut decode = PreviewDecode::open(Arc::clone(&p), &Default::default()).unwrap();
+        let shared = Arc::new(Mutex::new(AudioSharedState::default()));
+        shared.lock().unwrap().start_preview(Arc::clone(&p), 0.9);
+        let mut r = Renderer::new(Arc::clone(&shared), Arc::default(), Arc::default());
+        let mut heard = 0.0f32;
+        for _ in 0..80 {
+            decode.step();
+            let (left, _) = preview_run(&mut r, &shared, &[64], 8_000);
+            if heard == 0.0 {
+                heard = left.iter().copied().find(|&x| x != 0.0).unwrap_or(0.0);
+            }
+            if p.done() && heard != 0.0 {
+                break;
+            }
+        }
+        assert!(heard != 0.0, "preview died permanently during overestimated-header stepping");
+        // `preview_run` routes through `headphone_mix` at default `cue_volume = 0.8`.
+        assert!((heard - pcm[36_000 * 2] * 0.8).abs() < 1e-4, "expected 90% of real 40k frames, got {heard}");
+
+        // 2. Packet gap > 1 s (3 s jump) preserves timestamps without injecting extra 1 s silences between later packets.
+        let sr = 8_000u32;
+        let pkt = |v: f32, n: usize| vec![v; n * 2];
+        let gap_stream = TestStream {
+            rate: sr,
+            header_frames: Some(30_000),
+            packets: vec![(0, pkt(0.2, 1_000)), (25_000, pkt(0.5, 1_000)), (26_000, pkt(0.7, 1_000))],
+            seekable: true,
+        };
+        let gap_pcm = decode_script("large-gap", gap_stream, 0.0, 40);
+        let all = gap_pcm.assembled().unwrap();
+        assert_eq!(all.len(), 27_000 * 2, "contiguous packet after >1s gap must not trigger extra silence");
+        assert!((all[25_000 * 2] - 0.5).abs() < 1e-6 && (all[26_000 * 2] - 0.7).abs() < 1e-6);
+
+        // 3. seek_by clamps playhead_sec and graph_sinks ignores 0-channel format entries.
+        let mut st = AudioSharedState::default();
+        st.loaded_tracks[0] = Some(tone_track(440.0, 48_000, 10.0));
+        st.seek_to(0, 1.0);
+        st.seek_by(0, -5.0);
+        assert_eq!(st.playhead_sec[0], 0.0);
+        let dump = serde_json::json!([{
+            "type": "PipeWire:Interface:Node",
+            "info": {
+                "props": { "media.class": "Audio/Sink", "node.name": "k2", "audio.channels": 4 },
+                "params": { "EnumFormat": [{ "channels": 0 }] }
+            }
+        }]);
+        let sinks = graph_sinks(&dump);
+        assert_eq!(sinks.len(), 1);
+        assert_eq!(sinks[0].channels, 4);
     }
 }

@@ -2785,7 +2785,7 @@ impl LibraryManager {
             if let Some(total) = length.or(Some(t.duration_sec)).filter(|d| d.is_finite() && *d > 0.0) {
                 for c in t.cues.iter().filter(|c| (0..8).contains(&c.hotcue)) {
                     let x = at_x(c.start_ms / 1000.0 / total);
-                    painter.vline(x, rect.y_range(), Stroke::new(1.0, TraktorTheme::hotcue_color((c.hotcue + 1) as usize)));
+                    painter.vline(x, rect.y_range(), Stroke::new(1.0_f32, TraktorTheme::hotcue_color((c.hotcue + 1) as usize)));
                 }
             }
             let note = match (&problem, pending) {
@@ -2797,10 +2797,10 @@ impl LibraryManager {
                 painter.text(rect.center(), egui::Align2::CENTER_CENTER, text, egui::FontId::proportional(10.0), color);
             }
             if let Some(x) = response.hover_pos().map(|p| p.x) {
-                painter.vline(x, rect.y_range(), Stroke::new(1.0, TraktorTheme::TEXT_HIGHLIGHT().gamma_multiply(0.6)));
+                painter.vline(x, rect.y_range(), Stroke::new(1.0_f32, TraktorTheme::WAVEFORM_PLAYHEAD().gamma_multiply(0.6)));
             }
             if let Some(at) = playhead {
-                painter.vline(at_x(at), rect.y_range(), Stroke::new(1.5, TraktorTheme::WAVEFORM_PLAYHEAD()));
+                painter.vline(at_x(at), rect.y_range(), Stroke::new(1.5_f32, TraktorTheme::WAVEFORM_PLAYHEAD()));
             }
         }
         let state = match (&problem, pending) {

@@ -1182,7 +1182,7 @@ fn paint_overview_look(
         }
     };
     let painter = &painter.with_clip_rect(rect.shrink(1.0));
-    let vline = |x: f32, top: f32, bottom: f32, colour: Color32| painter.line_segment([Pos2::new(x, top), Pos2::new(x, bottom)], Stroke::new(1.0, colour));
+    let vline = |x: f32, top: f32, bottom: f32, colour: Color32| painter.line_segment([Pos2::new(x, top), Pos2::new(x, bottom)], Stroke::new(1.0_f32, colour));
     let style = crate::theme::waveform_style();
     match look {
         OverviewLook::Native if style == crate::theme::WaveformStyle::Classic => {
@@ -1808,7 +1808,7 @@ mod tests {
         let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(120.0, 40.0));
         let ctx = egui::Context::default();
         let out = ctx.run(egui::RawInput::default(), |ctx| {
-            paint_overview_look(&ctx.layer_painter(egui::LayerId::background()), rect, columns, 60.0, look, bands);
+            paint_overview_look(&ctx.layer_painter(egui::LayerId::background()), rect, columns, None, 60.0, look, bands);
         });
         out.shapes
             .into_iter()

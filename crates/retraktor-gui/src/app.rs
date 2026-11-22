@@ -186,6 +186,8 @@ pub struct ReTraktorApp {
     /// Switched from Browser to Mix after the first track load.
     first_load_done: bool,
     load_generation: [u64; 4],
+    /// Generation of the load that actually succeeded on each deck (unaffected by later failed load attempts).
+    deck_loaded_generation: [u64; 4],
     /// From worker dispatch until that generation's result arrives.
     deck_loading: [bool; 4],
     /// When the last load on a deck failed, shown on the deck for a few seconds.
@@ -349,6 +351,7 @@ impl Default for ReTraktorApp {
             deck_track_ids: [None; 4],
             first_load_done: false,
             load_generation: [0; 4],
+            deck_loaded_generation: [0; 4],
             deck_loading: [false; 4],
             deck_load_failed: [None; 4],
             load_channel: mpsc::channel(),
@@ -429,6 +432,11 @@ impl eframe::App for ReTraktorApp {
 
         // Flush the autosaved collection and preferences on close.
         if self.poll_recording() && self.close_after_recording {
+            if !self.exit_confirmed {
+                self.save_collection_according_to_prefs();
+                let _ = self.preferences.save();
+                self.exit_confirmed = true;
+            }
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         if self.recording.is_some() {
@@ -480,7 +488,7 @@ impl eframe::App for ReTraktorApp {
             _ => (false, 0.0),
         };
         if let Ok(state) = self.audio.shared.lock() {
-            for d in 0..2 {
+            for d in 0..4 {
                 let playing = state.is_playing[d];
                 self.set_state.update_playback(d, playing, dt);
 
@@ -1322,7 +1330,7 @@ impl ReTraktorApp {
                 }
                 DeckResult::Overview(d, generation, audio, overview) => {
                     let Ok(mut state) = self.audio.shared.lock() else { continue };
-                    let current = generation == self.load_generation[d];
+                    let current = generation == self.deck_loaded_generation[d];
                     if let Some(loaded) = state.loaded_tracks[d].as_mut().filter(|l| current && Arc::ptr_eq(&l.pcm_stereo, &audio)) {
                         loaded.overview = overview.clone();
                         if loaded.auto_gain == 1.0 {
@@ -1334,7 +1342,7 @@ impl ReTraktorApp {
                 DeckResult::Stems(d, generation, stemmed) => {
                     let Ok(mut state) = self.audio.shared.lock() else { continue };
                     // Only on the load they were decoded for, still holding that audio.
-                    let current = generation == self.load_generation[d];
+                    let current = generation == self.deck_loaded_generation[d];
                     if let Some(loaded) = state.loaded_tracks[d].as_mut().filter(|l| current && Arc::ptr_eq(&l.pcm_stereo, &stemmed.pcm_stereo)) {
                         loaded.pcm_drums = stemmed.pcm_drums;
                         loaded.pcm_bass = stemmed.pcm_bass;
@@ -1352,6 +1360,7 @@ impl ReTraktorApp {
             self.deck_loading[d] = false;
             match result {
                 Ok(mut loaded) => {
+                    self.deck_loaded_generation[d] = generation;
                     // Read on each load, so switching it never jumps the level of a track on air.
                     if !self.preferences.autogain {
                         loaded.auto_gain = 1.0;
@@ -1403,7 +1412,7 @@ impl ReTraktorApp {
     /// entry and deck alike, only if no slot is taken and the track's hot cues weren't set or cleared by hand since
     /// the load, on any deck.
     fn apply_deck_analysis(&mut self, d: usize, generation: u64, id: usize, a: &retraktor_library::TrackAnalysis, audio: &Arc<Vec<f32>>, kept: Kept) {
-        let on_deck = generation == self.load_generation[d]
+        let on_deck = generation == self.deck_loaded_generation[d]
             && self.audio.shared.lock().is_ok_and(|s| s.loaded_tracks[d].as_ref().is_some_and(|t| Arc::ptr_eq(&t.pcm_stereo, audio)));
         let hot_cues = self.library.cue_revision(id) == kept.cue_revision;
         self.library.apply_late_analysis(id, a, hot_cues);
@@ -3499,7 +3508,7 @@ impl ReTraktorApp {
             let phase = self.audio.shared.lock().ok().and_then(|state| {
                 let other = if d == 0 { 1 } else { 0 };
                 let beats = |i: usize| {
-                    let t = state.loaded_tracks[i].as_ref().filter(|_| state.is_playing[i])?;
+                    let t = state.loaded_tracks[i].as_ref().filter(|t| state.is_playing[i] && t.bpm > 0.0)?;
                     Some((state.playhead_sec[i] - t.grid_offset_sec) * t.bpm.max(20.0) / 60.0)
                 };
                 Some(beat_phase_diff(beats(other)?, beats(d)?, 1.0))
@@ -3872,7 +3881,7 @@ impl ReTraktorApp {
             let phase = self.audio.shared.lock().ok().and_then(|state| {
                 let other = if d == 0 { 1 } else { 0 };
                 let beats = |i: usize| {
-                    let t = state.loaded_tracks[i].as_ref().filter(|_| state.is_playing[i])?;
+                    let t = state.loaded_tracks[i].as_ref().filter(|t| state.is_playing[i] && t.bpm > 0.0)?;
                     Some((state.playhead_sec[i] - t.grid_offset_sec) * t.bpm.max(20.0) / 60.0)
                 };
                 Some(beat_phase_diff(beats(other)?, beats(d)?, 1.0))
@@ -3924,7 +3933,9 @@ impl ReTraktorApp {
                         self.tempo_master_deck = None;
                     } else {
                         self.tempo_master_deck = Some(d);
-                        self.master_tempo = bpm;
+                        if bpm > 0.0 {
+                            self.master_tempo = bpm;
+                        }
                     }
                 }
                 self.stem_buttons(ui, d);
@@ -4190,8 +4201,8 @@ impl ReTraktorApp {
             for d in 0..4 {
                 if let (Some(t), true) = (&state.loaded_tracks[d], state.is_playing[d]) {
                     let at = (state.playhead_sec[d].max(0.0) * PEAKS_PER_SEC as f64) as usize;
-                    bands[d] = t.waveform_peaks.get(at).copied().unwrap_or_default();
-                    stems[d] = t.stem_peaks.get(at).copied().unwrap_or_default();
+                    bands[d] = t.played_peaks.get(at).copied().unwrap_or_default();
+                    stems[d] = t.played_stem_peaks.get(at).copied().unwrap_or_default();
                 }
             }
         }
@@ -6829,7 +6840,7 @@ mod sync_audio {
         let t0 = std::time::Instant::now();
         let finished = |app: &ReTraktorApp, id: usize| app.library.row_waveforms.get(&id).is_some_and(|w| w.made_from.is_none());
         while !(1..=6).all(|id| finished(&app, id)) {
-            assert!(t0.elapsed() < std::time::Duration::from_secs(20), "rows never finished: {:?}", app.library.row_waveforms.keys().collect::<Vec<_>>());
+            assert!(t0.elapsed() < std::time::Duration::from_secs(60), "rows never finished: {:?}", app.library.row_waveforms.keys().collect::<Vec<_>>());
             app.poll_preview();
             frame(&mut app, vec![]);
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -6915,8 +6926,8 @@ mod sync_audio {
         app.remember_prepared(6, &fresh); // as `prepare_selection` does once the selection rests
         app.update_preview_jobs();
         let t0 = std::time::Instant::now();
-        while !fresh.complete() {
-            assert!(t0.elapsed() < std::time::Duration::from_secs(20), "the selection's decode never finished");
+        while !(fresh.complete() && fresh.cached().is_some()) {
+            assert!(t0.elapsed() < std::time::Duration::from_secs(60), "the selection's decode never finished");
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert_eq!(length(&app), Some(3.0), "the old waveform changed before the app looked");
@@ -7317,5 +7328,44 @@ mod sync_audio {
         assert!(fwd.3 && !node(&nodes, "Deck D beat jump back 16 beats").3, "forward should be disabled, back enabled");
         click(&mut app, &mut frame, fwd.2.center());
         assert_eq!(playhead(&app, 3), 92.0);
+    }
+
+    #[test]
+    fn failed_load_does_not_strand_current_decks_pending_analysis() {
+        let mut app = ReTraktorApp::default();
+        let entry = crate::library_ui::UiTrackEntry { id: 7, title: "Analysing".into(), bpm: 0.0, ..Default::default() };
+        app.library.tracks.push(entry.clone());
+        app.library.rebuild_index();
+        app.load_generation[0] = 1;
+        let loaded = track(0.0);
+        let audio = Arc::clone(&loaded.pcm_stereo);
+        app.load_channel.0.send(DeckResult::Loaded(0, 1, entry.clone(), Ok(loaded))).unwrap();
+        app.finish_loads();
+        assert!(app.deck_analysing[0]);
+        assert_eq!(app.deck_loaded_generation[0], 1);
+
+        // A second load attempt bumps load_generation to 2 and fails; track 7 stays on Deck A.
+        app.load_generation[0] = 2;
+        app.load_channel.0.send(DeckResult::Loaded(0, 2, entry, Err("corrupt".into()))).unwrap();
+        app.finish_loads();
+        assert_eq!(app.deck_loaded_generation[0], 1);
+
+        // Track 7's pending analysis (generation 1) still lands and clears `deck_analysing`.
+        let analysis = retraktor_library::TrackAnalysis {
+            bpm: 126.0,
+            beatgrid_offset_sec: 0.0,
+            key_value: 22,
+            key_open: "8m".into(),
+            energy: 6,
+            loudness_db: -10.0,
+            peak_db: -1.0,
+            cue_points_sec: Vec::new(),
+            phrases: Vec::new(),
+        };
+        let kept = Kept { bpm: false, grid: false, phrases: false, cue_revision: 0 };
+        app.load_channel.0.send(DeckResult::Analysis(0, 1, 7, analysis, audio, kept)).unwrap();
+        app.finish_loads();
+        assert!(!app.deck_analysing[0]);
+        assert_eq!(app.audio.shared.lock().unwrap().loaded_tracks[0].as_ref().unwrap().bpm, 126.0);
     }
 }

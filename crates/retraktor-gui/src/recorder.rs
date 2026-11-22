@@ -130,6 +130,10 @@ impl RecorderTap {
         if self.stopped {
             return;
         }
+        if self.shared.stop_requested.load(Ordering::Acquire) {
+            self.stopped = true;
+            return;
+        }
         if let Some(reason) = self.shared.stop_reason() {
             self.halt(reason);
         } else if self.rate == 0 {
@@ -329,6 +333,15 @@ impl Recording {
             self.unsaved = Some(unsaved);
             e
         })
+    }
+}
+
+impl Drop for Recording {
+    fn drop(&mut self) {
+        self.shared.stop_requested.store(true, Ordering::Release);
+        if let Some(writer) = self.writer.take() {
+            let _ = writer.join();
+        }
     }
 }
 
@@ -687,5 +700,26 @@ mod tests {
             std::fs::remove_file(&rec.wav).unwrap();
         }
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn dropping_active_recording_joins_writer_and_stops_tap() {
+        let dir = std::env::temp_dir().join(format!("retraktor-rec-drop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (rec, mut tap) = Recording::start(&dir, SystemTime::UNIX_EPOCH).unwrap();
+        let wav = rec.wav.clone();
+        tap.begin_block(48_000);
+        for _ in 0..CHUNK_FRAMES {
+            tap.push(0.25, -0.25);
+        }
+        tap.end_block();
+        // Dropping `rec` without calling `stop()` must signal & join the writer so the WAV header is finalized.
+        drop(rec);
+        let len = std::fs::metadata(&wav).unwrap().len();
+        assert_eq!(len, 80 + CHUNK_FRAMES as u64 * 4, "writer finalized the flushed chunk");
+        // A leftover tap must halt cleanly on the next block instead of overrunning.
+        tap.begin_block(48_000);
+        assert!(tap.stopped);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
