@@ -5,6 +5,10 @@
 //! thread ([`RemixLoader`]) into memory counted against one budget ([`SampleBudget`]); the audio callback plays
 //! them through [`RemixEngine`] into the deck's own mixer channel, so its gain, EQ, filter, cue, fader and the
 //! recorder treat it like the track it replaces.
+//!
+//! A cell can also capture a playing Track deck's active loop ([`CaptureSource`]): the same worker copies those
+//! frames of the track's decoded audio and saves them as a WAV in [`captures_dir`], which the cell then plays and a
+//! saved set names like any other sample file.
 
 use crate::audio::{AudioFile, Retired};
 use std::path::{Path, PathBuf};
@@ -153,6 +157,185 @@ impl RemixSample {
         budget.give_back(taken - bytes);
         Ok(Self::new(name, path.to_path_buf(), pcm, file.sample_rate, library_bpm, Arc::clone(budget), bytes))
     }
+
+    /// Copies `source`'s loop out of the track's audio and saves it as a new WAV in `dir` ([`write_capture`]), which
+    /// becomes the sample's file. Refused (nothing taken or left behind) when the loop can't be a cell
+    /// ([`CaptureSource::frames`]), the bank is full, the file can't be written or `cancelled` says the cell no
+    /// longer wants it.
+    pub fn capture(source: &CaptureSource, dir: &Path, budget: &Arc<SampleBudget>, cancelled: &dyn Fn() -> bool) -> Result<Self, String> {
+        let (start, end) = source.frames()?;
+        let bytes = (end - start) * 2 * 4;
+        if !budget.try_take(bytes) {
+            return Err(bank_full());
+        }
+        let title = source.title.trim();
+        let title = if title.is_empty() { "Deck capture" } else { title };
+        let at = start as f64 / source.sample_rate as f64;
+        let (minutes, seconds) = ((at / 60.0).floor(), at % 60.0);
+        let name = format!("{title} loop {minutes}:{seconds:06.3}");
+        // The sample owns the bytes from here: dropped on any failure below, it gives them back.
+        let mut sample = Self::new(&name, PathBuf::new(), source.pcm[2 * start..2 * end].to_vec(), source.sample_rate, source.bpm, Arc::clone(budget), bytes);
+        if cancelled() {
+            return Err("Cancelled".to_string());
+        }
+        let stem = format!("{} loop {minutes:.0}m{seconds:06.3}s {}", file_stem_text(title), crate::setlist::format_recording_timestamp(std::time::SystemTime::now()));
+        let path = write_capture(dir, &stem, &sample.pcm, sample.sample_rate)?;
+        if cancelled() {
+            let _ = std::fs::remove_file(&path); // no cell ever held it
+            return Err("Cancelled".to_string());
+        }
+        sample.source = path;
+        Ok(sample)
+    }
+}
+
+/// A playing Track deck's active loop, read in one go on the UI thread: the track's decoded audio (shared, not
+/// copied, and never changed by the capture) and the loop as the deck plays it.
+pub struct CaptureSource {
+    /// The track's interleaved stereo, at its own rate, before any gain or effect.
+    pub pcm: Arc<Vec<f32>>,
+    pub sample_rate: u32,
+    pub loop_start_sec: f64,
+    pub loop_len_sec: f64,
+    /// The track's BPM, which the loop's length is a whole number of beats of.
+    pub bpm: f64,
+    pub title: String,
+}
+
+impl CaptureSource {
+    /// The loop's frames in the track, `start..end`, each end rounded to the nearest whole frame. Refused when that
+    /// is no frame at all, isn't inside the decoded audio, or is longer than a cell takes ([`MAX_SAMPLE_SEC`]).
+    pub fn frames(&self) -> Result<(usize, usize), String> {
+        let rate = self.sample_rate as f64;
+        let start = (self.loop_start_sec * rate).round();
+        let end = ((self.loop_start_sec + self.loop_len_sec) * rate).round();
+        if self.sample_rate == 0 || !start.is_finite() || !end.is_finite() || start < 0.0 {
+            return Err("the loop isn't a valid place in the track".into());
+        }
+        let (start, end) = (start as usize, end as usize);
+        if end <= start {
+            return Err("the loop is shorter than one frame".into());
+        }
+        if end > self.pcm.len() / 2 {
+            return Err("the loop runs past the end of the track's audio: move it inside the track".into());
+        }
+        if end - start > (MAX_SAMPLE_SEC * rate) as usize {
+            return Err(format!("the loop is longer than {MAX_SAMPLE_SEC:.0} s, the most a cell takes: shorten it"));
+        }
+        Ok((start, end))
+    }
+}
+
+/// Where captured loops are saved: `~/Music/ReTraktor/Captures`, beside the master recordings. Refused for a home
+/// folder that isn't an absolute UTF-8 path, which a saved set couldn't name.
+pub fn captures_dir() -> Result<PathBuf, String> {
+    captures_dir_in(std::env::var_os("HOME"))
+}
+
+fn captures_dir_in(home: Option<std::ffi::OsString>) -> Result<PathBuf, String> {
+    let home = home.map(PathBuf::from).filter(|home| home.is_absolute() && home.to_str().is_some());
+    let home = home.ok_or("there is no home folder a set can name (HOME isn't an absolute UTF-8 path), so a capture has nowhere to be saved")?;
+    Ok(home.join("Music").join("ReTraktor").join("Captures"))
+}
+
+/// The most bytes of a track title in a capture's file name: with the loop, time, a `_n` and the temporary file's
+/// suffix it stays well inside the 255 bytes a file name may have on common drives.
+const TITLE_NAME_BYTES: usize = 120;
+
+/// `title` as part of a file name: no path separators, characters other drives refuse or control characters, at
+/// most [`TITLE_NAME_BYTES`] (cut between characters), and never hidden.
+fn file_stem_text(title: &str) -> String {
+    let mut text = String::new();
+    for c in title.chars().map(|c| if c.is_control() || "/\\:*?\"<>|".contains(c) { '_' } else { c }) {
+        if text.len() + c.len_utf8() > TITLE_NAME_BYTES {
+            break;
+        }
+        text.push(c);
+    }
+    let text = text.trim().trim_start_matches('.');
+    if text.is_empty() { "Capture".to_string() } else { text.to_string() }
+}
+
+/// Writes `pcm` (interleaved stereo at `rate`) as a 32-bit float WAV, so the decoded audio is kept exactly, named
+/// `{stem}.wav` in `dir` (created if missing), or `{stem}_2.wav` and on when that is taken. It is written whole into
+/// a hidden file beside it and flushed to disk before it takes its name, and only a name no file has, so another
+/// capture is never replaced and no half-written file carries a capture's name. Returns the WAV's path.
+/// shortcut: a process killed mid-write leaves its hidden .tmp file in the folder, sweep stale ones at startup if they pile up.
+pub fn write_capture(dir: &Path, stem: &str, pcm: &[f32], rate: u32) -> Result<PathBuf, String> {
+    use std::io::Write;
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+    let refused = |e: std::io::Error| format!("can't save the capture in {}: {e}", dir.display());
+    std::fs::create_dir_all(dir).map_err(refused)?;
+    let temp = dir.join(format!(".{stem}.{}-{}.tmp", std::process::id(), NEXT_TEMP.fetch_add(1, Ordering::Relaxed)));
+    let written = std::fs::File::create_new(&temp).map_err(refused).and_then(|file| {
+        let mut out = std::io::BufWriter::new(file);
+        out.write_all(&float_wav_header(pcm.len() / 2, rate))
+            .and_then(|_| pcm.iter().try_for_each(|s| out.write_all(&s.to_le_bytes())))
+            .and_then(|_| out.into_inner().map_err(std::io::IntoInnerError::into_error))
+            .and_then(|file| file.sync_all())
+            .map_err(|e| {
+                let _ = std::fs::remove_file(&temp);
+                refused(e)
+            })
+    });
+    written?;
+    // A drive without a no-replace rename may still link a second name to the file, which also never replaces one.
+    let publish = |path: &Path| match rename_no_replace(&temp, path) {
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported) => {
+            std::fs::hard_link(&temp, path).map(|()| {
+                let _ = std::fs::remove_file(&temp);
+            })
+        }
+        renamed => renamed,
+    };
+    for n in 1..=1000 {
+        let path = dir.join(if n == 1 { format!("{stem}.wav") } else { format!("{stem}_{n}.wav") });
+        match publish(&path) {
+            Ok(()) => {
+                if let Ok(dir) = std::fs::File::open(dir) {
+                    let _ = dir.sync_all(); // the new name lasts through a power cut
+                }
+                return Ok(path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                let _ = std::fs::remove_file(&temp);
+                return Err(match e.kind() {
+                    std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied => {
+                        format!("the drive holding {} can't add a file without risking replacing one (no safe rename or link: {e}), so the capture wasn't saved", dir.display())
+                    }
+                    _ => refused(e),
+                });
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&temp);
+    Err(format!("can't save the capture in {}: every name for '{stem}' is taken", dir.display()))
+}
+
+/// The 58-byte header of a stereo 32-bit IEEE float WAV of `frames` frames (`fmt ` with its empty extension, then
+/// `fact`, as the format asks of non-PCM data). A cell's 60 s at 768 kHz is far below the 4 GiB a RIFF size holds.
+fn float_wav_header(frames: usize, rate: u32) -> Vec<u8> {
+    let data = (frames * 8) as u32;
+    let mut h = Vec::with_capacity(58);
+    h.extend_from_slice(b"RIFF");
+    h.extend_from_slice(&(50 + data).to_le_bytes());
+    h.extend_from_slice(b"WAVEfmt ");
+    h.extend_from_slice(&18u32.to_le_bytes());
+    for field in [3u16, 2] {
+        h.extend_from_slice(&field.to_le_bytes()); // IEEE float, two channels
+    }
+    h.extend_from_slice(&rate.to_le_bytes());
+    h.extend_from_slice(&(rate * 8).to_le_bytes());
+    for field in [8u16, 32, 0] {
+        h.extend_from_slice(&field.to_le_bytes()); // bytes per frame, bits per sample, no extension
+    }
+    h.extend_from_slice(b"fact");
+    h.extend_from_slice(&4u32.to_le_bytes());
+    h.extend_from_slice(&(frames as u32).to_le_bytes());
+    h.extend_from_slice(b"data");
+    h.extend_from_slice(&data.to_le_bytes());
+    h
 }
 
 fn bank_full() -> String {
@@ -230,9 +413,22 @@ struct LoadJob {
     column: usize,
     row: usize,
     generation: u64,
-    path: PathBuf,
-    name: String,
-    bpm: f64,
+    source: JobSource,
+}
+
+/// What a cell load makes its sample from.
+enum JobSource {
+    /// Decodes a file (name and library BPM as the cell keeps them).
+    File { path: PathBuf, name: String, bpm: f64 },
+    /// Captures a deck's loop into a new WAV in `dir`.
+    Capture { source: CaptureSource, dir: PathBuf },
+}
+
+/// The sample loader's work, in order.
+enum Work {
+    Load(LoadJob),
+    /// Deletes a capture's WAV that no cell took (its load was superseded once finished).
+    Remove(PathBuf),
 }
 
 /// A finished cell load: where it goes, which load it was, and the sample or why not.
@@ -241,13 +437,19 @@ pub struct LoadedCell {
     pub column: usize,
     pub row: usize,
     generation: u64,
+    /// A capture: its WAV is new and only this load has it, and the cell takes it as a loop.
+    captured: bool,
     pub result: Result<Arc<RemixSample>, String>,
 }
 
-/// Decodes cell samples one at a time on its own worker thread, started on the first load.
+/// Decodes cell samples (and captures loops) one at a time on its own worker thread, started on the first load.
 pub struct RemixLoader {
     pub budget: Arc<SampleBudget>,
-    jobs: Option<mpsc::Sender<LoadJob>>,
+    /// Where captures are saved ([`captures_dir`]), or why there is nowhere.
+    pub captures: Result<PathBuf, String>,
+    jobs: Option<mpsc::Sender<Work>>,
+    /// The worker thread, joined by [`RemixLoader::shut_down`].
+    worker: Option<std::thread::JoinHandle<()>>,
     results: (mpsc::Sender<LoadedCell>, mpsc::Receiver<LoadedCell>),
     next_generation: u64,
     /// The load each cell (by [`cell_index`]) wants now, 0 for none, so the worker skips or stops outdated work.
@@ -257,7 +459,14 @@ pub struct RemixLoader {
 impl Default for RemixLoader {
     fn default() -> Self {
         let wanted = Arc::new((0..4 * COLUMNS * ROWS).map(|_| AtomicU64::new(0)).collect());
-        Self { budget: SampleBudget::new(BANK_BUDGET_BYTES), jobs: None, results: mpsc::channel(), next_generation: 0, wanted }
+        let captures = captures_dir();
+        Self { budget: SampleBudget::new(BANK_BUDGET_BYTES), captures, jobs: None, worker: None, results: mpsc::channel(), next_generation: 0, wanted }
+    }
+}
+
+impl Drop for RemixLoader {
+    fn drop(&mut self) {
+        self.shut_down();
     }
 }
 
@@ -269,33 +478,73 @@ impl RemixLoader {
     /// Queues `path` for `bank`'s cell; a newer load of the same cell, or [`RemixLoader::cancel`], supersedes it.
     /// The cell keeps what it has until a load succeeds.
     pub fn request(&mut self, bank: &mut RemixBank, deck: usize, column: usize, row: usize, path: PathBuf, name: &str, bpm: f64) {
+        self.queue(bank, deck, column, row, JobSource::File { path, name: name.to_string(), bpm });
+    }
+
+    /// Queues a capture of `source`'s loop for `bank`'s cell, saved in `dir`; superseded and cancelled like a load.
+    pub fn capture(&mut self, bank: &mut RemixBank, deck: usize, column: usize, row: usize, source: CaptureSource, dir: PathBuf) {
+        self.queue(bank, deck, column, row, JobSource::Capture { source, dir });
+    }
+
+    fn queue(&mut self, bank: &mut RemixBank, deck: usize, column: usize, row: usize, source: JobSource) {
         self.next_generation += 1;
         let generation = self.next_generation;
         bank.loading[column][row] = generation;
         self.wanted[cell_index(deck, column, row)].store(generation, Ordering::Release);
-        let job = LoadJob { deck, column, row, generation, path, name: name.to_string(), bpm };
+        let captured = matches!(source, JobSource::Capture { .. });
+        let job = LoadJob { deck, column, row, generation, source };
         let sender = self.jobs.get_or_insert_with(|| {
-            let (tx, rx) = mpsc::channel::<LoadJob>();
+            let (tx, rx) = mpsc::channel::<Work>();
             let (results, budget, wanted) = (self.results.0.clone(), Arc::clone(&self.budget), Arc::clone(&self.wanted));
-            std::thread::spawn(move || {
-                for job in rx {
+            self.worker = Some(std::thread::spawn(move || {
+                for work in rx {
+                    let job = match work {
+                        Work::Load(job) => job,
+                        Work::Remove(path) => {
+                            let _ = std::fs::remove_file(path);
+                            continue;
+                        }
+                    };
                     let outdated = || wanted[cell_index(job.deck, job.column, job.row)].load(Ordering::Acquire) != job.generation;
                     if outdated() {
                         continue; // superseded or cancelled while queued
                     }
-                    let result = RemixSample::decode(&job.path, &job.name, job.bpm, &budget, &outdated).map(Arc::new);
-                    let done = LoadedCell { deck: job.deck, column: job.column, row: job.row, generation: job.generation, result };
+                    let (captured, result) = match &job.source {
+                        JobSource::File { path, name, bpm } => (false, RemixSample::decode(path, name, *bpm, &budget, &outdated)),
+                        JobSource::Capture { source, dir } => (true, RemixSample::capture(source, dir, &budget, &outdated)),
+                    };
+                    let done = LoadedCell { deck: job.deck, column: job.column, row: job.row, generation: job.generation, captured, result: result.map(Arc::new) };
                     if results.send(done).is_err() {
                         break;
                     }
                 }
-            });
+            }));
             tx
         });
-        if let Err(mpsc::SendError(job)) = sender.send(job) {
+        if let Err(mpsc::SendError(_)) = sender.send(Work::Load(job)) {
             // The worker is gone (it panicked): say so on the cell instead of waiting forever.
             self.jobs = None;
-            let _ = self.results.0.send(LoadedCell { deck, column, row, generation: job.generation, result: Err("The sample loader stopped".into()) });
+            let _ = self.results.0.send(LoadedCell { deck, column, row, generation, captured, result: Err("The sample loader stopped".into()) });
+        }
+    }
+
+    /// Ends the worker for good as the app closes (also on drop). Every load is cancelled, so it skips what is
+    /// queued and stops what it is doing, and runs the deletes already asked for; a capture it finishes anyway
+    /// deletes its own WAV. Once it has stopped, the WAVs of finished captures no cell took are deleted. A WAV a cell
+    /// holds is never touched. Waits at most for the one file being written.
+    /// shortcut: a killed process skips this, leaving a hidden .tmp or an unclaimed WAV in the captures folder.
+    pub fn shut_down(&mut self) {
+        for wanted in self.wanted.iter() {
+            wanted.store(0, Ordering::Release);
+        }
+        self.jobs = None; // the worker's queue ends after what is already in it
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+        while let Ok(done) = self.results.1.try_recv() {
+            if let (true, Ok(sample)) = (done.captured, &done.result) {
+                let _ = std::fs::remove_file(&sample.source);
+            }
         }
     }
 
@@ -306,20 +555,27 @@ impl RemixLoader {
         self.wanted[cell_index(deck, column, row)].store(0, Ordering::Release);
     }
 
-    /// Finished loads still wanted by their cell; a superseded one is dropped here. A success fills the cell, a
-    /// failure leaves it as it was. Returns each outcome (deck, column, row, name or error) for the status line.
+    /// Finished loads still wanted by their cell; a superseded one is dropped here (a capture's new WAV deleted on
+    /// the worker). A success fills the cell (a capture as a loop), a failure leaves it as it was. Returns each
+    /// outcome (deck, column, row, name or error) for the status line.
     pub fn poll(&mut self, banks: &mut [RemixBank; 4]) -> Vec<(usize, usize, usize, Result<String, String>)> {
         let mut outcomes = Vec::new();
         while let Ok(done) = self.results.1.try_recv() {
             let bank = &mut banks[done.deck];
             if bank.loading[done.column][done.row] != done.generation {
+                if let (true, Ok(sample)) = (done.captured, &done.result) {
+                    let path = sample.source.clone();
+                    if !self.jobs.as_ref().is_some_and(|jobs| jobs.send(Work::Remove(path.clone())).is_ok()) {
+                        let _ = std::fs::remove_file(path); // the worker is gone: one small delete here
+                    }
+                }
                 continue;
             }
             bank.loading[done.column][done.row] = 0;
             let outcome = match done.result {
                 Ok(sample) => {
                     let name = sample.name.clone();
-                    bank.cells[done.column][done.row] = Some(RemixCell { looped: sample.fits_beats, sample });
+                    bank.cells[done.column][done.row] = Some(RemixCell { looped: done.captured || sample.fits_beats, sample });
                     Ok(name)
                 }
                 Err(e) => Err(e),
@@ -1554,5 +1810,223 @@ mod tests {
         assert_eq!(clock.tick(Some((0, 20.0, 120.0)), 120.0, dt).1, Some(0.0), "a hot cue on beat 20 is that beat");
         assert!(clock.tick(Some((0, 20.0 - step, 120.0)), 120.0, dt).1.is_none(), "easing back over the line fired");
         assert!(clock.tick(Some((0, 20.0 + step / 2.0, 120.0)), 120.0, dt).1.is_some(), "playing over it again didn't");
+    }
+
+    /// A track `total` frames long that is 0.1 / -0.1 before frame `start`, a ramp different on each side from there
+    /// to `end`, and 0.9 / -0.9 after it: any frame from outside the loop shows.
+    fn looped_track(start: usize, end: usize, total: usize) -> Vec<f32> {
+        (0..total)
+            .flat_map(|f| match f {
+                f if f < start => [0.1, -0.1],
+                f if f < end => [0.2 + (f - start) as f32 * 1e-6, -0.3 - (f - start) as f32 * 1e-6],
+                _ => [0.9, -0.9],
+            })
+            .collect()
+    }
+
+    fn capture_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("retraktor-captures-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn eventually(what: &str, mut done: impl FnMut() -> bool) {
+        for _ in 0..1000 {
+            if done() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("{what} never happened");
+    }
+
+    /// A 4-beat loop at 120 BPM in a 44.1 kHz track, its loop-in a fraction of a frame past 3 s: the capture is that
+    /// loop's frames exactly (rounded to whole frames, stereo and rate as they are, nothing from before or after),
+    /// a 120 BPM loop, saved as a float WAV that decodes back bit for bit, and the track's audio is unchanged. Played
+    /// at 120 BPM it repeats every 4 beats with every frame exact, across the seam too.
+    #[test]
+    fn a_capture_is_the_loops_exact_audio_and_repeats_on_the_beat() {
+        let rate = 44_100u32;
+        let (start, end) = (132_300, 220_500);
+        let pcm = Arc::new(looped_track(start, end, 10 * rate as usize));
+        let dir = capture_dir("exact");
+        let b = budget();
+        let src = CaptureSource { pcm: Arc::clone(&pcm), sample_rate: rate, loop_start_sec: 3.000_004, loop_len_sec: 2.0, bpm: 120.0, title: "Groove/Edit".into() };
+        assert_eq!(src.frames(), Ok((start, end)));
+        let s = RemixSample::capture(&src, &dir, &b, &|| false).unwrap();
+        assert_eq!((s.frames(), s.sample_rate, s.bpm, s.fits_beats), (end - start, rate, Some(120.0), true));
+        assert!(s.pcm == pcm[2 * start..2 * end], "not exactly the loop's frames");
+        assert_eq!((s.pcm[0], s.pcm[1]), (0.2, -0.3), "it doesn't start on the loop-in frame");
+        assert!(s.pcm.iter().all(|&x| x.abs() != 0.1 && x.abs() != 0.9), "audio from outside the loop");
+        assert_eq!((s.name.as_str(), b.used()), ("Groove/Edit loop 0:03.000", (end - start) * 8));
+        assert!(*pcm == looped_track(start, end, 10 * rate as usize), "the track's audio changed");
+
+        let files: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).collect();
+        assert_eq!(files, [s.source.clone()], "one WAV and nothing else");
+        let file_name = s.source.file_name().unwrap().to_str().unwrap();
+        assert!(file_name.starts_with("Groove_Edit loop 0m03.000s ") && file_name.ends_with(".wav"), "{file_name}");
+        let mut wav = AudioFile::open(&s.source).unwrap();
+        assert_eq!(wav.sample_rate, rate);
+        let decoded = wav.decode_all(&|| false).unwrap();
+        assert!(decoded.len() == s.pcm.len() && decoded.iter().zip(&s.pcm).all(|(a, b)| a.to_bits() == b.to_bits()), "the WAV isn't the loop bit for bit");
+
+        let sample = Arc::new(s);
+        let n = sample.frames();
+        assert_eq!(n as f64, 4.0 * 60.0 / 120.0 * rate as f64, "the loop isn't 4 beats");
+        let mut engine = RemixEngine::default();
+        let mut retired = Vec::with_capacity(256);
+        let mut requests: [[Option<RemixRequest>; COLUMNS]; 4] = Default::default();
+        requests[1][0] = Some(RemixRequest { launch: Some(Launch { sample: Arc::clone(&sample), row: 0, looped: true }), on_beat: false });
+        engine.take_requests(&mut requests, &mut retired);
+        for (i, o) in run(&mut engine, 2 * n + 100, rate, 120.0, 0.0, 0).iter().enumerate() {
+            let f = i % n;
+            assert_eq!(o[1], (sample.pcm[2 * f], sample.pcm[2 * f + 1]), "output frame {i}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A loop that can't be a cell (no frame, not a place in the track, past its end, over 60 s), a full bank, a
+    /// cancelled capture and a folder it can't write in are refused, saying why, with nothing taken or left on disk.
+    /// A capture never replaces another file, even one with the same name.
+    #[test]
+    fn captures_that_cant_be_cells_or_files_are_refused_and_leave_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+        let rate = 1000u32;
+        let pcm = Arc::new(vec![0.5f32; 100 * rate as usize * 2]);
+        let src = |start: f64, len: f64| CaptureSource { pcm: Arc::clone(&pcm), sample_rate: rate, loop_start_sec: start, loop_len_sec: len, bpm: 120.0, title: "t".into() };
+        let refusals = [
+            (1.0, 0.0, "shorter than one frame"),
+            (1.0, 0.0004, "shorter than one frame"),
+            (f64::NAN, 2.0, "valid place"),
+            (-1.0, 2.0, "valid place"),
+            (1.0, f64::INFINITY, "valid place"),
+            (99.0, 2.0, "past the end"),
+            (10.0, 60.5, "longer than 60 s"),
+        ];
+        for (start, len, want) in refusals {
+            let e = src(start, len).frames().unwrap_err();
+            assert!(e.contains(want), "{start} + {len}: {e}");
+        }
+        assert_eq!(src(10.0, 60.0).frames(), Ok((10_000, 70_000)), "60 s is a cell");
+        assert_eq!(src(98.0, 2.0).frames(), Ok((98_000, 100_000)), "up to the last frame is in the track");
+
+        let dir = capture_dir("refused");
+        let listing = |dir: &Path| std::fs::read_dir(dir).unwrap().count();
+        let small = SampleBudget::new(1000 * 8);
+        assert!(RemixSample::capture(&src(1.0, 2.0), &dir, &small, &|| false).err().unwrap().contains("full"));
+        let b = budget();
+        assert_eq!(RemixSample::capture(&src(1.0, 2.0), &dir, &b, &|| true).err().as_deref(), Some("Cancelled"));
+        assert!(RemixSample::capture(&src(99.0, 2.0), &dir, &b, &|| false).err().unwrap().contains("past the end"));
+        assert_eq!((small.used(), b.used(), listing(&dir)), (0, 0, 0));
+
+        let blocked = dir.join("a file, not a folder");
+        std::fs::write(&blocked, b"x").unwrap();
+        let e = RemixSample::capture(&src(1.0, 2.0), &blocked, &b, &|| false).err().unwrap();
+        assert!(e.contains("can't save the capture in") && e.contains("a file, not a folder"), "{e}");
+        let locked = dir.join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let root = std::fs::File::create(locked.join("probe")).is_ok(); // permissions don't bind root
+        let refused = RemixSample::capture(&src(1.0, 2.0), &locked, &b, &|| false);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        match refused {
+            Err(e) => assert!(e.contains("locked") && listing(&locked) == 0, "{e}, or a partial file was left behind"),
+            Ok(_) => assert!(root, "wrote into a folder it can't write in"),
+        }
+        assert_eq!(b.used(), 0);
+
+        let first = write_capture(&dir, "Same loop", &[0.25; 8], rate).unwrap();
+        let second = write_capture(&dir, "Same loop", &[0.75; 8], rate).unwrap();
+        let named = |path: &Path| path.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!((named(&first), named(&second)), ("Same loop.wav".to_string(), "Same loop_2.wav".to_string()));
+        assert_eq!(AudioFile::open(&first).unwrap().decode_all(&|| false).unwrap(), vec![0.25; 8], "the first capture was replaced");
+
+        // A long title in three-byte characters is cut between characters, so its capture still gets a file name.
+        let long = CaptureSource { title: "音".repeat(100), ..src(1.0, 2.0) };
+        assert_eq!(file_stem_text(&long.title), "音".repeat(TITLE_NAME_BYTES / 3));
+        let s = RemixSample::capture(&long, &dir, &b, &|| false).unwrap_or_else(|e| panic!("{e}"));
+        assert!(s.source.file_name().unwrap().len() < 200 && s.name.starts_with(&long.title));
+        drop(s);
+        assert_eq!(b.used(), 0);
+
+        // Only a home folder a set can name (absolute UTF-8) takes captures.
+        use std::os::unix::ffi::OsStringExt;
+        let not_text = std::ffi::OsString::from_vec(b"/home/dj\xff".to_vec());
+        assert!(captures_dir_in(Some(not_text)).unwrap_err().contains("UTF-8"));
+        assert!(captures_dir_in(None).is_err() && captures_dir_in(Some("music".into())).is_err());
+        assert_eq!(captures_dir_in(Some("/home/dj".into())), Ok(PathBuf::from("/home/dj/Music/ReTraktor/Captures")));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The loader puts a capture in its cell as a loop, even one with no BPM. A capture cancelled before it lands
+    /// leaves no file, also when it had already finished: the cell stays empty, its WAV is deleted and its memory
+    /// freed, while the WAV a cell holds is kept.
+    #[test]
+    fn captures_land_as_loops_and_superseded_ones_leave_no_file() {
+        let rate = 1000u32;
+        let pcm = Arc::new(vec![0.5f32; 20 * rate as usize * 2]);
+        let src = |title: &str| CaptureSource { pcm: Arc::clone(&pcm), sample_rate: rate, loop_start_sec: 2.0, loop_len_sec: 3.3, bpm: 0.0, title: title.into() };
+        let dir = capture_dir("superseded");
+        let names = || std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect::<Vec<_>>();
+        let mut loader = RemixLoader::default();
+        let mut banks: [RemixBank; 4] = Default::default();
+
+        loader.capture(&mut banks[2], 2, 1, 3, src("Break"), dir.clone());
+        let mut outcomes = Vec::new();
+        eventually("the capture", || {
+            outcomes.extend(loader.poll(&mut banks));
+            !RemixLoader::busy(&banks)
+        });
+        assert!(matches!(&outcomes[..], [(2, 1, 3, Ok(name))] if name == "Break loop 0:02.000"), "{:?}", outcomes.iter().map(|o| &o.3).collect::<Vec<_>>());
+        let kept = banks[2].cells[1][3].as_ref().unwrap().sample.source.clone();
+        assert!(banks[2].cells[1][3].as_ref().is_some_and(|c| c.looped && !c.sample.fits_beats && c.sample.bpm.is_none()));
+
+        // Cancelled at once: the worker skips it, or stops before or after writing, and deletes what it wrote.
+        loader.capture(&mut banks[2], 2, 2, 0, src("Gone"), dir.clone());
+        loader.cancel(&mut banks[2], 2, 2, 0);
+        // A capture that finished, WAV and all, for a load no cell wants any more: poll drops it and has the worker
+        // delete its WAV, after the cancelled one (the worker goes in order), so then both are gone for sure.
+        let stale = write_capture(&dir, "Stale", &[0.5; 8], rate).unwrap();
+        let mut sample = RemixSample::from_pcm("Stale", vec![0.5; 8], rate, 0.0, &loader.budget).unwrap();
+        sample.source = stale.clone();
+        let done = LoadedCell { deck: 2, column: 3, row: 0, generation: u64::MAX, captured: true, result: Ok(Arc::new(sample)) };
+        loader.results.0.send(done).unwrap();
+        assert!(loader.poll(&mut banks).is_empty(), "a superseded capture reported");
+        eventually("the stale capture's WAV deleted", || !stale.exists());
+        assert_eq!(names(), [kept.file_name().unwrap().to_string_lossy()], "the kept capture went, or another stayed");
+        assert!(banks[2].cells[2][0].is_none() && banks[2].cells[3][0].is_none());
+        assert_eq!(loader.budget.used(), 3300 * 8, "only the kept capture's audio is held");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Closing the app (the loader dropped): a capture still queued or being made never leaves a file, a finished one
+    /// no cell took yet is deleted, and the WAV a cell holds stays, with the cell.
+    #[test]
+    fn closing_keeps_installed_captures_and_deletes_unclaimed_ones() {
+        let rate = 1000u32;
+        let pcm = Arc::new(vec![0.5f32; 20 * rate as usize * 2]);
+        let src = |title: &str| CaptureSource { pcm: Arc::clone(&pcm), sample_rate: rate, loop_start_sec: 2.0, loop_len_sec: 3.3, bpm: 120.0, title: title.into() };
+        let dir = capture_dir("closing");
+        let names = || std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect::<Vec<_>>();
+        let mut loader = RemixLoader::default();
+        let mut banks: [RemixBank; 4] = Default::default();
+        loader.capture(&mut banks[0], 0, 0, 0, src("Kept"), dir.clone());
+        eventually("the capture", || {
+            loader.poll(&mut banks);
+            !RemixLoader::busy(&banks)
+        });
+        let kept = banks[0].cells[0][0].as_ref().expect("nothing captured").sample.source.clone();
+
+        loader.capture(&mut banks[1], 1, 0, 0, src("Pending"), dir.clone());
+        let unclaimed = write_capture(&dir, "Unclaimed", &[0.5; 8], rate).unwrap();
+        let mut sample = RemixSample::from_pcm("Unclaimed", vec![0.5; 8], rate, 0.0, &loader.budget).unwrap();
+        sample.source = unclaimed;
+        let done = LoadedCell { deck: 0, column: 2, row: 0, generation: loader.next_generation, captured: true, result: Ok(Arc::new(sample)) };
+        loader.results.0.send(done).unwrap();
+        drop(loader);
+        assert_eq!(names(), [kept.file_name().unwrap().to_string_lossy()], "an unclaimed capture stayed, or the kept one went");
+        assert!(banks[0].cells[0][0].as_ref().is_some_and(|c| c.sample.source == kept));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

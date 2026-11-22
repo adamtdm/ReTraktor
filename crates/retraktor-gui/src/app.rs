@@ -435,6 +435,11 @@ fn legacy_action(a: &str) -> String {
 }
 
 impl eframe::App for ReTraktorApp {
+    /// Closing normally: a capture still being made is stopped and no unclaimed capture WAV is left behind.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.remix_loader.shut_down();
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Request 60 FPS continuous repaint for smooth scrolling waveforms and VU meters
         ctx.request_repaint();
@@ -3990,6 +3995,60 @@ impl ReTraktorApp {
         self.remix_loader.request(&mut self.remix_banks[d], d, column, row, path, &name, t.bpm);
     }
 
+    /// Deck `s`'s active loop as it plays now, if it can be captured: a Track deck playing a library track with its
+    /// loop on. Everything is read in one short lock; the track's audio is shared, not copied.
+    fn remix_capture_source(&self, s: usize) -> Result<crate::remix::CaptureSource, String> {
+        let letter = DECK_LETTERS[s];
+        if self.deck_remix[s] {
+            return Err(format!("deck {letter} is a Remix deck"));
+        }
+        if self.deck_track_ids[s].is_none() {
+            return Err(format!("deck {letter} has no track loaded"));
+        }
+        let state = self.audio.shared.lock().map_err(|_| "the audio engine stopped".to_string())?;
+        let track = state.loaded_tracks[s].as_ref().ok_or(format!("deck {letter} has no track loaded"))?;
+        if !state.is_playing[s] {
+            return Err(format!("deck {letter} isn't playing"));
+        }
+        // As the callback judges a loop.
+        if !(state.loop_active[s] && state.loop_len_sec[s] > 0.05) {
+            return Err(format!("deck {letter}'s loop is off"));
+        }
+        Ok(crate::remix::CaptureSource {
+            pcm: Arc::clone(&track.pcm_stereo),
+            sample_rate: track.sample_rate,
+            loop_start_sec: state.loop_start_sec[s],
+            loop_len_sec: state.loop_len_sec[s],
+            bpm: track.bpm,
+            title: track.title.clone(),
+        })
+    }
+
+    /// Captures deck `s`'s active loop into empty cell (`column`, `row`) of Remix deck `d`, checking both again now.
+    /// The sample loader copies the loop and saves it as a WAV in the captures folder before the cell takes it, as a
+    /// loop; deck `s` plays on untouched.
+    fn remix_capture_cell(&mut self, d: usize, column: usize, row: usize, s: usize) {
+        let (letter, from) = (DECK_LETTERS[d], DECK_LETTERS[s]);
+        let cell = format!("deck {letter} cell {}.{}", column + 1, row + 1);
+        let bank = &self.remix_banks[d];
+        if !self.deck_remix[d] || bank.cells[column][row].is_some() || bank.is_loading(column, row) {
+            self.library.status_message = format!("Nothing captured: {cell} is no longer an empty cell of a Remix deck");
+            return;
+        }
+        let checked = self.remix_capture_source(s).and_then(|source| source.frames().map(|frames| (source, frames)));
+        let dir = self.remix_loader.captures.clone();
+        let ((source, (start, end)), dir) = match (checked, dir) {
+            (Ok(source), Ok(dir)) => (source, dir),
+            (Err(e), _) | (_, Err(e)) => {
+                self.library.status_message = format!("Can't capture deck {from}'s loop: {e}");
+                return;
+            }
+        };
+        let seconds = (end - start) as f64 / source.sample_rate as f64;
+        self.library.status_message = format!("Capturing {seconds:.2} s of '{}' from deck {from} into {cell}, saving it in {}…", source.title, dir.display());
+        self.remix_loader.capture(&mut self.remix_banks[d], d, column, row, source, dir);
+    }
+
     /// Empties cell (`column`, `row`) of deck `d` and cancels any load on its way there, so nothing refills it.
     fn remix_clear_cell(&mut self, d: usize, column: usize, row: usize) {
         self.remix_loader.cancel(&mut self.remix_banks[d], d, column, row);
@@ -4412,16 +4471,33 @@ impl ReTraktorApp {
         let resp = resp.on_hover_text(if cell.is_some() {
             "Click to play (replaces what this column plays). Right-click: loop or one-shot, load the selected track, clear"
         } else {
-            "Drag a sample from the library here, or right-click to load the selected track"
+            "Drag a sample from the library here, or right-click to load the selected track or capture a playing deck's loop"
         });
         if resp.clicked() {
             self.remix_launch(d, column, row);
         }
         let selected = self.library.selected_track_id;
         let looped = self.remix_banks[d].cells[column][row].as_ref().map(|c| c.looped);
-        let (mut load, mut flip, mut clear) = (false, false, false);
+        let (mut load, mut flip, mut clear, mut capture) = (false, false, false, None);
         resp.context_menu(|ui| {
             load = ui.add_enabled(selected.is_some(), egui::Button::new("Load selected track here")).clicked();
+            if looped.is_none() && !loading {
+                // One per deck whose loop can be captured now; checked again when clicked.
+                let sources: Vec<_> = (0..4).filter_map(|s| self.remix_capture_source(s).ok().map(|source| (s, source))).collect();
+                for (s, source) in &sources {
+                    let from = DECK_LETTERS[*s];
+                    let tip = format!(
+                        "Copies the {:.2} s loop playing on deck {from} ('{}') into this cell as a loop, saved as a WAV in ~/Music/ReTraktor/Captures. Deck {from} plays on untouched",
+                        source.loop_len_sec, source.title
+                    );
+                    if ui.button(format!("Capture deck {from}'s loop here")).on_hover_text(tip).clicked() {
+                        capture = Some(*s);
+                    }
+                }
+                if sources.is_empty() {
+                    ui.add_enabled(false, egui::Button::new("Capture a deck's loop here")).on_disabled_hover_text("Play a Track deck with its loop on, then capture that loop into this cell");
+                }
+            }
             if let Some(looped) = looped {
                 let label = if looped { "Play once (one-shot)" } else { "Loop" };
                 flip = ui.button(label).on_hover_text("Takes effect on the next launch").clicked();
@@ -4430,12 +4506,15 @@ impl ReTraktorApp {
                 let label = if looped.is_some() { "Clear cell" } else { "Cancel load" };
                 clear = ui.button(label).on_hover_text("Also cancels a load on its way here. A cell playing now plays on until stopped").clicked();
             }
-            if load || flip || clear {
+            if load || flip || clear || capture.is_some() {
                 ui.close_menu();
             }
         });
         if let Some(id) = selected.filter(|_| load) {
             self.remix_load_cell(d, column, row, id);
+        }
+        if let Some(s) = capture {
+            self.remix_capture_cell(d, column, row, s);
         }
         if let Some(c) = self.remix_banks[d].cells[column][row].as_mut().filter(|_| flip) {
             c.looped ^= true;
@@ -8386,6 +8465,120 @@ mod sync_audio {
         for path in paths {
             let _ = std::fs::remove_file(path);
         }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Deck A holds 'Groove' (44.1 kHz stereo, its library file since gone) at 120 BPM with a 4-beat loop from just
+    /// past 3 s. An empty cell of Remix deck B captures that loop only while A plays its library track with the loop
+    /// on, and only into a cell still empty, each checked at the click. Then the cell holds exactly the loop's frames
+    /// at A's own rate as a 120 BPM loop, saved in the captures folder, while A plays on in its loop with its audio
+    /// untouched. With A's loop released the cell launches on A's beat and keeps playing as A plays on past it. A set
+    /// saved from B reopens the capture on deck D of a fresh app with no track loaded anywhere.
+    #[test]
+    fn a_captured_loop_fills_a_cell_and_reopens_without_its_track() {
+        use crate::remix::SetAction;
+        let rate = 44_100u32;
+        let (start, end) = (132_300usize, 220_500usize);
+        let groove = || -> Vec<f32> {
+            (0..10 * rate as usize)
+                .flat_map(|f| if f < start { [0.1, -0.1] } else if f < end { [0.2 + (f - start) as f32 * 1e-6, -0.3 - (f - start) as f32 * 1e-6] } else { [0.9, -0.9] })
+                .collect()
+        };
+        let loop_audio = groove()[2 * start..2 * end].to_vec();
+        let dir = set_dir("capture");
+        let mut app = ReTraktorApp::default();
+        app.remix_loader.captures = Ok(dir.join("Captures"));
+        let entry = crate::library_ui::UiTrackEntry { id: 42, title: "Groove".into(), bpm: 120.0, file_path: Some(dir.join("moved away.flac")), ..Default::default() };
+        app.library.tracks.push(entry);
+        app.library.rebuild_index();
+        let source = crate::audio::LoadedTrackAudio { pcm_stereo: Arc::new(groove()), sample_rate: rate, duration_sec: 10.0, title: "Groove".into(), ..track(120.0) };
+        let track_audio = Arc::clone(&source.pcm_stereo);
+        {
+            let mut s = app.audio.shared.lock().unwrap();
+            s.loaded_tracks[0] = Some(source);
+            s.playhead_sec[0] = 3.5;
+        }
+        app.deck_track_ids[0] = Some(42);
+        (app.deck_loop_active[0], app.deck_loop_start_sec[0], app.deck_loop_size_beats[0]) = (true, 3.000_004, 4);
+        assert!(app.set_deck_mode(1, true));
+        app.sync_audio_state();
+
+        let refused = |app: &mut ReTraktorApp, column: usize, s: usize, want: &str| {
+            app.remix_capture_cell(1, column, 0, s);
+            assert!(app.library.status_message.contains(want), "wanted '{want}': {}", app.library.status_message);
+            assert!(!app.remix_banks[1].is_loading(column, 0));
+        };
+        refused(&mut app, 0, 0, "deck A isn't playing");
+        app.audio.shared.lock().unwrap().is_playing[0] = true;
+        app.deck_loop_active[0] = false;
+        app.sync_audio_state();
+        refused(&mut app, 0, 0, "deck A's loop is off");
+        app.deck_loop_active[0] = true;
+        app.sync_audio_state();
+        refused(&mut app, 0, 2, "deck C has no track loaded");
+        refused(&mut app, 0, 1, "deck B is a Remix deck");
+        let held = Arc::new(crate::remix::RemixSample::from_pcm("held", vec![0.0; 200], 48_000, 0.0, &app.remix_loader.budget).unwrap());
+        app.remix_banks[1].cells[1][0] = Some(crate::remix::RemixCell { sample: Arc::clone(&held), looped: false });
+        refused(&mut app, 1, 0, "no longer an empty cell");
+        assert!(app.remix_banks[1].cells[1][0].as_ref().is_some_and(|c| Arc::ptr_eq(&c.sample, &held)));
+        assert!(app.remix_banks[1].cells[0][0].is_none());
+
+        app.remix_capture_cell(1, 0, 0, 0);
+        assert!(app.remix_banks[1].is_loading(0, 0), "{}", app.library.status_message);
+        assert!(app.library.status_message.starts_with("Capturing 2.00 s of 'Groove' from deck A into deck B cell 1.1"), "{}", app.library.status_message);
+        // A keeps playing while the loader works, in 440-frame blocks (which don't divide its 2 s loop).
+        let mut blocks = 0usize;
+        for _ in 0..2000 {
+            render(&app, 0.01, 440, rate);
+            blocks += 1;
+            app.finish_remix_loads();
+            if !crate::remix::RemixLoader::busy(&app.remix_banks) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let cell = app.remix_banks[1].cells[0][0].clone().unwrap_or_else(|| panic!("nothing captured: {}", app.library.status_message));
+        assert!(cell.looped && cell.sample.pcm == loop_audio, "not the loop's exact audio, as a loop");
+        assert_eq!((cell.sample.sample_rate, cell.sample.bpm, cell.sample.fits_beats), (rate, Some(120.0), true));
+        assert_eq!(cell.sample.source.parent(), Some(dir.join("Captures").as_path()));
+        assert!(cell.sample.source.is_file());
+        assert_eq!(app.library.status_message, "Loaded 'Groove loop 0:03.000' into deck B cell 1.1");
+        {
+            let s = app.audio.shared.lock().unwrap();
+            assert!(s.is_playing[0] && s.loop_active[0] && (s.loop_start_sec[0], s.loop_len_sec[0]) == (3.000_004, 2.0), "deck A's playback or loop changed");
+            // Every block played, round the loop from 3.5 s.
+            let expected = 3.000_004 + (3.5 - 3.000_004 + blocks as f64 * 440.0 / rate as f64).rem_euclid(2.0);
+            assert!((s.playhead_sec[0] - expected).abs() < 1e-3, "deck A at {}, not {expected} after {blocks} blocks", s.playhead_sec[0]);
+            assert!(Arc::ptr_eq(&s.loaded_tracks[0].as_ref().unwrap().pcm_stereo, &track_audio));
+        }
+        assert!(*track_audio == groove(), "deck A's audio changed");
+
+        // A's loop released, A plays on past it; the cell, launched on A's beat, keeps playing.
+        app.toggle_loop(1);
+        app.sync_audio_state();
+        app.remix_launch(1, 0, 0); // Q on: on A's next beat
+        render(&app, 3.0, 440, rate);
+        {
+            let s = app.audio.shared.lock().unwrap();
+            assert!(s.is_playing[0] && !s.loop_active[0] && s.playhead_sec[0] > 5.000_004, "deck A at {} didn't play on past its loop", s.playhead_sec[0]);
+        }
+        assert_eq!(remix_cell_status(&app, 1, 0).playing, Some((0, cell.sample.id)));
+
+        app.remix_clear_cell(1, 1, 0); // the in-memory cell has no file a set could keep
+        let file = dir.join("Captured.remixset");
+        set_job(&mut app, 1, SetAction::Save, &file);
+        assert!(file.is_file(), "{}", app.library.status_message);
+        let saved = cell.sample.source.clone();
+        drop(cell);
+        drop(app);
+
+        let mut app = ReTraktorApp::default();
+        assert!(app.set_deck_mode(3, true));
+        set_job(&mut app, 3, SetAction::Open, &file);
+        let cell = app.remix_banks[3].cells[0][0].as_ref().unwrap_or_else(|| panic!("not reopened: {}", app.library.status_message));
+        assert!(cell.looped && cell.sample.pcm == loop_audio && cell.sample.source == saved, "the capture didn't reopen exactly");
+        assert_eq!((cell.sample.name.as_str(), cell.sample.sample_rate, cell.sample.bpm), ("Groove loop 0:03.000", rate, Some(120.0)));
+        assert!(app.audio.shared.lock().unwrap().loaded_tracks.iter().all(Option::is_none));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
