@@ -251,6 +251,15 @@ impl FourDeckAudioEngine {
 
     /// Processes a single stereo frame across all 4 decks, returning `(master_l, master_r, cue_l, cue_r)`.
     pub fn process_frame(&mut self, deck_inputs: [(f32, f32); 4]) -> (f32, f32, f32, f32) {
+        self.process_frame_with_fx(deck_inputs, |_| (0.0, 0.0))
+    }
+
+    /// Adds a stereo FX return from the post-fader deck signals before master gain and limiting.
+    pub fn process_frame_with_fx(
+        &mut self,
+        deck_inputs: [(f32, f32); 4],
+        fx_return: impl FnOnce([(f32, f32); 4]) -> (f32, f32),
+    ) -> (f32, f32, f32, f32) {
         let sr = self.routing.sample_rate as f64;
         let dt_sec = 1.0 / sr.max(1.0);
         let _phase = self.clock.advance(1, sr);
@@ -260,6 +269,7 @@ impl FourDeckAudioEngine {
         let mut master_r = 0.0_f32;
         let mut cue_l = 0.0_f32;
         let mut cue_r = 0.0_f32;
+        let mut post_fader = [(0.0, 0.0); 4];
 
         for (i, (in_l, in_r)) in deck_inputs.iter().copied().enumerate() {
             let strip = &mut self.strips[i];
@@ -287,12 +297,18 @@ impl FourDeckAudioEngine {
                 1.0
             };
 
-            let post_gain = strip.volume * xf_scalar * self.master_volume;
-            master_l += pre_l * post_gain;
-            master_r += pre_r * post_gain;
+            let post_gain = strip.volume * xf_scalar;
+            post_fader[i] = (pre_l * post_gain, pre_r * post_gain);
+            master_l += post_fader[i].0;
+            master_r += post_fader[i].1;
         }
 
-        let (lim_l, lim_r) = self.maximizer.process_stereo_at(master_l, master_r, sr as f32);
+        let (fx_l, fx_r) = fx_return(post_fader);
+        let (lim_l, lim_r) = self.maximizer.process_stereo_at(
+            (master_l + fx_l) * self.master_volume,
+            (master_r + fx_r) * self.master_volume,
+            sr as f32,
+        );
         self.last_master_peak = (lim_l.abs().clamp(0.0, 1.0), lim_r.abs().clamp(0.0, 1.0));
         (lim_l, lim_r, cue_l, cue_r)
     }
