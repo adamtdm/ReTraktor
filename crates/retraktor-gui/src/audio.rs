@@ -614,6 +614,9 @@ pub(crate) fn valid_bpm(bpm: f64) -> Option<f64> {
 /// half- or double-time pairing plays at its own speed (SYNC, and remix loops following the master). It runs in
 /// the audio callback: a tempo that isn't finite and positive gives 1, and the folding is a fixed amount of work.
 pub(crate) fn sync_ratio(bpm: f64, target: f64) -> f64 {
+    if !(bpm.is_finite() && bpm > 0.0 && target.is_finite() && target > 0.0) {
+        return 1.0;
+    }
     let ratio = target.max(20.0) / bpm.max(20.0);
     if !ratio.is_finite() || ratio <= 0.0 {
         return 1.0;

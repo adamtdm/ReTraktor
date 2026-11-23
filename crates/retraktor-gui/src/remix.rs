@@ -1950,6 +1950,13 @@ mod tests {
                 assert!(r.is_finite() && (0.70..=1.42).contains(&r), "sync_ratio({bpm}, {target}) = {r}");
             }
         }
+        // A tempo that isn't finite and positive, either side, plays at the deck's own speed: exactly 1, before any
+        // clamping to 20 BPM could turn a 0 or negative tag into a fold.
+        for bad in [0.0, -0.0, -1.0, -120.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(sync_ratio(bad, 140.0), 1.0, "sync_ratio({bad}, 140)");
+            assert_eq!(sync_ratio(140.0, bad), 1.0, "sync_ratio(140, {bad})");
+            assert_eq!(sync_ratio(bad, bad), 1.0, "sync_ratio({bad}, {bad})");
+        }
         assert_eq!(sync_ratio(70.0, 140.0), 1.0);
         assert_eq!(sync_ratio(140.0, 70.0), 1.0);
         assert!((sync_ratio(120.0, 126.0) - 1.05).abs() < 1e-12);
