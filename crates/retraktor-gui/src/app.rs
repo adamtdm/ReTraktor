@@ -241,6 +241,8 @@ pub struct ReTraktorApp {
     // Traktor MX2 (VID 0x17CC, PID 0x2420) Live Hardware State
     pub mx2_driver: Mx2HidDriver,
     pub mx2_hidraw_file: Option<File>,
+    /// Reports read on the MX2 reader thread; `None` when the device went away.
+    mx2_rx: Option<std::sync::mpsc::Receiver<Option<Vec<u8>>>>,
     pub mx2_dev_node: Option<String>,
     pub mx2_model_name: Option<String>,
     mx2_last_scan: Option<std::time::Instant>,
@@ -396,6 +398,7 @@ impl Default for ReTraktorApp {
             timeline_preset_idx: 1,
             mx2_driver: Mx2HidDriver::new(),
             mx2_hidraw_file: None,
+            mx2_rx: None,
             mx2_dev_node: None,
             mx2_model_name: None,
             mx2_last_scan: None,
@@ -442,11 +445,38 @@ fn legacy_action(a: &str) -> String {
     }
 }
 
+/// Reads `dev_node`'s HID reports on their own thread (blocking, so no polling), sends each one and wakes the UI.
+/// Sends `None` and ends when the device goes away; also ends once nobody listens (a reconnect replaced it).
+fn spawn_hid_reader(dev_node: &str) -> Option<std::sync::mpsc::Receiver<Option<Vec<u8>>>> {
+    let mut file = File::open(dev_node).ok()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 256];
+        loop {
+            let report = match file.read(&mut buf) {
+                Ok(n) if n > 0 => Some(buf[..n].to_vec()),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                _ => None,
+            };
+            let gone = report.is_none();
+            if tx.send(report).is_err() || gone {
+                crate::wake_ui();
+                return;
+            }
+            crate::wake_ui();
+        }
+    });
+    Some(rx)
+}
+
 impl eframe::App for ReTraktorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Full frame rate only while something moves or hardware needs polling; otherwise a slow tick.
+        // Capped frame rate only while something moves; otherwise a slow tick. Controller threads wake it on input.
+        crate::preferences::LOW_POWER.store(self.preferences.low_power, std::sync::atomic::Ordering::Relaxed);
         if self.needs_continuous_repaint() {
-            ctx.request_repaint();
+            // 0.9 of the period, so vsync never rounds a frame up to the next refresh: 60 fps stays 60, 30 stays 30.
+            let fps = if self.preferences.low_power { 30.0 } else { 60.0 };
+            ctx.request_repaint_after(std::time::Duration::from_secs_f32(0.9 / fps));
         } else {
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
         }
@@ -478,6 +508,7 @@ impl eframe::App for ReTraktorApp {
                 self.library.status_message = "Finishing the recording before closing…".into();
             }
         } else if ctx.input(|i| i.viewport().close_requested()) && !self.exit_confirmed {
+            self.demucs.set_paused(false); // never leave a stopped Demucs behind
             self.save_collection_according_to_prefs();
             let _ = self.preferences.save();
             self.exit_confirmed = true;
@@ -707,6 +738,9 @@ impl eframe::App for ReTraktorApp {
             crate::demucs::DemucsSeparationStatus::Idle => {}
         }
 
+        // Low power holds Demucs (running or queued) while a deck plays.
+        let hold = self.low_power_busy();
+        self.demucs.set_paused(hold);
         // Start the next queued separation once Demucs is free.
         let demucs_idle = matches!(*self.demucs.separation_status.lock().unwrap(), crate::demucs::DemucsSeparationStatus::Idle);
         if demucs_idle && !self.demucs.is_installed() && !self.library.stem_queue.is_empty() {
@@ -714,7 +748,7 @@ impl eframe::App for ReTraktorApp {
             self.library.status_message =
                 "Install Demucs in Preferences > Stems & AI to separate stems (live crossover stems work without it).".to_string();
         }
-        if let Some(track_id) = demucs_idle.then(|| self.library.stem_queue.pop_front()).flatten() {
+        if let Some(track_id) = (demucs_idle && !hold).then(|| self.library.stem_queue.pop_front()).flatten() {
             if let Some(track) = self.library.tracks.iter().find(|t| t.id == track_id).cloned() {
                 if let Some(ref file_path) = track.file_path {
                     if self.demucs.is_installed() {
@@ -1146,18 +1180,21 @@ impl ReTraktorApp {
         }
     }
 
+    /// Low power and a deck playing: background decodes and Demucs wait.
+    fn low_power_busy(&self) -> bool {
+        self.preferences.low_power && self.audio.shared.lock().is_ok_and(|s| s.is_playing.iter().any(|&p| p))
+    }
+
     fn needs_continuous_repaint(&self) -> bool {
         let engine_busy = self.audio.shared.lock().is_ok_and(|s| {
             (0..4).any(|d| s.is_playing[d] || s.scratch_active[d] || s.scratch_ramping[d])
         });
-        let generic_connected = self.preferences.generic_manager.discovered.lock().is_ok_and(|d| d.iter().any(|x| x.connected));
         engine_busy
             || self.preview.is_some()
             || self.deck_loading.iter().chain(&self.deck_analysing).any(|&b| b)
             || self.pattern_enabled
             || self.recording.as_ref().is_some_and(|r| r.is_active())
-            || self.mx2_hidraw_file.is_some()
-            || generic_connected
+            || self.mx2_led_test_active
             || self.active_cheer.is_some()
             || self.ai_rerank_runner.is_some()
             || self.shot.is_some()
@@ -1657,6 +1694,9 @@ impl ReTraktorApp {
             return;
         }
         let Some(id) = selected.filter(|_| self.browse_seen.1.elapsed() >= BROWSE_SETTLE) else { return };
+        if self.low_power_busy() {
+            return;
+        }
         // The file is looked at once per resting selection (again if its path changes), not every frame.
         let path = self.library.track(id).and_then(|t| t.file_path.clone());
         if self.browse_looked.as_ref().is_some_and(|(t, p)| *t == id && *p == path) {
@@ -1733,6 +1773,12 @@ impl ReTraktorApp {
             .collect();
         for (id, pcm) in &decodes {
             self.note_row_waveform(*id, pcm);
+        }
+        if self.low_power_busy() {
+            if self.row_job.take().is_some() {
+                self.update_preview_jobs();
+            }
+            return;
         }
         let decoding_anyway = |app: &Self, id: usize| app.preview.as_ref().is_some_and(|p| p.track == id) || (selected == Some(id) && app.prepared_for(id).is_some());
         let wanted = |app: &Self, id: usize| {
@@ -1944,12 +1990,13 @@ impl ReTraktorApp {
     /// Connects to a specific `/dev/hidraw*` endpoint for Traktor MX2 / Kontrol hardware.
     pub fn connect_hidraw_node(&mut self, dev_node: &str) {
         let mut opts = OpenOptions::new();
-        opts.read(true).write(true);
+        opts.write(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
             opts.custom_flags(0x0800); // O_NONBLOCK
         }
+        self.mx2_rx = spawn_hid_reader(dev_node);
         match opts.open(dev_node) {
             Ok(mut file) => {
                 // Send initial Output Report 0x80 to illuminate deck and bottom shell
@@ -2017,57 +2064,41 @@ impl ReTraktorApp {
             return;
         }
 
-        // Non-blocking read of up to 16 queued HID input reports per frame
+        // Reports arrive on the reader thread, which wakes the UI, so input never waits for a polling frame.
         let mut pending_events = Vec::new();
-        let mut disconnected = false;
-        if let Some(ref mut file) = self.mx2_hidraw_file {
-            let mut buf = [0u8; 256];
-            for _ in 0..16 {
-                match file.read(&mut buf) {
-                    Ok(n) if n > 0 => {
-                        self.mx2_packets_received = self.mx2_packets_received.wrapping_add(1);
-                        self.mx2_last_report_id = Some(buf[0]);
+        let mut disconnected = self.mx2_rx.is_none();
+        let reports: Vec<_> = self.mx2_rx.iter().flat_map(|rx| rx.try_iter()).collect();
+        for report in reports {
+            let Some(buf) = report else {
+                disconnected = true;
+                break;
+            };
+            let n = buf.len();
+            self.mx2_packets_received = self.mx2_packets_received.wrapping_add(1);
+            self.mx2_last_report_id = Some(buf[0]);
 
-                        // Format hex preview for Settings inspector
-                        let hex_bytes: Vec<String> = buf[..n.min(16)].iter().map(|b| format!("{:02X}", b)).collect();
-                        self.mx2_last_packet_hex = Some(format!("{} ({} bytes)", hex_bytes.join(" "), n));
+            // Format hex preview for Settings inspector
+            let hex_bytes: Vec<String> = buf[..n.min(16)].iter().map(|b| format!("{:02X}", b)).collect();
+            self.mx2_last_packet_hex = Some(format!("{} ({} bytes)", hex_bytes.join(" "), n));
 
-                        let evs = self.mx2_driver.decode_input_report(&buf[..n]);
-                        for ev in &evs {
-                            let desc = match ev {
-                                SurfaceEvent::Button { control, pressed } => format!("Button {control} = {pressed}"),
-                                SurfaceEvent::Fader { control, value } => format!("Fader {control} = {value:.3}"),
-                                SurfaceEvent::Encoder { control, delta } => format!("Encoder {control} += {delta}"),
-                            };
-                            self.mx2_last_events.push(desc);
-                            if self.mx2_last_events.len() > 8 {
-                                self.mx2_last_events.remove(0);
-                            }
-                        }
-                        pending_events.extend(evs);
-                    }
-                    Ok(_) => {
-                        // EOF -> device unplugged
-                        disconnected = true;
-                        break;
-                    }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::Interrupted => {
-                        break;
-                    }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::BrokenPipe || e.kind() == std::io::ErrorKind::NotConnected => {
-                        disconnected = true;
-                        break;
-                    }
-                    Err(_) => {
-                        // Transient I/O error, do not immediately disconnect
-                        break;
-                    }
+            let evs = self.mx2_driver.decode_input_report(&buf);
+            for ev in &evs {
+                let desc = match ev {
+                    SurfaceEvent::Button { control, pressed } => format!("Button {control} = {pressed}"),
+                    SurfaceEvent::Fader { control, value } => format!("Fader {control} = {value:.3}"),
+                    SurfaceEvent::Encoder { control, delta } => format!("Encoder {control} += {delta}"),
+                };
+                self.mx2_last_events.push(desc);
+                if self.mx2_last_events.len() > 8 {
+                    self.mx2_last_events.remove(0);
                 }
             }
+            pending_events.extend(evs);
         }
 
         if disconnected {
             self.mx2_hidraw_file = None;
+            self.mx2_rx = None;
             self.mx2_dev_node = None;
             self.mx2_access_status = Some("Disconnected (USB cable unplugged)".to_string());
             return;
@@ -7435,6 +7466,22 @@ mod sync_audio {
         let title = nodes.iter().find(|n| n.0 == "Track 2" && n.1 == Role::Label).unwrap().2;
         click(&mut app, &mut frame, title.center(), 2);
         assert!(app.deck_loading.iter().any(|&l| l) && app.library.status_message.contains("Loading 'Track 2'"), "{}", app.library.status_message);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Low power with a deck playing: no row is decoded in the background; once the decks stop, it is.
+    #[test]
+    fn low_power_holds_row_decodes_while_a_deck_plays() {
+        let (dir, mut app) = preview_app("low_power");
+        app.preferences.low_power = true;
+        app.audio.shared.lock().unwrap().is_playing[0] = true;
+        app.library.visible_rows = vec![6];
+        app.poll_preview();
+        assert!(app.row_job.is_none(), "a row was decoded while a deck played");
+        app.audio.shared.lock().unwrap().is_playing = [false; 4];
+        app.library.visible_rows = vec![6];
+        app.poll_preview();
+        assert!(app.row_job.as_ref().is_some_and(|(id, _)| *id == 6), "the row was never decoded once the decks stopped");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

@@ -30,6 +30,16 @@ mod widgets;
 
 use app::ReTraktorApp;
 
+/// The UI context, for threads that receive controller input to wake a throttled UI.
+static UI_CTX: std::sync::OnceLock<egui::Context> = std::sync::OnceLock::new();
+
+/// Asks for a redraw now; a no-op before the window exists (and in tests).
+pub fn wake_ui() {
+    if let Some(ctx) = UI_CTX.get() {
+        ctx.request_repaint();
+    }
+}
+
 /// Screenshot mode can test other window sizes via SHOT_SIZE=WxH.
 fn shot_window_size() -> Option<Vec2> {
     std::env::var("RETRAKTOR_SHOT_DIR").ok()?;
@@ -114,6 +124,7 @@ fn main() -> eframe::Result<()> {
         "ReTraktor",
         native_options,
         Box::new(move |cc| {
+            let _ = UI_CTX.set(cc.egui_ctx.clone());
             theme::install_fonts(&cc.egui_ctx);
             if let Err(e) = theme::remember_first_overview_look() {
                 eprintln!("retraktor: could not save the overview look: {e}");

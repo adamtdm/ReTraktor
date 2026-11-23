@@ -404,29 +404,26 @@ fn paint_3band_waveform(
 
     match style {
         WaveformStyle::Classic => {
-            let col_w = 1.5_f32;
+            // One plain mesh: abutting columns need no edge smoothing, and it is half the points of stroked lines.
+            let col_w = if crate::preferences::low_power() { 3.0_f32 } else { 1.5 };
             let cols = (rect.width() / col_w).ceil() as usize;
+            let mut mesh = egui::Mesh::default();
+            mesh.reserve_triangles((cols + 2) * 6);
+            mesh.reserve_vertices((cols + 2) * 12);
+            let mut bar = |x: f32, h: f32, c: Color32| {
+                let r = Rect::from_min_max(Pos2::new(x - col_w * 0.5, center_y - h), Pos2::new(x + col_w * 0.5, center_y + h));
+                mesh.add_colored_rect(r, c);
+            };
             for i in 0..cols + 2 {
                 let col_x = rect.left() + (i as f32) * col_w - shift(col_w);
                 let Some(((low_amp, mid_amp, high_amp), tone)) = sample_at_x(col_x) else { continue };
                 let (outer_col, mid_col, core_col) = spectrum_colors(bands, tone.0, tone.1, tone.2);
                 let total_env = low_amp.max(mid_amp * 0.92).max(high_amp * 0.85);
-                let h_outer = (total_env * max_half_h).max(1.0);
-                painter.line_segment(
-                    [Pos2::new(col_x, center_y - h_outer), Pos2::new(col_x, center_y + h_outer)],
-                    Stroke::new(col_w, outer_col),
-                );
-                let h_mid = (mid_amp.max(low_amp * 0.75) * max_half_h * 0.72).max(0.8);
-                painter.line_segment(
-                    [Pos2::new(col_x, center_y - h_mid), Pos2::new(col_x, center_y + h_mid)],
-                    Stroke::new(col_w, mid_col),
-                );
-                let h_core = (low_amp * max_half_h * 0.46).max(0.5);
-                painter.line_segment(
-                    [Pos2::new(col_x, center_y - h_core), Pos2::new(col_x, center_y + h_core)],
-                    Stroke::new(col_w, core_col),
-                );
+                bar(col_x, (total_env * max_half_h).max(1.0), outer_col);
+                bar(col_x, (mid_amp.max(low_amp * 0.75) * max_half_h * 0.72).max(0.8), mid_col);
+                bar(col_x, (low_amp * max_half_h * 0.46).max(0.5), core_col);
             }
+            painter.add(egui::Shape::mesh(mesh));
         }
         WaveformStyle::Dots => {
             let (cols, half_rows, step_x, step_y, radius) =

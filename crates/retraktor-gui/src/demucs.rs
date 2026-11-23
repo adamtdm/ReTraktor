@@ -14,6 +14,7 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -47,6 +48,9 @@ pub enum DemucsSeparationStatus {
 pub struct DemucsManager {
     pub install_state: Arc<Mutex<DemucsInstallState>>,
     pub separation_status: Arc<Mutex<DemucsSeparationStatus>>,
+    /// The running separation's process id (0 = none), and whether it should be held stopped.
+    pid: Arc<AtomicU32>,
+    paused: Arc<AtomicBool>,
 }
 
 impl Default for DemucsManager {
@@ -60,6 +64,8 @@ impl DemucsManager {
         let mgr = Self {
             install_state: Arc::new(Mutex::new(DemucsInstallState::NotInstalled)),
             separation_status: Arc::new(Mutex::new(DemucsSeparationStatus::Idle)),
+            pid: Arc::default(),
+            paused: Arc::default(),
         };
         mgr.refresh_status();
         mgr
@@ -418,6 +424,14 @@ impl DemucsManager {
         });
     }
 
+    /// Holds a running separation stopped (SIGSTOP) or lets it go on (SIGCONT); signals only on a change.
+    /// shortcut: a crash while paused leaves Demucs stopped until it is killed, signal it from a guard if that bites.
+    pub fn set_paused(&self, paused: bool) {
+        if self.paused.swap(paused, Ordering::Relaxed) != paused {
+            signal(self.pid.load(Ordering::Relaxed), paused);
+        }
+    }
+
     /// Spawns a background stem separation worker for an audio track.
     pub fn start_separation(
         &self,
@@ -457,6 +471,7 @@ impl DemucsManager {
         }
 
         let status_clone = self.separation_status.clone();
+        let (pid, paused) = (self.pid.clone(), self.paused.clone());
         let audio_path_buf = audio_path.to_path_buf();
         let cache_root = Self::source_cache_root(audio_path);
         let track_title_string = track_title.to_string();
@@ -491,6 +506,11 @@ impl DemucsManager {
                 }
             };
 
+            pid.store(child.id(), Ordering::Relaxed);
+            if paused.load(Ordering::Relaxed) {
+                signal(child.id(), true);
+            }
+
             // Demucs writes progress to stderr (tqdm)
             if let Some(stderr) = child.stderr.take() {
                 let reader = BufReader::new(stderr);
@@ -508,6 +528,7 @@ impl DemucsManager {
             }
 
             let exit = child.wait();
+            pid.store(0, Ordering::Relaxed);
             if exit.is_ok() && exit.unwrap().success() {
                 if let Some(stem_dir) = Self::get_cached_stem_dir(&audio_path_buf) {
                     if let Ok(mut st) = status_clone.lock() {
@@ -529,6 +550,14 @@ impl DemucsManager {
         });
 
         true
+    }
+}
+
+/// Stops or continues process `pid` (none when 0). chrt and nice exec Demucs, so the child's id is Demucs itself.
+fn signal(pid: u32, stop: bool) {
+    if pid != 0 {
+        let sig = if stop { "-STOP" } else { "-CONT" };
+        let _ = Command::new("kill").args([sig, &pid.to_string()]).status();
     }
 }
 

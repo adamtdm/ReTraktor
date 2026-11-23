@@ -895,12 +895,14 @@ fn run_hardware_worker(
                     let evs = parse_midi_bytes(state, slug, &buf[..n]);
                     for ev in evs {
                         let _ = tx.send(ev);
+                        crate::wake_ui();
                     }
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     // shortcut: pairs must arrive within one poll interval or use a device-specific layout.
                     if let Some(ev) = state.flush_msb(slug) {
                         let _ = tx.send(ev);
+                        crate::wake_ui();
                     }
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::BrokenPipe || e.kind() == std::io::ErrorKind::NotConnected => {
@@ -927,6 +929,7 @@ fn run_hardware_worker(
                         let evs = diff_hid_reports(*pid, prev, report, tracker);
                         for ev in evs {
                             let _ = tx.send(ev);
+                            crate::wake_ui();
                         }
                     }
                     *prev = report.to_vec();

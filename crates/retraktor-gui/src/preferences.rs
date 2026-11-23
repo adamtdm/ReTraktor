@@ -94,6 +94,13 @@ pub const FX_NAMES: [&str; 9] = [
     "Bit crush",
 ];
 
+/// [`PreferencesDialog::low_power`] for drawing code, set each frame.
+pub static LOW_POWER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn low_power() -> bool {
+    LOW_POWER.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub struct PreferencesDialog {
     /// Set when the user asks for the folder chooser; the app opens it via the library.
     pub request_folder_pick: bool,
@@ -131,6 +138,8 @@ pub struct PreferencesDialog {
 
     // Decks & Waveforms
     pub four_deck_mode: bool,
+    /// Low power: 30 fps, lighter deck waveforms, and no background decoding or Demucs while a deck plays.
+    pub low_power: bool,
     pub waveform_color_mode: usize, // 0: Spectrum 4-Band, 1: Ultraviolet, 2: High-Contrast RGB
 
     // Track Decks & Scratch
@@ -216,6 +225,7 @@ impl Default for PreferencesDialog {
             autogain: true,
             limiter_enabled: true,
             four_deck_mode: false,
+            low_power: false,
             waveform_color_mode: 0,
             keylock_quality: 0, // HiQ
             jog_scratch_sensitivity: 1.0,
@@ -295,6 +305,7 @@ impl PreferencesDialog {
             "output_pairs": output_pairs_value(&self.output_pairs),
             "keylock_quality": self.keylock_quality,
             "four_deck_mode": self.four_deck_mode,
+            "low_power": self.low_power,
             "waveform_color_mode": self.waveform_color_mode,
             "xfader_curve_idx": self.xfader_curve_idx,
             "autogain": self.autogain,
@@ -357,6 +368,7 @@ impl PreferencesDialog {
         if let Some(v) = obj.get("output_pairs") { self.output_pairs = output_pairs_from(v); }
         if let Some(v) = u("keylock_quality") { self.keylock_quality = v as usize; }
         if let Some(v) = b("four_deck_mode") { self.four_deck_mode = v; }
+        if let Some(v) = b("low_power") { self.low_power = v; }
         if let Some(v) = u("waveform_color_mode") { self.waveform_color_mode = v as usize; }
         if let Some(v) = u("xfader_curve_idx") { self.xfader_curve_idx = v as usize; }
         if let Some(v) = b("autogain") { self.autogain = v; }
@@ -968,6 +980,15 @@ impl PreferencesDialog {
             "Show Decks C and D alongside Decks A and B.",
             |ui| {
                 crate::dot::dot_toggle(ui, &mut self.four_deck_mode, TraktorTheme::PLAY_ACTIVE(), "Four decks");
+            },
+        );
+
+        Self::list_row(
+            ui,
+            "Low power",
+            "For slower laptops and battery: draws at 30 fps with lighter deck waveforms, and while a deck plays, stops decoding browser tracks in the background and pauses Demucs.",
+            |ui| {
+                crate::dot::dot_toggle(ui, &mut self.low_power, TraktorTheme::PLAY_ACTIVE(), "Low power");
             },
         );
 
@@ -1872,6 +1893,7 @@ mod tests {
         original.sample_rate = 96000;
         original.buffer_size = 256;
         original.four_deck_mode = true;
+        original.low_power = true;
         original.lock_playing_decks = false;
         original.audio_device_name = "Focusrite Scarlett 4i4".to_string();
         original.library_columns.comment = true;
@@ -1897,6 +1919,7 @@ mod tests {
         assert_eq!(restored.sample_rate, 96000);
         assert_eq!(restored.buffer_size, 256);
         assert!(restored.four_deck_mode);
+        assert!(restored.low_power);
         assert!(!restored.lock_playing_decks);
         assert_eq!(restored.audio_device_name, "Focusrite Scarlett 4i4");
         assert!(restored.library_columns.comment);
