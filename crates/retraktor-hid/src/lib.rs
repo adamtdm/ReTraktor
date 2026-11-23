@@ -718,6 +718,10 @@ impl Mx2HidDriver {
             }
             // Report 0x02: 53 bytes (byte 0 = 0x02, 26 Little-Endian 12-bit ADC words 0..=4095)
             0x02 if report.len() >= 52 => {
+                // Hardware slide pots sit slightly inside 0..=4095 at their physical stops; clamp a 32-count
+                // (~0.8%) margin at each end and always emit on entering an end-stop so hysteresis never strands them.
+                const ADC_MIN: u16 = 32;
+                const ADC_MAX: u16 = 4063;
                 let payload = &report[1..];
                 for (ch_idx, name) in MX2_POT_FADER_NAMES.iter().enumerate() {
                     let off = ch_idx * 2;
@@ -725,14 +729,13 @@ impl Mx2HidDriver {
                         break;
                     }
                     let raw = u16::from_le_bytes([payload[off], payload[off + 1]]) & 0x0FFF;
-                    let changed = if !self.adc_initialized {
-                        true
-                    } else {
-                        self.prev_adc[ch_idx].abs_diff(raw) >= 4
-                    };
+                    let clamped = raw.clamp(ADC_MIN, ADC_MAX);
+                    let prev = self.prev_adc[ch_idx];
+                    let hit_stop = (clamped == ADC_MIN && prev != ADC_MIN) || (clamped == ADC_MAX && prev != ADC_MAX);
+                    let changed = !self.adc_initialized || hit_stop || prev.abs_diff(clamped) >= 4;
                     if changed {
-                        self.prev_adc[ch_idx] = raw;
-                        let norm = (raw as f64) / 4095.0;
+                        self.prev_adc[ch_idx] = clamped;
+                        let norm = f64::from(clamped - ADC_MIN) / f64::from(ADC_MAX - ADC_MIN);
                         events.push(SurfaceEvent::Fader {
                             control: (*name).to_string(),
                             value: norm,
@@ -1477,6 +1480,17 @@ mod tests {
             e,
             SurfaceEvent::Fader { control, value }
                 if control == "surface.mixer.xfader" && (*value - 1.0).abs() < 1e-6
+        )));
+
+        // Hardware pot end-stop margin: raw 25 still reaches exact 0.0, even across hysteresis.
+        let mut r2_low = [0u8; 53];
+        r2_low[0] = 0x02;
+        r2_low[1 + 23 * 2..1 + 23 * 2 + 2].copy_from_slice(&25u16.to_le_bytes());
+        let ev2_low = mx2.decode_input_report(&r2_low);
+        assert!(ev2_low.iter().any(|e| matches!(
+            e,
+            SurfaceEvent::Fader { control, value }
+                if control == "surface.mixer.xfader" && *value == 0.0
         )));
 
         // Test Report 0x03: Jogwheel 0 (Left) rotates +24 ticks
