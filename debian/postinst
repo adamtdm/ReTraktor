@@ -18,5 +18,8 @@ fi
 if command -v gtk-update-icon-cache >/dev/null 2>&1; then
     gtk-update-icon-cache -f -t /usr/share/icons/hicolor || true
 fi
+if command -v gtk4-update-icon-cache >/dev/null 2>&1; then
+    gtk4-update-icon-cache -f -t /usr/share/icons/hicolor || true
+fi
 
 exit 0

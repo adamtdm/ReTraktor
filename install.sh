@@ -236,8 +236,10 @@ else
     $SUDO install -d -m 0755 /usr/share/applications
     $SUDO install -m 0644 "$SCRIPT_DIR/assets/retraktor.desktop" /usr/share/applications/retraktor.desktop
 
-    $SUDO install -d -m 0755 /usr/share/icons/hicolor/scalable/apps
+    $SUDO install -d -m 0755 /usr/share/icons/hicolor/scalable/apps /usr/share/icons/hicolor/256x256/apps /usr/share/pixmaps
     $SUDO install -m 0644 "$SCRIPT_DIR/assets/retraktor.svg" /usr/share/icons/hicolor/scalable/apps/retraktor.svg
+    [ -f "$SCRIPT_DIR/assets/retraktor.png" ] && $SUDO install -m 0644 "$SCRIPT_DIR/assets/retraktor.png" /usr/share/icons/hicolor/256x256/apps/retraktor.png
+    [ -f "$SCRIPT_DIR/assets/retraktor.png" ] && $SUDO install -m 0644 "$SCRIPT_DIR/assets/retraktor.png" /usr/share/pixmaps/retraktor.png
 fi
 
 # Ensure both /usr/local/bin and /usr/bin have the active retraktor, retraktor-gui, and retraktor-cli binaries

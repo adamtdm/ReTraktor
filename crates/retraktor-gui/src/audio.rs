@@ -5,15 +5,18 @@ use retraktor_audio::FourDeckAudioEngine;
 use crate::keylock::KeyLock;
 use crate::recorder::RecorderTap;
 use crate::remix::{self, Launch, RemixColumn, RemixEngine, RemixRequest, RemixSample};
+use retraktor_dsp::{DeckFxUnit, MixerFxKind};
+use std::collections::HashMap;
 use std::f32::consts::PI;
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 #[cfg(not(test))]
 use std::thread;
 #[cfg(not(test))]
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use std::time::Instant;
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::DecoderOptions;
 use symphonia::core::formats::FormatOptions;
@@ -215,10 +218,29 @@ impl LoadedTrackAudio {
         fallback_key: &str,
         autogain: bool,
     ) -> Result<Self, String> {
+        type CacheEntry = (crate::overview::FileIdentity, f32);
+        static AUTOGAIN_CACHE: LazyLock<Mutex<HashMap<PathBuf, CacheEntry>>> = LazyLock::new(Mutex::default);
+
+        let cache_key = if autogain { path.canonicalize().ok().zip(file_identity(path)) } else { None };
         let mut file = AudioFile::open(path)?;
         let (tag_title, tag_artist) = file.tags();
         let pcm_stereo = file.decode_all(&|| false)?;
-        let mut loaded = Self::from_pcm_with_autogain(pcm_stereo, file.sample_rate, fallback_title, fallback_artist, fallback_bpm, fallback_key, autogain);
+        let cache_key = cache_key.filter(|(_, identity)| file_identity(path) == Some(*identity));
+        let cached_gain = cache_key.as_ref().and_then(|(path, identity)| {
+            let (cached_identity, gain) = AUTOGAIN_CACHE.lock().unwrap_or_else(PoisonError::into_inner).get(path).copied()?;
+            (cached_identity == *identity).then_some(gain)
+        });
+        let mut loaded = Self::from_pcm_with_gain(
+            pcm_stereo, file.sample_rate, fallback_title, fallback_artist, fallback_bpm, fallback_key,
+            if autogain { cached_gain } else { Some(1.0) },
+        );
+        if let Some((key, identity)) = cache_key.filter(|(_, identity)| cached_gain.is_none() && file_identity(path) == Some(*identity)) {
+            let mut cache = AUTOGAIN_CACHE.lock().unwrap_or_else(PoisonError::into_inner);
+            if cache.len() >= 2048 {
+                cache.clear();
+            }
+            cache.insert(key, (identity, loaded.auto_gain));
+        }
         loaded.title = tag_title.unwrap_or(loaded.title);
         loaded.artist = tag_artist.unwrap_or(loaded.artist);
         Ok(loaded)
@@ -230,20 +252,29 @@ impl LoadedTrackAudio {
     }
 
     pub fn from_pcm_with_autogain(pcm_stereo: Vec<f32>, sr: u32, title: &str, artist: &str, bpm: f64, key: &str, autogain: bool) -> Self {
+        Self::from_pcm_with_gain(pcm_stereo, sr, title, artist, bpm, key, (!autogain).then_some(1.0))
+    }
+
+    fn from_pcm_with_gain(pcm_stereo: Vec<f32>, sr: u32, title: &str, artist: &str, bpm: f64, key: &str, gain: Option<f32>) -> Self {
         let duration_sec = (pcm_stereo.len() / 2) as f64 / (sr as f64);
-        let buckets = Self::measure_buckets(&pcm_stereo, sr);
+        let (buckets, auto_gain) = match gain {
+            Some(gain) => (Self::measure_buckets(&pcm_stereo, sr), gain),
+            None => std::thread::scope(|scope| {
+                let meter = scope.spawn(|| retraktor_library::autogain_multiplier(&pcm_stereo, sr));
+                (Self::measure_buckets(&pcm_stereo, sr), meter.join().unwrap())
+            }),
+        };
         let (waveform_peaks_vec, stem_peaks_vec) = Self::shape_peaks(&buckets, 1.0);
         let phrases = retraktor_library::detect_phrases(&waveform_peaks_vec, bpm, 0.0, duration_sec);
         let overview = crate::overview::from_peaks(&waveform_peaks_vec);
         let waveform_peaks: Arc<[[f32; 3]]> = waveform_peaks_vec.into();
         let stem_peaks: Arc<[[f32; 4]]> = stem_peaks_vec.into();
-        let (auto_gain, played_peaks, played_stem_peaks, played_overview) = if autogain {
-            let g = retraktor_library::autogain_multiplier(&pcm_stereo, sr);
-            let (pp, psp) = Self::shape_peaks(&buckets, g);
-            let po = crate::overview::from_peaks(&pp);
-            (g, pp.into(), psp.into(), po)
+        let (played_peaks, played_stem_peaks, played_overview) = if (auto_gain - 1.0).abs() < 1e-4 {
+            (Arc::clone(&waveform_peaks), Arc::clone(&stem_peaks), Arc::clone(&overview))
         } else {
-            (1.0, Arc::clone(&waveform_peaks), Arc::clone(&stem_peaks), Arc::clone(&overview))
+            let (pp, psp) = Self::shape_peaks(&buckets, auto_gain);
+            let po = crate::overview::from_peaks(&pp);
+            (pp.into(), psp.into(), po)
         };
         Self {
             title: title.to_string(),
@@ -294,10 +325,23 @@ impl LoadedTrackAudio {
         let vocals_p = find_stem("vocals");
 
         if let (Some(dp), Some(bp), Some(op), Some(vp)) = (drums_p, bass_p, other_p, vocals_p) {
-            let drums_pcm = Self::decode_file_to_pcm(&dp).ok().map(|(p, _)| p);
-            let bass_pcm = Self::decode_file_to_pcm(&bp).ok().map(|(p, _)| p);
-            let other_pcm = Self::decode_file_to_pcm(&op).ok().map(|(p, _)| p);
-            let vocals_pcm = Self::decode_file_to_pcm(&vp).ok().map(|(p, _)| p);
+            let decode_stem = |path: &Path| {
+                let (pcm, stem_sr) = Self::decode_file_to_pcm(path).ok()?;
+                if stem_sr == self.sample_rate {
+                    return Some(pcm);
+                }
+                let source_step = f64::from(stem_sr) / f64::from(self.sample_rate);
+                let source_frames = pcm.len() / 2;
+                let frames = (source_frames as f64 / source_step).round() as usize;
+                if source_frames == 1 {
+                    return Some(pcm.repeat(frames));
+                }
+                Some((0..frames).flat_map(|i| {
+                    let (l, r) = sample_stereo_hermite(&pcm, i as f64 * source_step);
+                    [l, r]
+                }).collect())
+            };
+            let [drums_pcm, bass_pcm, other_pcm, vocals_pcm] = [&dp, &bp, &op, &vp].map(|p| decode_stem(p));
 
             if let (Some(d), Some(b), Some(o), Some(v)) = (drums_pcm, bass_pcm, other_pcm, vocals_pcm) {
                 // Compute true stem waveform peaks from the isolated audio buffers
@@ -310,19 +354,10 @@ impl LoadedTrackAudio {
                 for b_idx in 0..num_buckets {
                     let start = b_idx * frames_per_bucket * 2;
                     let end = ((b_idx + 1) * frames_per_bucket * 2).min(self.pcm_stereo.len());
-                    let mut max_d = 0.0_f32;
-                    let mut max_b = 0.0_f32;
-                    let mut max_o = 0.0_f32;
-                    let mut max_v = 0.0_f32;
-
-                    for i in (start..end).step_by(2) {
-                        if let Some(&s) = d.get(i) { max_d = max_d.max(s.abs()); }
-                        if let Some(&s) = b.get(i) { max_b = max_b.max(s.abs()); }
-                        if let Some(&s) = o.get(i) { max_o = max_o.max(s.abs()); }
-                        if let Some(&s) = v.get(i) { max_v = max_v.max(s.abs()); }
-                    }
-
-                    let maxima = [max_d, max_b, max_o, max_v];
+                    let maxima = [&d, &b, &o, &v].map(|pcm| {
+                        pcm.get(start..end.min(pcm.len())).unwrap_or_default().iter()
+                            .fold(0.0_f32, |peak, sample| peak.max(sample.abs()))
+                    });
                     real_peaks.push(maxima.map(|m| m.clamp(0.04, 1.0)));
                     // Stems that arrive after a deck load use its latched gain; on load, `finish_loads` swaps in unity when Auto gain is off.
                     played_peaks.push(maxima.map(|m| (m * self.auto_gain).clamp(0.04, 1.0)));
@@ -597,6 +632,16 @@ pub(crate) fn sync_ratio(bpm: f64, target: f64) -> f64 {
     ratio
 }
 
+/// The power-of-two fold `sync_ratio` applies (2 for 70 synced to 140), so beat phases of a half- or double-time
+/// pairing compare in the same beats; 1 for a tempo that isn't finite and positive. Fixed work, like `sync_ratio`.
+pub(crate) fn sync_octave(bpm: f64, target: f64) -> f64 {
+    if !(bpm.is_finite() && bpm > 0.0 && target.is_finite() && target > 0.0) {
+        return 1.0;
+    }
+    let unfolded = target.max(20.0) / bpm.max(20.0);
+    2f64.powi((unfolded / sync_ratio(bpm, target)).log2().round() as i32)
+}
+
 /// Mixxx / xwax-based Alpha-Beta tracking filter for authentic turntable physics simulation.
 #[derive(Clone, Copy, Debug)]
 pub struct AlphaBetaFilter {
@@ -867,13 +912,27 @@ pub struct AudioSharedState {
     // Mixxx / xwax-based Vinyl Scratching Physics
     pub scratch_active: [bool; 4],
     pub scratch_rate: [f64; 4],
-    pub scratch_ticks_accum: [i64; 4],
+    scratch_target_rate: [f64; 4],
+    scratch_last_tick_at: [Option<Instant>; 4],
+    scratch_burst_ticks: [i64; 4],
+    scratch_burst_dt: [f64; 4],
+    scratch_burst_base: [f64; 4],
+    scratch_tick_serial: [u64; 4],
+    scratch_idle_sec: [f64; 4],
     pub scratch_dx_per_tick: [f64; 4],
-    pub scratch_filter: [AlphaBetaFilter; 4],
     pub scratch_ramping: [bool; 4],
     pub scratch_ramp_target: [f64; 4],
     /// Shared side only: a jog touch or release for the callback to pick up (its physics runs there, every block).
     scratch_changed: [bool; 4],
+    pub jog_nudge_rate: [f64; 4],
+    jog_nudge_delta: [f64; 4],
+
+    pub fx_enabled: [bool; 2],
+    pub fx_kind: [MixerFxKind; 2],
+    pub fx_dry_wet: [f32; 2],
+    pub fx_params: [[f32; 3]; 2],
+    pub deck_fx_assign: [[bool; 2]; 4],
+    pub limiter_enabled: bool,
 
     // Real-Time 4-Stem Mixing per Deck: [Drums, Bass, Instruments, Vocals]
     pub stem_volumes: [[f32; 4]; 4],
@@ -999,12 +1058,25 @@ impl Default for AudioSharedState {
             crossfader_curve: 0.5,
             scratch_active: [false; 4],
             scratch_rate: [0.0; 4],
-            scratch_ticks_accum: [0; 4],
+            scratch_target_rate: [0.0; 4],
+            scratch_last_tick_at: [None; 4],
+            scratch_burst_ticks: [0; 4],
+            scratch_burst_dt: [0.016; 4],
+            scratch_burst_base: [0.0; 4],
+            scratch_tick_serial: [0; 4],
+            scratch_idle_sec: [0.0; 4],
             scratch_dx_per_tick: [1.0 / 568.888889; 4],
-            scratch_filter: [AlphaBetaFilter::default(); 4],
             scratch_ramping: [false; 4],
             scratch_ramp_target: [1.0; 4],
             scratch_changed: [false; 4],
+            jog_nudge_rate: [0.0; 4],
+            jog_nudge_delta: [0.0; 4],
+            fx_enabled: [false; 2],
+            fx_kind: [MixerFxKind::Reverb, MixerFxKind::DualDelay],
+            fx_dry_wet: [0.3; 2],
+            fx_params: [[0.5; 3]; 2],
+            deck_fx_assign: [[true, false], [false, true], [true, false], [false, true]],
+            limiter_enabled: true,
             stem_volumes: [[1.0; 4]; 4],
             stem_muted: [[false; 4]; 4],
             stem_fx_send: [[false; 4]; 4],
@@ -1067,7 +1139,7 @@ impl AudioSharedState {
             None => next.max(0.0),
         };
         self.pending_seek[d] = Some(match self.pending_seek[d] {
-            Some(Seek::To(sec)) => Seek::To(sec + delta_sec),
+            Some(Seek::To(_)) => Seek::To(self.playhead_sec[d]),
             Some(Seek::By(sum)) => Seek::By(sum + delta_sec),
             None => Seek::By(delta_sec),
         });
@@ -1124,8 +1196,8 @@ impl AudioSharedState {
         deck: usize,
         intervals_per_rev: u32,
         rpm: f64,
-        alpha: f64,
-        beta: f64,
+        _alpha: f64,
+        _beta: f64,
     ) {
         let d = deck.min(3);
         let intervals_per_sec = (rpm * (intervals_per_rev as f64)) / 60.0;
@@ -1135,17 +1207,67 @@ impl AudioSharedState {
             1.0 / 568.888889
         };
         let init_v = if self.is_playing[d] { self.pitch_ratio[d] } else { 0.0 };
-        self.scratch_filter[d].init(0.002, init_v, alpha, beta);
         self.scratch_rate[d] = init_v;
-        self.scratch_ticks_accum[d] = 0;
+        self.scratch_target_rate[d] = init_v;
+        self.scratch_last_tick_at[d] = None;
+        self.scratch_burst_ticks[d] = 0;
+        self.scratch_burst_dt[d] = 0.016;
+        self.scratch_burst_base[d] = init_v;
+        self.scratch_idle_sec[d] = 0.0;
         self.scratch_active[d] = true;
         self.scratch_ramping[d] = false;
         self.scratch_changed[d] = true;
     }
 
     pub fn scratch_tick(&mut self, deck: usize, ticks: i64) {
+        self.scratch_tick_scaled(deck, ticks, 1.0);
+    }
+
+    /// Accumulates raw platter ticks within a burst before scaling by `sensitivity`, so fractional
+    /// sensitivity gives the same speed whether ticks arrive as many tiny reports or one larger report.
+    pub fn scratch_tick_scaled(&mut self, deck: usize, ticks: i64, sensitivity: f64) {
         let d = deck.min(3);
-        self.scratch_ticks_accum[d] += ticks;
+        if ticks == 0 || !self.scratch_active[d] {
+            return;
+        }
+        let now = Instant::now();
+        // Coalesce multi-report HID bursts drained in the same UI frame (<4 ms apart) so N reports
+        // of +1 tick yield the exact same velocity as 1 report of +N ticks.
+        let same_burst = self.scratch_last_tick_at[d]
+            .is_some_and(|last| now.saturating_duration_since(last).as_secs_f64() < 0.004);
+        if same_burst {
+            self.scratch_burst_ticks[d] = self.scratch_burst_ticks[d].saturating_add(ticks);
+        } else {
+            let elapsed = self.scratch_last_tick_at[d].map_or(0.016, |last| now.saturating_duration_since(last).as_secs_f64());
+            let already_held = self.scratch_idle_sec[d].max(0.045);
+            self.scratch_burst_base[d] = self.scratch_target_rate[d] * (-(elapsed - already_held).max(0.0) / 0.035).exp();
+            self.scratch_burst_dt[d] = elapsed.clamp(0.004, 0.050);
+            self.scratch_burst_ticks[d] = ticks;
+            self.scratch_last_tick_at[d] = Some(now);
+        }
+        let scaled = self.scratch_burst_ticks[d] as f64 * sensitivity.clamp(0.1, 4.0);
+        let velocity = (scaled * self.scratch_dx_per_tick[d] / self.scratch_burst_dt[d]).clamp(-6.0, 6.0);
+        self.scratch_target_rate[d] = self.scratch_burst_base[d] * 0.45 + velocity * 0.55;
+        self.scratch_idle_sec[d] = 0.0;
+        self.scratch_tick_serial[d] = self.scratch_tick_serial[d].wrapping_add(1);
+    }
+
+    pub fn jog_nudge(&mut self, d: usize, delta_ticks: i64, sensitivity: f64) {
+        let delta = delta_ticks as f64 / 1024.0 * sensitivity;
+        if self.is_playing[d] {
+            let next = (self.jog_nudge_rate[d] + delta).clamp(-0.18, 0.18);
+            self.jog_nudge_delta[d] += next - self.jog_nudge_rate[d];
+            self.jog_nudge_rate[d] = next;
+        } else {
+            self.seek_by(d, delta * 0.08);
+        }
+    }
+
+    pub fn fast_scrub(&mut self, d: usize, delta_ticks: i64, sensitivity: f64) {
+        self.seek_by(d, delta_ticks as f64 / 960.0 * 6.0 * sensitivity);
+        if self.is_playing[d] {
+            self.ease_jump(d);
+        }
     }
 
     pub fn disable_scratch(&mut self, deck: usize) {
@@ -1365,8 +1487,6 @@ enum Route {
     NativeDefault,
     /// A PipeWire sink by node name, with this many channels (None: as the node offers, up to what the pairs need).
     NativeNode { node: String, channels: Option<u16> },
-    /// A sound-server sink by name through one ALSA plugin, `"pipewire"` or `"pulse"`, each tried on its own.
-    AlsaBridge { plugin: &'static str, node: String, channels: u16 },
     /// A raw ALSA device, by its cpal ID.
     Alsa { id: String },
     /// ALSA's default device (on a desktop, usually the sound server's ALSA plugin).
@@ -1377,29 +1497,20 @@ impl Route {
     fn describe(&self) -> &'static str {
         match self {
             Route::NativeDefault | Route::NativeNode { .. } => "PipeWire",
-            Route::AlsaBridge { plugin: "pipewire", .. } => "PipeWire via ALSA",
-            Route::AlsaBridge { .. } => "PulseAudio via ALSA",
             Route::Alsa { .. } => "ALSA",
             Route::AlsaDefault => "ALSA default device",
         }
     }
 }
 
-/// The routes to try for `device_id`, best first: a sound-server sink (`pw:<name>`) natively when PipeWire
-/// runs (`native`), then through each ALSA plugin; any other ID as the raw ALSA device it names, whatever
-/// else is listed; then the system default, natively first. `listed` is the sink's channel count when the
-/// sound server listed it; `sink_absent` means the server's sinks are known and this one isn't among them,
-/// so only the default is tried (the ALSA plugins would quietly play to another sink). `want` is the
-/// [`OutputRoute::width`] to ask a named sink for, as far as it has channels.
+/// Try the named PipeWire sink or raw ALSA device first, then the system default.
+/// Only native PipeWire can target a graph sink directly through CPAL.
 fn routes(device_id: &str, listed: Option<u16>, sink_absent: bool, native: bool, want: u16) -> Vec<Route> {
     let width = |channels: u16| want_width(want, channels);
     let mut list = Vec::new();
     if let Some(node) = device_id.strip_prefix("pw:").filter(|_| !sink_absent) {
         if native {
             list.push(Route::NativeNode { node: node.to_string(), channels: listed.map(width) });
-        }
-        for plugin in ["pipewire", "pulse"] {
-            list.push(Route::AlsaBridge { plugin, node: node.to_string(), channels: listed.map_or(2, width) });
         }
     } else if !device_id.is_empty() && !device_id.starts_with("pw:") {
         list.push(Route::Alsa { id: device_id.to_string() });
@@ -1418,12 +1529,9 @@ fn want_width(want: u16, channels: u16) -> u16 {
     if channels == 0 { 2 } else { want.min(channels) }
 }
 
-/// The device configuration to open where no sound server converts (raw ALSA, an ALSA plugin), in f32 or
-/// i16: `want` channels, best at `rate`; else the narrowest wider layout (a fixed physical layout, even at
-/// another rate); else stereo at `rate`. Nothing wider than `most`, so a plugin never fakes outputs its sink
-/// lacks.
+/// Select a writable ALSA configuration: the requested width and rate, a fixed wider layout, or stereo.
 fn pick_config(ranges: &[cpal::SupportedStreamConfigRange], want: u16, most: u16, rate: u32) -> Option<&cpal::SupportedStreamConfigRange> {
-    let usable = || ranges.iter().filter(|r| matches!(r.sample_format(), cpal::SampleFormat::F32 | cpal::SampleFormat::I16) && r.channels() <= most);
+    let usable = || ranges.iter().filter(|r| matches!(r.sample_format(), cpal::SampleFormat::F32 | cpal::SampleFormat::I16 | cpal::SampleFormat::U16 | cpal::SampleFormat::I32) && r.channels() <= most);
     let wider = || usable().filter(|r| r.channels() > want);
     usable()
         .filter(|r| r.channels() == want)
@@ -1440,19 +1548,6 @@ fn alsa_host() -> Result<cpal::Host, String> {
     return cpal::host_from_id(cpal::HostId::Alsa).map_err(|e| e.to_string());
     #[cfg(not(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd")))]
     Ok(cpal::default_host())
-}
-
-/// Sets `var` to `value` while `f` runs, then restores what was there (or its absence). For an ALSA plugin,
-/// which reads its target from the environment when the stream opens.
-fn with_env<T>(var: &str, value: &str, f: impl FnOnce() -> T) -> T {
-    let before = std::env::var_os(var);
-    std::env::set_var(var, value);
-    let out = f();
-    match before {
-        Some(v) => std::env::set_var(var, v),
-        None => std::env::remove_var(var),
-    }
-    out
 }
 
 impl AudioSystem {
@@ -1540,8 +1635,7 @@ impl AudioSystem {
         #[cfg(not(target_os = "linux"))]
         let pipewire: Option<cpal::Host> = None;
         let mut failed = Vec::new();
-        // The sound server's own listing decides when there is one (a sink it lists is tried, through Pulse if
-        // need be, whatever another PipeWire graph holds); without it, PipeWire's nodes do.
+        // Prefer the sound server's listing for sink width and use CPAL's graph when no listing is available.
         let sink_absent = device_id.strip_prefix("pw:").is_some_and(|node| {
             if choices.iter().any(|c| c.id.starts_with("pw:")) {
                 choice.is_none()
@@ -1551,21 +1645,18 @@ impl AudioSystem {
                 })
             }
         });
-        if sink_absent {
-            failed.push(format!("{} is not connected", &device_id[3..]));
+        if let Some(node) = device_id.strip_prefix("pw:") {
+            if pipewire.is_none() {
+                failed.push(format!("native PipeWire unavailable for {node}"));
+            } else if sink_absent {
+                failed.push(format!("{node} is not connected"));
+            }
         }
         for way in routes(device_id, choice.map(|c| c.channels), sink_absent, pipewire.is_some(), want) {
             // The old stream is gone and the new one not built yet: its first block plays this routing.
             self.on_system_default = matches!(way, Route::NativeDefault | Route::AlsaDefault);
             self.reroute(route);
-            let attempt = match &way {
-                Route::AlsaBridge { plugin, node, .. } => {
-                    let var = if *plugin == "pipewire" { "PIPEWIRE_NODE" } else { "PULSE_SINK" };
-                    with_env(var, node, || self.open_route(&way, pipewire.as_ref(), choice, sample_rate, buffer, want))
-                }
-                _ => self.open_route(&way, pipewire.as_ref(), choice, sample_rate, buffer, want),
-            };
-            match attempt {
+            match self.open_route(&way, pipewire.as_ref(), choice, sample_rate, buffer, want) {
                 Ok(info) => {
                     let fell_back = if failed.is_empty() { String::new() } else { format!(" · fallback after {}", failed.join("; ")) };
                     self.output_info = Some(info + &fell_back);
@@ -1600,11 +1691,6 @@ impl AudioSystem {
                 let channels = channels.unwrap_or_else(|| want_width(want, widest()));
                 (found, channels, chosen_label)
             }
-            Route::AlsaBridge { plugin, channels, .. } => {
-                let host = alsa()?;
-                let found = host.output_devices().ok().and_then(|mut d| d.find(|d| d.id().is_ok_and(|id| id.id() == *plugin)));
-                (found, *channels, chosen_label)
-            }
             Route::Alsa { id } => {
                 let device = id.parse().ok().and_then(|id| alsa().ok()?.device_by_id(&id));
                 let widest = device.as_ref().and_then(|d| d.supported_output_configs().ok()?.map(|c| c.channels()).max()).unwrap_or(2);
@@ -1625,8 +1711,7 @@ impl AudioSystem {
             let sr = if ranges.iter().any(|r| r.contains_rate(sample_rate)) { sample_rate } else { default.sample_rate() };
             (cpal::SampleFormat::F32, ch as usize, sr, *default.buffer_size())
         } else {
-            // A plugin's sink was asked for no more than it lists; only raw hardware may open wider.
-            let most = if matches!(route, Route::AlsaBridge { .. }) { want_ch } else { u16::MAX };
+            let most = u16::MAX;
             let config = match pick_config(&ranges, want_ch, most, sample_rate) {
                 Some(r) => {
                     let rate = if r.contains_rate(sample_rate) { sample_rate } else { default.sample_rate().clamp(r.min_sample_rate(), r.max_sample_rate()) };
@@ -1656,12 +1741,25 @@ impl AudioSystem {
                     err_fn,
                     None,
                 ),
-                _ => device.build_output_stream(
+                cpal::SampleFormat::I16 => device.build_output_stream(
                     stream_config,
                     move |data: &mut [i16], _: &cpal::OutputCallbackInfo| renderer.render(data, channels, sr, pcm_i16),
                     err_fn,
                     None,
                 ),
+                cpal::SampleFormat::U16 => device.build_output_stream(
+                    stream_config,
+                    move |data: &mut [u16], _: &cpal::OutputCallbackInfo| renderer.render(data, channels, sr, cpal::Sample::from_sample),
+                    err_fn,
+                    None,
+                ),
+                cpal::SampleFormat::I32 => device.build_output_stream(
+                    stream_config,
+                    move |data: &mut [i32], _: &cpal::OutputCallbackInfo| renderer.render(data, channels, sr, cpal::Sample::from_sample),
+                    err_fn,
+                    None,
+                ),
+                _ => Err(cpal::ErrorKind::UnsupportedConfig.into()),
             }
         };
         let built = match fixed_ok.then(|| build(cpal::BufferSize::Fixed(buffer))) {
@@ -1762,13 +1860,12 @@ fn fallback_tick(state: &mut AudioSharedState, dt: f64) {
         state.pattern_phase_sec += dt;
         state.pattern_current_step = ((state.pattern_phase_sec / step_dur).floor() as usize) % 16;
     }
+    state.jog_nudge_delta = [0.0; 4];
+    jog_physics(state, dt);
     for d in 0..4 {
-        if !state.scratch_active[d] && state.scratch_ramping[d] {
-            release_step(state, d, dt); // the callback's jog physics isn't running to end the ramp
-        }
         let scratching = state.scratch_active[d] || state.scratch_ramping[d];
         if state.is_playing[d] || scratching {
-            let ratio = if scratching { state.scratch_rate[d] } else { state.pitch_ratio[d] };
+            let ratio = if scratching { state.scratch_rate[d] } else { state.pitch_ratio[d] + state.jog_nudge_rate[d] };
             state.playhead_sec[d] += dt * ratio;
             let duration = state.loaded_tracks[d].as_ref().map(|t| t.duration_sec);
             if state.loop_active[d] && state.loop_len_sec[d] > 0.05 {
@@ -2224,6 +2321,8 @@ pub(crate) struct Renderer {
     /// The callback's copy. Its `loaded_tracks` stay empty; `tracks` holds the audio.
     state: AudioSharedState,
     tracks: [Option<DeckPcm>; 4],
+    deck_fx: [DeckFxUnit; 2],
+    pattern_noise: u32,
     preview: PreviewPlayer,
     remix: RemixEngine,
     generation: u64,
@@ -2239,6 +2338,8 @@ impl Renderer {
             recorder,
             state: AudioSharedState::default(),
             tracks: Default::default(),
+            deck_fx: Default::default(),
+            pattern_noise: 0x9e37_79b9,
             preview: PreviewPlayer::default(),
             remix: RemixEngine::default(),
             generation: 0,
@@ -2256,6 +2357,14 @@ impl Renderer {
             Some(remix) => renderer.remix = remix,
             None => renderer.remix.clock = remix::BeatClock::starting_at(s.remix_beat),
         }
+        renderer.state.scratch_active = s.scratch_active;
+        renderer.state.scratch_rate = s.scratch_rate;
+        renderer.state.scratch_target_rate = s.scratch_target_rate;
+        renderer.state.scratch_tick_serial = s.scratch_tick_serial;
+        renderer.state.scratch_ramping = s.scratch_ramping;
+        renderer.state.scratch_ramp_target = s.scratch_ramp_target;
+        renderer.state.jog_nudge_rate = s.jog_nudge_rate;
+        s.jog_nudge_delta = [0.0; 4];
         renderer.take_from(&mut s);
         // The preview carries on from where the last stream left it; one that already ended stays silent.
         let p = s.preview_progress;
@@ -2283,13 +2392,14 @@ impl Renderer {
         }
         // While held, REC can't start or stop: this block is wholly in the take or wholly out. Busy only while
         // REC is being pressed right at this boundary, so the take starts or ends one block later or earlier.
-        let mut slot = self.recorder.try_lock().ok();
+        let recorder = Arc::clone(&self.recorder);
+        let mut slot = recorder.try_lock().ok();
         let mut tap = slot.as_deref_mut().and_then(Option::as_mut);
         if let Some(tap) = tap.as_deref_mut() {
             tap.begin_block(sr);
         }
         jog_physics(&mut self.state, (output.len() / channels) as f64 / (sr as f64).max(1.0));
-        Self::mix(&mut self.state, &self.tracks, &mut self.preview, &mut self.remix, tap.as_deref_mut(), output, channels, sr, to_sample);
+        self.mix(tap.as_deref_mut(), output, channels, sr, to_sample);
         if let Some(tap) = tap {
             tap.end_block();
         }
@@ -2315,6 +2425,14 @@ impl Renderer {
         r.keylock_hq = s.keylock_hq;
         r.crossfader = s.crossfader;
         r.crossfader_curve = s.crossfader_curve;
+        r.deck_fx_assign = s.deck_fx_assign;
+        r.engine.maximizer.enabled = s.limiter_enabled;
+        for (u, fx) in self.deck_fx.iter_mut().enumerate() {
+            fx.enabled = s.fx_enabled[u];
+            fx.kind = s.fx_kind[u];
+            fx.dry_wet = s.fx_dry_wet[u];
+            fx.params = s.fx_params[u];
+        }
         r.stem_volumes = s.stem_volumes;
         r.stem_muted = s.stem_muted;
         r.pattern_enabled = s.pattern_enabled;
@@ -2341,21 +2459,24 @@ impl Renderer {
             mine.filter.enabled = ui.filter.enabled;
         }
 
-        // Jog gestures and ticks; the physics itself runs in `render`, every block, so it never waits for the lock.
+        // Transfer each new target once so a handoff can't restart the callback's idle decay.
         for d in 0..4 {
-            if std::mem::take(&mut s.scratch_changed[d]) {
+            let changed = std::mem::take(&mut s.scratch_changed[d]);
+            if changed {
                 r.scratch_active[d] = s.scratch_active[d];
                 r.scratch_ramping[d] = s.scratch_ramping[d];
                 r.scratch_ramp_target[d] = s.scratch_ramp_target[d];
                 if s.scratch_active[d] {
-                    // A touch starts a fresh gesture; a release ramps from the speed the callback has reached.
-                    r.scratch_filter[d] = s.scratch_filter[d];
                     r.scratch_rate[d] = s.scratch_rate[d];
-                    r.scratch_dx_per_tick[d] = s.scratch_dx_per_tick[d];
-                    r.scratch_ticks_accum[d] = 0;
                 }
             }
-            r.scratch_ticks_accum[d] += std::mem::take(&mut s.scratch_ticks_accum[d]);
+            if changed || r.scratch_tick_serial[d] != s.scratch_tick_serial[d] {
+                r.scratch_target_rate[d] = s.scratch_target_rate[d];
+                r.scratch_tick_serial[d] = s.scratch_tick_serial[d];
+                r.scratch_idle_sec[d] = s.scratch_idle_sec[d];
+            }
+            let delta = std::mem::take(&mut s.jog_nudge_delta[d]);
+            r.jog_nudge_rate[d] = (r.jog_nudge_rate[d] + delta).clamp(-0.18, 0.18);
         }
 
         for d in 0..4 {
@@ -2430,7 +2551,13 @@ impl Renderer {
         s.pattern_phase_sec = r.pattern_phase_sec;
         s.scratch_rate = r.scratch_rate;
         s.scratch_ramping = r.scratch_ramping;
-        s.scratch_filter = r.scratch_filter;
+        for d in 0..4 {
+            if !s.scratch_changed[d] && r.scratch_tick_serial[d] == s.scratch_tick_serial[d] {
+                s.scratch_target_rate[d] = r.scratch_target_rate[d];
+                s.scratch_idle_sec[d] = r.scratch_idle_sec[d];
+            }
+        }
+        s.jog_nudge_rate = r.jog_nudge_rate;
         s.preview_progress = self.preview.progress();
         self.remix.publish(&mut s.remix_status);
         s.remix_beat = self.remix.clock.next;
@@ -2498,11 +2625,18 @@ fn settle_end(r: &mut AudioSharedState, mine: &Option<DeckPcm>, s: &mut AudioSha
 /// One block of jog physics in the callback's state: the scratch filter observes the ticks that arrived (none
 /// is an observation too), and a released platter eases back to playing speed.
 fn jog_physics(r: &mut AudioSharedState, block_dt: f64) {
+    let scratch_slew = 1.0 - (-block_dt / 0.012).exp();
+    let nudge_decay = (-block_dt / 0.09).exp();
     for d in 0..4 {
+        r.jog_nudge_rate[d] *= nudge_decay;
+        if !r.is_playing[d] || r.jog_nudge_rate[d].abs() < 1e-5 {
+            r.jog_nudge_rate[d] = 0.0;
+        }
         if r.scratch_active[d] {
-            let ticks = std::mem::take(&mut r.scratch_ticks_accum[d]);
-            r.scratch_filter[d].observation(r.scratch_dx_per_tick[d] * ticks as f64, block_dt);
-            r.scratch_rate[d] = r.scratch_filter[d].predicted_velocity();
+            r.scratch_idle_sec[d] += block_dt;
+            let decay_dt = (r.scratch_idle_sec[d] - 0.045).clamp(0.0, block_dt);
+            r.scratch_target_rate[d] *= (-decay_dt / 0.035).exp();
+            r.scratch_rate[d] += (r.scratch_target_rate[d] - r.scratch_rate[d]) * scratch_slew;
         } else if r.scratch_ramping[d] {
             release_step(r, d, block_dt);
         }
@@ -2559,16 +2693,16 @@ fn apply_seek(playhead: &mut f64, s: &mut AudioSharedState, d: usize) {
 impl Renderer {
     /// One block of the mix into `output`; with `rec`, its main output (before the cue routing) goes to the recorder too.
     fn mix<T: Copy>(
-        state: &mut AudioSharedState,
-        tracks: &[Option<DeckPcm>; 4],
-        preview: &mut PreviewPlayer,
-        remix: &mut RemixEngine,
+        &mut self,
         mut rec: Option<&mut RecorderTap>,
         output: &mut [T],
         channels: usize,
         sr: u32,
         to_sample: fn(f32) -> T,
     ) {
+        let state = &mut self.state;
+        let tracks = &self.tracks;
+        let remix = &mut self.remix;
         let frames = output.len() / channels;
         let dt = 1.0 / (sr as f64).max(1.0);
         output.fill(to_sample(0.0));
@@ -2599,8 +2733,9 @@ impl Renderer {
             let remix_sounding = remix.frame(reference, clock_bpm, sr, &mut remix_out);
 
             for d in 0..4 {
-                state.engine.strips[d].playing = state.is_playing[d];
-                if !state.is_playing[d] && !state.scratch_active[d] && !state.scratch_ramping[d] {
+                let scratching = state.scratch_active[d] || state.scratch_ramping[d];
+                state.engine.strips[d].playing = state.is_playing[d] || scratching;
+                if !state.engine.strips[d].playing {
                     state.jump_ease[d] = JumpEase::default(); // silent: no stale frame or request survives a stop
                     state.keylock_engaged[d] = false;
                     continue;
@@ -2612,14 +2747,13 @@ impl Renderer {
                 let mut has_sample = false;
                 let mut auto_gain = 1.0_f32;
 
-                let effective_rate = if state.scratch_active[d] || state.scratch_ramping[d] {
+                let effective_rate = if scratching {
                     state.scratch_rate[d]
                 } else {
-                    state.pitch_ratio[d]
+                    state.pitch_ratio[d] + state.jog_nudge_rate[d]
                 };
 
                 let mut true_stems = None;
-                let scratching = state.scratch_active[d] || state.scratch_ramping[d];
                 let looping = state.loop_active[d] && state.loop_len_sec[d] > 0.05;
                 // Plain playback ends after the last decoded frame; a loop or a hand on the platter carries on as before.
                 let track_end = tracks[d].as_ref().filter(|_| !scratching && !looping).map(|t| t.duration_sec);
@@ -2660,7 +2794,7 @@ impl Renderer {
                     // Phono cartridge magnetic induction scaling (output proportional to needle velocity)
                     // Attenuates frozen sample buzz/clicks when platter is stopped
                     let mut phono_gain = 1.0_f32;
-                    if state.scratch_active[d] {
+                    if state.scratch_active[d] || (state.scratch_ramping[d] && !state.is_playing[d]) {
                         let speed_abs = effective_rate.abs();
                         if speed_abs < 0.06 {
                             phono_gain = (speed_abs / 0.06) as f32;
@@ -2824,7 +2958,10 @@ impl Renderer {
                 // Voice 1: 909 Clap
                 if state.pattern_steps[1][step_idx] {
                     let env = (-step_t * 24.0 / decay_scale).exp();
-                    let noise = (((f * 1664525 + 1013904223) & 0x7FFF) as f32 / 16384.0) - 1.0;
+                    self.pattern_noise ^= self.pattern_noise << 13;
+                    self.pattern_noise ^= self.pattern_noise >> 17;
+                    self.pattern_noise ^= self.pattern_noise << 5;
+                    let noise = (self.pattern_noise >> 8) as f32 / 8_388_608.0 - 1.0;
                     pat_sample += noise * env * 0.45;
                 }
                 // Voice 2: 909 Closed/Open Hat
@@ -2845,7 +2982,34 @@ impl Renderer {
 
             state.engine.crossfader = state.crossfader;
             state.engine.crossfader_curve = state.crossfader_curve;
-            let (mut ml, mut mr, cl, cr) = state.engine.process_frame(deck_samples);
+            let bpm = state.engine.clock.bpm as f32;
+            let (mut ml, mut mr, cl, cr) = state.engine.process_frame_with_fx(deck_samples, |post_fader| {
+                let (mut delta_l, mut delta_r) = (0.0, 0.0);
+                let (mut both_l, mut both_r) = (0.0, 0.0);
+                for (d, (l, r)) in post_fader.into_iter().enumerate() {
+                    if state.deck_fx_assign[d][0] && state.deck_fx_assign[d][1] {
+                        both_l += l;
+                        both_r += r;
+                    }
+                }
+                let mut mix = [0.0f32; 2];
+                for (u, fx) in self.deck_fx.iter_mut().enumerate() {
+                    let (mut in_l, mut in_r) = (0.0, 0.0);
+                    for (d, (l, r)) in post_fader.into_iter().enumerate() {
+                        if state.deck_fx_assign[d][u] {
+                            in_l += l;
+                            in_r += r;
+                        }
+                    }
+                    let (out_l, out_r) = fx.process(in_l, in_r, sr as f32, bpm);
+                    mix[u] = fx.active_mix();
+                    delta_l += out_l - in_l;
+                    delta_r += out_r - in_r;
+                }
+                // Decks assigned to both units had dry attenuated twice (-m0 - m1); restore m0*m1 so dry stays (1-m0)(1-m1) >= 0.
+                let comp = mix[0] * mix[1];
+                (delta_l + both_l * comp, delta_r + both_r * comp)
+            });
             ml = (ml + pat_sample).clamp(-1.0, 1.0);
             mr = (mr + pat_sample).clamp(-1.0, 1.0);
 
@@ -2855,7 +3019,7 @@ impl Renderer {
 
             // The library preview joins the cue bus alone: after the main mix, its meters and the recorder.
             let (cl, cr) = if preview_heard {
-                let (pl, pr) = preview.next(sr);
+                let (pl, pr) = self.preview.next(sr);
                 (cl + pl, cr + pr)
             } else {
                 (cl, cr)
@@ -3603,7 +3767,117 @@ mod tests {
         assert!((shared.lock().unwrap().playhead_sec[0] - (published + PERIOD)).abs() < 1e-9, "the newer stream lost the move");
     }
 
-    /// A jog touch, 20 blocks of ticks scratching forward at about 2x, then release; then 75 blocks (200 ms)
+    #[test]
+    fn paused_scratch_sounds_and_holds_velocity_between_reports() {
+        let (shared, _, mut r) = playing_deck();
+        {
+            let mut s = shared.lock().unwrap();
+            s.is_playing[0] = false;
+            s.seek_to(0, 1.0);
+        }
+        assert!(block(&mut r).iter().all(|&x| x == 0.0));
+        {
+            let mut s = shared.lock().unwrap();
+            s.enable_scratch(0, 1024, 33.333, 0.125, 0.004);
+            s.scratch_tick(0, 10);
+            s.scratch_tick(0, 0);
+        }
+        let mut previous = 0.0;
+        for _ in 0..6 {
+            assert!(block(&mut r).iter().any(|&x| x.abs() > 1e-4));
+            let rate = r.state.scratch_rate[0];
+            assert!(rate > previous && rate < 1.0, "scratch velocity {rate} after {previous}");
+            previous = rate;
+        }
+        for _ in 0..100 {
+            block(&mut r);
+        }
+        assert!(r.state.scratch_rate[0].abs() < 0.005, "a resting platter kept moving");
+        assert!(!shared.lock().unwrap().is_playing[0]);
+    }
+
+    #[test]
+    fn jog_nudge_bends_playback_then_decays() {
+        let (shared, _, mut r) = playing_deck();
+        block(&mut r);
+        let start = r.state.playhead_sec[0];
+        shared.lock().unwrap().jog_nudge(0, 1024, 1.0);
+        block(&mut r);
+        assert!((1.0..1.18).contains(&((r.state.playhead_sec[0] - start) / PERIOD)));
+        let first = r.state.jog_nudge_rate[0];
+        {
+            let _busy = shared.lock().unwrap();
+            for _ in 0..34 {
+                block(&mut r);
+            }
+        }
+        block(&mut r);
+        assert!((0.34..0.38).contains(&(r.state.jog_nudge_rate[0] / first)));
+        for _ in 0..400 {
+            block(&mut r);
+        }
+        assert_eq!(r.state.jog_nudge_rate[0], 0.0);
+
+        {
+            let mut s = shared.lock().unwrap();
+            s.is_playing[0] = false;
+            s.seek_to(0, 1.0);
+            s.jog_nudge(0, 1024, 1.0);
+        }
+        block(&mut r);
+        assert_eq!(r.state.playhead_sec[0], 1.08);
+        {
+            let mut s = shared.lock().unwrap();
+            s.seek_to(0, 11.0);
+            s.fast_scrub(0, 960, 1.0);
+        }
+        block(&mut r);
+        assert_eq!(r.state.playhead_sec[0], 12.0);
+    }
+
+    #[test]
+    fn deck_reverb_rings_after_the_channel_fader_closes() {
+        for enabled in [false, true] {
+            let (shared, _, mut r) = playing_deck();
+            shared.lock().unwrap().fx_enabled[0] = enabled;
+            for _ in 0..64 {
+                block(&mut r);
+            }
+            shared.lock().unwrap().engine.strips[0].volume = 0.0;
+            let tail = block(&mut r);
+            assert_eq!(tail.iter().any(|&x| x.abs() > 1e-4), enabled);
+            shared.lock().unwrap().engine.master_volume = 0.0;
+            assert!(block(&mut r).iter().all(|&x| x == 0.0));
+        }
+    }
+
+    #[test]
+    fn master_limiter_can_be_bypassed() {
+        let (shared, _, mut r) = playing_deck();
+        shared.lock().unwrap().engine.master_volume = 100.0;
+        let peak = |r: &mut Renderer| block(r).into_iter().map(f32::abs).fold(0.0, f32::max);
+        assert!(peak(&mut r) < 1.0);
+        shared.lock().unwrap().limiter_enabled = false;
+        assert_eq!(peak(&mut r), 1.0);
+    }
+
+    #[test]
+    fn pattern_clap_noise_does_not_repeat_each_buffer() {
+        let shared = Arc::new(Mutex::new(AudioSharedState::default()));
+        {
+            let mut s = shared.lock().unwrap();
+            s.pattern_enabled = true;
+            s.pattern_steps = [[false; 16], [true; 16], [false; 16], [false; 16]];
+        }
+        let mut r = Renderer::new(shared, Arc::default(), Arc::default());
+        let first = block(&mut r);
+        r.state.pattern_phase_sec = 0.0; // Keep the envelope identical and compare the noise.
+        let second = block(&mut r);
+        assert!(first.iter().any(|&x| x.abs() > 0.01));
+        assert_ne!(first, second);
+    }
+
+    /// A jog touch, 20 blocks scratching forward, then release; then 75 blocks (200 ms)
     /// with no new input, the UI holding the lock or not, and 75 more. The release ramp runs in the callback
     /// either way: the deck is at the same spot at the same speed, and once back at playing speed the UI is
     /// told the ramp is over.
@@ -3613,8 +3887,8 @@ mod tests {
             let (shared, _, mut r) = playing_deck();
             block(&mut r);
             shared.lock().unwrap().enable_scratch(0, 1024, 33.333333333333336, 0.125, 0.125 / 32.0);
+            shared.lock().unwrap().scratch_tick(0, 24);
             for _ in 0..20 {
-                shared.lock().unwrap().scratch_tick(0, 3); // 3 ticks a 2.67 ms block: about 2x at 33 1/3 rpm
                 block(&mut r);
             }
             shared.lock().unwrap().disable_scratch(0);
@@ -3914,7 +4188,7 @@ mod tests {
 
         s.loop_active[0] = false;
         s.seek_to(0, 1.99);
-        (s.scratch_active[0], s.scratch_rate[0]) = (true, 1.0);
+        s.enable_scratch(0, 1024, 33.333, 0.125, 0.004);
         fallback_tick(&mut s, 0.016);
         assert!(s.is_playing[0] && s.playhead_sec[0] == 0.0, "a held platter past the end");
     }
@@ -3984,9 +4258,9 @@ mod tests {
             fallback_tick(&mut s, 0.016);
         }
         assert_eq!(s.playhead_sec[0], 2.0, "a resting hand moved the parked deck without a sound card");
-        s.scratch_rate[0] = -1.0; // the timer holds a touch's speed; this one drags back
+        s.scratch_tick(0, -8);
         fallback_tick(&mut s, 0.016);
-        assert!((s.playhead_sec[0] - (2.0 - 0.016)).abs() < 1e-9);
+        assert!((1.98..2.0).contains(&s.playhead_sec[0]));
     }
 
     /// Paused inside an active loop that runs past the end of the track, Play carries on round the loop from where
@@ -4103,28 +4377,20 @@ mod tests {
         assert!(take == first, "the take isn't exactly its one block");
     }
 
-    /// Which ways out `open` tries, in order: a named sound-server sink natively when PipeWire runs, then
-    /// through the PipeWire and the Pulse ALSA plugin as separate attempts, as wide as the chosen pairs need
-    /// when the sink has that many channels, else as many as it has, never under stereo (from the server's
-    /// listing, else from the native node); a sink the server
-    /// knows is gone goes straight to the default; a raw ALSA ID as that device even while sinks are listed;
-    /// the system default last, natively first; ALSA only when PipeWire doesn't run.
+    /// Try the named sink or raw device first, preserving its width, then the default output.
     #[test]
     fn routes_try_native_first_and_keep_named_outputs() {
         use Route::*;
-        let bridges = |channels| ["pipewire", "pulse"].map(|plugin| AlsaBridge { plugin, node: "usb.mx2".into(), channels });
         let native = |channels| NativeNode { node: "usb.mx2".into(), channels };
-        let [pw4, pulse4] = bridges(4);
-        assert_eq!(routes("pw:usb.mx2", Some(4), false, true, 4), [native(Some(4)), pw4.clone(), pulse4.clone(), NativeDefault, AlsaDefault]);
-        assert_eq!(routes("pw:usb.mx2", Some(4), false, false, 4), [pw4, pulse4, AlsaDefault], "Pulse or plain ALSA");
-        let [pw2, pulse2] = bridges(2);
-        assert_eq!(routes("pw:usb.mx2", Some(4), false, true, 2), [native(Some(2)), pw2.clone(), pulse2.clone(), NativeDefault, AlsaDefault], "split cue needs only stereo");
+        assert_eq!(routes("pw:usb.mx2", Some(4), false, true, 4), [native(Some(4)), NativeDefault, AlsaDefault]);
+        assert_eq!(routes("pw:usb.mx2", Some(4), false, false, 4), [AlsaDefault]);
+        assert_eq!(routes("pw:usb.mx2", Some(4), false, true, 2)[0], native(Some(2)), "split cue needs only stereo");
         assert_eq!(routes("pw:usb.mx2", Some(2), false, true, 4)[0], native(Some(2)));
-        assert_eq!(routes("pw:usb.mx2", None, false, true, 4), [native(None), pw2, pulse2, NativeDefault, AlsaDefault], "no pactl: the node decides");
+        assert_eq!(routes("pw:usb.mx2", None, false, true, 4)[0], native(None), "no pactl: the node decides");
         // Wider and odd sinks: as many as the pairs need, or all the sink has. A mono sink gets one channel, never
         // a stereo stream it would downmix (with the split cue in it); a sink that states nothing gets stereo.
         for (listed, want, asked) in [(8, 6, 6), (8, 4, 4), (4, 6, 4), (3, 4, 3), (5, 6, 5), (1, 4, 1), (1, 2, 1), (0, 4, 2)] {
-            assert_eq!(routes("pw:usb.mx2", Some(listed), false, true, want)[..2], [native(Some(asked)), bridges(asked)[0].clone()], "{listed} ch, {want} wanted");
+            assert_eq!(routes("pw:usb.mx2", Some(listed), false, true, want)[0], native(Some(asked)), "{listed} ch, {want} wanted");
         }
         assert_eq!(routes("pw:qa.gone", None, true, true, 4), [NativeDefault, AlsaDefault], "a sink the server knows is gone");
         assert_eq!(routes("alsa:hw:CARD=MX2,DEV=0", None, false, true, 4), [Alsa { id: "alsa:hw:CARD=MX2,DEV=0".into() }, NativeDefault, AlsaDefault]);
@@ -4137,12 +4403,14 @@ mod tests {
     /// Formats the callback can't write are skipped; a plugin capped at its sink's width never opens wider.
     #[test]
     fn raw_layouts_pick_the_narrowest_that_reaches_the_pairs() {
-        use cpal::SampleFormat::{F32, I16, U8};
+        use cpal::SampleFormat::{F32, I16, I32, U16, U8};
         let layout = |channels, min, max, format| cpal::SupportedStreamConfigRange::new(channels, min, max, cpal::SupportedBufferSize::Unknown, format);
         let pick = |ranges: &[cpal::SupportedStreamConfigRange], want, most| pick_config(ranges, want, most, 48_000).map(|r| (r.channels(), r.min_sample_rate()));
         let any = u16::MAX;
-        let four_only = [layout(4, 44_100, 96_000, I16)];
-        assert_eq!(pick(&four_only, 2, any), Some((4, 44_100)), "a K2-style fixed four-channel layout");
+        for format in [I16, U16, I32] {
+            let four_only = [layout(4, 44_100, 96_000, format)];
+            assert_eq!(pick(&four_only, 2, any), Some((4, 44_100)), "a fixed four-channel layout");
+        }
         let both = [layout(4, 48_000, 48_000, F32), layout(2, 48_000, 48_000, F32)];
         assert_eq!(pick(&both, 2, any), Some((2, 48_000)));
         let stereo_or_wide_elsewhere = [layout(2, 48_000, 48_000, F32), layout(8, 44_100, 44_100, I16)];
@@ -4220,18 +4488,6 @@ mod tests {
             ]
         );
         assert!(graph_sinks(&serde_json::json!({})).is_empty(), "not a dump");
-    }
-
-    /// The ALSA plugin's target is set only for its own attempt; whatever the user had set comes back.
-    #[test]
-    fn plugin_target_env_is_scoped_and_restored() {
-        let var = "RETRAKTOR_TEST_SINK_TARGET";
-        std::env::set_var(var, "users.own.sink");
-        assert_eq!(with_env(var, "qa.four", || std::env::var(var).unwrap()), "qa.four");
-        assert_eq!(std::env::var(var).unwrap(), "users.own.sink");
-        std::env::remove_var(var);
-        with_env(var, "qa.four", || ());
-        assert!(std::env::var_os(var).is_none(), "an unset variable was left set");
     }
 
     /// Non-xrun stream errors are counted and named for the UI; underruns only counted.
@@ -4914,6 +5170,59 @@ mod tests {
         for p in &wf_peaks_sq {
             assert!(p[0] <= 1.0 && p[1] <= 1.0 && p[2] <= 1.0);
         }
+    }
+
+    #[test]
+    fn stem_loading_matches_track_sample_rate_and_reads_both_channels() {
+        let dir = std::env::temp_dir().join(format!("retraktor-resampled-stems-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pcm: Vec<i16> = (0..4_410)
+            .flat_map(|i| [0, if i < 2_205 { 0 } else { 16_384 }])
+            .collect();
+        for stem in ["drums", "bass", "other", "vocals"] {
+            AudioSystem::write_stereo_wav_file(&dir.join(format!("{stem}.wav")), &pcm, 44_100).unwrap();
+        }
+        for sample_rate in [48_000, 96_000] {
+            let frames = sample_rate as usize / 10;
+            let mut track = LoadedTrackAudio::from_pcm_with_autogain(
+                vec![0.0; frames * 2], sample_rate, "", "", 128.0, "", false,
+            );
+            assert!(track.load_stems_from_dir(&dir));
+            let drums = track.pcm_drums.as_ref().unwrap();
+            assert_eq!(drums.len(), frames * 2);
+            assert_eq!(drums[frames..frames + 2], [0.0, 0.5]);
+            assert_eq!(track.stem_peaks.first().unwrap(), &[0.04; 4]);
+            assert_eq!(track.stem_peaks.last().unwrap(), &[0.5; 4]);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn autogain_reload_uses_the_current_file_version() {
+        let path = std::env::temp_dir().join(format!("retraktor-autogain-reload-{}.wav", std::process::id()));
+        let write_tone = |frames: usize, amplitude: f32| {
+            let pcm: Vec<i16> = (0..frames).flat_map(|i| {
+                let sample = (amplitude * (i as f32 * 2.0 * PI / 48.0).sin()) as i16;
+                [sample; 2]
+            }).collect();
+            AudioSystem::write_stereo_wav_file(&path, &pcm, 48_000).unwrap();
+        };
+        let load = || LoadedTrackAudio::from_file(&path, "", "", 128.0, "").unwrap().auto_gain;
+        write_tone(48_000, 12_000.0);
+        let first = load();
+        assert_eq!(load(), first);
+        write_tone(96_000, 3_000.0);
+        assert!(load() > first * 3.0);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn unity_autogain_reuses_peak_arrays() {
+        let track = LoadedTrackAudio::from_pcm(vec![0.0; 48_000 * 2], 48_000, "", "", 128.0, "");
+        assert_eq!(track.auto_gain, 1.0);
+        assert!(Arc::ptr_eq(&track.waveform_peaks, &track.played_peaks));
+        assert!(Arc::ptr_eq(&track.stem_peaks, &track.played_stem_peaks));
+        assert!(Arc::ptr_eq(&track.overview, &track.played_overview));
     }
 
     /// Two copies of one recording 18 dB apart, each loaded with its own measured auto gain, play the

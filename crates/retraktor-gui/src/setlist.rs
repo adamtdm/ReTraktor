@@ -330,7 +330,9 @@ pub fn cue_sheet(entries: &[(f64, &str, &str)], wav_file_name: &str) -> String {
     let wav_base = Path::new(wav_file_name)
         .file_name()
         .and_then(|n| n.to_str())
-        .unwrap_or(wav_file_name);
+        .unwrap_or(wav_file_name)
+        .replace('"', "'")
+        .replace(['\r', '\n'], " ");
 
     let mut out = format!("FILE \"{wav_base}\" WAVE\n");
     for (i, &(start_sec, artist, title)) in entries.iter().enumerate() {
@@ -340,6 +342,8 @@ pub fn cue_sheet(entries: &[(f64, &str, &str)], wav_file_name: &str) -> String {
         let frames = (((s % 1.0) * 75.0).round() as u32).min(74);
 
         out.push_str(&format!("  TRACK {:02} AUDIO\n", i + 1));
+        let title = title.replace('"', "'").replace(['\r', '\n'], " ");
+        let artist = artist.replace('"', "'").replace(['\r', '\n'], " ");
         out.push_str(&format!("    TITLE \"{title}\"\n"));
         out.push_str(&format!("    PERFORMER \"{artist}\"\n"));
         out.push_str(&format!("    INDEX 01 {min:02}:{sec:02}:{frames:02}\n"));
@@ -1095,6 +1099,13 @@ mod tests {
         assert!(cue.contains("INDEX 01 00:00:00"));
         assert!(cue.contains("TRACK 02 AUDIO"));
         assert!(cue.contains("INDEX 01 02:05:38")); // 125.5s = 2m 5s, 0.5 * 75 = 38 frames
+    }
+
+    #[test]
+    fn cue_sheet_keeps_quoted_metadata_inside_its_fields() {
+        let cue = cue_sheet(&[(0.0, r#"DJ "A""#, "The \"Dub\"\nMix")], "Mix.wav");
+        assert!(cue.contains("    TITLE \"The 'Dub' Mix\"\n"));
+        assert!(cue.contains("    PERFORMER \"DJ 'A'\"\n"));
     }
 
     #[test]
