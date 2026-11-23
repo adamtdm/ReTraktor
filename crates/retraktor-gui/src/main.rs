@@ -49,7 +49,50 @@ fn load_app_icon() -> Option<egui::IconData> {
     Some(egui::IconData { rgba: buf, width: info.width, height: info.height })
 }
 
+/// Extracts `.nml` paths from CLI arguments, accepting plain paths and `file://` URIs from file managers.
+fn nml_paths_from_args(args: impl IntoIterator<Item = String>) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for raw in args {
+        if raw.starts_with('-') {
+            continue;
+        }
+        let path_str = match raw.strip_prefix("file://") {
+            Some(rest) => {
+                let rest = rest.strip_prefix("localhost").unwrap_or(rest);
+                percent_decode_path(rest)
+            }
+            None => raw,
+        };
+        let p = std::path::PathBuf::from(path_str);
+        if p.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("nml")) {
+            out.push(p);
+        }
+    }
+    out
+}
+
+fn percent_decode_path(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
+                if let Ok(val) = u8::from_str_radix(hex, 16) {
+                    out.push(val);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 fn main() -> eframe::Result<()> {
+    let nml_files = nml_paths_from_args(std::env::args().skip(1));
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("ReTraktor")
         .with_app_id("retraktor")
@@ -64,14 +107,42 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "ReTraktor",
         native_options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             theme::install_fonts(&cc.egui_ctx);
             if let Err(e) = theme::remember_first_overview_look() {
                 eprintln!("retraktor: could not save the overview look: {e}");
             }
             // egui moves 40 pt per wheel notch (under 2 library rows); desktop apps move about 3 lines.
             cc.egui_ctx.options_mut(|o| o.line_scroll_speed = 3.0 * 22.0);
-            Ok(Box::new(ReTraktorApp::default()))
+            let mut app = ReTraktorApp::default();
+            app.open_nml_files(nml_files);
+            Ok(Box::new(app))
         }),
     )
+}
+
+#[cfg(test)]
+mod main_tests {
+    use super::*;
+
+    #[test]
+    fn nml_paths_from_args_handles_plain_uppercase_and_file_uris() {
+        let got = nml_paths_from_args([
+            "--flag".into(),
+            "/tmp/other.mp3".into(),
+            "/music/collection.nml".into(),
+            "/music/SET.NML".into(),
+            "file:///home/dj/My%20Set%20%231.nml".into(),
+            "file://localhost/tmp/cafe%CC%81.nml".into(),
+        ]);
+        assert_eq!(
+            got,
+            vec![
+                std::path::PathBuf::from("/music/collection.nml"),
+                std::path::PathBuf::from("/music/SET.NML"),
+                std::path::PathBuf::from("/home/dj/My Set #1.nml"),
+                std::path::PathBuf::from("/tmp/cafe\u{0301}.nml"),
+            ]
+        );
+    }
 }

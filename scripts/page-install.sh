@@ -18,6 +18,9 @@ TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 echo "Downloading ReTraktor from $BASE ..."
 curl -fSL "$BASE/retraktor_latest_amd64.deb" -o "$TMP/retraktor.deb"
 sudo apt-get install -y --reinstall --allow-downgrades "$TMP/retraktor.deb"
+if command -v xdg-mime >/dev/null 2>&1; then
+    xdg-mime default retraktor.desktop application/x-traktor-nml || true
+fi
 hash -r
 echo
 echo "Installed $(dpkg-query -W -f='${Version}' retraktor) -> $(command -v retraktor-gui)"

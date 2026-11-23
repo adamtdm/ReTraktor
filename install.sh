@@ -233,8 +233,18 @@ else
     $SUDO install -d -m 0755 /etc/security/limits.d
     $SUDO install -m 0644 "$SCRIPT_DIR/assets/99-retraktor-realtime.conf" /etc/security/limits.d/99-retraktor-realtime.conf
 
-    $SUDO install -d -m 0755 /usr/share/applications
+    $SUDO install -d -m 0755 /usr/share/applications /usr/share/mime/packages
     $SUDO install -m 0644 "$SCRIPT_DIR/assets/retraktor.desktop" /usr/share/applications/retraktor.desktop
+    [ -f "$SCRIPT_DIR/assets/retraktor-nml.xml" ] && $SUDO install -m 0644 "$SCRIPT_DIR/assets/retraktor-nml.xml" /usr/share/mime/packages/retraktor-nml.xml
+    command -v update-mime-database >/dev/null 2>&1 && $SUDO update-mime-database /usr/share/mime || true
+    command -v update-desktop-database >/dev/null 2>&1 && $SUDO update-desktop-database /usr/share/applications || true
+    if command -v xdg-mime >/dev/null 2>&1; then
+        if [ -n "${TARGET_USER:-}" ] && [ "$(id -u)" = "0" ]; then
+            su - "$TARGET_USER" -c "xdg-mime default retraktor.desktop application/x-traktor-nml" || true
+        else
+            xdg-mime default retraktor.desktop application/x-traktor-nml || true
+        fi
+    fi
 
     $SUDO install -d -m 0755 /usr/share/icons/hicolor/scalable/apps /usr/share/icons/hicolor/256x256/apps /usr/share/pixmaps
     $SUDO install -m 0644 "$SCRIPT_DIR/assets/retraktor.svg" /usr/share/icons/hicolor/scalable/apps/retraktor.svg

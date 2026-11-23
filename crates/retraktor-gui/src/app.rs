@@ -1510,6 +1510,13 @@ impl ReTraktorApp {
     /// channels for (swapping main and headphone pairs) switches at the next block instead, so playback and
     /// recording carry on; so does one needing a width already asked for, so a narrower card isn't reopened
     /// every frame. Rescan tries the chosen card again once, only while it isn't the one playing.
+    /// Queues `.nml` collection files passed on launch so they link into the library on the first frame.
+    pub fn open_nml_files(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
+        for p in paths {
+            self.library.queue_nml(p);
+        }
+    }
+
     fn apply_audio_output(&mut self) {
         let p = &self.preferences;
         let (route, settings) = (p.output_route(), (p.audio_device_name.clone(), p.sample_rate, p.buffer_size));

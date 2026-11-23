@@ -1108,6 +1108,11 @@ impl LibraryManager {
         });
     }
 
+    /// Queues a `.nml` collection file (e.g. passed on the command line or opened from a file manager) to be linked.
+    pub fn queue_nml(&mut self, path: PathBuf) {
+        self.picked.push((Pick::Collection, path));
+    }
+
     /// Processes background results and chosen files; call every frame, even while preferences are open.
     pub fn apply_picks(&mut self, music_folders: &mut Vec<PathBuf>) {
         self.poll();
