@@ -1422,7 +1422,15 @@ impl LibraryManager {
             for mut pl in imported {
                 pl.name = format!("{prefix}{}", pl.name);
                 match self.playlists.iter_mut().find(|p| p.name == pl.name) {
-                    Some(existing) => existing.track_ids = pl.track_ids,
+                    // Tracks added here are the DJ's work: a re-read (every start) only adds the library's new ones.
+                    // shortcut: a track removed in the other app stays here; remove it here too, or track the last read if that matters.
+                    Some(existing) => {
+                        for id in pl.track_ids {
+                            if !existing.track_ids.contains(&id) {
+                                existing.track_ids.push(id);
+                            }
+                        }
+                    }
                     None => self.playlists.push(pl),
                 }
             }
@@ -2076,6 +2084,16 @@ impl LibraryManager {
             format!("Added {} tracks to '{}'", pl.track_ids.len() - before, pl.name)
         };
         self.touch();
+    }
+
+    /// ADD TO LIST on a controller: the selected track joins the Preparation list, as in Traktor.
+    pub fn add_selected_to_preparation(&mut self) {
+        let Some(id) = self.selected_track_id else {
+            self.status_message = "Select a track first".into();
+            return;
+        };
+        let idx = self.preparation_index();
+        self.add_to_playlist(&[id], Some(idx));
     }
 
     fn preparation_index(&mut self) -> usize {
@@ -3563,6 +3581,19 @@ mod tests {
         assert_eq!(names, vec!["My set", "rekordbox / Warmup"]);
         assert_eq!(lib.tracks.len(), 2, "re-reading adds nothing twice");
 
+        // A track I add to a library's playlist here survives the re-read every start does, and a restart.
+        let warmup = lib.playlists.iter().position(|p| p.name == "rekordbox / Warmup").unwrap();
+        lib.add_to_playlist(&[my_id], Some(warmup));
+        lib.read_library(0);
+        wait_for_library(&mut lib);
+        assert!(lib.playlists[warmup].track_ids.contains(&my_id), "re-read dropped the track I added");
+        lib.save_collection_nml(&dir.join("collection.nml")).unwrap();
+        let mut reopened = LibraryManager::new(dir.join("collection.nml"));
+        wait_for_library(&mut reopened);
+        let back = reopened.playlists.iter().find(|p| p.name == "rekordbox / Warmup").unwrap();
+        let mine_id = reopened.tracks.iter().find(|t| t.title == "Deep Low (mine)").unwrap().id;
+        assert!(back.track_ids.contains(&mine_id), "restart dropped the track I added");
+
 
         // The link survives a restart.
         assert!(fs::read_to_string(lib.libraries_file()).unwrap().contains("rekordbox\t"));
@@ -3586,6 +3617,20 @@ mod tests {
         wait_for_library(&mut reopened);
         assert_eq!(reopened.tracks.len(), 1, "only the re-added track, merged once");
         assert!(!fs::read_to_string(reopened.removed_file()).unwrap().contains("Deep Low"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn add_to_list_puts_the_selected_track_in_preparation_and_saves() {
+        let (mut lib, dir) = temp_lib("add-to-list");
+        let id = lib.push_track(track("Chosen", &dir.join("a.flac")));
+        lib.add_selected_to_preparation();
+        assert!(lib.playlists.iter().all(|p| p.track_ids.is_empty()), "nothing selected, nothing added");
+        lib.selected_track_id = Some(id);
+        lib.add_selected_to_preparation();
+        let prep = lib.playlists.iter().find(|p| p.name == "Preparation").unwrap();
+        assert_eq!(prep.track_ids, [id]);
+        assert!(lib.dirty_since.is_some(), "the change is queued for autosave");
         let _ = fs::remove_dir_all(dir);
     }
 

@@ -2294,6 +2294,7 @@ impl ReTraktorApp {
                     "surface.right.flux" => self.deck_flux_active[1] = !self.deck_flux_active[1],
                     "surface.left.loop_size.push" => self.toggle_loop(1),
                     "surface.right.loop_size.push" => self.toggle_loop(2),
+                    "surface.left.browse.add_to_list" | "surface.right.browse.add_to_list" => self.library.add_selected_to_preparation(),
                     "surface.left.browse.preview" | "surface.right.browse.preview" => self.press_preview(self.library.selected_track_id),
 
                     // Turntable Vinyl Scratch Mode vs CDJ Jog Bend Mode
