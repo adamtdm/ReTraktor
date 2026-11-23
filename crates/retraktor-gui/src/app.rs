@@ -215,6 +215,8 @@ pub struct ReTraktorApp {
     deck_remix: [bool; 4],
     /// Each deck's remix cells, kept through mode switches for the whole session.
     remix_banks: [crate::remix::RemixBank; 4],
+    /// Each deck's cell (column, row) selected for tuning, on any page; selecting one never plays it.
+    remix_selected: [Option<(usize, usize)>; 4],
     remix_loader: crate::remix::RemixLoader,
     /// Saving and opening `.remixset` files from each Remix deck's SET menu.
     remix_sets: crate::remix::RemixSets,
@@ -375,6 +377,7 @@ impl Default for ReTraktorApp {
             deck_analysing: [false; 4],
             deck_remix: [false; 4],
             remix_banks: Default::default(),
+            remix_selected: [None; 4],
             remix_loader: Default::default(),
             remix_sets: Default::default(),
             recording: None,
@@ -995,7 +998,7 @@ impl ReTraktorApp {
                     for (column, row, name, bpm) in [(0, 0, "Drum loop 4 bars", 124.0), (1, 1, "Vocal: hey!", 0.0), (2, 3, "Bass loop", 124.0), (0, 5, "Paged-out cell", 124.0)] {
                         let pcm: Vec<f32> = (0..(48_000.0 * 1.935) as usize).flat_map(|i| [(i as f32 * 0.03).sin() * 0.2; 2]).collect();
                         if let Ok(sample) = crate::remix::RemixSample::from_pcm(name, pcm, 48_000, bpm, &self.remix_loader.budget) {
-                            self.remix_banks[d].cells[column][row] = Some(crate::remix::RemixCell { looped: sample.fits_beats, sample: Arc::new(sample) });
+                            self.remix_banks[d].cells[column][row] = Some(crate::remix::RemixCell { looped: sample.fits_beats, sample: Arc::new(sample), tune: 0 });
                         }
                     }
                 }
@@ -1847,6 +1850,9 @@ impl ReTraktorApp {
                 state.engine.strips[d].filter.knob = self.channel_filter[d];
                 state.engine.strips[d].filter.enabled = self.channel_filter_on[d];
                 state.engine.strips[d].filter.kind = self.channel_fx_kind[d];
+                state.remix_filter[d] = self.remix_banks[d].filter;
+                state.remix_keylock[d] = self.remix_banks[d].keylock;
+                state.remix_tunings[d] = self.remix_banks[d].tunings();
                 let knob = |kill: bool, v: f32| if kill { 0.0 } else { v };
                 state.engine.strips[d].eq.high = knob(self.eq_kill_hi[d], self.channel_eq_hi[d]);
                 state.engine.strips[d].eq.mid = knob(self.eq_kill_mid[d], self.channel_eq_mid[d]);
@@ -4137,7 +4143,7 @@ impl ReTraktorApp {
         if job.action == crate::remix::SetAction::Open && job.deck != (self.deck_remix[d], self.load_generation[d]) {
             return Some(format!("Deck {} changed mode or loaded a track in the meantime, so {what}: try again", DECK_LETTERS[d]));
         }
-        (self.remix_banks[d].contents() != job.contents).then(|| format!("Deck {}'s cells changed in the meantime, so {what}: try again", DECK_LETTERS[d]))
+        (self.remix_banks[d].contents() != job.contents).then(|| format!("Deck {}'s cells or settings changed in the meantime, so {what}: try again", DECK_LETTERS[d]))
     }
 
     /// Why a set job on deck `d` failed, on the status line and kept on the deck until dismissed.
@@ -4264,6 +4270,7 @@ impl ReTraktorApp {
                             let cells = bank.contents().1.len();
                             // The old bank's audio is freed here, with no lock held on the audio.
                             drop(std::mem::replace(&mut self.remix_banks[d], bank));
+                            self.remix_selected[d] = None; // a position in the old cells means nothing in the new
                             self.remix_sets.reports[d] = None;
                             let now_remix = match (was_track, had_track) {
                                 (true, true) => " (now a Remix deck; its track was unloaded)",
@@ -4271,9 +4278,14 @@ impl ReTraktorApp {
                                 _ => "",
                             };
                             let mut status = format!("Opened '{}' onto deck {letter}{now_remix}: {cells} cells, nothing playing until you launch one", path.display());
-                            if let Some(imported) = imported {
+                            if let Some(mut imported) = imported {
                                 if !imported.notes.is_empty() {
                                     status += &format!(". {}", imported.notes);
+                                }
+                                let skipped = std::mem::take(&mut imported.pitch_skipped);
+                                if !skipped.is_empty() {
+                                    let title = format!("Pitch left at 0 on {} cells of '{}': ReTraktor can't yet read their Traktor values as semitones", skipped.len(), set_file_name(&path));
+                                    self.remix_sets.reports[d] = Some(crate::remix::SetReport { title, lines: skipped, expanded: false });
                                 }
                                 status += &format!(". Samples copied to {}", imported.keep().display());
                             }
@@ -4397,8 +4409,9 @@ impl ReTraktorApp {
                     self.remix_set_menu(ui, d);
                 });
             });
-            // Its own row, so the header fits the narrowest deck (4-Deck in a 1024 px window).
-            ui.horizontal(|ui| {
+            // Its own row, so the header fits the narrowest deck (4-Deck in a 1024 px window); the selected cell's
+            // tuning sits at its end, on its own line only where the deck is too narrow.
+            ui.horizontal_wrapped(|ui| {
                 ui.label(caps("PAGE"));
                 ui.scope(|ui| {
                     ui.spacing_mut().item_spacing.x = 2.0;
@@ -4422,6 +4435,7 @@ impl ReTraktorApp {
                 if resp.clicked() {
                     self.remix_banks[d].quantize ^= true;
                 }
+                self.remix_tune_controls(ui, d);
             });
             self.remix_set_report(ui, d);
 
@@ -4435,6 +4449,7 @@ impl ReTraktorApp {
                     }
                 });
             }
+
 
             // Each column's stop names what it plays, wherever that cell is paged.
             ui.horizontal(|ui| {
@@ -4458,7 +4473,162 @@ impl ReTraktorApp {
                     }
                 }
             });
+
+            // Under the stops, one short row: each column's filter and Key Lock, which stay with the column through
+            // pages and cell swaps. Kept to one row so the library keeps its rows in the smallest window.
+            ui.horizontal(|ui| {
+                for column in 0..COLUMNS {
+                    ui.allocate_ui_with_layout(Vec2::new(w, HIT), Layout::left_to_right(Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 2.0;
+                        let key_w = 30.0;
+                        self.remix_filter_bar(ui, d, column, (w - key_w - 2.0).max(16.0), accent);
+                        self.remix_keylock_button(ui, d, column, key_w);
+                    });
+                }
+            });
         });
+    }
+
+    /// One Remix column's Key Lock switch: on, its cells keep their pitch at any tempo and play their tuning.
+    fn remix_keylock_button(&mut self, ui: &mut Ui, d: usize, column: usize, width: f32) {
+        let letter = DECK_LETTERS[d];
+        let on = self.remix_banks[d].keylock[column];
+        let resp = pill(ui, "KEY", on, TraktorTheme::ACCENT(), width).on_hover_text(format!(
+            "Column {} Key Lock: on, its cells keep their pitch at any tempo and play their tuning; off, a synced loop's pitch follows the tempo and tuning is kept but not heard. Only this column, separate from the deck's KEY and the mixer",
+            column + 1
+        ));
+        resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, true, on, format!("Deck {letter} column {} Key Lock", column + 1)));
+        if resp.clicked() {
+            self.remix_banks[d].keylock[column] ^= true;
+        }
+    }
+
+    /// The selected cell's tuning, inline: down, the value, up and reset. A tuning edit turns its column's Key Lock on
+    /// (tuning is only heard with it); reset back to 0 leaves Key Lock as it is. With no cell selected the buttons
+    /// are off and say how to select one. The cell itself is outlined on the grid.
+    fn remix_tune_controls(&mut self, ui: &mut Ui, d: usize) {
+        let letter = DECK_LETTERS[d];
+        let selected = self.remix_selected[d].and_then(|(c, r)| self.remix_banks[d].cells[c][r].as_ref().map(|cell| (c, r, cell.tune, cell.sample.name.clone())));
+        let how = "Ctrl+click a cell, or right-click it → Select to tune; selecting never plays it";
+        ui.scope(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            let (tune, which, locked) = match &selected {
+                Some((c, r, tune, name)) => (*tune, format!("cell {}.{} {name}", c + 1, r + 1), self.remix_banks[d].keylock[*c]),
+                None => (0, "no cell selected".to_string(), false),
+            };
+            let value = if selected.is_some() { crate::remix::tune_text(tune) } else { "–".to_string() };
+            let button = |ui: &mut Ui, text: &str, enabled: bool, info: String, tip: &str| {
+                let resp = ui.add_enabled(enabled, egui::Button::new(RichText::new(text).size(12.0)).min_size(Vec2::new(HIT, HIT))).on_hover_text(tip).on_disabled_hover_text(how);
+                resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, &info));
+                resp.clicked()
+            };
+            let (most, any) = (crate::remix::MAX_TUNE, selected.is_some());
+            // Which cell the buttons change, also when it is on another page.
+            if let Some((c, r, _, name)) = &selected {
+                ui.label(RichText::new(format!("{}.{}", c + 1, r + 1)).size(10.5).color(TraktorTheme::TEXT_SECONDARY()))
+                    .on_hover_text(format!("The selected cell, {}.{} '{name}' on page {}: the tuning buttons change it", c + 1, r + 1, r / crate::remix::PAGE_ROWS + 1));
+            }
+            let down = button(ui, "−", any && tune > -most, format!("Deck {letter} tune down, {which}, now {value}"), "Selected cell one semitone down (turns its column's Key Lock on)");
+            let ink = if locked { TraktorTheme::TEXT_PRIMARY() } else { TraktorTheme::TEXT_MUTED() };
+            let readout = ui.add_sized(Vec2::new(26.0, HIT), egui::Label::new(RichText::new(&value).size(13.0).strong().color(ink)));
+            let heard = if !any { how } else if locked { "heard" } else { "kept, not heard: the column's Key Lock is off" };
+            readout.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, format!("Deck {letter} tuning of {which}: {value}, {heard}")));
+            readout.on_hover_text(match &selected {
+                Some((c, r, _, _)) => format!("Tuning of the selected {which} (page {}), in semitones. {}", r / crate::remix::PAGE_ROWS + 1, if self.remix_banks[d].keylock[*c] { "Its column's Key Lock is on" } else { "Its column's Key Lock is off, so it isn't heard" }),
+                None => how.to_string(),
+            });
+            let up = button(ui, "+", any && tune < most, format!("Deck {letter} tune up, {which}, now {value}"), "Selected cell one semitone up (turns its column's Key Lock on)");
+            let reset = button(ui, "0", any && tune != 0, format!("Deck {letter} tuning back to 0, {which}"), "Selected cell back to 0 (Key Lock stays as it is)");
+            if down || up {
+                self.remix_retune(d, Some(if up { 1 } else { -1 }));
+            }
+            if reset {
+                self.remix_retune(d, None);
+            }
+        });
+    }
+
+    /// Tunes deck `d`'s selected cell `by` semitones (within the range) and turns its column's Key Lock on, as a
+    /// tuning edit does on Traktor's Remix Decks; `None` puts it back to 0 and leaves Key Lock alone. A cell playing
+    /// changes at once, in time; nothing restarts.
+    fn remix_retune(&mut self, d: usize, by: Option<i8>) {
+        let Some((c, r)) = self.remix_selected[d] else { return };
+        let bank = &mut self.remix_banks[d];
+        let Some(cell) = bank.cells[c][r].as_mut() else { return };
+        let most = crate::remix::MAX_TUNE;
+        cell.tune = by.map_or(0, |by| (cell.tune + by).clamp(-most, most));
+        if by.is_some() {
+            bank.keylock[c] = true;
+        }
+        let (tune, name) = (cell.tune, cell.sample.name.clone());
+        self.library.status_message = format!("Tuned deck {} cell {}.{} '{name}' to {}{}", DECK_LETTERS[d], c + 1, r + 1, crate::remix::tune_text(tune), if bank.keylock[c] { "" } else { " (Key Lock off: not heard)" });
+    }
+
+    /// One Remix column's filter as a short bipolar bar: left of centre a low-pass, right a high-pass, centre off.
+    /// Drag (sideways or up and down), or arrow keys once focused; double-click, right-click or Delete turns it off.
+    fn remix_filter_bar(&mut self, ui: &mut Ui, d: usize, column: usize, width: f32, accent: Color32) {
+        let letter = DECK_LETTERS[d];
+        let knob = &mut self.remix_banks[d].filter[column];
+        let (rect, mut resp) = ui.allocate_exact_size(Vec2::new(width, HIT), Sense::click_and_drag());
+        if resp.dragged() {
+            let drag = resp.drag_delta();
+            *knob = (*knob + (drag.x - drag.y) / 200.0).clamp(0.0, 1.0);
+            resp.mark_changed();
+        }
+        let step = |k: f32, by: f32| ((k + by) * 20.0).round().clamp(0.0, 20.0) / 20.0; // 0.05 steps that land on 0.5
+        if resp.has_focus() {
+            // The arrows turn this filter instead of moving the focus on.
+            let arrows = egui::EventFilter { horizontal_arrows: true, vertical_arrows: true, ..Default::default() };
+            ui.memory_mut(|m| m.set_focus_lock_filter(resp.id, arrows));
+            let (down, up, reset) = ui.input(|i| {
+                use egui::Key;
+                (i.key_pressed(Key::ArrowLeft) || i.key_pressed(Key::ArrowDown), i.key_pressed(Key::ArrowRight) || i.key_pressed(Key::ArrowUp), i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace))
+            });
+            let before = *knob;
+            if down {
+                *knob = step(*knob, -0.05);
+            }
+            if up {
+                *knob = step(*knob, 0.05);
+            }
+            if reset {
+                *knob = 0.5;
+            }
+            if *knob != before {
+                resp.mark_changed();
+            }
+        }
+        if resp.double_clicked() || resp.secondary_clicked() {
+            *knob = 0.5;
+            resp.mark_changed();
+        }
+        let value = *knob;
+        if ui.is_rect_visible(rect) {
+            let painter = ui.painter_at(rect.expand(2.0));
+            painter.rect_filled(rect, 3.0, TraktorTheme::BG_INPUT());
+            let x = |v: f32| rect.left() + 2.0 + v * (rect.width() - 4.0);
+            let bar = egui::Rect::from_x_y_ranges(x(value.min(0.5))..=x(value.max(0.5)), rect.top() + 3.0..=rect.bottom() - 3.0);
+            painter.rect_filled(bar, 2.0, accent.gamma_multiply(0.8));
+            painter.line_segment([egui::pos2(x(0.5), rect.top() + 2.0), egui::pos2(x(0.5), rect.bottom() - 2.0)], Stroke::new(1.0, TraktorTheme::TEXT_SECONDARY()));
+            let text = if value == 0.5 { "FLT" } else if value < 0.5 { "LP" } else { "HP" };
+            let ink = if value == 0.5 { TraktorTheme::TEXT_SECONDARY() } else { TraktorTheme::TEXT_PRIMARY() };
+            painter.text(rect.center(), egui::Align2::CENTER_CENTER, text, egui::FontId::proportional(9.5), ink);
+            if resp.has_focus() {
+                painter.rect_stroke(rect.expand(1.0), 4.0, Stroke::new(2.0, TraktorTheme::ACCENT()));
+            }
+        }
+        let hz = crate::remix::filter_hz_text(value);
+        let state = match value {
+            v if v == 0.5 => "off".to_string(),
+            v if v < 0.5 => format!("low-pass at {hz}"),
+            _ => format!("high-pass at {hz}"),
+        };
+        let label = format!("Deck {letter} column {} filter, {state}", column + 1);
+        resp.widget_info(|| egui::WidgetInfo::slider(true, value as f64, &label));
+        resp.on_hover_text(format!(
+            "Column {} filter, {state}: left a low-pass, right a high-pass, centre is off. It stays with the column through pages and cell swaps, and is saved with the set. Drag, or arrow keys; double-click, right-click or Delete turns it off",
+            column + 1
+        ));
     }
 
     /// One remix cell: its name, loop or one-shot, and whether it plays or waits for the beat. Click launches it,
@@ -4472,7 +4642,9 @@ impl ReTraktorApp {
         let loading = bank.is_loading(column, row);
         let playing = cell.is_some_and(|c| status.playing == Some((row as u8, c.sample.id)));
         let queued = cell.is_some() && status.queued == Some(Some(row as u8));
-        let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 36.0), Sense::click());
+        // 29 px, two lines: with the filter and Key Lock row under the stops, the deck is as tall as before them, so
+        // the library keeps its rows in the smallest window.
+        let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 29.0), Sense::click());
 
         let fill = if playing { accent } else if cell.is_some() { TraktorTheme::CONTROL() } else { TraktorTheme::BG_INPUT() };
         let ink = if playing { on(accent) } else { TraktorTheme::TEXT_PRIMARY() };
@@ -4485,13 +4657,22 @@ impl ReTraktorApp {
         } else if resp.has_focus() {
             painter.rect_stroke(rect.shrink(1.0), 4.0, Stroke::new(2.0, TraktorTheme::ACCENT()));
         }
+        let selected = self.remix_selected[d] == Some((column, row));
+        if selected {
+            painter.rect_stroke(rect.shrink(3.0), 3.0, Stroke::new(1.0, ink));
+        }
         let (name, kind) = match cell {
             Some(c) => {
-                let kind = match (c.looped, c.sample.bpm) {
+                let mut kind = match (c.looped, c.sample.bpm) {
                     (true, Some(bpm)) => format!("LOOP {bpm:.0}"),
                     (true, None) => "LOOP".to_string(),
                     (false, _) => "ONE-SHOT".to_string(),
                 };
+                if c.tune != 0 {
+                    // In brackets while its column's Key Lock is off: kept, not heard.
+                    let tune = crate::remix::tune_text(c.tune);
+                    kind += &if bank.keylock[column] { format!(" {tune}") } else { format!(" ({tune})") };
+                }
                 (c.sample.name.clone(), kind)
             }
             None => (String::new(), "EMPTY".to_string()),
@@ -4502,26 +4683,35 @@ impl ReTraktorApp {
             job.wrap = egui::text::TextWrapping { max_width: (rect.width() - 8.0).max(1.0), max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
             ui.fonts(|f| f.layout_job(job))
         };
-        painter.galley(rect.left_top() + Vec2::new(4.0, 3.0), line(&name, 11.5, ink), ink);
+        painter.galley(rect.left_top() + Vec2::new(4.0, 2.0), line(&name, 11.5, ink), ink);
         let dim = if playing { ink } else { TraktorTheme::TEXT_SECONDARY() };
-        painter.galley(rect.left_top() + Vec2::new(4.0, 20.0), line(&kind, 9.5, dim), dim);
+        painter.galley(rect.left_top() + Vec2::new(4.0, 16.0), line(&kind, 9.5, dim), dim);
 
         let state = if playing { ", playing" } else if queued { ", waiting for the beat" } else { "" };
-        let label = format!("Deck {letter} cell {}.{} {name} {kind}{state}", column + 1, row + 1);
+        let selected_text = if selected { ", selected for tuning" } else { "" };
+        let label = format!("Deck {letter} cell {}.{} {name} {kind}{state}{selected_text}", column + 1, row + 1);
         resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &label));
         let resp = resp.on_hover_text(if cell.is_some() {
-            "Click to play (replaces what this column plays). Right-click: loop or one-shot, load the selected track, clear"
+            "Click to play (replaces what this column plays) and select it for tuning; Ctrl+click selects it without playing. Right-click: loop or one-shot, select to tune, load the selected track, clear"
         } else {
             "Drag a sample from the library here, or right-click to load the selected track or capture a playing deck's loop"
         });
         if resp.clicked() {
-            self.remix_launch(d, column, row);
+            if cell.is_some() {
+                self.remix_selected[d] = Some((column, row));
+            }
+            if !ui.input(|i| i.modifiers.command) {
+                self.remix_launch(d, column, row);
+            }
         }
-        let selected = self.library.selected_track_id;
+        let library_selected = self.library.selected_track_id;
         let looped = self.remix_banks[d].cells[column][row].as_ref().map(|c| c.looped);
-        let (mut load, mut flip, mut clear, mut capture) = (false, false, false, None);
+        let (mut load, mut flip, mut clear, mut capture, mut pick) = (false, false, false, None, false);
         resp.context_menu(|ui| {
-            load = ui.add_enabled(selected.is_some(), egui::Button::new("Load selected track here")).clicked();
+            if looped.is_some() {
+                pick = ui.button("Select to tune").on_hover_text("Shows this cell's tuning under the columns, without playing it").clicked();
+            }
+            load = ui.add_enabled(library_selected.is_some(), egui::Button::new("Load selected track here")).clicked();
             if looped.is_none() && !loading {
                 // One per deck whose loop can be captured now; checked again when clicked.
                 let sources: Vec<_> = (0..4).filter_map(|s| self.remix_capture_source(s).ok().map(|source| (s, source))).collect();
@@ -4547,11 +4737,14 @@ impl ReTraktorApp {
                 let label = if looped.is_some() { "Clear cell" } else { "Cancel load" };
                 clear = ui.button(label).on_hover_text("Also cancels a load on its way here. A cell playing now plays on until stopped").clicked();
             }
-            if load || flip || clear || capture.is_some() {
+            if load || flip || clear || capture.is_some() || pick {
                 ui.close_menu();
             }
         });
-        if let Some(id) = selected.filter(|_| load) {
+        if pick {
+            self.remix_selected[d] = Some((column, row));
+        }
+        if let Some(id) = library_selected.filter(|_| load) {
             self.remix_load_cell(d, column, row, id);
         }
         if let Some(s) = capture {
@@ -8246,7 +8439,7 @@ mod sync_audio {
         // A cell on B, launched at once, plays through B's channel on A's beatgrid.
         let pcm: Vec<f32> = (0..96_000).flat_map(|i| [(i as f32 * 0.05).sin() * 0.3; 2]).collect();
         let sample = Arc::new(crate::remix::RemixSample::from_pcm("loop", pcm, 48_000, 120.0, &app.remix_loader.budget).unwrap());
-        app.remix_banks[1].cells[0][0] = Some(crate::remix::RemixCell { sample: Arc::clone(&sample), looped: true });
+        app.remix_banks[1].cells[0][0] = Some(crate::remix::RemixCell { sample: Arc::clone(&sample), looped: true, tune: 0 });
         app.remix_banks[1].quantize = false;
         {
             let mut s = app.audio.shared.lock().unwrap();
@@ -8312,7 +8505,7 @@ mod sync_audio {
         assert!(app.set_deck_mode(1, true));
         let pcm: Vec<f32> = (0..96_000).flat_map(|i| [(i as f32 * 0.05).sin() * 0.3; 2]).collect();
         let sample = Arc::new(crate::remix::RemixSample::from_pcm("loop", pcm, 48_000, 120.0, &app.remix_loader.budget).unwrap());
-        app.remix_banks[1].cells[0][0] = Some(crate::remix::RemixCell { sample, looped: true });
+        app.remix_banks[1].cells[0][0] = Some(crate::remix::RemixCell { sample, looped: true, tune: 0 });
         {
             let mut s = app.audio.shared.lock().unwrap();
             s.loaded_tracks[0] = Some(track(120.0));
@@ -8352,7 +8545,7 @@ mod sync_audio {
         let pcm: Vec<f32> = (0..96_000).flat_map(|i| [(i as f32 * 0.05).sin() * 0.3; 2]).collect();
         let sample = Arc::new(crate::remix::RemixSample::from_pcm("loop", pcm, 48_000, 120.0, &app.remix_loader.budget).unwrap());
         for column in 0..3 {
-            app.remix_banks[1].cells[column][0] = Some(crate::remix::RemixCell { sample: Arc::clone(&sample), looped: true });
+            app.remix_banks[1].cells[column][0] = Some(crate::remix::RemixCell { sample: Arc::clone(&sample), looped: true, tune: 0 });
         }
         app.remix_banks[1].quantize = false;
         app.remix_launch(1, 0, 0);
@@ -8563,7 +8756,7 @@ mod sync_audio {
         refused(&mut app, 0, 2, "deck C has no track loaded");
         refused(&mut app, 0, 1, "deck B is a Remix deck");
         let held = Arc::new(crate::remix::RemixSample::from_pcm("held", vec![0.0; 200], 48_000, 0.0, &app.remix_loader.budget).unwrap());
-        app.remix_banks[1].cells[1][0] = Some(crate::remix::RemixCell { sample: Arc::clone(&held), looped: false });
+        app.remix_banks[1].cells[1][0] = Some(crate::remix::RemixCell { sample: Arc::clone(&held), looped: false, tune: 0 });
         refused(&mut app, 1, 0, "no longer an empty cell");
         assert!(app.remix_banks[1].cells[1][0].as_ref().is_some_and(|c| Arc::ptr_eq(&c.sample, &held)));
         assert!(app.remix_banks[1].cells[0][0].is_none());
@@ -8610,6 +8803,9 @@ mod sync_audio {
         assert_eq!(remix_cell_status(&app, 1, 0).playing, Some((0, cell.sample.id)));
 
         app.remix_clear_cell(1, 1, 0); // the in-memory cell has no file a set could keep
+        app.remix_banks[1].filter = [0.2, 0.5, 0.5, 0.9];
+        app.remix_banks[1].keylock = [true, false, false, true];
+        app.remix_banks[1].cells[0][0].as_mut().unwrap().tune = 5;
         let file = dir.join("Captured.remixset");
         set_job(&mut app, 1, SetAction::Save, &file);
         assert!(file.is_file(), "{}", app.library.status_message);
@@ -8622,6 +8818,8 @@ mod sync_audio {
         set_job(&mut app, 3, SetAction::Open, &file);
         let cell = app.remix_banks[3].cells[0][0].as_ref().unwrap_or_else(|| panic!("not reopened: {}", app.library.status_message));
         assert!(cell.looped && cell.sample.pcm == loop_audio && cell.sample.source == saved, "the capture didn't reopen exactly");
+        assert_eq!(app.remix_banks[3].filter, [0.2, 0.5, 0.5, 0.9], "the column filters didn't reopen");
+        assert_eq!((app.remix_banks[3].keylock, cell.tune), ([true, false, false, true], 5), "the Key Locks or tuning didn't reopen");
         assert_eq!((cell.sample.name.as_str(), cell.sample.sample_rate, cell.sample.bpm), ("Groove loop 0:03.000", rate, Some(120.0)));
         assert!(app.audio.shared.lock().unwrap().loaded_tracks.iter().all(Option::is_none));
         std::fs::remove_dir_all(dir).unwrap();
@@ -8640,8 +8838,8 @@ mod sync_audio {
         let garbage = dir.join("not audio.wav");
         std::fs::write(&garbage, b"RIFF? no, just text").unwrap();
         let gone = dir.join("moved away.wav");
-        let cell = |column, row, path: &std::path::Path, name: &str| SetCell { column, row, path: path.to_str().unwrap().into(), name: name.into(), bpm: 120.0, looped: true };
-        let set = |cells| RemixSet { quantize: false, page: 3, cells }.to_json();
+        let cell = |column, row, path: &std::path::Path, name: &str| SetCell { column, row, path: path.to_str().unwrap().into(), name: name.into(), bpm: 120.0, looped: true, tune: 0 };
+        let set = |cells| RemixSet { quantize: false, page: 3, filters: [0.5; 4], keylock: [false; 4], cells }.to_json();
         let edit = |change: &dyn Fn(&mut serde_json::Value)| {
             let mut doc: serde_json::Value = serde_json::from_str(&set(vec![cell(0, 0, &good, "Good")])).unwrap();
             change(&mut doc);
@@ -8661,12 +8859,12 @@ mod sync_audio {
         }
         let pcm: Vec<f32> = (0..96_000).flat_map(|i| [(i as f32 * 0.05).sin() * 0.3; 2]).collect();
         let playing = Arc::new(crate::remix::RemixSample::from_pcm("A loop", pcm.clone(), 48_000, 120.0, &app.remix_loader.budget).unwrap());
-        app.remix_banks[0].cells[0][0] = Some(crate::remix::RemixCell { sample: Arc::clone(&playing), looped: true });
+        app.remix_banks[0].cells[0][0] = Some(crate::remix::RemixCell { sample: Arc::clone(&playing), looped: true, tune: 0 });
         app.remix_banks[0].quantize = false;
         app.remix_launch(0, 0, 0);
         render(&app, 0.05, 128, 48_000);
         let held = Arc::new(crate::remix::RemixSample::from_pcm("B cell", pcm, 48_000, 120.0, &app.remix_loader.budget).unwrap());
-        app.remix_banks[1].cells[1][2] = Some(crate::remix::RemixCell { sample: Arc::clone(&held), looped: false });
+        app.remix_banks[1].cells[1][2] = Some(crate::remix::RemixCell { sample: Arc::clone(&held), looped: false, tune: 0 });
         let used = app.remix_loader.budget.used();
         let mut progress = remix_cell_status(&app, 0, 0).progress;
 
@@ -8705,10 +8903,10 @@ mod sync_audio {
         let dir = set_dir("guards");
         let mut app = ReTraktorApp::default();
         let sample = sample_in_library(&mut app, 1, "set-guard");
-        let at = |column, row| SetCell { column, row, path: sample.to_str().unwrap().into(), name: "Guard".into(), bpm: 120.0, looped: true };
+        let at = |column, row| SetCell { column, row, path: sample.to_str().unwrap().into(), name: "Guard".into(), bpm: 120.0, looped: true, tune: 0 };
         let (first, second) = (dir.join("first.remixset"), dir.join("second.remixset"));
-        crate::remix::write_set(&first, &RemixSet { quantize: true, page: 0, cells: vec![at(2, 3)] }, false).unwrap();
-        crate::remix::write_set(&second, &RemixSet { quantize: true, page: 0, cells: vec![at(0, 1)] }, false).unwrap();
+        crate::remix::write_set(&first, &RemixSet { quantize: true, page: 0, filters: [0.5; 4], keylock: [false; 4], cells: vec![at(2, 3)] }, false).unwrap();
+        crate::remix::write_set(&second, &RemixSet { quantize: true, page: 0, filters: [0.5; 4], keylock: [false; 4], cells: vec![at(0, 1)] }, false).unwrap();
         assert!(app.set_deck_mode(1, true));
         let ask = |app: &mut ReTraktorApp, action| {
             app.remix_set_request(1, action);
@@ -8722,6 +8920,20 @@ mod sync_audio {
         settle_sets(&mut app);
         assert!(app.remix_banks[1].is_empty() && app.library.status_message.contains("changed in the meantime"), "{}", app.library.status_message);
         app.remix_banks[1].quantize = true;
+        // Nor with a column filter turned meanwhile.
+        let t = ask(&mut app, SetAction::Open).unwrap();
+        app.remix_set_chosen(1, t, Some(first.clone()));
+        app.remix_banks[1].filter[2] = 0.3;
+        settle_sets(&mut app);
+        assert!(app.remix_banks[1].is_empty() && app.library.status_message.contains("cells or settings changed"), "{}", app.library.status_message);
+        app.remix_banks[1].filter[2] = 0.5;
+        // Nor with a column's Key Lock switched meanwhile.
+        let t = ask(&mut app, SetAction::Open).unwrap();
+        app.remix_set_chosen(1, t, Some(first.clone()));
+        app.remix_banks[1].keylock[0] = true;
+        settle_sets(&mut app);
+        assert!(app.remix_banks[1].is_empty() && app.library.status_message.contains("cells or settings changed"), "{}", app.library.status_message);
+        app.remix_banks[1].keylock[0] = false;
 
         // One chooser per deck at a time; once a lost one is forgotten, its late answer is ignored and says so on the
         // deck, and only the newer request counts.
@@ -8769,7 +8981,7 @@ mod sync_audio {
         assert!(app.library.status_message.contains("still loading"));
         settle_remix_loads(&mut app);
         let made = crate::remix::RemixSample::from_pcm("made in memory", vec![0.0; 2000], 48_000, 0.0, &app.remix_loader.budget).unwrap();
-        app.remix_banks[1].cells[1][1] = Some(crate::remix::RemixCell { sample: Arc::new(made), looped: false });
+        app.remix_banks[1].cells[1][1] = Some(crate::remix::RemixCell { sample: Arc::new(made), looped: false, tune: 0 });
         assert_eq!(ask(&mut app, SetAction::Save), None);
         assert!(app.library.status_message.contains("cell 2.2 'made in memory' has no file"), "{}", app.library.status_message);
         app.remix_clear_cell(1, 1, 1);
@@ -8802,12 +9014,14 @@ mod sync_audio {
     /// A Traktor Remix Set opened onto Track deck C (its track stopped) while deck A plays a track: C keeps its track
     /// and Track mode until the whole set has decoded, A plays on, then C is a Remix deck holding the set's cells (a
     /// loop that repeats, a one-shot that ends), Q as the set has it, nothing playing, the .trak untouched. Saved as a
-    /// .remixset it reopens on empty Track deck D of a fresh app with the .trak gone. Opens refused because C plays or loads a
+    /// .remixset it reopens on empty Track deck D of a fresh app with the .trak gone. Slot Key Locks come along (an empty
+    /// slot's too), the kick's -0.333333 pitch as -4 with its slot's Key Lock off, and the shot's unmeasured 0.166667 is
+    /// left at 0 and named, all kept through the save and reopen. Opens refused because C plays or loads a
     /// track (whatever the lock preference), when asked or before the set lands, or because the set is broken, leave
     /// C's track, mode and cells as they were and no copied samples or decoded audio behind.
     #[test]
     fn a_traktor_set_opens_onto_a_track_deck_as_a_remix_deck() {
-        use crate::remix::trak_fixture::{archive, grid, nisound, Cell};
+        use crate::remix::trak_fixture::{archive, grid, nisound_keylock, Cell};
         use crate::remix::{test_wav, SetAction};
         let dir = set_dir("trak");
         let rate = 8000;
@@ -8817,7 +9031,10 @@ mod sync_audio {
             (0, 0, Cell { file: "loop.wav", name: "Trance Kick", play_type: 0, synced: true, bpm: 120.0 }),
             (2, 0, Cell { file: "shot.wav", name: "Hi Reverse", play_type: 1, synced: false, bpm: 0.0 }),
         ];
-        let set = nisound(false, &grid(&cells), 2);
+        let mut slots = grid(&cells);
+        slots[0].1[0].1 = slots[0].1[0].1.replace("<Pitch>0</Pitch>", "<Pitch>-0.333333</Pitch>");
+        slots[2].1[0].1 = slots[2].1[0].1.replace("<Pitch>0</Pitch>", "<Pitch>0.166667</Pitch>");
+        let set = nisound_keylock(false, &slots, 2, [Some("false"), Some("true"), Some("true"), Some("false")]);
         let trak = dir.join("Electric Test.trak");
         let bytes = archive(&[("loop.wav", &test_wav(&loop_pcm, rate)), ("shot.wav", &test_wav(&shot_pcm, rate)), ("NISOUND", &set)]);
         std::fs::write(&trak, &bytes).unwrap();
@@ -8873,6 +9090,7 @@ mod sync_audio {
         assert!(report.contains("cell 1.1 (page 1) 'Trance Kick' from 'loop.wav'"), "{report}");
         c_unchanged(&app, "broken");
 
+        app.remix_selected[2] = Some((3, 15));
         let t = ask(&mut app).unwrap();
         app.remix_set_chosen(2, t, Some(trak.clone()));
         assert!(!app.deck_remix[2], "C switched before the set loaded");
@@ -8888,8 +9106,17 @@ mod sync_audio {
         assert!(app.deck_remix[2] && app.audio.shared.lock().unwrap().loaded_tracks[2].is_none(), "{}", app.library.status_message);
         assert!(app.library.status_message.contains("now a Remix deck") && app.library.status_message.contains(&format!("Samples copied to {}", root.display())), "{}", app.library.status_message);
         let bank = &app.remix_banks[2];
-        assert_eq!(bank.contents().1.iter().map(|c| (c.0, c.1, c.3)).collect::<Vec<_>>(), [(0, 0, true), (2, 0, false)]);
-        assert!(!bank.quantize && app.remix_sets.reports[2].is_none());
+        assert_eq!(bank.contents().1.iter().map(|c| (c.0, c.1, c.3, c.4)).collect::<Vec<_>>(), [(0, 0, true, -4), (2, 0, false, 0)]);
+        assert_eq!(bank.keylock, [false, true, true, false]);
+        assert!(!bank.quantize);
+        assert_eq!(app.remix_selected[2], None, "a selection from before the set survived it");
+        let report = app.remix_sets.reports[2].as_ref().expect("the skipped pitch isn't listed on the deck");
+        assert!(report.title.starts_with("Pitch left at 0 on 1 cells of 'Electric Test.trak'") && report.lines == ["cell 3.1 (page 1) 'Hi Reverse' (0.166667)"], "{} {:?}", report.title, report.lines);
+        assert!(
+            app.library.status_message.contains("Pitch left at 0 (a Traktor value ReTraktor can't yet read as semitones) on 1: cell 3.1 (page 1) 'Hi Reverse' (0.166667)"),
+            "{}",
+            app.library.status_message
+        );
         assert!((0..crate::remix::COLUMNS).all(|c| remix_cell_status(&app, 2, c) == crate::remix::RemixColumn::default()), "the set launched a cell");
         app.remix_launch(2, 0, 0);
         app.remix_launch(2, 2, 0);
@@ -8903,7 +9130,7 @@ mod sync_audio {
         let saved = dir.join("Imported.remixset");
         set_job(&mut app, 2, SetAction::Save, &saved);
         assert!(saved.is_file(), "{}", app.library.status_message);
-        let cell_of = |bank: &crate::remix::RemixBank, c: usize| bank.cells[c][0].as_ref().map(|c| (c.sample.name.clone(), c.looped, c.sample.source.clone(), c.sample.library_bpm));
+        let cell_of = |bank: &crate::remix::RemixBank, c: usize| bank.cells[c][0].as_ref().map(|c| (c.sample.name.clone(), c.looped, c.sample.source.clone(), c.sample.library_bpm, c.tune));
         let imported = [cell_of(&app.remix_banks[2], 0), cell_of(&app.remix_banks[2], 2)];
         drop(app);
         std::fs::remove_file(&trak).unwrap();
@@ -8911,6 +9138,7 @@ mod sync_audio {
         let mut app = ReTraktorApp::default();
         set_job(&mut app, 3, SetAction::Open, &saved);
         assert_eq!([cell_of(&app.remix_banks[3], 0), cell_of(&app.remix_banks[3], 2)], imported, "{}", app.library.status_message);
+        assert_eq!(app.remix_banks[3].keylock, [false, true, true, false], "the Key Locks didn't reopen");
         assert!(app.deck_remix[3] && app.library.status_message.contains("(now a Remix deck)") && !app.library.status_message.contains("unloaded"), "{}", app.library.status_message);
         assert_eq!(imported[0].as_ref().map(|c| c.3), Some(120.0));
         std::fs::remove_dir_all(dir).unwrap();
@@ -9143,7 +9371,63 @@ mod sync_audio {
         click(&mut app, &mut frame, find(&nodes, "Deck B cell 2.3").2.center());
         assert_eq!(remix_cell_status(&app, 1, 1).queued, Some(Some(2)));
         let nodes = settle(&mut app, &mut frame);
-        assert!(find(&nodes, "Deck B cell 2.3").0.ends_with("waiting for the beat"), "{}", find(&nodes, "Deck B cell 2.3").0);
+        assert!(find(&nodes, "Deck B cell 2.3").0.contains("waiting for the beat"), "{}", find(&nodes, "Deck B cell 2.3").0);
+
+        // The click also selected it for tuning. Each column's filter and Key Lock and the tuning row are on the
+        // window; up tunes it and turns its column's Key Lock on, 0 resets it and leaves Key Lock on, KEY turns it off.
+        assert_eq!(app.remix_selected[1], Some((1, 2)));
+        assert!(find(&nodes, "Deck B cell 2.3").0.ends_with("selected for tuning"));
+        for name in ["Deck B column 1 filter,", "Deck B column 2 filter,", "Deck B column 3 filter,", "Deck B column 4 filter,", "Deck B column 1 Key Lock", "Deck B column 4 Key Lock", "Deck B tune down,", "Deck B tune up,", "Deck B tuning of cell 2.3 layout:", "Stop deck B column 4"] {
+            let r = find(&nodes, name).2;
+            assert!(screen.contains_rect(r), "Mix: {name} at {r:?} is off the 1024 x 640 window");
+        }
+        click(&mut app, &mut frame, find(&nodes, "Deck B tune up,").2.center());
+        let tuned = |app: &ReTraktorApp| (app.remix_banks[1].cells[1][2].as_ref().unwrap().tune, app.remix_banks[1].keylock[1]);
+        assert_eq!(tuned(&app), (1, true));
+        app.sync_audio_state();
+        {
+            let id = app.remix_banks[1].cells[1][2].as_ref().unwrap().sample.id;
+            let s = app.audio.shared.lock().unwrap();
+            assert_eq!((s.remix_tunings[1][1][2], s.remix_keylock[1][1]), ((id, 1), true), "the tuning didn't reach the callback");
+        }
+        let nodes = settle(&mut app, &mut frame);
+        assert!(find(&nodes, "Deck B cell 2.3").0.contains("LOOP 120 +1"), "{}", find(&nodes, "Deck B cell 2.3").0);
+        // The tuning row shows which cell it changes.
+        let tune_row = find(&nodes, "Deck B tune up,").2;
+        let position = find(&nodes, "2.3").2;
+        assert!((position.center().y - tune_row.center().y).abs() < 4.0 && screen.contains_rect(position), "the selected position isn't beside the tuning: {position:?}");
+        click(&mut app, &mut frame, find(&nodes, "Deck B tuning back to 0,").2.center());
+        assert_eq!(tuned(&app), (0, true));
+        let nodes = settle(&mut app, &mut frame);
+        click(&mut app, &mut frame, find(&nodes, "Deck B column 2 Key Lock").2.center());
+        assert_eq!(tuned(&app), (0, false));
+        // A column filter reads out its side and cutoff, and a right-click turns it off.
+        app.remix_banks[1].filter[2] = 0.25;
+        let nodes = settle(&mut app, &mut frame);
+        assert!(find(&nodes, "Deck B column 3 filter,").0.starts_with("Deck B column 3 filter, low-pass at 1.3 kHz"), "{}", find(&nodes, "Deck B column 3 filter,").0);
+        let knob = find(&nodes, "Deck B column 3 filter,").2.center();
+        let right = |pressed| egui::Event::PointerButton { pos: knob, button: egui::PointerButton::Secondary, pressed, modifiers: egui::Modifiers::NONE };
+        frame(&mut app, vec![egui::Event::PointerMoved(knob)]);
+        frame(&mut app, vec![right(true)]);
+        frame(&mut app, vec![right(false)]);
+        assert_eq!(app.remix_banks[1].filter[2], 0.5, "the right-click didn't reset the filter");
+        let nodes = settle(&mut app, &mut frame);
+        assert_eq!(find(&nodes, "Deck B column 3 filter,").0, "Deck B column 3 filter, off");
+        // Right-click → Select to tune selects a cell without playing it (as Ctrl+click does).
+        let copy = app.remix_banks[1].cells[1][2].clone();
+        app.remix_banks[1].cells[0][0] = copy;
+        let nodes = settle(&mut app, &mut frame);
+        let at = find(&nodes, "Deck B cell 1.1").2.center();
+        let right = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Secondary, pressed, modifiers: egui::Modifiers::NONE };
+        frame(&mut app, vec![egui::Event::PointerMoved(at)]);
+        frame(&mut app, vec![right(true)]);
+        frame(&mut app, vec![right(false)]);
+        let nodes = settle(&mut app, &mut frame);
+        click(&mut app, &mut frame, find(&nodes, "Select to tune").2.center());
+        assert_eq!(app.remix_selected[1], Some((0, 0)));
+        assert_eq!(remix_cell_status(&app, 1, 0).queued, None, "selecting played the cell");
+        app.remix_selected[1] = Some((1, 2));
+        let nodes = settle(&mut app, &mut frame);
 
         // Page 2 shows cells 5–8.
         click(&mut app, &mut frame, find(&nodes, "Deck B page 2").2.center());
@@ -9175,11 +9459,18 @@ mod sync_audio {
         app.layout = TraktorLayout::FourDeck;
         let nodes = settle(&mut app, &mut frame);
         assert!(screen.contains_rect(find(&nodes, "Deck B cell 1.5").2), "4-Deck: deck B's cells are off screen");
+        // Deck B's page 2 shows, its cell 2.3 (page 1) still selected: the narrow deck keeps its filters, Key Locks and
+        // tuning row, each control within the deck's own width.
+        let deck_b = find(&nodes, "Deck B cell 1.5").2.left()..=find(&nodes, "Deck B cell 4.5").2.right();
+        for name in ["Deck B column 1 filter,", "Deck B column 4 Key Lock", "Deck B tune up,", "Deck B tuning back to 0,"] {
+            let r = find(&nodes, name).2;
+            assert!(deck_b.contains(&r.left()) && deck_b.contains(&r.right()), "4-Deck: {name} at {r:?} is outside deck B ({deck_b:?})");
+        }
         let wheel = egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: Vec2::new(0.0, -2000.0), modifiers: egui::Modifiers::NONE };
         frame(&mut app, vec![egui::Event::PointerMoved(egui::pos2(500.0, 400.0))]);
         frame(&mut app, vec![wheel]);
         let nodes = settle(&mut app, &mut frame);
-        for name in ["Deck D cell 4.4", "Stop deck D column 4", "Deck D Track mode", "Deck D set"] {
+        for name in ["Deck D cell 4.4", "Stop deck D column 4", "Deck D Track mode", "Deck D set", "Deck D column 4 filter,", "Deck D column 4 Key Lock"] {
             let r = find(&nodes, name).2;
             assert!(screen.contains_rect(r), "4-Deck scrolled: {name} at {r:?} is off the window");
         }

@@ -917,6 +917,12 @@ pub struct AudioSharedState {
     pub remix_clock: Option<(usize, f64, f64)>,
     /// Published by the callback: what each remix column plays and has waiting.
     pub remix_status: [[RemixColumn; remix::COLUMNS]; 4],
+    /// Each deck's remix column filter knobs (`RemixBank::filter`, 0.5 off).
+    pub remix_filter: [[f32; remix::COLUMNS]; 4],
+    /// Each deck's remix column Key Locks (`RemixBank::keylock`).
+    pub remix_keylock: [[bool; remix::COLUMNS]; 4],
+    /// Each deck's remix cells' (sample id, tuning) (`RemixBank::tunings`).
+    pub remix_tunings: [[[(u64, i8); remix::ROWS]; remix::COLUMNS]; 4],
     /// The callback's beat count, carried to the next stream on a reopen.
     remix_beat: f64,
     /// A closing stream's remix columns, playing on in the next one.
@@ -1024,6 +1030,9 @@ impl Default for AudioSharedState {
             remix_requests: Default::default(),
             remix_clock: None,
             remix_status: Default::default(),
+            remix_filter: [[0.5; remix::COLUMNS]; 4],
+            remix_keylock: [[false; remix::COLUMNS]; 4],
+            remix_tunings: [[[(0, 0); remix::ROWS]; remix::COLUMNS]; 4],
             remix_beat: 0.0,
             remix_resume: None,
         }
@@ -1159,7 +1168,7 @@ impl AudioSharedState {
     /// Plays `sample` in remix column `column` of deck `d`, replacing what the column plays, from the next beat
     /// (`on_beat`) or at once. A newer launch or stop for the column, before the callback takes this, replaces it.
     pub fn remix_launch(&mut self, d: usize, column: usize, row: usize, sample: Arc<RemixSample>, looped: bool, on_beat: bool) {
-        let launch = Launch { sample, row: row as u8, looped };
+        let launch = Launch { sample, row: row as u8, looped, tune: 0 }; // its tuning comes from `remix_tunings`
         self.remix_requests[d][column] = Some(RemixRequest { launch: Some(launch), on_beat });
     }
 
@@ -2316,7 +2325,11 @@ impl Renderer {
         r.engine.master_volume = s.engine.master_volume;
         r.engine.clock.bpm = s.engine.clock.bpm;
         r.remix_clock = s.remix_clock;
+        self.remix.filter = s.remix_filter;
+        self.remix.keylock = s.remix_keylock;
+        self.remix.tunings = s.remix_tunings;
         self.remix.take_requests(&mut s.remix_requests, &mut s.retired);
+        self.remix.retune();
         for (mine, ui) in r.engine.strips.iter_mut().zip(&s.engine.strips) {
             mine.volume = ui.volume;
             mine.cue_enabled = ui.cue_enabled;
@@ -5047,6 +5060,10 @@ mod tests {
         replace: bool,
         fader_up: bool,
         record: bool,
+        /// Deck B's column 1 low-pass and column 2 high-pass, set before the start.
+        filter: bool,
+        /// Deck B's column 1 Key Lock on, its first loop tuned +2 and the replacement -3, set before the start.
+        tuned: bool,
     }
 
     /// The first remix demo through the real callback, 1.3 s at `rate` in `block`-frame buffers on a 4-channel
@@ -5060,6 +5077,7 @@ mod tests {
         let first_loop = remix_tone("loop", 1000.0, true, 2.0, 44_100, 120.0, &budget);
         let second_loop = remix_tone("loop 2", 1500.0, false, 2.0, 44_100, 120.0, &budget);
         let vocal = remix_tone("vocal", 700.0, false, 3.0, 48_000, 0.0, &budget);
+        let loop_ids = (first_loop.id, second_loop.id);
         let shared = Arc::new(Mutex::new(AudioSharedState::default()));
         {
             let mut s = shared.lock().unwrap();
@@ -5074,6 +5092,14 @@ mod tests {
             }
             if run.vocal {
                 s.remix_launch(1, 1, 4, vocal, false, false);
+            }
+            if run.filter {
+                s.remix_filter[1] = [0.2, 0.85, 0.5, 0.5];
+            }
+            if run.tuned {
+                s.remix_keylock[1][0] = true;
+                s.remix_tunings[1][0][0] = (loop_ids.0, 2);
+                s.remix_tunings[1][0][1] = (loop_ids.1, -3);
             }
         }
         let recorder: Arc<Mutex<Option<RecorderTap>>> = Arc::default();
@@ -5146,6 +5172,21 @@ mod tests {
                     Some(f) => assert!(f == &out, "{rate} Hz: {block}-frame buffers play different samples"),
                 }
             }
+
+            // With the column filters and column 1's Key Lock and tunings on, every buffer size still plays the same
+            // samples, and only deck B changes.
+            let unfiltered = first.take().unwrap();
+            let mut filtered: Option<Vec<f32>> = None;
+            for block in [64usize, 333, 1024] {
+                let (out, _, _) = remix_demo(rate, block, DemoRun { replace: true, filter: true, tuned: true, ..demo });
+                assert!(out.iter().all(|x| x.is_finite()));
+                assert_eq!(main(&out), main(&track_only), "{rate} Hz, {block}: the filters reached the main mix");
+                match &filtered {
+                    None => filtered = Some(out),
+                    Some(f) => assert!(f == &out, "{rate} Hz: filtered {block}-frame buffers play different samples"),
+                }
+            }
+            assert_ne!(phones(&filtered.unwrap()), phones(&unfiltered), "{rate} Hz: the filters did nothing");
 
             let (out, take, _) = remix_demo(rate, 333, DemoRun { replace: true, fader_up: true, record: true, ..demo });
             let take = take.unwrap();
@@ -5303,6 +5344,16 @@ mod tests {
                         // Still playing at the reopen, with nothing else asked of its column.
                         s.remix_launch(2, 3, 3, Arc::clone(&loops[0]), true, false);
                     }
+                    // Column filters swept, reset and crossed over through launches, stops and tails.
+                    s.remix_filter[2] = [[0.5, 0.0, 1.0, 0.3][block % 4], [0.9, 0.5][block % 2], 0.1, 0.5];
+                    s.remix_filter[3][1] = if block % 10 < 5 { 0.7 } else { 0.5 };
+                    // Key Locks switched and cells retuned live, also on the sounds fading out under replacements.
+                    s.remix_keylock[2] = [block % 3 == 0, true, block % 7 < 3, false];
+                    s.remix_keylock[3] = [false, block % 5 < 2, true, false];
+                    s.remix_tunings[2][0][0] = (loops[0].id, (block % 25) as i8 - 12);
+                    s.remix_tunings[2][0][5] = (loops[1].id, 5);
+                    s.remix_tunings[2][1][1] = (shot.id, 2);
+                    s.remix_tunings[3][2][2] = (loops[1].id, if block % 2 == 0 { -7 } else { 12 });
                 }
                 let held = ((block / 5) % 3 == 1).then(|| shared.lock().unwrap());
                 let frames = if block % 4 == 0 { 1024 } else { 128 };
@@ -5336,6 +5387,328 @@ mod tests {
         drop(shared.lock().unwrap().take_retired());
         for s in loops.iter().chain([&shot]) {
             assert_eq!(Arc::strong_count(s), 1, "{} still held", s.name);
+        }
+    }
+
+    /// Measurements for review, not a pass/fail test: Deck C's Remix columns through the real callback, at 44.1 and
+    /// 48 kHz. Writes a plain-text report to `RETRAKTOR_MEASURE_OUT` (and stdout):
+    /// `RETRAKTOR_MEASURE_OUT=report.txt cargo test --release -p retraktor-gui remix_measurements -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn remix_measurements() {
+        use std::fmt::Write;
+        let budget = remix::SampleBudget::new(remix::BANK_BUDGET_BYTES);
+        let tau = std::f32::consts::TAU;
+        // A 4-beat loop at 120 BPM in a 44.1 kHz file: a 0.2 sine at 440 Hz, silent for its first 100 ms (the marker).
+        let marked: Vec<f32> = (0..88_200).flat_map(|i| [if i < 4410 { 0.0 } else { 0.2 * (i as f32 * 440.0 * tau / 44_100.0).sin() }; 2]).collect();
+        let marked = Arc::new(RemixSample::from_pcm("marked loop", marked, 44_100, 120.0, &budget).unwrap());
+        // A kick: 0.25 s of a 60 Hz sine falling away, a one-shot.
+        let kick: Vec<f32> = (0..11_025).flat_map(|i| [0.3 * (-(i as f32) / 2000.0).exp() * (i as f32 * 60.0 * tau / 44_100.0).sin(); 2]).collect();
+        let kick = Arc::new(RemixSample::from_pcm("kick", kick, 44_100, 0.0, &budget).unwrap());
+        // Treble (5 kHz) left, bass (100 Hz) right, a 4-beat loop.
+        let stereo: Vec<f32> = (0..88_200).flat_map(|i| { let t = i as f32 * tau / 44_100.0; [0.2 * (5000.0 * t).sin(), 0.2 * (100.0 * t).sin()] }).collect();
+        let stereo = Arc::new(RemixSample::from_pcm("stereo loop", stereo, 44_100, 120.0, &budget).unwrap());
+
+        /// Renders `secs` of the main output (L, R) in `block`-frame buffers after `setup`; `live` runs before each block
+        /// with the frame it starts at. Returns the frames and each callback's time.
+        fn render(rate: u32, block: usize, secs: f64, setup: &dyn Fn(&mut AudioSharedState), live: &mut dyn FnMut(usize, &mut AudioSharedState)) -> (Vec<(f32, f32)>, Vec<f64>) {
+            let shared = Arc::new(Mutex::new(AudioSharedState::default()));
+            setup(&mut shared.lock().unwrap());
+            let mut renderer = Renderer::new(Arc::clone(&shared), Arc::default(), Arc::default());
+            let total = (secs * rate as f64) as usize;
+            let (mut out, mut times) = (Vec::with_capacity(total), Vec::new());
+            let mut buf = vec![0.0f32; block * 2];
+            while out.len() < total {
+                live(out.len(), &mut shared.lock().unwrap());
+                let t0 = std::time::Instant::now();
+                renderer.render(&mut buf, 2, rate, |x| x);
+                times.push(t0.elapsed().as_secs_f64());
+                out.extend(buf.chunks(2).map(|f| (f[0], f[1])));
+                drop(shared.lock().unwrap().take_retired());
+            }
+            out.truncate(total);
+            (out, times)
+        }
+        let deck_c = |s: &mut AudioSharedState, bpm: f64| {
+            s.engine.clock.bpm = bpm;
+            s.engine.strips[2].volume = 1.0;
+        };
+        let hz = |out: &[(f32, f32)], rate: u32| out.windows(2).filter(|w| w[0].0 < 0.0 && w[1].0 >= 0.0).count() as f64 * rate as f64 / out.len() as f64;
+        let markers = |out: &[(f32, f32)], rate: u32| {
+            let ms = rate as usize / 1000;
+            let peaks: Vec<f32> = out.chunks(ms).map(|c| c.iter().fold(0.0f32, |m, f| m.max(f.0.abs()))).collect();
+            (1..peaks.len().saturating_sub(20)).filter(|&i| peaks[i - 1] >= 0.01 && peaks[i..i + 20].iter().all(|&p| p < 0.01)).map(|i| (i * ms) as f64 / rate as f64).collect::<Vec<f64>>()
+        };
+        let level = |v: &[f32]| (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32).sqrt();
+        let mut r = String::new();
+        let profile = if cfg!(debug_assertions) { "debug (unoptimized; timings not representative)" } else { "release (optimized)" };
+        writeln!(r, "Remix column filter and Key Lock measurements, build profile: {profile}").unwrap();
+        writeln!(r, "Deck C, main output L. Loop: 4 beats at 120 BPM, 44.1 kHz file, 440 Hz, a 100 ms silent marker at its start.").unwrap();
+
+        writeln!(r, "\n1. Pitch and loop period (column 2), kick one-shot in column 1 at the start").unwrap();
+        writeln!(r, "rate   BPM  keylock tune  Hz (ideal)          period s (ideal)    marker errors ms").unwrap();
+        for rate in [44_100u32, 48_000] {
+            for bpm in [120.0, 144.0] {
+                let period = 240.0 / bpm;
+                for (keylock, tune) in [(false, 0i8), (false, 2), (true, 0), (true, 2)] {
+                    let (m, k) = (Arc::clone(&marked), Arc::clone(&kick));
+                    let setup = move |s: &mut AudioSharedState| {
+                        deck_c(s, bpm);
+                        s.remix_keylock[2][1] = keylock;
+                        s.remix_tunings[2][1][4] = (m.id, tune);
+                        s.remix_launch(2, 1, 4, Arc::clone(&m), true, false);
+                        s.remix_launch(2, 0, 0, Arc::clone(&k), false, false);
+                    };
+                    let (out, _) = render(rate, 256, 3.3 * period, &setup, &mut |_, _| {});
+                    let ideal_hz = if keylock { 440.0 * 2f64.powf(tune as f64 / 12.0) } else { 440.0 * bpm / 120.0 };
+                    let mid: Vec<f64> = (0..3).map(|n| { let a = ((n as f64 + 0.2) * period * rate as f64) as usize; hz(&out[a..a + (0.6 * period * rate as f64) as usize], rate) }).collect();
+                    let marks = markers(&out, rate);
+                    let errors: Vec<String> = marks.iter().enumerate().map(|(n, t)| format!("{:+.2}", (t - (n + 1) as f64 * period) * 1000.0)).collect();
+                    let measured = if marks.len() > 1 { (marks[marks.len() - 1] - marks[0]) / (marks.len() - 1) as f64 } else { f64::NAN };
+                    writeln!(r, "{rate}  {bpm:>3}  {keylock:<7} {tune:+}    {:>7.2} ({ideal_hz:>7.2})   {measured:.5} ({period:.5})   {}", mid.iter().sum::<f64>() / 3.0, errors.join(" ")).unwrap();
+                }
+            }
+        }
+
+        writeln!(r, "\n2. Kick unaffected: |(kick + tuned loop) - kick alone - tuned loop alone| over the kick's 0.25 s").unwrap();
+        for rate in [44_100u32, 48_000] {
+            let run = |with_kick: bool, with_loop: bool| {
+                let (m, k) = (Arc::clone(&marked), Arc::clone(&kick));
+                let setup = move |s: &mut AudioSharedState| {
+                    deck_c(s, 144.0);
+                    s.remix_keylock[2][1] = true;
+                    s.remix_tunings[2][1][4] = (m.id, 2);
+                    s.remix_filter[2][1] = 0.3;
+                    if with_loop {
+                        s.remix_launch(2, 1, 4, Arc::clone(&m), true, false);
+                    }
+                    if with_kick {
+                        s.remix_launch(2, 0, 0, Arc::clone(&k), false, false);
+                    }
+                };
+                render(rate, 256, 0.3, &setup, &mut |_, _| {}).0
+            };
+            let (both, kick_only, loop_only) = (run(true, true), run(true, false), run(false, true));
+            let n = (0.25 * rate as f64) as usize;
+            let worst = (0..n).map(|i| (both[i].0 - kick_only[i].0 - loop_only[i].0).abs()).fold(0.0f32, f32::max);
+            let peak = kick_only[..n].iter().fold(0.0f32, |m, f| m.max(f.0.abs()));
+            writeln!(r, "{rate} Hz: largest difference {worst:.2e} (kick peak {peak:.3}; column 2 key-locked +2 with its filter at 0.3)").unwrap();
+        }
+
+        writeln!(r, "\n3. Block boundaries: column 2 key-locked +2, filter 0.25, at 144 BPM; largest difference to 64-frame buffers").unwrap();
+        for rate in [44_100u32, 48_000] {
+            let m = Arc::clone(&marked);
+            let setup = move |s: &mut AudioSharedState| {
+                deck_c(s, 144.0);
+                s.remix_keylock[2][1] = true;
+                s.remix_tunings[2][1][4] = (m.id, 2);
+                s.remix_filter[2][1] = 0.25;
+                s.remix_launch(2, 1, 4, Arc::clone(&m), true, false);
+            };
+            let first = render(rate, 64, 2.0, &setup, &mut |_, _| {}).0;
+            for block in [128usize, 333, 1024] {
+                let out = render(rate, block, 2.0, &setup, &mut |_, _| {}).0;
+                let worst = first.iter().zip(&out).map(|(a, b)| (a.0 - b.0).abs().max((a.1 - b.1).abs())).fold(0.0f32, f32::max);
+                writeln!(r, "{rate} Hz, {block}-frame buffers: {worst:e}").unwrap();
+            }
+        }
+
+        writeln!(r, "\n4. Column filter on a stereo loop (treble 5 kHz left, bass 100 Hz right), levels relative to the filter off").unwrap();
+        for rate in [44_100u32, 48_000] {
+            let at = |knob: f32| {
+                let st = Arc::clone(&stereo);
+                let setup = move |s: &mut AudioSharedState| {
+                    deck_c(s, 120.0);
+                    s.remix_filter[2][2] = knob;
+                    s.remix_launch(2, 2, 0, Arc::clone(&st), true, false);
+                };
+                let out = render(rate, 256, 0.5, &setup, &mut |_, _| {}).0;
+                let tail = &out[out.len() / 2..];
+                (level(&tail.iter().map(|f| f.0).collect::<Vec<_>>()), level(&tail.iter().map(|f| f.1).collect::<Vec<_>>()))
+            };
+            let off = at(0.5);
+            for knob in [0.2f32, 0.8] {
+                let (l, rr) = at(knob);
+                writeln!(r, "{rate} Hz, knob {knob} ({} at {}): treble {:.4}, bass {:.4}", if knob < 0.5 { "low-pass" } else { "high-pass" }, remix::filter_hz_text(knob), l / off.0, rr / off.1).unwrap();
+            }
+            // Reset: at 0.8 for 0.3 s, then off; frames until the output is exactly the never-filtered output.
+            let st = Arc::clone(&stereo);
+            let setup = move |s: &mut AudioSharedState| {
+                deck_c(s, 120.0);
+                s.remix_launch(2, 2, 0, Arc::clone(&st), true, false);
+            };
+            let switch = (0.3 * rate as f64) as usize / 64 * 64;
+            let plain = render(rate, 64, 0.6, &setup, &mut |_, _| {}).0;
+            let reset = render(rate, 64, 0.6, &setup, &mut |f, s| s.remix_filter[2][2] = if f < switch { 0.8 } else { 0.5 }).0;
+            let last_diff = (switch..plain.len()).rev().find(|&i| plain[i] != reset[i]).map_or(0, |i| i + 1 - switch);
+            let step = reset.windows(2).skip(switch - 10).take(2000).map(|w| (w[1].0 - w[0].0).abs()).fold(0.0f32, f32::max);
+            // From 25 ms on the column's own output is exact; what is left at the main output is the deck channel's
+            // EQ (a crossover with memory) still carrying the earlier, filtered input.
+            let after = switch + rate as usize / 40 + 64;
+            let residue = (after..plain.len()).map(|i| (plain[i].0 - reset[i].0).abs().max((plain[i].1 - reset[i].1).abs())).fold(0.0f32, f32::max);
+            writeln!(r, "{rate} Hz reset from 0.8: main output bit-exact again {last_diff} frames ({:.1} ms) after; from 25 ms on it differs by at most {residue:.1e} (the channel EQ's memory); largest frame step around the reset {step:.4}", last_diff as f64 * 1000.0 / rate as f64).unwrap();
+        }
+
+        writeln!(r, "\n5. Live: Key Lock and tuning changed every 0.25 s while column 2 plays at 120 BPM (off, on, +3, off, on, -12, on +2)").unwrap();
+        for rate in [44_100u32, 48_000] {
+            let m = Arc::clone(&marked);
+            let setup = move |s: &mut AudioSharedState| {
+                deck_c(s, 120.0);
+                s.remix_tunings[2][1][4] = (m.id, 0);
+                s.remix_launch(2, 1, 4, Arc::clone(&m), true, false);
+            };
+            let steps = [(false, 0i8), (true, 0), (true, 3), (false, 3), (true, 3), (true, -12), (true, 2)];
+            let id = marked.id;
+            let quarter = rate as usize / 4;
+            let (live, _) = render(rate, 333, 6.5, &setup, &mut |f, s| {
+                let (k, t) = steps[(f / quarter).min(steps.len() - 1)];
+                s.remix_keylock[2][1] = k;
+                s.remix_tunings[2][1][4] = (id, t);
+            });
+            let (still, _) = render(rate, 333, 6.5, &setup, &mut |_, _| {});
+            // Steps outside the marker gaps: a 0.2 sine at 440 Hz moves up to 0.2 * 2π * 440 / rate, twice that an octave up.
+            let step = live.windows(2).map(|w| (w[1].0 - w[0].0).abs()).fold(0.0f32, f32::max);
+            let slope = 0.2 * tau * 440.0 / rate as f32;
+            let (a, b) = (markers(&live, rate), markers(&still, rate));
+            let shifts: Vec<String> = a.iter().zip(&b).map(|(x, y)| format!("{:+.2}", (x - y) * 1000.0)).collect();
+            writeln!(r, "{rate} Hz: largest frame step {step:.4} (the tone's own up to {slope:.4}, {:.4} at +3); loop markers vs unchanged run, ms: {}", slope * 2f32.powf(0.25), shifts.join(" ")).unwrap();
+        }
+
+        writeln!(r, "\n6. Percussive: the kick one-shot (60 Hz, falling away over 0.25 s) at 120 BPM, Key Lock off vs on +2").unwrap();
+        for rate in [44_100u32, 48_000] {
+            let shot = |keylock: bool, tune: i8| {
+                let k = Arc::clone(&kick);
+                let setup = move |s: &mut AudioSharedState| {
+                    deck_c(s, 120.0);
+                    s.remix_keylock[2][0] = keylock;
+                    s.remix_tunings[2][0][0] = (k.id, tune);
+                    s.remix_launch(2, 0, 0, Arc::clone(&k), false, false);
+                };
+                render(rate, 128, 0.4, &setup, &mut |_, _| {}).0
+            };
+            let (plain, locked) = (shot(false, 0), shot(true, 2));
+            let onset = |o: &[(f32, f32)]| o.iter().position(|f| f.0.abs() > 0.01).unwrap_or(usize::MAX);
+            let peak = |o: &[(f32, f32)], n: usize| o[..n].iter().fold(0.0f32, |m, f| m.max(f.0.abs()));
+            let length = |o: &[(f32, f32)]| o.iter().rposition(|f| f.0 != 0.0).map_or(0, |i| i + 1);
+            let attack = (0.01 * rate as f64) as usize;
+            let (o1, o2) = (onset(&plain), onset(&locked));
+            writeln!(
+                r,
+                "{rate} Hz: onset frame {o1} vs {o2}; peak in the first 10 ms {:.4} vs {:.4}; overall peak {:.4} vs {:.4}; sounding {:.1} ms vs {:.1} ms (incl. the filter's rest); pitch {:.1} Hz vs {:.1} Hz (ideal 60.0 and {:.1})",
+                peak(&plain, o1 + attack),
+                peak(&locked, o2 + attack),
+                peak(&plain, plain.len()),
+                peak(&locked, locked.len()),
+                length(&plain) as f64 * 1000.0 / rate as f64,
+                length(&locked) as f64 * 1000.0 / rate as f64,
+                hz(&plain[(0.03 * rate as f64) as usize..(0.2 * rate as f64) as usize], rate),
+                hz(&locked[(0.03 * rate as f64) as usize..(0.2 * rate as f64) as usize], rate),
+                60.0 * 2f64.powf(2.0 / 12.0)
+            )
+            .unwrap();
+        }
+
+        writeln!(r, "\n7. Callback cost at 48 kHz (whole callback: decks idle, Remix columns, mixer, master), per buffer").unwrap();
+        writeln!(r, "No audio device: these are the callback's own compute times. 'Over budget' counts callbacks that took longer than").unwrap();
+        writeln!(r, "their buffer lasts (each would be a dropout if the device needed it then); scheduling delay before a callback runs").unwrap();
+        writeln!(r, "isn't measured. Run under the shared build queue (one core, nice 10, idle I/O, other work on the machine).").unwrap();
+        let rate = 48_000u32;
+        let beat = move |bpm: f64| (60.0 / bpm * rate as f64) as usize;
+        let loops: Vec<Arc<RemixSample>> = (0..4).map(|i| Arc::clone(if i % 2 == 0 { &marked } else { &stereo })).collect();
+        let fired = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        type Live = Box<dyn FnMut(usize, &mut AudioSharedState)>;
+        type Case<'a> = (&'a str, Box<dyn Fn(&mut AudioSharedState)>, Box<dyn Fn() -> Live>, bool);
+        let (m, k) = (Arc::clone(&marked), Arc::clone(&kick));
+        let two = move |s: &mut AudioSharedState| {
+            deck_c(s, 144.0);
+            s.remix_keylock[2][1] = true;
+            s.remix_tunings[2][1][4] = (m.id, 2);
+            s.remix_launch(2, 1, 4, Arc::clone(&m), true, false);
+        };
+        // The kick again on every beat (asked during each beat, it lands on the next), throughout.
+        let kicks = move || -> Live {
+            let k = Arc::clone(&k);
+            let mut asked = usize::MAX;
+            Box::new(move |f: usize, s: &mut AudioSharedState| {
+                if f / beat(144.0) != asked {
+                    asked = f / beat(144.0);
+                    s.remix_launch(2, 0, 0, Arc::clone(&k), false, true);
+                }
+            })
+        };
+        let l1 = loops.clone();
+        let all = move |s: &mut AudioSharedState| {
+            for d in 0..4 {
+                s.engine.clock.bpm = 144.0;
+                s.engine.strips[d].volume = 1.0;
+                for c in 0..4 {
+                    s.remix_keylock[d][c] = true;
+                    s.remix_tunings[d][c][c] = (l1[c].id, 2);
+                    s.remix_filter[d][c] = 0.3;
+                    s.remix_launch(d, c, c, Arc::clone(&l1[c]), true, true);
+                }
+            }
+        };
+        // At the first buffer from 1 s on, every column is replaced (on the next beat, 1.25 s), so 32 voices stretch
+        // through the crossfade.
+        let (l2, count) = (loops.clone(), std::rc::Rc::clone(&fired));
+        let replace = move || -> Live {
+            let (l2, count) = (l2.clone(), std::rc::Rc::clone(&count));
+            let mut done = false;
+            Box::new(move |f: usize, s: &mut AudioSharedState| {
+                if !done && f >= rate as usize {
+                    done = true;
+                    count.set(count.get() + 1);
+                    for d in 0..4 {
+                        for c in 0..4 {
+                            s.remix_tunings[d][c][c + 4] = (l2[(c + 1) % 4].id, -5);
+                            s.remix_launch(d, c, c + 4, Arc::clone(&l2[(c + 1) % 4]), true, true);
+                        }
+                    }
+                }
+            })
+        };
+        let cases: Vec<Case> = vec![
+            ("two columns: kick on every beat + loop key-locked +2", Box::new(two), Box::new(kicks), false),
+            ("worst: 16 columns key-locked +2, filtered, launched together, all replaced on one beat", Box::new(all), Box::new(replace), true),
+        ];
+        for (name, setup, live, replaces) in cases {
+            for block in [64usize, 128, 256] {
+                for take in 1..=2 {
+                    fired.set(0);
+                    let mut live = live();
+                    let (_, times) = render(rate, block, 3.0, &*setup, &mut |f, s| live(f, s));
+                    assert_eq!(fired.get(), replaces as usize, "{name}, {block}: the replacement didn't fire once");
+                    let budget_s = block as f64 / rate as f64;
+                    let mut sorted = times[2..].to_vec();
+                    sorted.sort_by(f64::total_cmp);
+                    let mean = sorted.iter().sum::<f64>() / sorted.len() as f64;
+                    let p99 = sorted[(sorted.len() as f64 * 0.99) as usize];
+                    let max = *sorted.last().unwrap();
+                    let over = times.iter().filter(|&&t| t > budget_s).count();
+                    // The three slowest buffers and when they started (launches land at 0.417 s, replacements at 1.25 s).
+                    let mut slowest: Vec<(usize, f64)> = times.iter().copied().enumerate().collect();
+                    slowest.sort_by(|a, b| b.1.total_cmp(&a.1));
+                    let at: Vec<String> = slowest.iter().take(3).map(|(i, t)| format!("{:.3} ms at {:.3} s", t * 1e3, (i * block) as f64 / rate as f64)).collect();
+                    writeln!(
+                        r,
+                        "{name}, {block} frames (budget {:.3} ms), take {take}: mean {:.3} ms ({:.1}%), p99 {:.3} ms, max {:.3} ms ({:.1}%), over budget {over} of {}; slowest: {}",
+                        budget_s * 1e3,
+                        mean * 1e3,
+                        100.0 * mean / budget_s,
+                        p99 * 1e3,
+                        max * 1e3,
+                        100.0 * max / budget_s,
+                        times.len(),
+                        at.join(", ")
+                    )
+                    .unwrap();
+                }
+            }
+        }
+        print!("{r}");
+        if let Ok(path) = std::env::var("RETRAKTOR_MEASURE_OUT") {
+            std::fs::write(path, &r).unwrap();
         }
     }
 }

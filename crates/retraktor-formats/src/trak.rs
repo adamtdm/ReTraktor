@@ -243,16 +243,59 @@ pub struct TrakCell {
     /// `Synced`: follows the master tempo at `bpm`.
     pub synced: bool,
     pub bpm: f64,
+    /// `Pitch` as the set stores it (0 when absent, NaN when it isn't a number).
+    pub pitch: f64,
+    /// `pitch` in semitones by [`semitones_from_pitch`], or `None` when its meaning isn't known.
+    pub tune: Option<i8>,
     /// The cell's Traktor settings that differ from their defaults and that a plain sample player doesn't carry.
     pub unapplied: Vec<&'static str>,
 }
 
-/// A Traktor Remix Set: Q, its filled cells and the files the archive stores.
+/// A Traktor Remix Set: Q, each slot's Key Lock, its filled cells and the files the archive stores.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TrakRemixSet {
     pub quantize: bool,
+    /// `TraktorSlot`'s `Keylock` per slot (column), off when a slot doesn't say.
+    pub keylock: [bool; TRAK_SLOTS],
     pub cells: Vec<TrakCell>,
     pub members: Vec<TrakMember>,
+}
+
+/// Raw `Pitch` values in NI's official sets with the whole semitones Traktor Pro 4.4.1.22's own Pitch knob readout
+/// shows for them: the Remix Deck Tutorial's Bubble Gate (page 2, slot 3, cell 5) reads -4 st, and Drop Squad's Shaker
+/// (page 2, slot 2, cell 7) reads -0 st, its knob a hair left of centre. The native readout supersedes the TRAKTOR
+/// KONTROL F1 manual's tutorial (section 3.5.4), which calls the Bubble Gate cell 3 down. The readout is whole
+/// semitones only, so the Shaker's exact sounding offset is unmeasured; ReTraktor's whole-semitone tuning takes 0.
+const MEASURED_PITCHES: [(f64, i8); 2] = [(-0.333333, -4), (-0.0117647, 0)];
+/// The most Traktor tunes a cell either way, in semitones (F1 manual, section 4.8), at its bipolar control's end.
+const FULL_SCALE_SEMITONES: i8 = 12;
+/// Absolute tolerance (0.0000005) for matching a parsed `Pitch` to the decimal values written in the archives.
+const PITCH_DIGITS: f64 = 5e-7;
+
+/// A cell's `Pitch` in semitones, only for the raw values whose meaning is known; `None` for any other.
+///
+/// What is known: `Pitch` is a signed control (Traktor's own F1 pages draw it as a bipolar bar), so 0 is untuned and
+/// its ends, -1 and +1, are the documented full range of 12 semitones either way; and Traktor's own readout shows
+/// the [`MEASURED_PITCHES`]. Those few points don't establish how values between are spaced, or that a positive value
+/// mirrors its negative, so any other value is left for the importer to name by cell and raw value, never guessed or
+/// rounded.
+///
+/// shortcut: only these raw values are placed; add others once a Traktor readout shows what they mean.
+pub fn semitones_from_pitch(pitch: f64) -> Option<i8> {
+    let near = |known: f64| (pitch - known).abs() <= PITCH_DIGITS;
+    if !(-1.0..=1.0).contains(&pitch) {
+        None // past either end of the control (or not a number) isn't a pitch Traktor writes
+    } else if pitch == 0.0 {
+        Some(0)
+    } else if let Some(&(_, semitones)) = MEASURED_PITCHES.iter().find(|(raw, _)| near(*raw)) {
+        Some(semitones)
+    } else if near(1.0) {
+        Some(FULL_SCALE_SEMITONES)
+    } else if near(-1.0) {
+        Some(-FULL_SCALE_SEMITONES)
+    } else {
+        None
+    }
 }
 
 const NI_CONTAINER_MAGIC: &[u8; 16] = b"/\\ NI FC MTD  /\\";
@@ -324,7 +367,7 @@ pub fn read_remix_set<R: std::io::Read + std::io::Seek>(r: &mut R) -> Result<Tra
         pos = end;
     }
     let nisound = nisound.ok_or("has no cell list (NISOUND)")?;
-    let (quantize, cells) = read_nisound(&nisound, &members)?;
+    let (quantize, keylock, cells) = read_nisound(&nisound, &members)?;
     // Only FLAC and WAV, the formats Traktor's own sets store, are taken: anything else is refused, not guessed at.
     let mut checked: Vec<&str> = Vec::new();
     for cell in &cells {
@@ -339,7 +382,7 @@ pub fn read_remix_set<R: std::io::Read + std::io::Seek>(r: &mut R) -> Result<Tra
             return Err(format!("{}: '{}' isn't FLAC or WAV audio", trak_cell_label(cell.column, cell.row), cell.file));
         }
     }
-    Ok(TrakRemixSet { quantize, cells, members })
+    Ok(TrakRemixSet { quantize, keylock, cells, members })
 }
 
 fn trak_cell_label(column: usize, row: usize) -> String {
@@ -435,9 +478,9 @@ fn ni_children<'a>(item: &'a NiItem<'a>, count: usize, id: u32, root: &str, what
     Ok(placed.into_iter().map(|p| p.expect("every position filled once")).collect())
 }
 
-/// Q and the filled cells from `NISOUND`'s tree: root → set → 4 slots → 16 cells each. Each filled cell's file is
-/// one of `members`, by its exact name.
-fn read_nisound(d: &[u8], members: &[TrakMember]) -> Result<(bool, Vec<TrakCell>), String> {
+/// Q, each slot's Key Lock and the filled cells from `NISOUND`'s tree: root → set → 4 slots → 16 cells each. Each
+/// filled cell's file is one of `members`, by its exact name.
+fn read_nisound(d: &[u8], members: &[TrakMember]) -> Result<(bool, [bool; TRAK_SLOTS], Vec<TrakCell>), String> {
     // The tree's root item says how long it is; opaque filler (not always zeros) follows it in the record.
     let (root, _) = ni_item(d, 0, d.len(), 0)?;
     if &root.kind != b"DSIN" {
@@ -451,7 +494,14 @@ fn read_nisound(d: &[u8], members: &[TrakMember]) -> Result<(bool, Vec<TrakCell>
         _ => return Err("has no quantize setting (QuantState)".into()),
     };
     let mut cells = Vec::new();
-    for (column, (slot, _)) in ni_children(set, TRAK_SLOTS, 2, "TraktorSlot", "slot")?.into_iter().enumerate() {
+    let mut keylock = [false; TRAK_SLOTS];
+    for (column, (slot, slot_xml)) in ni_children(set, TRAK_SLOTS, 2, "TraktorSlot", "slot")?.into_iter().enumerate() {
+        // Every slot, filled or empty, says it; a slot that doesn't is taken as off, Traktor's default.
+        keylock[column] = match slot_xml.child("Keylock").map(|n| n.text.trim()) {
+            None | Some("false") => false,
+            Some("true") => true,
+            Some(other) => return Err(format!("has slot {} with a Key Lock setting '{other}' (only true or false)", column + 1)),
+        };
         for (row, (_, cell)) in ni_children(slot, TRAK_CELLS, 3, "TraktorCell", "cell")?.into_iter().enumerate() {
             let at = trak_cell_label(column, row);
             let text = |tag: &str| cell.child(tag).map(|n| n.text.trim());
@@ -502,7 +552,6 @@ fn read_nisound(d: &[u8], members: &[TrakMember]) -> Result<(bool, Vec<TrakCell>
                 ("gain", differs("Gain", 0.5)),
                 ("reverse", text("Reverse").is_some_and(|t| t != "false")),
                 ("speed", differs("Speed", 1.0)),
-                ("pitch", differs("Pitch", 0.0)),
                 ("markers", differs("Offset", 0.0) || differs("StartMarker", 0.0) || differs("EndMarker", 0.0) || differs("BeatGridOffset", 0.0)),
                 ("trigger", differs("TriggerType", 1.0)),
                 ("one-shot sync", synced && !looped),
@@ -511,10 +560,12 @@ fn read_nisound(d: &[u8], members: &[TrakMember]) -> Result<(bool, Vec<TrakCell>
                     unapplied.push(setting);
                 }
             }
-            cells.push(TrakCell { column, row, file, name, name_shortened, looped, synced, bpm, unapplied });
+            let pitch = text("Pitch").map_or(0.0, |t| t.parse::<f64>().unwrap_or(f64::NAN));
+            let tune = semitones_from_pitch(pitch);
+            cells.push(TrakCell { column, row, file, name, name_shortened, looped, synced, bpm, pitch, tune, unapplied });
         }
     }
-    Ok((quantize, cells))
+    Ok((quantize, keylock, cells))
 }
 
 /// Test-only `.trak` builder, shared with the GUI's tests (not built into the library).
@@ -542,7 +593,7 @@ mod tests {
         assert_eq!(extracted.mastering_dsp.compressor.ratio, 2.5);
     }
 
-    use super::trak_fixture::{archive, grid, nisound, Cell, Slots};
+    use super::trak_fixture::{archive, grid, nisound, nisound_keylock, Cell, Slots};
 
     fn read(bytes: &[u8]) -> Result<TrakRemixSet, String> {
         read_remix_set(&mut std::io::Cursor::new(bytes))
@@ -581,6 +632,48 @@ mod tests {
             }
             assert!(read.cells.iter().all(|c| !c.name_shortened));
         }
+    }
+
+    /// Pitch values with their expected semitones written out by hand, not computed: 0, the two Traktor Pro 4 readouts
+    /// (-0.333333 as -4, -0.0117647 as -0, so 0) and the full-scale ends, ±1 (±12). Everything else stays unplaced, also
+    /// values that look like whole twelfths (±0.25, -0.5, 0.0833333), the mirrored +0.333333 and +0.0117647, out of
+    /// range or not a number.
+    #[test]
+    fn cell_pitch_becomes_semitones_only_for_known_values() {
+        for (pitch, want) in [(0.0, 0), (-0.333333, -4), (-0.0117647, 0), (1.0, 12), (-1.0, -12)] {
+            assert_eq!(semitones_from_pitch(pitch), Some(want), "Pitch {pitch}");
+        }
+        for pitch in [0.25, -0.25, -0.5, 0.0833333, 0.166667, 0.333333, 0.0117647, 0.9999, 1.0000004, -1.0000004, 1.5, -1.0001, f64::NAN, f64::INFINITY] {
+            assert_eq!(semitones_from_pitch(pitch), None, "Pitch {pitch} was placed");
+        }
+    }
+
+    /// Each slot's Key Lock reads back on or off, empty slots too, and a slot without one is off; anything but true
+    /// or false is refused. A cell's pitch reads back raw with its semitones, or none when unplaced, also with the
+    /// slot's Key Lock off.
+    #[test]
+    fn slot_key_lock_and_cell_pitch_read_back() {
+        let cells = three_cells();
+        let mut slots = grid(&cells);
+        slots[0].1[0].1 = slots[0].1[0].1.replace("<Pitch>0</Pitch>", "<Pitch>-0.333333</Pitch>");
+        slots[2].1[6].1 = slots[2].1[6].1.replace("<Pitch>0</Pitch>", "<Pitch>-0.0117647</Pitch>");
+        slots[3].1[15].1 = slots[3].1[15].1.replace("<Pitch>0</Pitch>", "<Pitch>0.166667</Pitch>");
+        let files = |set: &[u8]| archive(&[("A kick.flac", FLAC), ("B vocal.wav", WAV), ("NISOUND", set)]);
+        // Slot 2 holds no cells; slot 4 has no Keylock at all.
+        let set = read(&files(&nisound_keylock(false, &slots, 3, [Some("false"), Some("true"), Some("true"), None]))).unwrap();
+        assert_eq!(set.keylock, [false, true, true, false]);
+        let pitches: Vec<_> = set.cells.iter().map(|c| (c.column, c.row, c.pitch, c.tune)).collect();
+        assert_eq!(pitches, [(0, 0, -0.333333, Some(-4)), (2, 6, -0.0117647, Some(0)), (3, 15, 0.166667, None)]);
+        assert!(set.cells.iter().all(|c| !c.unapplied.contains(&"pitch")), "pitch is carried, not listed as unapplied");
+        let off = read(&files(&nisound(false, &slots, 3))).unwrap();
+        assert_eq!(off.keylock, [false; 4]);
+        assert_eq!(off.cells[0].tune, Some(-4), "the tuning is kept with Key Lock off");
+        let e = read(&files(&nisound_keylock(false, &slots, 3, [Some("false"), Some("yes"), Some("false"), Some("false")]))).unwrap_err();
+        assert!(e.contains("slot 2") && e.contains("Key Lock"), "{e}");
+        let mut broken = slots.clone();
+        broken[0].1[0].1 = broken[0].1[0].1.replace("-0.333333", "low");
+        let bad = read(&files(&nisound(false, &broken, 3))).unwrap();
+        assert!(bad.cells[0].pitch.is_nan() && bad.cells[0].tune.is_none());
     }
 
     /// A cell name with control characters, or longer than a pad can show, is cut to MAX_CELL_NAME_CHARS with its

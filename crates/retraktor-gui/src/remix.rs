@@ -258,6 +258,9 @@ pub struct Imported {
     dir: PathBuf,
     /// What of the set ReTraktor doesn't carry over (settings, shortened names), for the status line (empty: nothing).
     pub notes: String,
+    /// Every cell whose pitch wasn't applied, with its raw Traktor value, for the deck's report (the status line
+    /// names only the first few).
+    pub pitch_skipped: Vec<String>,
     kept: bool,
 }
 
@@ -285,7 +288,9 @@ const MAX_IMPORT_BYTES: u64 = BANK_BUDGET_BYTES as u64;
 /// filled cell in its place with its name, as a loop or a one-shot, Q as the set has it and page 1 showing. Each
 /// sample file the cells play is copied out once, under its exact name in the set, into a new folder in `root` that
 /// only this import writes to (cells sharing a file share its copy), then decoded whole ([`RemixSample::decode`]).
-/// A synced cell keeps its BPM; an unsynced one plays at its own speed. On any failure, or once `cancelled`, the
+/// A synced cell keeps its BPM; an unsynced one plays at its own speed. Each slot's Key Lock comes along, and each
+/// cell's pitch where [`retraktor_formats::trak::semitones_from_pitch`] knows its meaning (kept with Key Lock off too);
+/// any other pitch is left at 0 and named in the notes by cell and raw value. On any failure, or once `cancelled`, the
 /// folder is removed again; on success the returned [`Imported`] owns it. Errors read on their own.
 pub fn import_trak(path: &Path, root: &Path, budget: &Arc<SampleBudget>, cancelled: &dyn Fn() -> bool) -> Result<(RemixBank, Imported), Vec<String>> {
     use std::io::{Read, Seek, SeekFrom, Write};
@@ -311,7 +316,7 @@ pub fn import_trak(path: &Path, root: &Path, budget: &Arc<SampleBudget>, cancell
         let dir = root.join(if n == 1 { base.clone() } else { format!("{base}_{n}") });
         match std::fs::create_dir(&dir) {
             Ok(()) => {
-                imported = Some(Imported { dir, notes: String::new(), kept: false });
+                imported = Some(Imported { dir, notes: String::new(), pitch_skipped: Vec::new(), kept: false });
                 break;
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -345,13 +350,14 @@ pub fn import_trak(path: &Path, root: &Path, budget: &Arc<SampleBudget>, cancell
         let _ = dir.sync_all(); // the new names last through a power cut
     }
 
-    let mut bank = RemixBank { quantize: set.quantize, ..Default::default() };
+    let mut bank = RemixBank { quantize: set.quantize, keylock: set.keylock, ..Default::default() };
     for cell in &set.cells {
         let bpm = if cell.synced { cell.bpm } else { 0.0 };
         let sample = RemixSample::decode(&imported.dir.join(&cell.file), &cell.name, bpm, budget, cancelled, true).map_err(|e| {
             vec![format!("cell {}.{} (page {}) '{}' from '{}': {e}", cell.column + 1, cell.row + 1, cell.row / PAGE_ROWS + 1, cell.name, cell.file)]
         })?;
-        bank.cells[cell.column][cell.row] = Some(RemixCell { sample: Arc::new(sample), looped: cell.looped });
+        // A pitch whose meaning isn't known is left at 0 and named below, never guessed or rounded.
+        bank.cells[cell.column][cell.row] = Some(RemixCell { sample: Arc::new(sample), looped: cell.looped, tune: cell.tune.unwrap_or(0) });
     }
     let mut unapplied: Vec<&str> = set.cells.iter().flat_map(|c| c.unapplied.iter().copied()).collect();
     unapplied.sort_unstable();
@@ -360,6 +366,22 @@ pub fn import_trak(path: &Path, root: &Path, budget: &Arc<SampleBudget>, cancell
     let differing = set.cells.iter().filter(|c| !c.unapplied.is_empty()).count();
     if differing > 0 {
         notes.push(format!("Traktor settings not applied on {differing} cells: {}", unapplied.join(", ")));
+    }
+    let unplaced: Vec<String> = set
+        .cells
+        .iter()
+        .filter(|c| c.tune.is_none())
+        .map(|c| {
+            let raw = if c.pitch.is_nan() { "unreadable".to_string() } else { c.pitch.to_string() };
+            format!("cell {}.{} (page {}) '{}' ({raw})", c.column + 1, c.row + 1, c.row / PAGE_ROWS + 1, c.name)
+        })
+        .collect();
+    if !unplaced.is_empty() {
+        const NAMED: usize = 3;
+        let more = if unplaced.len() > NAMED { format!(" and {} more (all listed on the deck)", unplaced.len() - NAMED) } else { String::new() };
+        let first = unplaced.iter().take(NAMED).cloned().collect::<Vec<_>>().join(", ");
+        notes.push(format!("Pitch left at 0 (a Traktor value ReTraktor can't yet read as semitones) on {}: {first}{more}", unplaced.len()));
+        imported.pitch_skipped = unplaced;
     }
     let renamed = set.cells.iter().filter(|c| c.name_shortened).count();
     if renamed > 0 {
@@ -527,12 +549,18 @@ fn fitted_bpm(library_bpm: f64, seconds: f64) -> (Option<f64>, bool) {
     }
 }
 
-/// What a cell holds: its sample and whether it loops or plays once.
+/// What a cell holds: its sample, whether it loops or plays once, and its tuning.
 #[derive(Clone)]
 pub struct RemixCell {
     pub sample: Arc<RemixSample>,
     pub looped: bool,
+    /// Semitones, [`-MAX_TUNE..=MAX_TUNE`](MAX_TUNE), 0 untuned. Heard only while its column's Key Lock is on
+    /// ([`RemixBank::keylock`]); kept while it is off.
+    pub tune: i8,
 }
+
+/// The most a cell is tuned up or down, in semitones (Traktor's range).
+pub const MAX_TUNE: i8 = 12;
 
 /// One deck's cells, the page on screen and whether launches wait for the next beat.
 pub struct RemixBank {
@@ -541,13 +569,19 @@ pub struct RemixBank {
     pub page: usize,
     /// Launch and stop on the next beat (on) or at once (off).
     pub quantize: bool,
+    /// Each column's filter knob (`0..=1`, see [`retraktor_dsp::TwoWayFilter`]): exactly 0.5 is off, lower a
+    /// low-pass, higher a high-pass. It belongs to the column, whatever cell or page plays in it.
+    pub filter: [f32; COLUMNS],
+    /// Each column's Key Lock: on, its cells keep their pitch at any tempo and play their tuning; off (the default),
+    /// a synced loop's pitch follows its speed and tuning isn't heard. Separate from a Track deck's KEY.
+    pub keylock: [bool; COLUMNS],
     /// The load each cell waits for (its generation), 0 for none.
     loading: [[u64; ROWS]; COLUMNS],
 }
 
 impl Default for RemixBank {
     fn default() -> Self {
-        Self { cells: Default::default(), page: 0, quantize: true, loading: [[0; ROWS]; COLUMNS] }
+        Self { cells: Default::default(), page: 0, quantize: true, filter: [0.5; COLUMNS], keylock: [false; COLUMNS], loading: [[0; ROWS]; COLUMNS] }
     }
 }
 
@@ -564,19 +598,44 @@ impl RemixBank {
         self.loading.iter().flatten().any(|&g| g != 0)
     }
 
-    /// What a saved set of this bank depends on: Q and each filled cell (column, row, sample id, loop). Equal values
-    /// mean no cell or setting changed in between (the page is left out: flipping it edits nothing).
+    /// What a saved set of this bank depends on: Q, each filled cell (column, row, sample id, loop, tuning), the
+    /// column filters and Key Locks. Equal values mean no cell or setting changed in between (the page is left out:
+    /// flipping it edits nothing).
     pub fn contents(&self) -> BankContents {
         let cells = (0..COLUMNS)
             .flat_map(|c| (0..ROWS).map(move |r| (c, r)))
-            .filter_map(|(c, r)| self.cells[c][r].as_ref().map(|cell| (c, r, cell.sample.id, cell.looped)))
+            .filter_map(|(c, r)| self.cells[c][r].as_ref().map(|cell| (c, r, cell.sample.id, cell.looped, cell.tune)))
             .collect();
-        (self.quantize, cells)
+        (self.quantize, cells, self.filter, self.keylock)
+    }
+
+    /// Each cell's (sample id, tuning) for the callback, `(0, 0)` where empty (no sample has id 0).
+    pub fn tunings(&self) -> [[(u64, i8); ROWS]; COLUMNS] {
+        std::array::from_fn(|c| std::array::from_fn(|r| self.cells[c][r].as_ref().map_or((0, 0), |cell| (cell.sample.id, cell.tune))))
+    }
+}
+
+/// A tuning for the screen: `+2`, `−3`, `0` (semitones).
+pub fn tune_text(tune: i8) -> String {
+    match tune {
+        0 => "0".to_string(),
+        t if t > 0 => format!("+{t}"),
+        t => format!("−{}", -t),
+    }
+}
+
+/// A column filter knob's cutoff for the screen: `350 Hz`, `1.2 kHz`.
+pub fn filter_hz_text(knob: f32) -> String {
+    let hz = retraktor_dsp::TwoWayFilter::cutoff_hz(knob);
+    if hz >= 1000.0 {
+        format!("{:.1} kHz", hz / 1000.0)
+    } else {
+        format!("{hz:.0} Hz")
     }
 }
 
 /// See [`RemixBank::contents`].
-pub type BankContents = (bool, Vec<(usize, usize, u64, bool)>);
+pub type BankContents = (bool, Vec<(usize, usize, u64, bool, i8)>, [f32; COLUMNS], [bool; COLUMNS]);
 
 struct LoadJob {
     deck: usize,
@@ -745,7 +804,8 @@ impl RemixLoader {
             let outcome = match done.result {
                 Ok(sample) => {
                     let name = sample.name.clone();
-                    bank.cells[done.column][done.row] = Some(RemixCell { looped: done.captured || sample.fits_beats, sample });
+                    // A new sample in the cell starts untuned.
+                    bank.cells[done.column][done.row] = Some(RemixCell { looped: done.captured || sample.fits_beats, sample, tune: 0 });
                     Ok(name)
                 }
                 Err(e) => Err(e),
@@ -766,8 +826,9 @@ impl RemixLoader {
 /// A remix set file: `My set.remixset`.
 pub const SET_EXTENSION: &str = "remixset";
 const SET_FORMAT: &str = "retraktor-remix-set";
-/// The newest set format this build reads and the one it writes.
-const SET_VERSION: u64 = 1;
+/// The newest set format this build reads and the one it writes. Format 2 added the column filters and Key Locks
+/// and each cell's tuning: an older build refuses it rather than open the cells and drop those on its next save.
+const SET_VERSION: u64 = 2;
 /// 64 cells with the longest paths fit in well under this; anything bigger isn't a set.
 const MAX_SET_BYTES: u64 = 1 << 20;
 
@@ -782,6 +843,8 @@ pub struct SetCell {
     /// The library BPM it was decoded with (0: none).
     pub bpm: f64,
     pub looped: bool,
+    /// See [`RemixCell::tune`].
+    pub tune: i8,
 }
 
 impl SetCell {
@@ -793,12 +856,18 @@ impl SetCell {
 
 /// A Remix deck's cells and settings as a `.remixset` file keeps them: no audio, ids, transport or mixer state.
 ///
-/// The file is JSON: `format`, `version`, the grid's `columns` and `rows`, `quantize`, `page` (1–4) and `cells`,
-/// each with its 1-based `column` and `row`, `path`, `name`, `bpm` and `looped`. Empty cells are left out.
+/// The file is JSON: `format`, `version`, the grid's `columns` and `rows`, `quantize`, `page` (1–4), `filters` (one
+/// knob 0–1 per column, 0.5 off), `keylock` (one true/false per column) and `cells`, each with its 1-based `column`
+/// and `row`, `path`, `name`, `bpm`, `looped` and `tune` (whole semitones, -12–12). Empty cells are left out. Format
+/// 1 has no filters, Key Locks or tunings, and opens with them off and at 0.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RemixSet {
     pub quantize: bool,
     pub page: usize,
+    /// See [`RemixBank::filter`].
+    pub filters: [f32; COLUMNS],
+    /// See [`RemixBank::keylock`].
+    pub keylock: [bool; COLUMNS],
     pub cells: Vec<SetCell>,
 }
 
@@ -822,21 +891,23 @@ impl RemixSet {
                     return Err(format!("{at} '{name}': its file path ({}) isn't UTF-8 text, so a set can't keep it exactly", cell.sample.source.display()));
                 };
                 let bpm = crate::audio::valid_bpm(cell.sample.library_bpm).unwrap_or(0.0);
-                cells.push(SetCell { column, row, path: path.to_string(), name: name.clone(), bpm, looped: cell.looped });
+                cells.push(SetCell { column, row, path: path.to_string(), name: name.clone(), bpm, looped: cell.looped, tune: cell.tune });
             }
         }
-        Ok(Self { quantize: bank.quantize, page: bank.page, cells })
+        Ok(Self { quantize: bank.quantize, page: bank.page, filters: bank.filter, keylock: bank.keylock, cells })
     }
 
     pub fn to_json(&self) -> String {
         let cells: Vec<serde_json::Value> = self
             .cells
             .iter()
-            .map(|c| serde_json::json!({ "column": c.column + 1, "row": c.row + 1, "path": c.path, "name": c.name, "bpm": c.bpm, "looped": c.looped }))
+            .map(|c| serde_json::json!({ "column": c.column + 1, "row": c.row + 1, "path": c.path, "name": c.name, "bpm": c.bpm, "looped": c.looped, "tune": c.tune }))
             .collect();
+        // Each f32 as its shortest decimal (0.3, not 0.30000001192092896), which reads back as the same f32.
+        let filters: Vec<f64> = self.filters.iter().map(|f| f.to_string().parse().unwrap_or(0.5)).collect();
         let doc = serde_json::json!({
             "format": SET_FORMAT, "version": SET_VERSION, "columns": COLUMNS, "rows": ROWS,
-            "quantize": self.quantize, "page": self.page + 1, "cells": cells,
+            "quantize": self.quantize, "page": self.page + 1, "filters": filters, "keylock": self.keylock, "cells": cells,
         });
         serde_json::to_string_pretty(&doc).unwrap_or_default() + "\n"
     }
@@ -860,6 +931,25 @@ impl RemixSet {
         let quantize = doc.get("quantize").and_then(Value::as_bool).ok_or("has no quantize setting")?;
         let pages = (ROWS / PAGE_ROWS) as u64;
         let page = number("page").filter(|p| (1..=pages).contains(p)).ok_or(format!("has no page 1–{pages}"))? as usize - 1;
+        let mut filters = [0.5; COLUMNS];
+        if version >= 2 {
+            let knobs = doc.get("filters").and_then(Value::as_array).filter(|k| k.len() == COLUMNS);
+            let knobs = knobs.map(|k| k.iter().map(|v| v.as_f64().filter(|f| (0.0..=1.0).contains(f))).collect::<Option<Vec<f64>>>());
+            let Some(Some(knobs)) = knobs else {
+                return Err(format!("has no filter setting from 0 to 1 for each of its {COLUMNS} columns"));
+            };
+            for (filter, knob) in filters.iter_mut().zip(knobs) {
+                *filter = knob as f32;
+            }
+        }
+        let mut keylock = [false; COLUMNS];
+        if version >= 2 {
+            let locks = doc.get("keylock").and_then(Value::as_array).filter(|k| k.len() == COLUMNS);
+            let Some(Some(locks)) = locks.map(|k| k.iter().map(Value::as_bool).collect::<Option<Vec<bool>>>()) else {
+                return Err(format!("has no Key Lock setting (true or false) for each of its {COLUMNS} columns"));
+            };
+            keylock.copy_from_slice(&locks);
+        }
         let entries = doc.get("cells").and_then(Value::as_array).ok_or("has no cell list")?;
         if entries.len() > COLUMNS * ROWS {
             return Err(format!("lists {} cells; a deck has {}", entries.len(), COLUMNS * ROWS));
@@ -883,9 +973,16 @@ impl RemixSet {
             let (Some(path), Some(name), Some(bpm), Some(looped)) = (path, name, bpm, looped) else {
                 return Err(format!("has {at} without an absolute path, a name, a BPM and loop setting"));
             };
-            cells.push(SetCell { column, row, path: path.to_string(), name: name.to_string(), bpm, looped });
+            let tune = match version {
+                1 => Some(0),
+                _ => entry.get("tune").and_then(Value::as_i64).filter(|t| (-(MAX_TUNE as i64)..=MAX_TUNE as i64).contains(t)).map(|t| t as i8),
+            };
+            let Some(tune) = tune else {
+                return Err(format!("has {at} without a tuning from -{MAX_TUNE} to {MAX_TUNE} semitones"));
+            };
+            cells.push(SetCell { column, row, path: path.to_string(), name: name.to_string(), bpm, looped, tune });
         }
-        Ok(Self { quantize, page, cells })
+        Ok(Self { quantize, page, filters, keylock, cells })
     }
 }
 
@@ -984,10 +1081,10 @@ pub fn stage(set: &RemixSet, budget: &Arc<SampleBudget>, cancelled: &dyn Fn() ->
         lines.push("Put each file back at its path (or fix its \"path\" in the .remixset file, it is plain text), then open the set again".into());
         return Err(lines);
     }
-    let mut bank = RemixBank { quantize: set.quantize, page: set.page, ..Default::default() };
+    let mut bank = RemixBank { quantize: set.quantize, page: set.page, filter: set.filters, keylock: set.keylock, ..Default::default() };
     for c in &set.cells {
         let sample = RemixSample::decode(Path::new(&c.path), &c.name, c.bpm, budget, cancelled, false).map_err(|e| vec![format!("{}: {} ({e})", c.label(), c.path)])?;
-        bank.cells[c.column][c.row] = Some(RemixCell { sample: Arc::new(sample), looped: c.looped });
+        bank.cells[c.column][c.row] = Some(RemixCell { sample: Arc::new(sample), looped: c.looped, tune: c.tune });
     }
     Ok(bank)
 }
@@ -1207,6 +1304,9 @@ pub(crate) struct Launch {
     pub sample: Arc<RemixSample>,
     pub row: u8,
     pub looped: bool,
+    /// The cell's tuning in semitones, kept current from the bank while it waits and plays (see
+    /// [`RemixEngine::retune`]).
+    pub tune: i8,
 }
 
 /// A launch (or, with none, a stop) for one column, at once or on the next beat.
@@ -1229,8 +1329,16 @@ pub struct RemixColumn {
 
 struct Voice {
     launch: Launch,
-    /// Source frames from the sample's start.
+    /// Source frames from the sample's start: the transport, at the tempo whether Key Lock is on or off.
     pos: f64,
+    /// Which of its column's two stretchers this voice uses.
+    stretcher: usize,
+    /// Key Lock as the voice last heard its column's switch.
+    locked: bool,
+    /// Frames left of the crossfade from the other mode into `locked`'s, after a switch.
+    switching: u32,
+    /// Its stretcher ran on the last frame, so it carries on without priming again.
+    stretching: bool,
 }
 
 /// One column in the callback: the cell sounding, the one fading out under it, and a launch or stop waiting.
@@ -1246,7 +1354,22 @@ pub(crate) struct RemixColumnPlayer {
     /// The column's last output frame.
     last: (f32, f32),
     pending: Option<RemixRequest>,
+    /// One time-stretcher for the playing voice and one for the fading voice, made once, swapped between them.
+    stretchers: [crate::keylock::KeyLock; 2],
+    /// This column's place among all decks' columns (deck × 4 + column), set by the engine each frame.
+    index: usize,
+    /// The column's filter, on its mixed output (crossfades included), callback-owned.
+    filter: retraktor_dsp::TwoWayFilter,
+    /// Frames the filter rings on for after the column fell silent; at 0 it rests, and starts clean next time.
+    ringing: u32,
 }
+
+/// How long a column's filter rings on after its sound stops: long enough for its slowest setting to die away.
+const FILTER_TAIL_SEC: f64 = 0.1;
+/// How long a voice crossfades between plain playback and Key Lock when its column's switch flips.
+const KEYLOCK_FADE_SEC: f64 = 0.01;
+/// Every stretcher of every deck's columns (two per column), each with its own place in a hop for its grain work.
+const STRETCH_SLOTS: usize = 4 * COLUMNS * 2;
 
 /// A linear read of interleaved stereo at a fractional frame; a loop reads across its seam into its start.
 fn read(pcm: &[f32], pos: f64, looped: bool) -> (f32, f32) {
@@ -1261,6 +1384,24 @@ fn read(pcm: &[f32], pos: f64, looped: bool) -> (f32, f32) {
 }
 
 impl Voice {
+    /// A voice starting `launch` on stretcher `stretcher`, in the mode its column's Key Lock `keylock` means for it
+    /// (so it starts with no crossfade).
+    fn new(launch: Launch, stretcher: usize, keylock: bool, tempo: f64, out_rate: u32) -> Self {
+        let mut voice = Self { launch, pos: 0.0, stretcher, locked: false, switching: 0, stretching: false };
+        voice.locked = voice.stretches(keylock, tempo, out_rate).is_some();
+        voice
+    }
+
+    /// The grain read step (source frames per output frame) when the voice stretches under Key Lock `keylock`; `None`
+    /// when it plays straight: Key Lock off, or on with nothing to change (untuned, the transport at the sample's own
+    /// speed), which is then the exact sound with no stretching work.
+    fn stretches(&self, keylock: bool, tempo: f64, out_rate: u32) -> Option<f64> {
+        let natural = self.launch.sample.sample_rate as f64 / out_rate.max(1) as f64;
+        let grain_step = natural * 2f64.powf(self.launch.tune as f64 / 12.0);
+        let transport = self.step(tempo, out_rate);
+        (keylock && (self.launch.tune != 0 || (grain_step - transport).abs() > 1e-9 * transport)).then_some(grain_step)
+    }
+
     /// Source frames per output frame: a loop with a known tempo follows `tempo`, anything else plays at its own speed.
     fn step(&self, tempo: f64, out_rate: u32) -> f64 {
         let natural = self.launch.sample.sample_rate as f64 / out_rate.max(1) as f64;
@@ -1271,10 +1412,51 @@ impl Voice {
     }
 
     /// This frame of the voice, then on to the next. False once a one-shot has played its last frame.
-    fn next(&mut self, tempo: f64, out_rate: u32) -> ((f32, f32), bool) {
+    ///
+    /// The transport (`pos`) moves at [`Voice::step`] either way, so a synced loop stays on its beats and a one-shot
+    /// keeps its length. With Key Lock off the voice is read straight at the transport, exactly as without Key Lock,
+    /// so its pitch follows its speed and its tuning isn't heard. With it on, `stretcher` reads grains from the
+    /// transport at the sample's own speed times 2^(tune/12): the pitch is the sample's, tuned, at any tempo. A
+    /// switch either way crossfades the two over [`KEYLOCK_FADE_SEC`], and a tuning change glides over one grain.
+    /// Key Lock with nothing to change plays straight too ([`Voice::stretches`]).
+    ///
+    /// `slot` (0..[`STRETCH_SLOTS`]) staggers where in a hop its stretcher does its grain work, so columns launched
+    /// on the same beat don't all do theirs on the same frame.
+    fn next(&mut self, tempo: f64, out_rate: u32, keylock: bool, stretcher: &mut crate::keylock::KeyLock, slot: usize) -> ((f32, f32), bool) {
         let frames = self.launch.sample.frames() as f64;
-        let out = read(&self.launch.sample.pcm, self.pos, self.launch.looped);
-        self.pos += self.step(tempo, out_rate);
+        let transport = self.step(tempo, out_rate);
+        let grain = self.stretches(keylock, tempo, out_rate);
+        // While fading out of Key Lock the grains keep the tuning they had.
+        let natural = self.launch.sample.sample_rate as f64 / out_rate.max(1) as f64;
+        let grain_step = grain.unwrap_or(natural * 2f64.powf(self.launch.tune as f64 / 12.0));
+        let keylock = grain.is_some();
+        if keylock != self.locked {
+            let fade = (KEYLOCK_FADE_SEC * out_rate as f64).round().max(1.0) as u32;
+            self.locked = keylock;
+            self.switching = fade - self.switching.min(fade); // a switch back mid-fade turns round from where it is
+        }
+        let direct = read(&self.launch.sample.pcm, self.pos, self.launch.looped);
+        let out = if self.locked || self.switching > 0 {
+            if !self.stretching {
+                stretcher.reset_staggered(slot, STRETCH_SLOTS);
+            }
+            let lp = self.launch.looped.then_some((0.0, frames));
+            let stretched = stretcher.next(&[&self.launch.sample.pcm], self.pos, grain_step, lp, false)[0];
+            self.stretching = true;
+            if self.switching == 0 {
+                stretched
+            } else {
+                let fade = (KEYLOCK_FADE_SEC * out_rate as f64).round().max(1.0) as f32;
+                let to = 1.0 - self.switching as f32 / fade;
+                self.switching -= 1;
+                let (now, before) = if self.locked { (stretched, direct) } else { (direct, stretched) };
+                (before.0 + (now.0 - before.0) * to, before.1 + (now.1 - before.1) * to)
+            }
+        } else {
+            self.stretching = false;
+            direct
+        };
+        self.pos += transport;
         if self.pos >= frames {
             if !self.launch.looped || frames <= 0.0 {
                 return (out, false);
@@ -1305,7 +1487,10 @@ impl RemixColumnPlayer {
     /// still running, the column's last mixed frame held (as a beat jump's ease does); an outgoing one-shot that runs
     /// out during the ramp is held at its last frame the same way. So the incoming cell always gets its full ramp,
     /// and a column holds at most one fading voice and one held frame.
-    fn frame(&mut self, beat: Option<f64>, tempo: f64, out_rate: u32, retire: &mut Vec<Retired>) -> (f32, f32) {
+    ///
+    /// `keylock` is the column's Key Lock ([`Voice::next`]); the fading voice keeps its stretcher, a new voice takes
+    /// the other.
+    fn frame(&mut self, beat: Option<f64>, tempo: f64, out_rate: u32, keylock: bool, retire: &mut Vec<Retired>) -> (f32, f32) {
         let fade = (FADE_SEC * out_rate as f64).round().max(1.0) as u32;
         let due = self.pending.as_ref().and_then(|p| if p.on_beat { beat } else { Some(0.0) });
         if let Some((late, request)) = due.and_then(|late| Some((late, self.pending.take()?))) {
@@ -1320,8 +1505,9 @@ impl RemixColumnPlayer {
                 self.fading = self.playing.take();
             }
             self.fade_done = 0;
+            let free = self.fading.as_ref().map_or(0, |v| 1 - v.stretcher);
             self.playing = request.launch.map(|launch| {
-                let mut voice = Voice { launch, pos: 0.0 };
+                let mut voice = Voice::new(launch, free, keylock, tempo, out_rate);
                 // Started late by a fraction of a frame: begin that far in, so the beat lands between frames exactly.
                 voice.pos = late * voice.step(tempo, out_rate);
                 voice
@@ -1332,8 +1518,9 @@ impl RemixColumnPlayer {
             self.fade_done as f32 / fade as f32
         });
         let mut out = (0.0, 0.0);
+        let stretchers = &mut self.stretchers;
         if let Some(voice) = self.playing.as_mut() {
-            let (sound, more) = voice.next(tempo, out_rate);
+            let (sound, more) = voice.next(tempo, out_rate, keylock, &mut stretchers[voice.stretcher], self.index * 2 + voice.stretcher);
             let gain = rising.unwrap_or(1.0);
             out = (sound.0 * gain, sound.1 * gain);
             if !more {
@@ -1344,7 +1531,7 @@ impl RemixColumnPlayer {
             let falling = 1.0 - rising;
             let outgoing = match self.fading.as_mut() {
                 Some(voice) => {
-                    let (sound, more) = voice.next(tempo, out_rate);
+                    let (sound, more) = voice.next(tempo, out_rate, keylock, &mut stretchers[voice.stretcher], self.index * 2 + voice.stretcher);
                     if !more {
                         retire.push(self.fading.take().unwrap().launch.sample);
                         self.held = Some(sound); // ran out: its last frame finishes the ramp
@@ -1439,13 +1626,26 @@ const RETIRING_CAPACITY: usize = 128;
 pub(crate) struct RemixEngine {
     pub columns: [[RemixColumnPlayer; COLUMNS]; 4],
     pub clock: BeatClock,
+    /// Each deck's column filter knobs as the UI last handed them over ([`RemixBank::filter`]).
+    pub filter: [[f32; COLUMNS]; 4],
+    /// Each deck's column Key Locks as last handed over ([`RemixBank::keylock`]).
+    pub keylock: [[bool; COLUMNS]; 4],
+    /// Each deck's cells' (sample id, tuning) as last handed over ([`RemixBank::tunings`]).
+    pub tunings: [[[(u64, i8); ROWS]; COLUMNS]; 4],
     /// Samples the callback is done with, until the next handoff passes them to the UI thread to free.
     retiring: Vec<Retired>,
 }
 
 impl Default for RemixEngine {
     fn default() -> Self {
-        Self { columns: Default::default(), clock: BeatClock::default(), retiring: Vec::with_capacity(RETIRING_CAPACITY) }
+        Self {
+            columns: Default::default(),
+            clock: BeatClock::default(),
+            filter: [[0.5; COLUMNS]; 4],
+            keylock: [[false; COLUMNS]; 4],
+            tunings: [[[(0, 0); ROWS]; COLUMNS]; 4],
+            retiring: Vec::with_capacity(RETIRING_CAPACITY),
+        }
     }
 }
 
@@ -1467,6 +1667,24 @@ impl RemixEngine {
         self.pass_on(retired);
     }
 
+    /// After a handoff: every voice and waiting launch takes the tuning its cell now has, but only while that cell
+    /// still holds the same sample (by row and sample id). A cell refilled since keeps its old voice's tuning, so a
+    /// retune never reaches a different sample, and nothing restarts or moves its transport.
+    pub fn retune(&mut self) {
+        for (players, tunings) in self.columns.iter_mut().zip(&self.tunings) {
+            for (player, cells) in players.iter_mut().zip(tunings) {
+                let pending = player.pending.as_mut().and_then(|p| p.launch.as_mut());
+                let voices = [player.playing.as_mut(), player.fading.as_mut()].into_iter().flatten().map(|v| &mut v.launch);
+                for launch in voices.chain(pending) {
+                    let (id, tune) = cells[launch.row as usize % ROWS];
+                    if id == launch.sample.id {
+                        launch.tune = tune;
+                    }
+                }
+            }
+        }
+    }
+
     fn pass_on(&mut self, retired: &mut Vec<Retired>) {
         while retired.len() < retired.capacity() {
             match self.retiring.pop() {
@@ -1478,16 +1696,29 @@ impl RemixEngine {
 
     /// One output frame for every deck's columns into `out`; `true` per deck that sounds. `reference` is the
     /// reference track's (deck, beat, tempo) at this frame.
+    ///
+    /// Each column's mix goes through its own filter before the deck sum. After the column falls silent the filter
+    /// rings on for [`FILTER_TAIL_SEC`], then rests; a column starting again from rest starts with a clean filter at
+    /// its knob, so nothing heard before (or a knob turned meanwhile) leaks into a new cell.
     pub fn frame(&mut self, reference: Option<(usize, f64, f64)>, clock_bpm: f64, out_rate: u32, out: &mut [(f32, f32); 4]) -> [bool; 4] {
         let dt = 1.0 / out_rate.max(1) as f64;
         let (tempo, beat) = self.clock.tick(reference, clock_bpm, dt);
+        let tail = (FILTER_TAIL_SEC * out_rate as f64) as u32;
         let mut sounding = [false; 4];
-        for (d, players) in self.columns.iter_mut().enumerate() {
-            for player in players.iter_mut() {
-                if player.pending.is_none() && !player.sounding() {
+        for (d, ((players, knobs), locks)) in self.columns.iter_mut().zip(&self.filter).zip(&self.keylock).enumerate() {
+            for (c, ((player, &knob), &keylock)) in players.iter_mut().zip(knobs).zip(locks).enumerate() {
+                player.index = d * COLUMNS + c;
+                let active = player.pending.is_some() || player.sounding();
+                if !active && player.ringing == 0 {
                     continue;
                 }
-                let (l, r) = player.frame(beat, tempo, out_rate, &mut self.retiring);
+                if player.ringing == 0 {
+                    player.filter.reset(knob);
+                }
+                let dry = if active { player.frame(beat, tempo, out_rate, keylock, &mut self.retiring) } else { (0.0, 0.0) };
+                let (l, r) = player.filter.process(out_rate, dry.0, dry.1, knob);
+                // Armed by any sound this frame too: a one-frame one-shot from rest leaves its response to ring out.
+                player.ringing = if player.sounding() || dry != (0.0, 0.0) { tail } else { player.ringing.saturating_sub(1) };
                 out[d].0 += l;
                 out[d].1 += r;
                 sounding[d] |= player.sounding() || l != 0.0 || r != 0.0;
@@ -1577,7 +1808,7 @@ mod tests {
     #[test]
     fn tagged_loops_follow_the_tempo_and_the_rest_keep_their_own() {
         let b = budget();
-        let voice = |bpm: f64, looped: bool| Voice { launch: Launch { sample: level("s", 0.1, 44_100, 44_100, bpm, &b), row: 0, looped }, pos: 0.0 };
+        let voice = |bpm: f64, looped: bool| Voice::new(Launch { sample: level("s", 0.1, 44_100, 44_100, bpm, &b), row: 0, looped, tune: 0 }, 0, false, 120.0, 44_100);
         let natural = 44_100.0 / 48_000.0;
         assert!((voice(120.0, true).step(126.0, 48_000) - natural * 1.05).abs() < 1e-12);
         assert!((voice(70.0, true).step(140.0, 48_000) - natural).abs() < 1e-12);
@@ -1696,28 +1927,43 @@ mod tests {
     }
 
     fn set_cell(column: usize, row: usize, name: &str) -> SetCell {
-        SetCell { column, row, path: format!("/music/samples/{name}.wav"), name: name.into(), bpm: 124.0, looped: column % 2 == 0 }
+        SetCell { column, row, path: format!("/music/samples/{name}.wav"), name: name.into(), bpm: 124.0, looped: column % 2 == 0, tune: 0 }
     }
 
     /// A sparse set over all four pages, its last cell included, reads back from its JSON exactly. Positions and the
     /// page are 1-based as the deck labels them, and a cell holds only its file, name, BPM and loop setting.
     #[test]
     fn a_saved_set_reads_back_exactly() {
-        let set = RemixSet { quantize: false, page: 3, cells: vec![set_cell(0, 0, "Kick"), set_cell(1, 6, "Vocal: ünï \"cœur\""), set_cell(3, 15, "Last")] };
+        let filters = [0.5, 0.3, 0.0, 0.8123];
+        let tuned = |tune, cell| SetCell { tune, ..cell };
+        let cells = vec![tuned(-12, set_cell(0, 0, "Kick")), tuned(2, set_cell(1, 6, "Vocal: ünï \"cœur\"")), tuned(12, set_cell(3, 15, "Last"))];
+        let set = RemixSet { quantize: false, page: 3, filters, keylock: [false, true, false, true], cells };
         let json = set.to_json();
-        assert_eq!(RemixSet::parse(&json), Ok(set));
+        assert_eq!(RemixSet::parse(&json), Ok(set.clone()));
         let doc: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!((doc["page"].as_u64(), doc["cells"][2]["column"].as_u64(), doc["cells"][2]["row"].as_u64()), (Some(4), Some(4), Some(16)));
+        assert_eq!(doc["version"].as_u64(), Some(2), "column filters, Key Locks and tunings are format 2");
+        assert_eq!((doc["keylock"][1].as_bool(), doc["cells"][1]["tune"].as_i64()), (Some(true), Some(2)));
+        assert!(json.contains("0.3,") && json.contains("0.8123"), "filters as written: {}", doc["filters"]);
         let mut keys: Vec<&str> = doc["cells"][0].as_object().unwrap().keys().map(String::as_str).collect();
         keys.sort();
-        assert_eq!(keys, ["bpm", "column", "looped", "name", "path", "row"]);
+        assert_eq!(keys, ["bpm", "column", "looped", "name", "path", "row", "tune"]);
+        // A format 1 set (before these) opens with every filter and Key Lock off and every cell untuned.
+        let mut old = doc.clone();
+        old["version"] = 1.into();
+        for key in ["filters", "keylock"] {
+            old.as_object_mut().unwrap().remove(key);
+        }
+        old["cells"].as_array_mut().unwrap().iter_mut().for_each(|c| drop(c.as_object_mut().unwrap().remove("tune")));
+        let untuned = set.cells.iter().map(|c| SetCell { tune: 0, ..c.clone() }).collect();
+        assert_eq!(RemixSet::parse(&old.to_string()), Ok(RemixSet { filters: [0.5; COLUMNS], keylock: [false; COLUMNS], cells: untuned, ..set }));
     }
 
     /// Anything but a whole, current set is refused, saying what is wrong with it.
     #[test]
     fn broken_or_newer_sets_are_refused_with_the_reason() {
         use serde_json::Value;
-        let good = RemixSet { quantize: true, page: 0, cells: vec![set_cell(0, 0, "Kick")] }.to_json();
+        let good = RemixSet { quantize: true, page: 0, filters: [0.5; COLUMNS], keylock: [false; COLUMNS], cells: vec![set_cell(0, 0, "Kick")] }.to_json();
         let edit = |change: &dyn Fn(&mut Value)| {
             let mut doc: Value = serde_json::from_str(&good).unwrap();
             change(&mut doc);
@@ -1727,7 +1973,19 @@ mod tests {
             ("{\"format\": ".to_string(), "JSON"),
             ("[]".into(), "isn't a remix set"),
             (edit(&|v| v["format"] = "retraktor-collection".into()), "isn't a ReTraktor remix set"),
-            (edit(&|v| v["version"] = 2.into()), "newer ReTraktor"),
+            (edit(&|v| v["version"] = 3.into()), "newer ReTraktor"),
+            (edit(&|v| { v.as_object_mut().unwrap().remove("filters"); }), "filter setting"),
+            (edit(&|v| v["filters"] = vec![0.5; 3].into()), "filter setting"),
+            (edit(&|v| v["filters"][2] = 1.5.into()), "filter setting"),
+            (edit(&|v| v["filters"][0] = "off".into()), "filter setting"),
+            (edit(&|v| { v.as_object_mut().unwrap().remove("keylock"); }), "Key Lock setting"),
+            (edit(&|v| v["keylock"] = vec![true; 5].into()), "Key Lock setting"),
+            (edit(&|v| v["keylock"][3] = 1.into()), "Key Lock setting"),
+            (edit(&|v| { v["cells"][0].as_object_mut().unwrap().remove("tune"); }), "tuning"),
+            (edit(&|v| v["cells"][0]["tune"] = 13.into()), "tuning"),
+            (edit(&|v| v["cells"][0]["tune"] = 1.5.into()), "tuning"),
+            (edit(&|v| v["cells"][0]["tune"] = i64::MIN.into()), "tuning"),
+            (edit(&|v| v["cells"][0]["tune"] = (-13).into()), "tuning"),
             (edit(&|v| v["version"] = 0.into()), "format version"),
             (edit(&|v| v["columns"] = 8.into()), "grid"),
             (edit(&|v| v["rows"] = 4.into()), "grid"),
@@ -1772,8 +2030,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("Friday.remixset");
-        let first = RemixSet { quantize: true, page: 0, cells: vec![set_cell(0, 0, "Kick")] };
-        let second = RemixSet { quantize: false, page: 2, cells: vec![set_cell(3, 15, "Last")] };
+        let first = RemixSet { quantize: true, page: 0, filters: [0.5; COLUMNS], keylock: [false; COLUMNS], cells: vec![set_cell(0, 0, "Kick")] };
+        let second = RemixSet { quantize: false, page: 2, filters: [0.1, 0.5, 0.5, 0.9], keylock: [true; COLUMNS], cells: vec![set_cell(3, 15, "Last")] };
         write_set(&path, &first, false).unwrap();
         write_set(&path, &second, true).unwrap();
         assert_eq!(read_set(&path), Ok(second.clone()));
@@ -1797,7 +2055,7 @@ mod tests {
 
         let e = write_set(&path, &first, false).unwrap_err();
         assert!(e.contains("already exists"), "{e}");
-        let huge = RemixSet { quantize: true, page: 0, cells: vec![SetCell { name: "x".repeat(MAX_SET_BYTES as usize), ..set_cell(0, 0, "Kick") }] };
+        let huge = RemixSet { quantize: true, page: 0, filters: [0.5; COLUMNS], keylock: [false; COLUMNS], cells: vec![SetCell { name: "x".repeat(MAX_SET_BYTES as usize), ..set_cell(0, 0, "Kick") }] };
         let e = write_set(&path, &huge, true).unwrap_err();
         assert!(e.contains("more than ReTraktor opens"), "{e}");
         assert_eq!((files(), read_set(&path)), (2, Ok(second)), "a refused save touched the old set");
@@ -1828,7 +2086,7 @@ mod tests {
             let loop_b = level("loop b", 0.5, rate as usize * 2, rate, 120.0, &b);
             let vocal = level("vocal", 0.125, rate as usize * 10, rate, 0.0, &b);
             let mut requests: [[Option<RemixRequest>; COLUMNS]; 4] = Default::default();
-            let launch = |s: &Arc<RemixSample>, row: u8, looped: bool, on_beat: bool| Some(RemixRequest { launch: Some(Launch { sample: Arc::clone(s), row, looped }), on_beat });
+            let launch = |s: &Arc<RemixSample>, row: u8, looped: bool, on_beat: bool| Some(RemixRequest { launch: Some(Launch { sample: Arc::clone(s), row, looped, tune: 0 }), on_beat });
             requests[1][0] = launch(&loop_a, 0, true, true);
             requests[1][3] = launch(&vocal, 4, false, false);
             engine.take_requests(&mut requests, &mut retired);
@@ -1898,7 +2156,7 @@ mod tests {
         let mut heard: Vec<f32> = Vec::new();
         let play = |engine: &mut RemixEngine, retired: &mut Vec<Retired>, sample: &Arc<RemixSample>, frames: usize, heard: &mut Vec<f32>| {
             let mut requests: [[Option<RemixRequest>; COLUMNS]; 4] = Default::default();
-            requests[0][0] = Some(RemixRequest { launch: Some(Launch { sample: Arc::clone(sample), row: 0, looped: true }), on_beat: false });
+            requests[0][0] = Some(RemixRequest { launch: Some(Launch { sample: Arc::clone(sample), row: 0, looped: true, tune: 0 }), on_beat: false });
             engine.take_requests(&mut requests, retired);
             let start = heard.len();
             heard.extend(run(engine, frames, rate, 120.0, 0.3, start).iter().map(|o| o[0].0));
@@ -1942,7 +2200,7 @@ mod tests {
         };
         let ask = |engine: &mut RemixEngine, retired: &mut Vec<Retired>, row: u8, on_beat: bool| {
             let mut requests: [[Option<RemixRequest>; COLUMNS]; 4] = Default::default();
-            requests[0][0] = Some(RemixRequest { launch: Some(Launch { sample: Arc::clone(&samples[row as usize]), row, looped: true }), on_beat });
+            requests[0][0] = Some(RemixRequest { launch: Some(Launch { sample: Arc::clone(&samples[row as usize]), row, looped: true, tune: 0 }), on_beat });
             engine.take_requests(&mut requests, retired);
         };
         ask(&mut engine, &mut retired, 0, false);
@@ -1981,7 +2239,7 @@ mod tests {
         let mut heard = Vec::new();
         for (sample, looped, frames) in [(&shot, false, 70), (&pad, true, 300)] {
             let mut requests: [[Option<RemixRequest>; COLUMNS]; 4] = Default::default();
-            requests[0][0] = Some(RemixRequest { launch: Some(Launch { sample: Arc::clone(sample), row: 0, looped }), on_beat: false });
+            requests[0][0] = Some(RemixRequest { launch: Some(Launch { sample: Arc::clone(sample), row: 0, looped, tune: 0 }), on_beat: false });
             engine.take_requests(&mut requests, &mut retired);
             let from = heard.len();
             heard.extend(run(&mut engine, frames, rate, 120.0, 0.3, from).iter().map(|o| o[0].0));
@@ -1990,6 +2248,294 @@ mod tests {
         assert!(biggest <= 0.25 / 144.0 + 1e-6, "a step of {biggest} when the one-shot ran out");
         assert!(heard[70 + 100] > 0.25 + 0.05, "the new cell reached full level early: {}", heard[70 + 100]);
         assert_eq!(heard[70 + 143], 0.25);
+    }
+
+    /// A 4-beat loop at 120 BPM: 0.3 sines, treble (5 kHz) on the left and bass (100 Hz) on the right.
+    fn treble_left_bass_right(rate: u32, b: &Arc<SampleBudget>) -> Arc<RemixSample> {
+        let pcm = (0..rate as usize * 2)
+            .flat_map(|i| {
+                let t = i as f32 * std::f32::consts::TAU / rate as f32;
+                [0.3 * (5_000.0 * t).sin(), 0.3 * (100.0 * t).sin()]
+            })
+            .collect();
+        Arc::new(RemixSample::from_pcm("stereo", pcm, rate, 120.0, b).unwrap())
+    }
+
+    /// Each channel's level (1: a 0.3 sine untouched) of deck `d` over `out`.
+    fn levels(out: &[[(f32, f32); 4]], d: usize) -> (f32, f32) {
+        let rms = |pick: &dyn Fn(&(f32, f32)) -> f32| (out.iter().map(|o| pick(&o[d]).powi(2)).sum::<f32>() / out.len() as f32).sqrt() / (0.3 * std::f32::consts::FRAC_1_SQRT_2);
+        (rms(&|f| f.0), rms(&|f| f.1))
+    }
+
+    fn launch_now(sample: &Arc<RemixSample>, row: u8) -> Option<RemixRequest> {
+        Some(RemixRequest { launch: Some(Launch { sample: Arc::clone(sample), row, looped: true, tune: 0 }), on_beat: false })
+    }
+
+    /// A column's filter, turned while it plays at 44.1, 48 and 96 kHz: low-pass takes the left's treble and keeps the
+    /// right's bass, high-pass the other way round, each channel on its own; back to off it is the cell's exact audio
+    /// again within half a sweep, with no click on the way. Throughout, the next column on the same deck and a
+    /// column on another deck sound exactly as with no filter turned.
+    #[test]
+    fn a_column_filter_shapes_its_own_column_only() {
+        for rate in [44_100u32, 48_000, 96_000] {
+            let b = budget();
+            let stereo = treble_left_bass_right(rate, &b);
+            let other = level("other", 0.2, rate as usize * 2, rate, 120.0, &b);
+            let mut retired = Vec::with_capacity(256);
+            // `filtered`: deck B column 1 plays `stereo` with its filter turned, column 2 and deck A column 1 play
+            // `other`. `plain` is the same with the filter left off, `solo` the filtered column alone, `alone` the rest.
+            let mut engines: [RemixEngine; 4] = Default::default();
+            for (e, (stereo_in, other_in)) in engines.iter_mut().zip([(true, true), (true, true), (true, false), (false, true)]) {
+                let mut requests: [[Option<RemixRequest>; COLUMNS]; 4] = Default::default();
+                if stereo_in {
+                    requests[1][0] = launch_now(&stereo, 0);
+                }
+                if other_in {
+                    requests[1][1] = launch_now(&other, 1);
+                    requests[0][0] = launch_now(&other, 2);
+                }
+                e.take_requests(&mut requests, &mut retired);
+            }
+            let segment = rate as usize / 4;
+            let mut biggest = 0.0f32;
+            let mut last: Option<f32> = None; // from the first frame on (the columns start at full level there)
+            for (i, knob) in [0.5f32, 0.2, 0.8, 0.5].into_iter().enumerate() {
+                engines[0].filter[1][0] = knob;
+                engines[2].filter[1][0] = knob;
+                let [filtered, plain, solo, alone] = engines.each_mut().map(|e| run(e, segment, rate, 120.0, 0.0, i * segment));
+                for (((f, p), s), a) in filtered.iter().zip(&plain).zip(&solo).zip(&alone) {
+                    assert_eq!(f[0], p[0], "{rate}: deck A changed");
+                    // Deck B less its filtered column is the other column, untouched (to the sum's rounding).
+                    let left_over = ((f[1].0 - s[1].0) - a[1].0).abs().max(((f[1].1 - s[1].1) - a[1].1).abs());
+                    assert!(left_over < 1e-6, "{rate}, knob {knob}: the next column changed by {left_over}");
+                    if let Some(last) = last {
+                        biggest = biggest.max((f[1].0 - last).abs());
+                    }
+                    last = Some(f[1].0);
+                }
+                // Settled (past the sweep and the filter's own settling): which channel survives shows the direction.
+                let (treble, bass) = levels(&solo[segment / 2..], 1);
+                match knob {
+                    k if k < 0.5 => assert!(treble < 0.05 && bass > 0.95, "{rate}: low-pass left {treble} right {bass}"),
+                    k if k > 0.5 => assert!(treble > 0.95 && bass < 0.05, "{rate}: high-pass left {treble} right {bass}"),
+                    _ => {
+                        // Off: from half a sweep on, the exact output with the filter never turned.
+                        let land = (retraktor_dsp::TwoWayFilter::SWEEP_SEC * 0.5 * rate as f32).ceil() as usize + 1;
+                        assert!(filtered[land..] == plain[land..], "{rate}: still filtered after the reset");
+                    }
+                }
+            }
+            // The left's 5 kHz moves up to 0.3 * 2π * 5000 / rate a frame by itself; a click would show far more.
+            let slope = 0.3 * std::f32::consts::TAU * 5_000.0 / rate as f32 + 0.2 / 100.0;
+            assert!(biggest < slope * 1.5, "{rate}: a step of {biggest} (the tones move {slope})");
+        }
+    }
+
+    /// A column stopped with its filter on rings out for a moment, then rests and costs nothing. A cell launched there
+    /// later, with the knob turned meanwhile, sounds exactly as on a column that never played: nothing of the old sound
+    /// or the old knob is left in the filter.
+    #[test]
+    fn a_column_filter_rests_after_a_stop_and_starts_clean() {
+        let rate = 48_000u32;
+        let b = budget();
+        let bass = treble_left_bass_right(rate, &b);
+        let next = level("next", 0.25, rate as usize * 2, rate, 120.0, &b);
+        let mut retired = Vec::with_capacity(256);
+        let mut used = RemixEngine::default();
+        used.filter[2][3] = 0.1;
+        let mut requests: [[Option<RemixRequest>; COLUMNS]; 4] = Default::default();
+        requests[2][3] = launch_now(&bass, 0);
+        used.take_requests(&mut requests, &mut retired);
+        run(&mut used, rate as usize / 2, rate, 120.0, 0.0, 0);
+        requests[2][3] = Some(RemixRequest { launch: None, on_beat: false });
+        used.take_requests(&mut requests, &mut retired);
+        let after_stop = run(&mut used, rate as usize / 2, rate, 120.0, 0.0, rate as usize / 2);
+        let fade = (FADE_SEC * rate as f64).round() as usize;
+        let quiet_from = fade + (FILTER_TAIL_SEC * rate as f64) as usize + 1;
+        assert!(after_stop[fade + 1][2] != (0.0, 0.0), "the filter didn't ring on past the fade");
+        assert!(after_stop[quiet_from..].iter().all(|o| o[2] == (0.0, 0.0)), "still sounding after the filter's tail");
+        assert_eq!(used.columns[2][3].ringing, 0, "the filter never came to rest");
+
+        let mut fresh = RemixEngine::default();
+        for engine in [&mut used, &mut fresh] {
+            engine.filter[2][3] = 0.8;
+            requests[2][3] = launch_now(&next, 5);
+            engine.take_requests(&mut requests, &mut retired);
+        }
+        let again = run(&mut used, rate as usize / 4, rate, 120.0, 0.0, rate as usize);
+        let first = run(&mut fresh, rate as usize / 4, rate, 120.0, 0.0, rate as usize);
+        assert!(again == first, "the new cell heard what the column's filter held from before");
+        assert!(again.iter().any(|o| o[2].0 != 0.25) && again.iter().all(|o| o[2].0.is_finite()), "the high-pass did nothing");
+
+        // A one-frame one-shot from rest: the filter's response to it rings on after its only frame.
+        let click = Arc::new(RemixSample::from_pcm("click", vec![0.8, 0.8], rate, 0.0, &b).unwrap());
+        let mut engine = RemixEngine::default();
+        engine.filter[0][0] = 0.1;
+        requests[0][0] = Some(RemixRequest { launch: Some(Launch { sample: click, row: 0, looped: false, tune: 0 }), on_beat: false });
+        engine.take_requests(&mut requests, &mut retired);
+        let out = run(&mut engine, 200, rate, 120.0, 0.0, 0);
+        assert!(engine.columns[0][0].playing.is_none(), "the click is still playing");
+        assert!(out[1..50].iter().all(|o| o[0].0 > 0.0), "the click's filtered response was cut after its frame");
+    }
+
+    /// A 4-beat loop at 120 BPM (2 s at `rate`): a 0.3 sine at `hz`, silent for its first 100 ms (its marker).
+    fn marked_loop(hz: f32, rate: u32, b: &Arc<SampleBudget>) -> Arc<RemixSample> {
+        let gap = rate as usize / 10;
+        let pcm = (0..rate as usize * 2)
+            .flat_map(|i| {
+                let v = if i < gap { 0.0 } else { 0.3 * (i as f32 * hz * std::f32::consts::TAU / rate as f32).sin() };
+                [v, v]
+            })
+            .collect();
+        Arc::new(RemixSample::from_pcm("marked", pcm, rate, 120.0, b).unwrap())
+    }
+
+    /// Rising zero crossings per second of deck `d`'s left channel over `out`.
+    fn crossings_hz(out: &[[(f32, f32); 4]], d: usize, rate: u32) -> f64 {
+        let n = out.windows(2).filter(|w| w[0][d].0 < 0.0 && w[1][d].0 >= 0.0).count();
+        n as f64 * rate as f64 / out.len() as f64
+    }
+
+    /// Seconds at which deck `d` falls quiet for at least 20 ms (1 ms blocks peaking under 0.02): the loop markers.
+    fn marker_times(out: &[[(f32, f32); 4]], d: usize, rate: u32) -> Vec<f64> {
+        let ms = rate as usize / 1000;
+        let peaks: Vec<f32> = out.chunks(ms).map(|c| c.iter().fold(0.0f32, |m, o| m.max(o[d].0.abs()))).collect();
+        (1..peaks.len().saturating_sub(20))
+            .filter(|&i| peaks[i - 1] >= 0.02 && peaks[i..i + 20].iter().all(|&p| p < 0.02))
+            .map(|i| (i * ms) as f64 / rate as f64)
+            .collect()
+    }
+
+    /// Deck C column 2 plays `sample` (cell row 4) at once, its Key Lock and tuning as given, the tempo `bpm`.
+    fn tuned_engine(sample: &Arc<RemixSample>, keylock: bool, tune: i8) -> RemixEngine {
+        let mut engine = RemixEngine::default();
+        engine.keylock[2][1] = keylock;
+        engine.tunings[2][1][4] = (sample.id, tune);
+        let mut requests: [[Option<RemixRequest>; COLUMNS]; 4] = Default::default();
+        requests[2][1] = launch_now(sample, 4);
+        engine.take_requests(&mut requests, &mut Vec::with_capacity(16));
+        engine.retune();
+        engine
+    }
+
+    /// A synced 4-beat loop (440 Hz, a 44.1 kHz file, played at 44.1 and 48 kHz): with Key Lock off it varispeeds
+    /// as before, its tuning unheard and the output exactly as untuned; with it on, +2 sounds at 440 × 2^(2/12) =
+    /// 493.88 Hz at 120 and at 144 BPM, and +0 at 440 Hz at 144. At its own tempo and rate, untuned, Key Lock on is
+    /// exactly the plain output. Either way its loop markers stay on the beat period: 2 s at 120, 1.6667 s at 144,
+    /// with no drift loop to loop.
+    #[test]
+    fn key_lock_plays_the_tuning_and_keeps_the_loop_on_its_beats() {
+        for rate in [44_100u32, 48_000] {
+            let b = budget();
+            let sample = marked_loop(440.0, 44_100, &b);
+            // (BPM, Key Lock, tune, expected Hz, expected loop period in s), worked out by hand.
+            let cases = [(120.0, false, 2, 440.0, 2.0), (120.0, true, 0, 440.0, 2.0), (120.0, true, 2, 493.88, 2.0), (144.0, false, 2, 528.0, 1.666_667), (144.0, true, 2, 493.88, 1.666_667), (144.0, true, 0, 440.0, 1.666_667)];
+            for (bpm, keylock, tune, want_hz, period) in cases {
+                let mut engine = tuned_engine(&sample, keylock, tune);
+                let frames = (3.2 * period * rate as f64) as usize;
+                let out = run(&mut engine, frames, rate, bpm, 0.0, 0);
+                let what = format!("{rate} Hz, {bpm} BPM, key lock {keylock}, tune {tune}");
+                // Pitch in the loud middle of each loop.
+                for n in 0..3 {
+                    let from = ((n as f64 + 0.2) * period * rate as f64) as usize;
+                    let hz = crossings_hz(&out[from..from + (0.6 * period * rate as f64) as usize], 2, rate);
+                    assert!((hz - want_hz).abs() < want_hz * 0.01, "{what}: loop {n} at {hz} Hz, not {want_hz}");
+                }
+                // The markers (where each loop's 100 ms gap begins after the first): one every period, within 15 ms,
+                // with no drift from loop to loop.
+                let marks = marker_times(&out, 2, rate);
+                assert_eq!(marks.len(), 3, "{what}: markers {marks:?}");
+                for (n, &t) in marks.iter().enumerate() {
+                    let ideal = (n + 1) as f64 * period;
+                    assert!((t - ideal).abs() < 0.015, "{what}: marker {} at {t} s, not {ideal}", n + 2);
+                }
+                let neutral = tune == 0 && bpm == 120.0 && rate == 44_100;
+                if !keylock || neutral {
+                    let plain = run(&mut tuned_engine(&sample, false, 0), frames, rate, bpm, 0.0, 0);
+                    assert!(out == plain, "{what}: not exactly the plain output");
+                }
+            }
+        }
+    }
+
+    /// While a loop plays: Key Lock on, a retune, off, on again. Each change is heard without a click, and the loop's
+    /// transport is exactly where it is with nothing changed. A cell refilled meanwhile never passes its tuning to
+    /// the sound still playing from the old sample; the new sample, launched, takes its own. A key-locked tuned
+    /// loop replaced mid-play crossfades without a step.
+    #[test]
+    fn key_lock_and_tuning_change_live_without_clicks_moving_the_loop_or_reaching_another_sample() {
+        let rate = 48_000u32;
+        let b = budget();
+        let pcm: Vec<f32> = (0..rate as usize * 2).flat_map(|i| [0.3 * (i as f32 * 300.0 * std::f32::consts::TAU / rate as f32).sin(); 2]).collect();
+        let tone = Arc::new(RemixSample::from_pcm("tone", pcm, rate, 120.0, &b).unwrap());
+        let other = level("other", 0.2, rate as usize, rate, 120.0, &b);
+        let (mut live, mut still) = (tuned_engine(&tone, false, 0), tuned_engine(&tone, false, 0));
+        let mut biggest = 0.0f32;
+        let mut last: Option<f32> = None;
+        let quarter = rate as usize / 4;
+        for (i, (keylock, tune)) in [(false, 0), (true, 0), (true, 3), (false, 3), (true, 3), (true, -12)].into_iter().enumerate() {
+            live.keylock[2][1] = keylock;
+            live.tunings[2][1][4] = (tone.id, tune);
+            live.retune();
+            let out = run(&mut live, quarter, rate, 120.0, 0.0, i * quarter);
+            run(&mut still, quarter, rate, 120.0, 0.0, i * quarter);
+            for o in &out {
+                if let Some(last) = last {
+                    biggest = biggest.max((o[2].0 - last).abs());
+                }
+                last = Some(o[2].0);
+            }
+            let (a, b) = (live.columns[2][1].playing.as_ref().unwrap().pos, still.columns[2][1].playing.as_ref().unwrap().pos);
+            assert_eq!(a, b, "step {i}: the loop's transport moved");
+        }
+        // A 0.3 sine at 300 Hz moves up to 0.012 a frame (0.024 an octave up); a click is far more.
+        assert!(biggest < 0.05, "a step of {biggest}");
+
+        // The cell refilled with `other` (tuned +7): the old sound keeps its -12.
+        live.tunings[2][1][4] = (other.id, 7);
+        live.retune();
+        assert_eq!(live.columns[2][1].playing.as_ref().unwrap().launch.tune, -12, "a refill's tuning reached the old sample");
+        let mut requests: [[Option<RemixRequest>; COLUMNS]; 4] = Default::default();
+        requests[2][1] = launch_now(&other, 4);
+        live.take_requests(&mut requests, &mut Vec::with_capacity(16));
+        live.retune();
+        assert_eq!(live.columns[2][1].pending.as_ref().and_then(|p| p.launch.as_ref()).map(|l| l.tune), Some(7));
+        let out = run(&mut live, quarter, rate, 120.0, 0.0, 6 * quarter);
+        let player = &live.columns[2][1];
+        assert_eq!(player.playing.as_ref().map(|v| (v.launch.sample.id, v.launch.tune)), Some((other.id, 7)));
+        assert!(player.fading.is_none(), "the fade never ended");
+        let step = out.windows(2).map(|w| (w[1][2].0 - w[0][2].0).abs()).fold(0.0f32, f32::max);
+        assert!(step < 0.1, "a step of {step} replacing the tuned loop");
+    }
+
+    /// A key-locked one-shot tuned +2 sounds 2 semitones up and lasts its own length, as untuned.
+    #[test]
+    fn a_tuned_one_shot_keeps_its_length() {
+        let rate = 48_000u32;
+        let b = budget();
+        let pcm: Vec<f32> = (0..rate as usize / 2).flat_map(|i| [0.3 * (i as f32 * 440.0 * std::f32::consts::TAU / rate as f32).sin(); 2]).collect();
+        let shot = Arc::new(RemixSample::from_pcm("shot", pcm, rate, 0.0, &b).unwrap());
+        let mut lengths = Vec::new();
+        for (keylock, tune, want_hz) in [(false, 0, 440.0), (true, 2, 493.88)] {
+            let mut engine = RemixEngine::default();
+            engine.keylock[0][0] = keylock;
+            engine.tunings[0][0][0] = (shot.id, tune);
+            let mut requests: [[Option<RemixRequest>; COLUMNS]; 4] = Default::default();
+            requests[0][0] = Some(RemixRequest { launch: Some(Launch { sample: Arc::clone(&shot), row: 0, looped: false, tune: 0 }), on_beat: false });
+            engine.take_requests(&mut requests, &mut Vec::with_capacity(16));
+            engine.retune();
+            let mut playing = 0;
+            let mut out = Vec::new();
+            for f in 0..rate as usize {
+                out.extend(run(&mut engine, 1, rate, 120.0, 0.0, f));
+                playing += engine.columns[0][0].playing.is_some() as usize;
+            }
+            let hz = crossings_hz(&out[rate as usize / 20..rate as usize * 9 / 20], 0, rate);
+            assert!((hz - want_hz).abs() < want_hz * 0.01, "key lock {keylock}: {hz} Hz");
+            lengths.push(playing);
+        }
+        assert_eq!(lengths[0], rate as usize / 2 - 1, "untuned length (frames it plays on after, so all but its last)");
+        assert_eq!(lengths[1], lengths[0], "the tuned one-shot's length changed");
     }
 
     /// The callback's own clock carries on from the reference's last beat at the master tempo when the reference
@@ -2096,7 +2642,7 @@ mod tests {
         let mut engine = RemixEngine::default();
         let mut retired = Vec::with_capacity(256);
         let mut requests: [[Option<RemixRequest>; COLUMNS]; 4] = Default::default();
-        requests[1][0] = Some(RemixRequest { launch: Some(Launch { sample: Arc::clone(&sample), row: 0, looped: true }), on_beat: false });
+        requests[1][0] = Some(RemixRequest { launch: Some(Launch { sample: Arc::clone(&sample), row: 0, looped: true, tune: 0 }), on_beat: false });
         engine.take_requests(&mut requests, &mut retired);
         for (i, o) in run(&mut engine, 2 * n + 100, rate, 120.0, 0.0, 0).iter().enumerate() {
             let f = i % n;
@@ -2416,8 +2962,9 @@ mod tests {
 
     /// Opt-in and local only (no NI audio is in the repository): imports every `.trak` in `RETRAKTOR_TRAK_DIR` through
     /// the real importer into `RETRAKTOR_TRAK_OUT`, keeping what it copies, and lists every cell in `cells.tsv` there
-    /// for comparison with an independent reading of the same archives. Each bank is also saved as a .remixset there and
-    /// reopened natively. Fails naming each set that was refused or didn't reopen the same.
+    /// for comparison with an independent reading of the same archives (with each cell's tuning and its column's Key
+    /// Lock), and each set's import notes in `notes.tsv`. Each bank is also saved as a .remixset there and reopened
+    /// natively. Fails naming each set that was refused or didn't reopen the same.
     #[test]
     #[ignore = "needs genuine Traktor Remix Sets: set RETRAKTOR_TRAK_DIR and RETRAKTOR_TRAK_OUT"]
     fn genuine_traktor_sets_import_whole() {
@@ -2428,7 +2975,8 @@ mod tests {
         let mut paths: Vec<PathBuf> = std::fs::read_dir(sets).unwrap().map(|e| e.unwrap().path()).filter(|p| p.extension().is_some_and(|e| e == TRAK_EXTENSION)).collect();
         paths.sort();
         assert!(!paths.is_empty(), "no .trak files");
-        let mut lines = vec!["archive\tcolumn\trow\tpage\tfile\tname\tlooped\tlibrary_bpm\tbpm\tframes\trate\tpath".to_string()];
+        let mut lines = vec!["archive\tcolumn\trow\tpage\tfile\tname\tlooped\tlibrary_bpm\tbpm\tframes\trate\ttune\tkeylock\tpath".to_string()];
+        let mut notes = vec!["archive\tnotes\tpitch_skipped".to_string()];
         let mut refused = Vec::new();
         for path in &paths {
             let b = budget();
@@ -2439,15 +2987,16 @@ mod tests {
                     continue;
                 }
             };
+            let archive = path.file_name().unwrap().to_string_lossy().into_owned();
+            notes.push(format!("{archive}\t{}\t{}", imported.notes, imported.pitch_skipped.join(" | ")));
             imported.keep();
-            let archive = path.file_name().unwrap().to_string_lossy();
             for column in 0..COLUMNS {
                 for row in 0..ROWS {
                     let Some(cell) = &bank.cells[column][row] else { continue };
                     let s = &cell.sample;
                     let file = s.source.file_name().unwrap().to_string_lossy();
                     lines.push(format!(
-                        "{archive}\t{}\t{}\t{}\t{file}\t{}\t{}\t{}\t{:?}\t{}\t{}\t{}",
+                        "{archive}\t{}\t{}\t{}\t{file}\t{}\t{}\t{}\t{:?}\t{}\t{}\t{}\t{}\t{}",
                         column + 1,
                         row + 1,
                         row / PAGE_ROWS + 1,
@@ -2457,6 +3006,8 @@ mod tests {
                         s.bpm,
                         s.frames(),
                         s.sample_rate,
+                        cell.tune,
+                        bank.keylock[column],
                         s.source.display()
                     ));
                 }
@@ -2467,11 +3018,11 @@ mod tests {
             match stage(&read_set(&saved).unwrap(), &b, &|| false) {
                 Ok(reopened) => {
                     let same = (0..COLUMNS).flat_map(|c| (0..ROWS).map(move |r| (c, r))).all(|(c, r)| match (&bank.cells[c][r], &reopened.cells[c][r]) {
-                        (Some(a), Some(b)) => a.sample.pcm == b.sample.pcm && a.sample.name == b.sample.name && a.looped == b.looped && a.sample.bpm == b.sample.bpm,
+                        (Some(a), Some(b)) => a.sample.pcm == b.sample.pcm && a.sample.name == b.sample.name && a.looped == b.looped && a.sample.bpm == b.sample.bpm && a.tune == b.tune,
                         (None, None) => true,
                         _ => false,
                     });
-                    if !same {
+                    if !same || reopened.keylock != bank.keylock {
                         refused.push(format!("{archive}: the reopened .remixset differs"));
                     }
                 }
@@ -2479,6 +3030,7 @@ mod tests {
             }
         }
         std::fs::write(out.join("cells.tsv"), lines.join("\n") + "\n").unwrap();
+        std::fs::write(out.join("notes.tsv"), notes.join("\n") + "\n").unwrap();
         assert!(refused.is_empty(), "refused:\n{}", refused.join("\n"));
     }
 }

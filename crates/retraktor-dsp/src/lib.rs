@@ -4,6 +4,7 @@
 //! - [`MixerEqModel`] & [`MixerEqFlavor`]: All 5 Traktor mixer EQ models (`Classic`, `P600`, `Nuo`, `Z ISO`, `Xone:92` 4-band).
 //! - [`MixerFxProcessor`] & [`MixerFxKind`]: All 9 Traktor Channel Mixer FX (`Filter`, `Reverb`, `DualDelay`,
 //!   `Noise`, `TimeGater`, `Flanger`, `BarberPole`, `DottedDelay`, `Crush`).
+//! - [`TwoWayFilter`]: Hz-aware low-pass / high-pass DJ filter with an exact dry centre (Remix Deck columns).
 //! - [`DeckTransportDsp`]: Playhead timeline with **Flux / Slip Mode** ghost playhead, **Loop / Loop Roll**,
 //!   **Beatjump**, and **8-Slice Freeze Mode**.
 //! - [`MasterClock`]: Beatgrid phase & BPM synchronization engine with Flexible Beatgrid interpolation.
@@ -262,6 +263,94 @@ impl BipolarFilter {
     }
 }
 
+/// A DJ two-way filter on one stereo signal, steered by a knob `0..=1`: exactly `0.5` passes the input untouched,
+/// left of it a low-pass sweeps down from 20 kHz to 80 Hz, right of it a high-pass sweeps up from 20 Hz to 8 kHz
+/// (12 dB/oct, Butterworth). The cutoff is in Hz at any sample rate.
+///
+/// The knob it applies follows the one asked for at most [`TwoWayFilter::SWEEP_SEC`] per full travel, so a jump or a
+/// reset never clicks, and lands on it exactly. Just off centre the filtered signal fades in over the first
+/// [`TwoWayFilter::BLEND`] of each side, so leaving or reaching the centre is seamless. Centre, also on the frame a
+/// sweep crosses it, is the exact input with the filter's memory cleared.
+#[derive(Debug, Clone, Copy)]
+pub struct TwoWayFilter {
+    ch: [Svf; 2],
+    /// The knob applied now.
+    pos: f32,
+    /// `tan(pi * fc / sr)` for `cached`'s (knob, sample rate).
+    g: f32,
+    cached: (f32, u32),
+}
+
+impl Default for TwoWayFilter {
+    fn default() -> Self {
+        Self { ch: Default::default(), pos: 0.5, g: 0.0, cached: (f32::NAN, 0) }
+    }
+}
+
+impl TwoWayFilter {
+    /// Seconds the applied knob takes for a full travel, `0` to `1` (a reset from either end takes half).
+    pub const SWEEP_SEC: f32 = 0.05;
+    /// The share of each half of the knob, from the centre, over which the filtered signal fades in.
+    pub const BLEND: f32 = 0.05;
+    const LP_TOP_HZ: f32 = 20_000.0;
+    const LP_BOTTOM_HZ: f32 = 80.0;
+    const HP_BOTTOM_HZ: f32 = 20.0;
+    const HP_TOP_HZ: f32 = 8_000.0;
+    /// Filter memory below this (about -300 dB) is cleared on silence.
+    const QUIET: f32 = 1e-15;
+
+    /// The cutoff in Hz at `knob`: a low-pass's below the centre, a high-pass's above (at the centre, the high-pass's
+    /// lowest, though nothing is filtered there).
+    pub fn cutoff_hz(knob: f32) -> f32 {
+        let side = (knob.clamp(0.0, 1.0) - 0.5) * 2.0;
+        if side < 0.0 {
+            Self::LP_TOP_HZ * (Self::LP_BOTTOM_HZ / Self::LP_TOP_HZ).powf(-side)
+        } else {
+            Self::HP_BOTTOM_HZ * (Self::HP_TOP_HZ / Self::HP_BOTTOM_HZ).powf(side)
+        }
+    }
+
+    /// Forgets what the filter heard and applies `knob` at once (for a signal starting from silence).
+    pub fn reset(&mut self, knob: f32) {
+        self.ch = Default::default();
+        self.pos = if knob.is_finite() { knob.clamp(0.0, 1.0) } else { 0.5 };
+    }
+
+    /// One stereo frame at `sr` Hz, the knob moving one step toward `knob` (not finite: the centre).
+    pub fn process(&mut self, sr: u32, l: f32, r: f32, knob: f32) -> (f32, f32) {
+        let target = if knob.is_finite() { knob.clamp(0.0, 1.0) } else { 0.5 };
+        let step = 1.0 / (Self::SWEEP_SEC * sr.max(1) as f32);
+        let mut next = if (target - self.pos).abs() <= step { target } else { self.pos + step.copysign(target - self.pos) };
+        if (self.pos - 0.5) * (next - 0.5) < 0.0 {
+            next = 0.5; // crossing the centre: one dry frame, so neither side's memory leaks into the other
+        }
+        self.pos = next;
+        if self.pos == 0.5 {
+            self.ch = Default::default();
+            return (l, r);
+        }
+        if self.cached != (self.pos, sr) {
+            let fs = sr.max(1) as f32;
+            self.g = (std::f32::consts::PI * Self::cutoff_hz(self.pos).min(fs * 0.45) / fs).tan();
+            self.cached = (self.pos, sr);
+        }
+        let (g, low_pass) = (self.g, self.pos < 0.5);
+        let wet = ((self.pos - 0.5).abs() * 2.0 / Self::BLEND).min(1.0);
+        let [a, b] = &mut self.ch;
+        let one = |svf: &mut Svf, x: f32| {
+            let (lo, _, hi) = svf.tick(x, g);
+            x + ((if low_pass { lo } else { hi }) - x) * wet
+        };
+        let out = (one(a, l), one(b, r));
+        // On digital silence the memory decays toward subnormals, which are slow on some CPUs: once it is far below
+        // anything audible, it is exactly zero.
+        if l == 0.0 && r == 0.0 && self.ch.iter().all(|s| s.ic1.abs() < Self::QUIET && s.ic2.abs() < Self::QUIET) {
+            self.ch = Default::default();
+        }
+        out
+    }
+}
+
 /// Deck timeline processor supporting **Flux / Slip Mode**, **Loop / Loop Roll**, **Beatjump**,
 /// and **8-Slice Freeze Mode**.
 #[derive(Debug, Clone)]
@@ -495,6 +584,102 @@ mod tests {
         assert!(isolator_rms(10_000.0, (1.0, 1.0, 0.0)) < 0.15, "high kill leaves treble");
         assert!(isolator_rms(1000.0, (0.0, 1.0, 0.0)) > 0.6, "mid survives low+high kill");
         assert!(isolator_rms(10_000.0, (0.0, 1.0, 1.0)) > 0.9, "low kill keeps treble");
+    }
+
+    /// Level (1 = untouched) of a sine at `hz` through a two-way filter set to `knob` from the start, at `sr`.
+    fn two_way_level(knob: f32, hz: f32, sr: u32) -> f32 {
+        let mut f = TwoWayFilter::default();
+        f.reset(knob);
+        let (mut acc, mut n) = (0.0, 0);
+        for i in 0..sr {
+            let x = (i as f32 * hz * std::f32::consts::TAU / sr as f32).sin();
+            let (l, r) = f.process(sr, x, -x, knob);
+            assert_eq!(l, -r, "the channels differ");
+            if i > sr / 2 {
+                acc += l * l;
+                n += 1;
+            }
+        }
+        (acc / n as f32).sqrt() / std::f32::consts::FRAC_1_SQRT_2
+    }
+
+    #[test]
+    fn two_way_filter_is_exact_at_centre_and_sweeps_each_side_the_right_way() {
+        let mut f = TwoWayFilter::default();
+        for i in 0..1000 {
+            let (l, r) = ((i as f32 * 0.37).sin(), (i as f32 * 1.3).cos() * 0.5);
+            assert_eq!(f.process(48_000, l, r, 0.5), (l, r));
+            assert_eq!(f.process(48_000, l, r, f32::NAN), (l, r), "a broken knob is the centre");
+        }
+        for sr in [44_100, 48_000, 96_000] {
+            // Lower knob, darker: the treble goes first, the bass stays until the far end.
+            let treble: Vec<f32> = [0.5, 0.4, 0.25, 0.1, 0.0].iter().map(|&k| two_way_level(k, 5_000.0, sr)).collect();
+            assert!(treble.windows(2).all(|w| w[1] < w[0]) && treble[0] > 0.99 && treble[4] < 0.01, "{sr}: low-pass {treble:?}");
+            assert!(two_way_level(0.25, 100.0, sr) > 0.95, "{sr}: low-pass halfway cuts the bass");
+            // Higher knob, thinner: the bass goes first, the treble stays.
+            let bass: Vec<f32> = [0.5, 0.6, 0.75, 0.9, 1.0].iter().map(|&k| two_way_level(k, 100.0, sr)).collect();
+            assert!(bass.windows(2).all(|w| w[1] < w[0]) && bass[0] > 0.99 && bass[4] < 0.01, "{sr}: high-pass {bass:?}");
+            assert!(two_way_level(0.75, 10_000.0, sr) > 0.95, "{sr}: high-pass halfway cuts the treble");
+            // The cutoff is in Hz: the same knob sounds the same at every rate.
+            for k in [0.2, 0.8] {
+                assert!((two_way_level(k, 1_000.0, sr) - two_way_level(k, 1_000.0, 48_000)).abs() < 0.02, "{sr}: knob {k} depends on the rate");
+            }
+        }
+    }
+
+    #[test]
+    fn two_way_filter_sweeps_and_resets_smoothly_and_lands_exactly() {
+        let sr = 48_000;
+        let sine = |i: usize| 0.5 * (i as f32 * 1_000.0 * std::f32::consts::TAU / sr as f32).sin();
+        let mut f = TwoWayFilter::default();
+        f.reset(0.0);
+        let mut i = 0;
+        let mut last = 0.0;
+        let mut biggest = 0.0f32;
+        // Settle at the far left, jump to the far right (through the centre), then reset to the centre.
+        for (knob, frames) in [(0.0, 4_800), (1.0, 4_800), (0.5, 4_800)] {
+            for _ in 0..frames {
+                let (l, _) = f.process(sr, sine(i), sine(i), knob);
+                if i > 4_800 {
+                    biggest = biggest.max((l - last).abs());
+                }
+                last = l;
+                i += 1;
+            }
+        }
+        // A 0.5 sine at 1 kHz moves up to 0.065 a frame; a click would be far more.
+        assert!(biggest < 0.1, "a step of {biggest}");
+        // The reset from the far right lands within half a sweep, and from then on the output is the input.
+        let mut f = TwoWayFilter::default();
+        f.reset(1.0);
+        let land = (TwoWayFilter::SWEEP_SEC * 0.5 * sr as f32).ceil() as usize + 1;
+        for i in 0..2 * land {
+            let (l, _) = f.process(sr, sine(i), sine(i), 0.5);
+            if i >= land {
+                assert_eq!(l, sine(i), "frame {i} is still filtered");
+            }
+        }
+    }
+
+    /// A burst through a low-pass and a high-pass, then a minute of digital silence: the output never becomes a
+    /// subnormal number and settles to exactly zero.
+    #[test]
+    fn two_way_filter_comes_to_exact_rest_on_silence() {
+        for knob in [0.05, 0.6, 0.95] {
+            let mut f = TwoWayFilter::default();
+            f.reset(knob);
+            for i in 0..4800 {
+                f.process(48_000, (i as f32 * 0.31).sin(), (i as f32 * 0.17).cos(), knob);
+            }
+            let mut last = (1.0, 1.0);
+            for i in 0..48_000 * 60 {
+                last = f.process(48_000, 0.0, 0.0, knob);
+                for x in [last.0, last.1] {
+                    assert!(x == 0.0 || x.is_normal(), "knob {knob}: subnormal output {x:e} {i} frames into the silence");
+                }
+            }
+            assert_eq!(last, (0.0, 0.0), "knob {knob}: never came to rest");
+        }
     }
 
     #[test]

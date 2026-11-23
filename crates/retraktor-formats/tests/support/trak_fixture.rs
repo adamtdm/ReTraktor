@@ -82,14 +82,20 @@ fn kart(id: u32, xml: &str, word: u32, children: &[(u32, [u8; 4], u32, Vec<u8>)]
     item(b"kart", id, &payload, children)
 }
 
-/// The `NISOUND` record: a set with Q `quantize` and `slots`, then zero filler.
+/// The `NISOUND` record: a set with Q `quantize` and `slots`, every slot's Key Lock off, then zero filler.
 pub fn nisound(quantize: bool, slots: &Slots, word: u32) -> Vec<u8> {
-    let slot_xml = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<TraktorSlot><FxEnable>true</FxEnable><Keylock>false</Keylock><PunchEnable>false</PunchEnable></TraktorSlot>";
+    nisound_keylock(quantize, slots, word, [Some("false"); 4])
+}
+
+/// [`nisound`] with each slot's `Keylock` text by slot position (`None`: the slot has no `Keylock`).
+pub fn nisound_keylock(quantize: bool, slots: &Slots, word: u32, keylock: [Option<&str>; 4]) -> Vec<u8> {
     let slot_items: Vec<_> = slots
         .iter()
         .map(|(position, cells)| {
+            let lock = keylock.get(*position as usize).copied().flatten().map_or(String::new(), |k| format!("<Keylock>{k}</Keylock>"));
+            let slot_xml = format!("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<TraktorSlot><FxEnable>true</FxEnable>{lock}<PunchEnable>false</PunchEnable></TraktorSlot>");
             let cell_items: Vec<_> = cells.iter().map(|(row, xml)| (*row, *b"kart", 3, kart(3, xml, word, &[]))).collect();
-            (*position, *b"kart", 2, kart(2, slot_xml, word, &cell_items))
+            (*position, *b"kart", 2, kart(2, &slot_xml, word, &cell_items))
         })
         .collect();
     let set_xml = format!("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<TraktorSet><QuantValue>4</QuantValue><QuantState>{quantize}</QuantState><Title>{}</Title><BPM>120</BPM></TraktorSet>", text("Test set"));
