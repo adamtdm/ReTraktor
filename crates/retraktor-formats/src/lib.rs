@@ -7,7 +7,8 @@
 //! - [`tsi`]: `.tsi` `TraktorSettings` XML + Base64-encoded Big-Endian FourCC TLV (`DIOM`, `DEVS`,
 //!   `DEVI`, `DDCB`, `CMAS`, `CMAI`, `CMAD`) controller mapping parser and builder.
 //! - [`trak`]: `.stem.m4a` MP4 `stem` atom JSON metadata parser/serializer and the Traktor Remix
-//!   Set (`.trak`) reader: its cells and where each sample's audio sits in the archive.
+//!   Set (`.trak`) reader (its cells and where each sample's audio sits in the archive) and the
+//!   pieces a writer assembles one from.
 //! - [`stripes`]: Binary waveform Stripe (`STRP`) and Transient (`TRNS`) cache reader/writer.
 
 pub mod nml;

@@ -289,7 +289,7 @@ const MAX_IMPORT_BYTES: u64 = BANK_BUDGET_BYTES as u64;
 /// sample file the cells play is copied out once, under its exact name in the set, into a new folder in `root` that
 /// only this import writes to (cells sharing a file share its copy), then decoded whole ([`RemixSample::decode`]).
 /// A synced cell keeps its BPM; an unsynced one plays at its own speed. Each slot's Key Lock comes along, and each
-/// cell's pitch where [`retraktor_formats::trak::semitones_from_pitch`] knows its meaning (kept with Key Lock off too);
+/// cell's pitch where [`retraktor_formats::trak::semitones_from_pitch`] reads it as whole semitones (kept with Key Lock off too);
 /// any other pitch is left at 0 and named in the notes by cell and raw value. On any failure, or once `cancelled`, the
 /// folder is removed again; on success the returned [`Imported`] owns it. Errors read on their own.
 pub fn import_trak(path: &Path, root: &Path, budget: &Arc<SampleBudget>, cancelled: &dyn Fn() -> bool) -> Result<(RemixBank, Imported), Vec<String>> {
@@ -380,7 +380,7 @@ pub fn import_trak(path: &Path, root: &Path, budget: &Arc<SampleBudget>, cancell
         const NAMED: usize = 3;
         let more = if unplaced.len() > NAMED { format!(" and {} more (all listed on the deck)", unplaced.len() - NAMED) } else { String::new() };
         let first = unplaced.iter().take(NAMED).cloned().collect::<Vec<_>>().join(", ");
-        notes.push(format!("Pitch left at 0 (a Traktor value ReTraktor can't yet read as semitones) on {}: {first}{more}", unplaced.len()));
+        notes.push(format!("Pitch left at 0 (a Traktor value between whole semitones) on {}: {first}{more}", unplaced.len()));
         imported.pitch_skipped = unplaced;
     }
     let renamed = set.cells.iter().filter(|c| c.name_shortened).count();
@@ -1003,11 +1003,19 @@ pub fn read_set(path: &Path) -> Result<RemixSet, String> {
 /// has that name yet. A failure at any step, or a set too big to open again, leaves whatever was at `path` as it was.
 pub fn write_set(path: &Path, set: &RemixSet, replace: bool) -> Result<(), String> {
     use std::io::Write;
-    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
     let text = set.to_json();
     if text.len() as u64 > MAX_SET_BYTES {
         return Err(format!("the set would be {} KiB, more than ReTraktor opens ({} KiB): shorten the cell names", text.len() >> 10, MAX_SET_BYTES >> 10));
     }
+    write_whole(path, replace, |file| file.write_all(text.as_bytes()))
+}
+
+/// Writes a new file at `path` all at once, as [`write_set`] describes: `fill` writes it into a hidden file beside
+/// `path`, which is flushed to disk and then renamed into place (over what is there only with `replace`). On any
+/// failure the hidden file is removed and whatever was at `path` is left as it was.
+/// shortcut: a process killed mid-write leaves its hidden .tmp beside `path` (safe to remove once ReTraktor has exited; a normal close waits for the write), sweep stale ones at startup if they pile up.
+fn write_whole(path: &Path, replace: bool, fill: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>) -> Result<(), String> {
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
     let file_name = path.file_name().ok_or("that isn't a file name")?;
     let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
     let mut temp_name = std::ffi::OsString::from(".");
@@ -1015,19 +1023,19 @@ pub fn write_set(path: &Path, set: &RemixSet, replace: bool) -> Result<(), Strin
     temp_name.push(format!(".{}-{}.tmp", std::process::id(), NEXT_TEMP.fetch_add(1, Ordering::Relaxed)));
     let temp = dir.join(temp_name);
     let mut file = std::fs::File::create_new(&temp).map_err(|e| e.to_string())?;
-    let written = file
-        .write_all(text.as_bytes())
+    let written = fill(&mut file)
         .and_then(|_| file.sync_all())
         .and_then(|_| if replace { std::fs::rename(&temp, path) } else { rename_no_replace(&temp, path) });
     if let Err(e) = written {
         let _ = std::fs::remove_file(&temp);
+        let extension = path.extension().map_or_else(String::new, |e| e.to_string_lossy().into_owned());
         return Err(match e.kind() {
             std::io::ErrorKind::AlreadyExists => {
                 format!("'{}' already exists and the chooser never asked to replace it: choose that file by its full name to replace it, or pick another name", path.display())
             }
             // The drive can't add a file only-if-new: refused rather than risk a file that appeared meanwhile.
             std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported => {
-                format!("this drive can't safely add '{}' under a name typed without .{SET_EXTENSION}: save again and type the full name ending .{SET_EXTENSION}", path.display())
+                format!("this drive can't safely add '{}' under a name typed without .{extension}: save again and type the full name ending .{extension}", path.display())
             }
             _ => e.to_string(),
         });
@@ -1089,20 +1097,158 @@ pub fn stage(set: &RemixSet, budget: &Arc<SampleBudget>, cancelled: &dyn Fn() ->
     Ok(bank)
 }
 
+/// A Remix deck's bank as a Traktor Remix Set export takes it: Q, the column Key Locks and every filled cell, each
+/// sharing its sample's audio (never a copy), and what of the bank a `.trak` can't hold, one line each for the deck.
+#[derive(Clone)]
+pub struct TrakExport {
+    pub quantize: bool,
+    pub keylock: [bool; COLUMNS],
+    /// (column, row, cell), column by column.
+    pub cells: Vec<(usize, usize, RemixCell)>,
+    pub dropped: Vec<String>,
+}
+
+impl TrakExport {
+    /// The export of `bank`; refused while a cell loads.
+    pub fn from_bank(bank: &RemixBank) -> Result<Self, String> {
+        let mut dropped = Vec::new();
+        if bank.page != 0 {
+            dropped.push(format!("Page {} was showing: a .trak keeps no page, so Traktor shows page 1", bank.page + 1));
+        }
+        for (column, &knob) in bank.filter.iter().enumerate().filter(|(_, &knob)| knob != 0.5) {
+            let kind = if knob < 0.5 { "low-pass" } else { "high-pass" };
+            dropped.push(format!("Column {} filter ({kind} at {}): a .trak has no column filters", column + 1, filter_hz_text(knob)));
+        }
+        let mut cells = Vec::new();
+        for column in 0..COLUMNS {
+            for row in 0..ROWS {
+                if bank.is_loading(column, row) {
+                    return Err(format!("cell {}.{} is still loading: wait for it, or cancel it", column + 1, row + 1));
+                }
+                if let Some(cell) = &bank.cells[column][row] {
+                    cells.push((column, row, cell.clone()));
+                }
+            }
+        }
+        Ok(Self { quantize: bank.quantize, keylock: bank.keylock, cells, dropped })
+    }
+}
+
+/// Bytes of a member's WAV header ([`pcm24_wav_header`]).
+const PCM24_HEAD_BYTES: u64 = 44;
+/// The most characters of a sample's name in its member's file name.
+const MEMBER_STEM_CHARS: usize = 32;
+
+/// Writes `export` as a Traktor Remix Set at `path`, all at once as [`write_set`] does (`replace` as there). Each
+/// sample is stored once, as the 24-bit stereo PCM WAV of the audio the deck plays, at its own rate, named after the
+/// first cell that plays it ([`member_name`]); `NISOUND` follows, titled after the file's name. Each cell keeps its
+/// name, loop or one-shot and tuning ([`retraktor_formats::trak::pitch_from_semitones`]); a loop with
+/// a tempo is synced at its fitted BPM, the set's BPM being the first one's. Runs on the set writer, never the callback.
+pub fn write_trak(path: &Path, export: &TrakExport, replace: bool) -> Result<(), String> {
+    use retraktor_formats::trak::{container_header, pitch_from_semitones, record_header, write_nisound, TrakCell, TrakRemixSet, NISOUND, NISOUND_ITEMS};
+    use std::io::{Read, Write};
+    let mut members: Vec<(String, &Arc<RemixSample>)> = Vec::new();
+    let mut cells = Vec::new();
+    let mut set_bpm = None;
+    for (column, row, cell) in &export.cells {
+        let sample = &cell.sample;
+        let file = match members.iter().find(|(_, s)| s.id == sample.id) {
+            Some((name, _)) => name.clone(),
+            None => {
+                members.push((member_name(*column, *row, &sample.name), sample));
+                members[members.len() - 1].0.clone()
+            }
+        };
+        let synced = cell.looped && sample.bpm.is_some();
+        if synced {
+            set_bpm = set_bpm.or(sample.bpm);
+        }
+        let pitch = pitch_from_semitones(cell.tune);
+        cells.push(TrakCell { column: *column, row: *row, file, name: sample.name.clone(), name_shortened: false, looped: cell.looped, synced, bpm: sample.bpm.unwrap_or(0.0), pitch, tune: None, unapplied: Vec::new() });
+    }
+    let set = TrakRemixSet { quantize: export.quantize, keylock: export.keylock, cells, members: Vec::new() };
+    let title = path.file_stem().map_or_else(String::new, |s| s.to_string_lossy().into_owned());
+    let mut ids = [[0u8; 16]; NISOUND_ITEMS];
+    std::fs::File::open("/dev/urandom").and_then(|mut random| ids.iter_mut().try_for_each(|id| random.read_exact(id))).map_err(|e| format!("no random ids for the set ({e})"))?;
+    // 120 BPM, Traktor's default master tempo, when no loop follows the tempo.
+    let nisound = write_nisound(&title, set_bpm.unwrap_or(120.0), &set, &ids)?;
+    // A cell's 60 s even at 768 kHz is far below the 4 GiB a WAV's RIFF size holds.
+    let headers = members.iter().enumerate().map(|(i, (name, sample))| record_header(i as u64 + 1, name, PCM24_HEAD_BYTES + sample.frames() as u64 * 6)).collect::<Result<Vec<_>, _>>()?;
+    let nisound_header = record_header(members.len() as u64 + 1, NISOUND, nisound.len() as u64)?;
+    write_whole(path, replace, |file| {
+        let mut out = std::io::BufWriter::new(file);
+        out.write_all(&container_header())?;
+        for (header, (_, sample)) in headers.iter().zip(&members) {
+            out.write_all(header)?;
+            out.write_all(&pcm24_wav_header(sample.frames(), sample.sample_rate))?;
+            // Scaled as the decoder reads 24-bit audio, so 16- and 24-bit sources come back exactly; peaks past full scale clip.
+            for &s in &sample.pcm {
+                let level = (f64::from(s) * 8_388_608.0).round().clamp(-8_388_608.0, 8_388_607.0) as i32;
+                out.write_all(&level.to_le_bytes()[..3])?;
+            }
+        }
+        out.write_all(&nisound_header)?;
+        out.write_all(&nisound)?;
+        out.flush()
+    })
+}
+
+/// A member's file name: the place of the first cell playing it and the letters, digits, spaces and `-_()` of its
+/// sample's name, at most [`MEMBER_STEM_CHARS`] (`A1-Groove loop.wav`), so it is plain and safe on any drive. No two
+/// cells share a place, so no two names clash, in any case.
+fn member_name(column: usize, row: usize, name: &str) -> String {
+    let stem: String = name.chars().filter(|c| c.is_ascii_alphanumeric() || " -_()".contains(*c)).take(MEMBER_STEM_CHARS).collect();
+    let place = format!("{}{}", (b'A' + column as u8) as char, row + 1);
+    match stem.trim() {
+        "" => format!("{place}.wav"),
+        stem => format!("{place}-{stem}.wav"),
+    }
+}
+
+/// The 44-byte header of a stereo 24-bit PCM WAV of `frames` frames at `rate`.
+fn pcm24_wav_header(frames: usize, rate: u32) -> Vec<u8> {
+    let data = frames as u32 * 6;
+    let mut h = Vec::with_capacity(PCM24_HEAD_BYTES as usize);
+    h.extend_from_slice(b"RIFF");
+    h.extend_from_slice(&(36 + data).to_le_bytes());
+    h.extend_from_slice(b"WAVEfmt ");
+    h.extend_from_slice(&16u32.to_le_bytes());
+    for field in [1u16, 2] {
+        h.extend_from_slice(&field.to_le_bytes()); // PCM, two channels
+    }
+    h.extend_from_slice(&rate.to_le_bytes());
+    h.extend_from_slice(&(rate * 6).to_le_bytes());
+    for field in [6u16, 24] {
+        h.extend_from_slice(&field.to_le_bytes()); // bytes per frame, bits per sample
+    }
+    h.extend_from_slice(b"data");
+    h.extend_from_slice(&data.to_le_bytes());
+    h
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SetAction {
     Save,
     Open,
+    /// Save the deck's cells, with their audio, as a Traktor Remix Set (`.trak`).
+    Export,
 }
 
-/// A deck's save or open, from its SET click until the file is written or the bank replaced.
+/// What a save or export writes: the set as it was when asked.
+#[derive(Clone)]
+pub enum SetFile {
+    Native(RemixSet),
+    Trak(TrakExport),
+}
+
+/// A deck's save, export or open, from its SET click until the file is written or the bank replaced.
 pub struct SetJob {
     pub ticket: u64,
     pub action: SetAction,
     /// The bank when asked: an edit since makes the job stale.
     pub contents: BankContents,
-    /// Save: the set as it was when asked.
-    pub snapshot: Option<RemixSet>,
+    /// Save or export: what to write, as it was when asked.
+    pub snapshot: Option<SetFile>,
     /// Whether the deck was a Remix deck, and its track load generation, when asked: an open lands only on the deck
     /// as it was, never over a track loaded or a mode switched since.
     pub deck: (bool, u64),
@@ -1114,7 +1260,8 @@ pub struct SetJob {
 pub enum SetDone {
     /// The desktop chooser closed: the file picked, or none when cancelled.
     Chosen(Option<PathBuf>),
-    Saved(PathBuf, Result<(), String>),
+    /// A save or export written (with what of the bank the file couldn't hold, one line each), or why not.
+    Saved(PathBuf, Result<Vec<String>, String>),
     /// The set at that path decoded into a bank (with the samples an imported Traktor set copied out, removed unless
     /// kept), or every reason it can't be.
     Staged(PathBuf, Result<(RemixBank, Option<Imported>), Vec<String>>),
@@ -1137,7 +1284,7 @@ pub struct RemixSets {
     next_ticket: u64,
     done: (mpsc::Sender<(usize, u64, SetDone)>, mpsc::Receiver<(usize, u64, SetDone)>),
     /// The one thread that writes sets, in the order they were accepted, so a later save is never overtaken.
-    writer: Option<mpsc::Sender<(usize, u64, PathBuf, RemixSet, bool)>>,
+    writer: Option<mpsc::Sender<(usize, u64, PathBuf, SetFile, bool)>>,
     /// Saves accepted whose outcome the UI hasn't taken yet.
     writes_pending: usize,
     /// Where an imported Traktor set's samples go ([`imports_dir`]), or why there is nowhere.
@@ -1164,7 +1311,7 @@ pub const TRAK_EXTENSION: &str = "trak";
 
 impl RemixSets {
     /// Starts deck `d`'s job, superseding any it had, and opens the chooser for it. `deck`: see [`SetJob::deck`].
-    pub fn start(&mut self, d: usize, action: SetAction, contents: BankContents, snapshot: Option<RemixSet>, deck: (bool, u64)) -> u64 {
+    pub fn start(&mut self, d: usize, action: SetAction, contents: BankContents, snapshot: Option<SetFile>, deck: (bool, u64)) -> u64 {
         self.next_ticket += 1;
         let ticket = self.next_ticket;
         self.tickets[d].store(ticket, Ordering::Release);
@@ -1177,12 +1324,17 @@ impl RemixSets {
         std::thread::spawn(move || {
             let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_default();
             let dialog = rfd::FileDialog::new().set_directory(&home);
-            // The desktop's save chooser asks before replacing an existing file. Only ReTraktor's own sets are saved.
+            // The desktop's save chooser asks before replacing an existing file. Saves write only .remixset, exports .trak.
             let picked = match action {
                 SetAction::Save => dialog
                     .add_filter("ReTraktor remix set", &[SET_EXTENSION])
                     .set_title(format!("Save deck {letter}'s remix set"))
                     .set_file_name(format!("Deck {letter} remix set.{SET_EXTENSION}"))
+                    .save_file(),
+                SetAction::Export => dialog
+                    .add_filter("Traktor Remix Set", &[TRAK_EXTENSION])
+                    .set_title(format!("Export deck {letter}'s set as a Traktor Remix Set"))
+                    .set_file_name(format!("Deck {letter} remix set.{TRAK_EXTENSION}"))
                     .save_file(),
                 SetAction::Open => dialog
                     .add_filter("Remix sets (ReTraktor .remixset, Traktor .trak)", &[SET_EXTENSION, TRAK_EXTENSION])
@@ -1208,7 +1360,7 @@ impl RemixSets {
         self.tickets[d].store(0, Ordering::Release);
     }
 
-    /// Drops deck `d`'s open, if it has one (its mode changed); a save keeps going.
+    /// Drops deck `d`'s open, if it has one (its mode changed); a save or export keeps going.
     pub fn cancel_open(&mut self, d: usize) {
         if self.jobs[d].as_ref().is_some_and(|j| j.action == SetAction::Open) {
             self.finish(d);
@@ -1259,15 +1411,19 @@ impl RemixSets {
     }
 
     /// Queues `set` to be written to `path` (see [`write_set`] for `replace`) for deck `d`'s job `ticket`, after
-    /// every save accepted before it.
-    pub fn save(&mut self, d: usize, ticket: u64, path: PathBuf, set: RemixSet, replace: bool) {
+    /// every save or export accepted before it.
+    pub fn save(&mut self, d: usize, ticket: u64, path: PathBuf, set: SetFile, replace: bool) {
         self.writes_pending += 1;
         let writer = self.writer.get_or_insert_with(|| {
-            let (tx, rx) = mpsc::channel::<(usize, u64, PathBuf, RemixSet, bool)>();
+            let (tx, rx) = mpsc::channel::<(usize, u64, PathBuf, SetFile, bool)>();
             let done = self.done.0.clone();
             std::thread::spawn(move || {
                 for (d, ticket, path, set, replace) in rx {
-                    let result = write_set(&path, &set, replace);
+                    // An export shares its samples' audio with the bank, so a cell cleared meanwhile is freed once it is written.
+                    let result = match set {
+                        SetFile::Native(set) => write_set(&path, &set, replace).map(|()| Vec::new()),
+                        SetFile::Trak(export) => write_trak(&path, &export, replace).map(|()| export.dropped),
+                    };
                     let _ = done.send((d, ticket, SetDone::Saved(path, result)));
                 }
             });
@@ -2059,6 +2215,57 @@ mod tests {
         let e = write_set(&path, &huge, true).unwrap_err();
         assert!(e.contains("more than ReTraktor opens"), "{e}");
         assert_eq!((files(), read_set(&path)), (2, Ok(second)), "a refused save touched the old set");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A bank exported as a .trak imports back with no source file anywhere (its samples were made in memory): each cell
+    /// in its place with its name, loop or one-shot, synced tempo and tuning (-4, +3), Q and Key Locks (the page and
+    /// filter it leaves out are named), and the audio the deck plays, as 24-bit
+    /// (16-bit steps come back exactly, peaks past full scale clip). A sample in two cells is stored once, under a short
+    /// plain name. An existing .trak is replaced only when the chooser confirmed it; a folder in the way fails, leaving no
+    /// temporary file.
+    #[test]
+    fn a_bank_exported_as_a_trak_imports_back_without_its_sources() {
+        let dir = capture_dir("trak-export");
+        let b = budget();
+        // 2 s at 120 BPM: a 4-beat loop.
+        let groove: Vec<f32> = (0..88_200).flat_map(|f| [((f % 200) as f32 - 100.0) / 128.0, -0.25]).collect();
+        let groove = Arc::new(RemixSample::from_pcm("Groove: Ölé/loop", groove, 44_100, 120.0, &b).unwrap());
+        let shot = Arc::new(RemixSample::from_pcm("Bell", vec![1.5, -0.5, 0.25, -2.0], 48_000, 0.0, &b).unwrap());
+        let mut bank = RemixBank { quantize: false, page: 2, keylock: [true, false, false, true], ..Default::default() };
+        bank.filter[2] = 0.2;
+        bank.cells[0][0] = Some(RemixCell { sample: Arc::clone(&groove), looped: true, tune: -4 });
+        bank.cells[2][6] = Some(RemixCell { sample: Arc::clone(&shot), looped: false, tune: 0 });
+        bank.cells[3][15] = Some(RemixCell { sample: Arc::clone(&groove), looped: true, tune: 3 });
+        let export = TrakExport::from_bank(&bank).unwrap();
+        assert_eq!(export.dropped.len(), 2, "{:?}", export.dropped);
+        assert!(export.dropped[0].starts_with("Page 3 was showing") && export.dropped[1].starts_with("Column 3 filter (low-pass at"), "{:?}", export.dropped);
+
+        let path = dir.join("Friday.trak");
+        write_trak(&path, &export, false).unwrap();
+        let set = retraktor_formats::trak::read_remix_set(&mut std::fs::File::open(&path).unwrap()).unwrap();
+        assert_eq!(set.members.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(), ["A1-Groove lloop.wav", "C7-Bell.wav"]);
+        let (back, imported) = import_trak(&path, &dir.join("Remix Sets"), &b, &|| false).unwrap_or_else(|e| panic!("{e:?}"));
+        assert!(imported.notes.is_empty(), "{}", imported.notes);
+        assert_eq!((back.quantize, back.keylock), (false, [true, false, false, true]));
+        let cells: Vec<_> = back.contents().1.iter().map(|&(c, r, _, looped, tune)| (c, r, looped, tune)).collect();
+        assert_eq!(cells, [(0, 0, true, -4), (2, 6, false, 0), (3, 15, true, 3)]);
+        let cell = |c: usize, r: usize| &back.cells[c][r].as_ref().unwrap().sample;
+        assert_eq!((cell(0, 0).name.as_str(), cell(0, 0).sample_rate, cell(0, 0).bpm, cell(3, 15).bpm), ("Groove: Ölé/loop", 44_100, Some(120.0), Some(120.0)));
+        assert!(cell(0, 0).pcm == groove.pcm && cell(3, 15).pcm == groove.pcm, "the loop's audio changed");
+        assert_eq!((cell(2, 6).name.as_str(), cell(2, 6).bpm, &cell(2, 6).pcm[..]), ("Bell", None, &[8_388_607.0 / 8_388_608.0, -0.5, 0.25, -1.0][..]));
+        drop((back, imported));
+
+        let before = std::fs::read(&path).unwrap();
+        assert!(write_trak(&path, &export, false).unwrap_err().contains("already exists"));
+        assert_eq!(std::fs::read(&path).unwrap(), before, "an unconfirmed export touched the old file");
+        let quantized = TrakExport { quantize: true, ..export.clone() };
+        write_trak(&path, &quantized, true).unwrap();
+        assert!(retraktor_formats::trak::read_remix_set(&mut std::fs::File::open(&path).unwrap()).unwrap().quantize, "a confirmed export didn't replace the file");
+        std::fs::create_dir(dir.join("folder.trak")).unwrap();
+        assert!(write_trak(&dir.join("folder.trak"), &export, true).is_err());
+        let names: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert!(names.iter().all(|n| !n.starts_with('.')), "a temporary file was left behind: {names:?}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

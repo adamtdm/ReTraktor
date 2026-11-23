@@ -772,7 +772,7 @@ impl ReTraktorApp {
         }
         let close = ctx.input(|i| i.viewport().close_requested());
         // A save chooser could be confirmed after the window has gone, losing that save.
-        let save_chooser = self.remix_sets.jobs.iter().flatten().any(|j| j.choosing && j.action == crate::remix::SetAction::Save);
+        let save_chooser = self.remix_sets.jobs.iter().flatten().any(|j| j.choosing && j.action != crate::remix::SetAction::Open);
         if close && save_failed {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             if !self.library.status_message.ends_with("Close again to quit") {
@@ -4092,7 +4092,7 @@ impl ReTraktorApp {
             Some(format!("Deck {letter}'s file chooser is still open: finish or cancel it there (or forget it in this menu)"))
         } else if bank.any_loading() {
             Some(format!("Deck {letter} is still loading cells: wait for them, or cancel them"))
-        } else if action == crate::remix::SetAction::Save && bank.is_empty() {
+        } else if action != crate::remix::SetAction::Open && bank.is_empty() {
             Some(format!("Deck {letter} has no cells to save"))
         } else if action == crate::remix::SetAction::Open && !self.deck_remix[d] && self.track_busy(d) {
             // Whatever the lock preference: an open turns this deck into a Remix deck, unloading its track.
@@ -4104,27 +4104,30 @@ impl ReTraktorApp {
         }
     }
 
-    /// SET → save or open on deck `d`: checks it can, keeps what the bank holds now, then asks for the file.
+    /// SET → save, export or open on deck `d`: checks it can, keeps what the bank holds now, then asks for the file.
     fn remix_set_request(&mut self, d: usize, action: crate::remix::SetAction) {
-        use crate::remix::{RemixSet, SetAction};
+        use crate::remix::{RemixSet, SetAction, SetFile, TrakExport};
         let letter = DECK_LETTERS[d];
         if let Some(why) = self.remix_set_blocked(d, action) {
             self.library.status_message = why;
             return;
         }
         let snapshot = match action {
-            SetAction::Save => match RemixSet::from_bank(&self.remix_banks[d]) {
-                Ok(set) => Some(set),
-                Err(e) => {
-                    self.library.status_message = format!("Can't save deck {letter}'s set: {e}");
-                    return;
-                }
-            },
-            SetAction::Open => None,
+            SetAction::Save => RemixSet::from_bank(&self.remix_banks[d]).map(|set| Some(SetFile::Native(set))),
+            SetAction::Export => TrakExport::from_bank(&self.remix_banks[d]).map(|export| Some(SetFile::Trak(export))),
+            SetAction::Open => Ok(None),
+        };
+        let snapshot = match snapshot {
+            Ok(snapshot) => snapshot,
+            Err(e) => {
+                self.library.status_message = format!("Can't save deck {letter}'s set: {e}");
+                return;
+            }
         };
         self.remix_sets.start(d, action, self.remix_banks[d].contents(), snapshot, (self.deck_remix[d], self.load_generation[d]));
         self.library.status_message = match action {
             SetAction::Save => format!("Choose where to save deck {letter}'s set"),
+            SetAction::Export => format!("Choose where to export deck {letter}'s set as a Traktor .trak (with its samples' audio)"),
             SetAction::Open if self.deck_remix[d] => format!("Choose a set to open onto deck {letter}: it replaces the cells only if every sample loads"),
             SetAction::Open => match self.audio.shared.lock().ok().and_then(|s| s.loaded_tracks[d].as_ref().map(|t| t.title.clone())) {
                 Some(title) => format!("Choose a set to open onto deck {letter}: once every sample loads, deck {letter} becomes a Remix deck and its stopped track '{title}' is unloaded"),
@@ -4136,7 +4139,7 @@ impl ReTraktorApp {
     /// Why deck `d`'s job `ticket` can't go on (an edit since it was asked, or the deck can't take it now), if so.
     fn remix_set_stale(&self, d: usize, ticket: u64) -> Option<String> {
         let job = self.remix_sets.job(d, ticket)?;
-        let what = if job.action == crate::remix::SetAction::Save { "nothing was saved" } else { "it was left as it was" };
+        let what = if job.action == crate::remix::SetAction::Open { "it was left as it was" } else { "nothing was saved" };
         if let Some(why) = self.remix_set_blocked(d, job.action) {
             return Some(format!("{why}; {what}"));
         }
@@ -4154,7 +4157,7 @@ impl ReTraktorApp {
 
     /// The chooser of deck `d`'s job `ticket` closed on `path` (none: cancelled). Whether a save was refused.
     fn remix_set_chosen(&mut self, d: usize, ticket: u64, path: Option<PathBuf>) -> bool {
-        use crate::remix::{SetAction, SET_EXTENSION};
+        use crate::remix::{SetAction, SET_EXTENSION, TRAK_EXTENSION};
         let letter = DECK_LETTERS[d];
         let Some(job) = self.remix_sets.jobs[d].as_mut().filter(|j| j.ticket == ticket) else {
             // A chooser forgotten (or its open cancelled by a switch to Track): what it picked is ignored, visibly.
@@ -4166,11 +4169,16 @@ impl ReTraktorApp {
         };
         job.choosing = false;
         let action = job.action;
-        let verdict = if action == SetAction::Save { "Not saved" } else { "Not opened" };
+        let verdict = match action {
+            SetAction::Save => "Not saved",
+            SetAction::Export => "Not exported",
+            SetAction::Open => "Not opened",
+        };
         let Some(mut path) = path else {
             self.remix_sets.finish(d);
             self.library.status_message = match action {
                 SetAction::Save => "Save cancelled: nothing was written".to_string(),
+                SetAction::Export => "Export cancelled: nothing was written".to_string(),
                 SetAction::Open => format!("Open cancelled: deck {letter} is unchanged"),
             };
             return false;
@@ -4178,7 +4186,7 @@ impl ReTraktorApp {
         if let Some(why) = self.remix_set_stale(d, ticket) {
             self.remix_sets.finish(d);
             self.remix_set_problem(d, format!("{verdict}: '{}'", set_file_name(&path)), vec![why]);
-            return action == SetAction::Save;
+            return action != SetAction::Open;
         }
         if action == SetAction::Open {
             self.remix_sets.stage(d, ticket, path.clone(), &self.remix_loader.budget);
@@ -4187,10 +4195,11 @@ impl ReTraktorApp {
         }
         // Without the extension the chooser couldn't list the set again. It never asked about replacing the name with
         // it added, so that one is only written if nothing has it yet.
-        let replace = path.extension().is_some_and(|e| e == SET_EXTENSION);
+        let extension = if action == SetAction::Export { TRAK_EXTENSION } else { SET_EXTENSION };
+        let replace = path.extension().is_some_and(|e| e == extension);
         if !replace {
             let mut named = path.into_os_string();
-            named.push(format!(".{SET_EXTENSION}"));
+            named.push(format!(".{extension}"));
             path = PathBuf::from(named);
         }
         let Some(set) = self.remix_sets.job(d, ticket).and_then(|j| j.snapshot.clone()) else {
@@ -4198,7 +4207,8 @@ impl ReTraktorApp {
             self.remix_set_problem(d, format!("{verdict}: '{}'", set_file_name(&path)), vec!["The set to save was lost, so nothing was written: try again".into()]);
             return true;
         };
-        self.library.status_message = format!("Saving deck {letter}'s set to '{}'…", path.display());
+        let saving = if action == SetAction::Export { "Exporting" } else { "Saving" };
+        self.library.status_message = format!("{saving} deck {letter}'s set to '{}'…", path.display());
         self.remix_sets.save(d, ticket, path, set, replace);
         false
     }
@@ -4225,10 +4235,18 @@ impl ReTraktorApp {
                     if self.remix_sets.job(d, ticket).is_some() {
                         self.remix_sets.finish(d);
                     }
+                    // Only an export writes a .trak.
+                    let (done, not_done) = if path.extension().is_some_and(|e| e == crate::remix::TRAK_EXTENSION) { ("Exported", "Not exported") } else { ("Saved", "Not saved") };
                     match result {
-                        Ok(()) => {
-                            self.library.status_message = format!("Saved deck {letter}'s set to '{}'", path.display());
+                        Ok(dropped) => {
+                            self.library.status_message = format!("{done} deck {letter}'s set to '{}'", path.display());
                             self.remix_sets.reports[d] = None;
+                            if let Some(first) = dropped.first() {
+                                let more = if dropped.len() > 1 { format!(" (and {} more, listed on the deck)", dropped.len() - 1) } else { String::new() };
+                                self.library.status_message += &format!(". Not carried: {first}{more}");
+                                let title = format!("Not carried into '{}': {} setting{}", set_file_name(&path), dropped.len(), if dropped.len() == 1 { "" } else { "s" });
+                                self.remix_sets.reports[d] = Some(crate::remix::SetReport { title, lines: dropped, expanded: false });
+                            }
                         }
                         Err(e) => {
                             save_failed = true;
@@ -4238,7 +4256,7 @@ impl ReTraktorApp {
                             if stayed_open {
                                 lines.push("ReTraktor stayed open so you see this: close it again to quit".into());
                             }
-                            self.remix_set_problem(d, format!("Not saved: '{}' (any file there is unchanged)", set_file_name(&path)), lines);
+                            self.remix_set_problem(d, format!("{not_done}: '{}' (any file there is unchanged)", set_file_name(&path)), lines);
                             if stayed_open {
                                 self.library.status_message += ". Close again to quit";
                             }
@@ -4284,7 +4302,7 @@ impl ReTraktorApp {
                                 }
                                 let skipped = std::mem::take(&mut imported.pitch_skipped);
                                 if !skipped.is_empty() {
-                                    let title = format!("Pitch left at 0 on {} cells of '{}': ReTraktor can't yet read their Traktor values as semitones", skipped.len(), set_file_name(&path));
+                                    let title = format!("Pitch left at 0 on {} cells of '{}': their Traktor values fall between whole semitones", skipped.len(), set_file_name(&path));
                                     self.remix_sets.reports[d] = Some(crate::remix::SetReport { title, lines: skipped, expanded: false });
                                 }
                                 status += &format!(". Samples copied to {}", imported.keep().display());
@@ -4298,7 +4316,7 @@ impl ReTraktorApp {
         save_failed
     }
 
-    /// SET on deck `d`'s header: save its cells to a file, or open one onto it.
+    /// SET on deck `d`'s header: save or export its cells to a file, or open one onto it.
     fn remix_set_menu(&mut self, ui: &mut Ui, d: usize) {
         use crate::remix::SetAction;
         let letter = DECK_LETTERS[d];
@@ -4314,12 +4332,17 @@ impl ReTraktorApp {
                 for (action, text, tip) in [
                     (SetAction::Save, format!("Save deck {letter}'s set as…"), "Saves which file each cell plays, loop or one-shot, Q and the page to a .remixset file"),
                     (
+                        SetAction::Export,
+                        format!("Export deck {letter}'s set as Traktor .trak…"),
+                        "A Traktor Remix Set holding each cell's audio (24-bit WAV), name, loop or one-shot, synced tempo and tuning, the column Key Locks and Q (one beat). Not carried: the page shown and the column filters; the deck lists any it leaves out. Traktor Pro 4.4.1 turns every slot's Key Lock on when it loads a set, so check them on its deck",
+                    ),
+                    (
                         SetAction::Open,
                         format!("Open a set onto deck {letter}…"),
                         "A .remixset, or a Traktor .trak Remix Set (its samples are copied to Music/ReTraktor/Remix Sets; the .trak is only read). Replaces this deck's cells and settings once every sample has loaded, a Track deck becoming a Remix deck. Nothing starts playing",
                     ),
                 ] {
-                    if action == SetAction::Save && !self.deck_remix[d] {
+                    if action != SetAction::Open && !self.deck_remix[d] {
                         continue; // a Track deck has no cells to save
                     }
                     let blocked = self.remix_set_blocked(d, action);
@@ -4331,7 +4354,7 @@ impl ReTraktorApp {
                 }
             })
             .response
-            .on_hover_text("Save this deck's cells as a set, or open a set (.remixset or Traktor .trak) onto it");
+            .on_hover_text("Save or export this deck's cells as a set, or open a set (.remixset or Traktor .trak) onto it");
         resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, format!("Deck {letter} set")));
         if forget {
             self.remix_sets.finish(d);
@@ -9011,11 +9034,75 @@ mod sync_audio {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// SET → Export on Remix deck B (a loop tuned -4 on page 1, a one-shot on page 2, column 2's Key Lock on, page 2
+    /// showing and a column filter turned) writes the .trak under the chosen name, titled after it, and says on the deck
+    /// what it left out. Track deck D of a fresh app opens it as the same cells with their sample files gone. Refused for
+    /// an empty bank; nothing is written when the chooser is cancelled, the cells change while it is open, or a name typed
+    /// without .trak is taken.
+    #[test]
+    fn a_remix_deck_exports_a_trak_that_reopens_without_its_samples() {
+        use crate::remix::SetAction;
+        let dir = set_dir("export");
+        let mut app = ReTraktorApp::default();
+        let files = [sample_in_library(&mut app, 1, "export-loop"), sample_in_library(&mut app, 2, "export-shot")];
+        let ask = |app: &mut ReTraktorApp| {
+            app.remix_set_request(1, SetAction::Export);
+            app.remix_sets.jobs[1].as_ref().map(|j| j.ticket)
+        };
+        assert!(app.set_deck_mode(1, true));
+        assert_eq!(ask(&mut app), None);
+        assert!(app.library.status_message.contains("no cells to save"), "{}", app.library.status_message);
+        app.remix_load_cell(1, 0, 1, 1);
+        app.remix_load_cell(1, 1, 6, 2);
+        settle_remix_loads(&mut app);
+        let bank = &mut app.remix_banks[1];
+        bank.cells[0][1].as_mut().unwrap().tune = -4;
+        bank.cells[1][6].as_mut().unwrap().looped = false;
+        (bank.keylock[1], bank.page, bank.filter[3]) = (true, 1, 0.8);
+
+        let t = ask(&mut app).unwrap();
+        app.remix_set_chosen(1, t, None);
+        assert!(app.library.status_message.starts_with("Export cancelled") && app.remix_sets.jobs[1].is_none(), "{}", app.library.status_message);
+        let t = ask(&mut app).unwrap();
+        app.remix_banks[1].quantize = false;
+        assert!(app.remix_set_chosen(1, t, Some(dir.join("Late.trak"))));
+        assert!(app.remix_sets.reports[1].as_ref().is_some_and(|r| r.title == "Not exported: 'Late.trak'") && !dir.join("Late.trak").exists());
+        app.remix_banks[1].quantize = true;
+        std::fs::write(dir.join("Taken.trak"), b"keep").unwrap();
+        set_job(&mut app, 1, SetAction::Export, &dir.join("Taken"));
+        assert!(app.remix_sets.reports[1].as_ref().is_some_and(|r| r.lines[0].contains("already exists")), "{}", app.library.status_message);
+        assert_eq!(std::fs::read(dir.join("Taken.trak")).unwrap(), b"keep");
+
+        set_job(&mut app, 1, SetAction::Export, &dir.join("Saturday"));
+        let file = dir.join("Saturday.trak");
+        let status = app.library.status_message.clone();
+        assert!(status.starts_with("Exported deck B's set to") && status.contains("Not carried: Page 2 was showing") && status.contains("(and 1 more, listed on the deck)"), "{status}");
+        let report = app.remix_sets.reports[1].as_ref().expect("nothing on the deck lists what was left out");
+        assert!(report.title == "Not carried into 'Saturday.trak': 2 settings" && report.lines[1].starts_with("Column 4 filter (high-pass"), "{} {:?}", report.title, report.lines);
+        let title = retraktor_formats::tsi::base64_encode(&"Saturday".encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<u8>>());
+        assert!(String::from_utf8_lossy(&std::fs::read(&file).unwrap()).contains(&format!("<Title>{title}</Title>")), "not titled after its file");
+        drop(app);
+        for path in files {
+            std::fs::remove_file(path).unwrap();
+        }
+
+        let mut app = ReTraktorApp::default();
+        app.remix_sets.imports = Ok(dir.join("Remix Sets"));
+        set_job(&mut app, 3, SetAction::Open, &file);
+        assert!(app.library.status_message.starts_with("Opened") && app.deck_remix[3], "{}", app.library.status_message);
+        let bank = &app.remix_banks[3];
+        assert_eq!((bank.quantize, bank.keylock), (true, [false, true, false, false]));
+        assert_eq!(bank.contents().1.iter().map(|&(c, r, _, looped, tune)| (c, r, looped, tune)).collect::<Vec<_>>(), [(0, 1, true, -4), (1, 6, false, 0)]);
+        let sample = |c: usize, r: usize| &bank.cells[c][r].as_ref().unwrap().sample;
+        assert_eq!((sample(0, 1).name.as_str(), sample(0, 1).bpm, sample(1, 6).name.as_str()), ("export-loop", Some(120.0), "export-shot"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// A Traktor Remix Set opened onto Track deck C (its track stopped) while deck A plays a track: C keeps its track
     /// and Track mode until the whole set has decoded, A plays on, then C is a Remix deck holding the set's cells (a
     /// loop that repeats, a one-shot that ends), Q as the set has it, nothing playing, the .trak untouched. Saved as a
     /// .remixset it reopens on empty Track deck D of a fresh app with the .trak gone. Slot Key Locks come along (an empty
-    /// slot's too), the kick's -0.333333 pitch as -4 with its slot's Key Lock off, and the shot's unmeasured 0.166667 is
+    /// slot's too), the kick's -0.333333 pitch as -4 with its slot's Key Lock off, and the shot's 0.2, between semitones, is
     /// left at 0 and named, all kept through the save and reopen. Opens refused because C plays or loads a
     /// track (whatever the lock preference), when asked or before the set lands, or because the set is broken, leave
     /// C's track, mode and cells as they were and no copied samples or decoded audio behind.
@@ -9033,7 +9120,7 @@ mod sync_audio {
         ];
         let mut slots = grid(&cells);
         slots[0].1[0].1 = slots[0].1[0].1.replace("<Pitch>0</Pitch>", "<Pitch>-0.333333</Pitch>");
-        slots[2].1[0].1 = slots[2].1[0].1.replace("<Pitch>0</Pitch>", "<Pitch>0.166667</Pitch>");
+        slots[2].1[0].1 = slots[2].1[0].1.replace("<Pitch>0</Pitch>", "<Pitch>0.2</Pitch>");
         let set = nisound_keylock(false, &slots, 2, [Some("false"), Some("true"), Some("true"), Some("false")]);
         let trak = dir.join("Electric Test.trak");
         let bytes = archive(&[("loop.wav", &test_wav(&loop_pcm, rate)), ("shot.wav", &test_wav(&shot_pcm, rate)), ("NISOUND", &set)]);
@@ -9111,9 +9198,9 @@ mod sync_audio {
         assert!(!bank.quantize);
         assert_eq!(app.remix_selected[2], None, "a selection from before the set survived it");
         let report = app.remix_sets.reports[2].as_ref().expect("the skipped pitch isn't listed on the deck");
-        assert!(report.title.starts_with("Pitch left at 0 on 1 cells of 'Electric Test.trak'") && report.lines == ["cell 3.1 (page 1) 'Hi Reverse' (0.166667)"], "{} {:?}", report.title, report.lines);
+        assert!(report.title.starts_with("Pitch left at 0 on 1 cells of 'Electric Test.trak'") && report.lines == ["cell 3.1 (page 1) 'Hi Reverse' (0.2)"], "{} {:?}", report.title, report.lines);
         assert!(
-            app.library.status_message.contains("Pitch left at 0 (a Traktor value ReTraktor can't yet read as semitones) on 1: cell 3.1 (page 1) 'Hi Reverse' (0.166667)"),
+            app.library.status_message.contains("Pitch left at 0 (a Traktor value between whole semitones) on 1: cell 3.1 (page 1) 'Hi Reverse' (0.2)"),
             "{}",
             app.library.status_message
         );
