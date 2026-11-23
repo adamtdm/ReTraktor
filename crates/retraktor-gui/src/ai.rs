@@ -123,9 +123,9 @@ impl AiSettings {
         format!(
             "provider={}\napi_key={}\nmodel={}\nbase_url={}\n",
             self.provider.as_str(),
-            self.api_key,
-            self.model,
-            self.base_url,
+            self.api_key.replace(['\r', '\n'], ""),
+            self.model.replace(['\r', '\n'], ""),
+            self.base_url.replace(['\r', '\n'], ""),
         )
     }
 
@@ -225,60 +225,39 @@ pub fn build_playlist_prompt(request: &str, tracks: &[TrackBrief], max_tracks: u
 /// Parses a list of track IDs from model output, handling code fences, surrounding prose, duplicates, and unknown IDs.
 pub fn parse_id_list(reply: &str, valid_ids: &[usize]) -> Vec<usize> {
     let valid_set: HashSet<usize> = valid_ids.iter().copied().collect();
-    let text = reply.trim();
-
-    // Find the innermost or primary bracketed JSON array `[...]`
-    if let (Some(start), Some(end)) = (text.find('['), text.rfind(']')) {
-        if start < end {
-            let slice = &text[start..=end];
-            if let Ok(nums) = serde_json::from_str::<Vec<serde_json::Value>>(slice) {
-                let mut seen = HashSet::new();
-                let mut out = Vec::new();
-                for v in nums {
-                    if let Some(id) = v.as_u64().map(|n| n as usize) {
-                        if valid_set.contains(&id) && seen.insert(id) {
-                            out.push(id);
-                        }
-                    }
-                }
-                if !out.is_empty() {
-                    return out;
-                }
+    for (start, _) in reply.match_indices('[') {
+        let mut json = serde_json::Deserializer::from_str(&reply[start..]).into_iter::<Vec<usize>>();
+        if let Some(Ok(ids)) = json.next() {
+            let mut seen = HashSet::new();
+            let ids: Vec<_> = ids.into_iter()
+                .filter(|id| valid_set.contains(id) && seen.insert(*id))
+                .collect();
+            if !ids.is_empty() {
+                return ids;
             }
         }
     }
-
-    // Fallback: extract integers from any brackets or text
-    let mut out = Vec::new();
-    let mut seen = HashSet::new();
-    let mut cur = String::new();
-    for ch in text.chars() {
-        if ch.is_ascii_digit() {
-            cur.push(ch);
-        } else {
-            if !cur.is_empty() {
-                if let Ok(id) = cur.parse::<usize>() {
-                    if valid_set.contains(&id) && seen.insert(id) {
-                        out.push(id);
-                    }
-                }
-                cur.clear();
-            }
-        }
-    }
-    if !cur.is_empty() {
-        if let Ok(id) = cur.parse::<usize>() {
-            if valid_set.contains(&id) && seen.insert(id) {
-                out.push(id);
-            }
-        }
-    }
-    out
+    Vec::new()
 }
 
 // ---------------------------------------------------------------------------
 // Per-provider request builders and extractors
 // ---------------------------------------------------------------------------
+
+fn gemini_request_url(model: &str) -> String {
+    use std::fmt::Write as _;
+
+    let mut url = String::from("https://generativelanguage.googleapis.com/v1beta/models/");
+    for byte in model.trim().bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
+            url.push(char::from(byte));
+        } else {
+            let _ = write!(url, "%{byte:02X}");
+        }
+    }
+    url.push_str(":generateContent");
+    url
+}
 
 pub fn build_gemini_request(prompt: &str) -> serde_json::Value {
     serde_json::json!({
@@ -367,10 +346,7 @@ pub fn call_ai_api(settings: &AiSettings, prompt: &str) -> Result<String, String
             if settings.api_key.trim().is_empty() {
                 return Err("Gemini API key is required".to_string());
             }
-            let url = format!(
-                "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
-                settings.model.trim()
-            );
+            let url = gemini_request_url(&settings.model);
             let body = build_gemini_request(prompt);
             // Key goes in a header, not the URL, so it can never appear in an error message.
             let resp = agent.post(&url)
@@ -771,6 +747,20 @@ mod tests {
     }
 
     #[test]
+    fn ai_settings_remove_cr_and_lf_from_values() {
+        let settings = AiSettings {
+            provider: AiProvider::Anthropic,
+            api_key: "first\r\nsecond".into(),
+            model: "model\nname".into(),
+            base_url: "http://local\rhost".into(),
+        };
+        assert_eq!(
+            settings.to_text(),
+            "provider=anthropic\napi_key=firstsecond\nmodel=modelname\nbase_url=http://localhost\n"
+        );
+    }
+
+    #[test]
     fn test_parse_id_list_tolerates_fences_and_prose() {
         let valid = vec![1, 2, 3, 4, 5, 10, 20];
 
@@ -784,13 +774,21 @@ mod tests {
         // Duplicates removed, preserving first occurrence
         assert_eq!(parse_id_list("[3, 2, 3, 2, 5]", &valid), vec![3, 2, 5]);
 
-        // Fallback digit extraction without brackets
-        let prose = "I suggest tracks 1 and then 20 followed by 5.";
-        assert_eq!(parse_id_list(prose, &valid), vec![1, 20, 5]);
+        let valid = [1, 2, 3, 120];
+        assert_eq!(
+            parse_id_list("[120 BPM] Here are the IDs: [1, 2, 3] [end]", &valid),
+            vec![1, 2, 3]
+        );
+        assert!(parse_id_list("[120 BPM] Tracks 1, 2 and 3", &valid).is_empty());
+        assert!(parse_id_list(r#"[1, "2", 3]"#, &valid).is_empty());
     }
 
     #[test]
     fn test_gemini_request_and_reply() {
+        assert_eq!(
+            gemini_request_url(" model/é?#% "),
+            "https://generativelanguage.googleapis.com/v1beta/models/model%2F%C3%A9%3F%23%25:generateContent"
+        );
         let req = build_gemini_request("test prompt");
         assert_eq!(req["contents"][0]["parts"][0]["text"], "test prompt");
 

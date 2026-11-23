@@ -835,10 +835,10 @@ impl Mx2HidDriver {
             1 => {
                 // Stems Mode: Pad 1 Drums (Orange), Pad 2 Bass (Blue), Pad 3 Inst (Cyan), Pad 4 Vocals (Magenta)
                 let stem_muted = [
-                    bus.get("app.traktor.decks.1.stems.0.muted").and_then(|v| v.as_bool()).unwrap_or(false),
                     bus.get("app.traktor.decks.1.stems.1.muted").and_then(|v| v.as_bool()).unwrap_or(false),
                     bus.get("app.traktor.decks.1.stems.2.muted").and_then(|v| v.as_bool()).unwrap_or(false),
                     bus.get("app.traktor.decks.1.stems.3.muted").and_then(|v| v.as_bool()).unwrap_or(false),
+                    bus.get("app.traktor.decks.1.stems.4.muted").and_then(|v| v.as_bool()).unwrap_or(false),
                 ];
                 self.leds[20] = if stem_muted[0] { RED_DIM } else { ORANGE_FULL }; // Drums
                 self.leds[21] = if stem_muted[1] { RED_DIM } else { BLUE_FULL };   // Bass
@@ -896,10 +896,10 @@ impl Mx2HidDriver {
         match d2_pad_mode {
             1 => {
                 let stem_muted = [
-                    bus.get("app.traktor.decks.2.stems.0.muted").and_then(|v| v.as_bool()).unwrap_or(false),
                     bus.get("app.traktor.decks.2.stems.1.muted").and_then(|v| v.as_bool()).unwrap_or(false),
                     bus.get("app.traktor.decks.2.stems.2.muted").and_then(|v| v.as_bool()).unwrap_or(false),
                     bus.get("app.traktor.decks.2.stems.3.muted").and_then(|v| v.as_bool()).unwrap_or(false),
+                    bus.get("app.traktor.decks.2.stems.4.muted").and_then(|v| v.as_bool()).unwrap_or(false),
                 ];
                 self.leds[50] = if stem_muted[0] { RED_DIM } else { ORANGE_FULL }; // Drums
                 self.leds[51] = if stem_muted[1] { RED_DIM } else { BLUE_FULL };   // Bass
@@ -1217,10 +1217,10 @@ pub fn scan_linux_ni_hidraw_devices() -> Vec<DetectedNiHidrawDevice> {
             continue;
         };
         // Only the USB IDs count: an unknown NI product or a name containing "mx2" is never taken for an MX2.
-        if let Some(desc) = hidraw_vid_pid(&uevent).and_then(|(vid, pid)| lookup_ni_device(vid, pid)) {
+        if let Some(descriptor) = ni_hidraw_descriptor(&uevent) {
             found.push(DetectedNiHidrawDevice {
                 dev_node: format!("/dev/{name}"),
-                descriptor: desc,
+                descriptor,
             });
         }
     }
@@ -1239,6 +1239,11 @@ pub fn hidraw_vid_pid(uevent: &str) -> Option<(u16, u16)> {
 pub fn hidraw_node_vid_pid(dev_node: &str) -> Option<(u16, u16)> {
     let name = std::path::Path::new(dev_node).file_name()?.to_str()?;
     hidraw_vid_pid(&std::fs::read_to_string(format!("/sys/class/hidraw/{name}/device/uevent")).ok()?)
+}
+
+/// The NI controller a hidraw `uevent` names by its USB IDs, if it is one this crate knows.
+fn ni_hidraw_descriptor(uevent: &str) -> Option<&'static NiDeviceDescriptor> {
+    hidraw_vid_pid(uevent).and_then(|(vid, pid)| lookup_ni_device(vid, pid))
 }
 
 /// Scans all connected DJ hardware across `/sys/class/hidraw`, `/sys/bus/usb/devices`,
@@ -1274,7 +1279,7 @@ pub fn scan_all_dj_hardware() -> Vec<DiscoveredHardwareItem> {
             }
 
             let is_ni = vid == 0x17CC;
-            let is_mx2 = (vid == 0x17CC && pid == TRAKTOR_MX2_PID) || name.to_lowercase().contains("mx2");
+            let is_mx2 = is_ni && matches!(pid, TRAKTOR_MX2_PID | TRAKTOR_MX4_PID);
             let is_dj = is_ni || is_mx2 || name.to_lowercase().contains("traktor") || name.to_lowercase().contains("kontrol")
                 || name.to_lowercase().contains("dj") || name.to_lowercase().contains("pioneer") || name.to_lowercase().contains("denon");
 
@@ -1331,7 +1336,7 @@ pub fn scan_all_dj_hardware() -> Vec<DiscoveredHardwareItem> {
                 let vid = u16::from_str_radix(&vs, 16).unwrap_or(0);
                 let pid = u16::from_str_radix(&ps, 16).unwrap_or(0);
                 let is_ni = vid == 0x17CC;
-                let is_mx2 = (vid == 0x17CC && pid == TRAKTOR_MX2_PID) || prod.to_lowercase().contains("mx2");
+                let is_mx2 = is_ni && matches!(pid, TRAKTOR_MX2_PID | TRAKTOR_MX4_PID);
                 let is_dj = is_ni || is_mx2 || prod.to_lowercase().contains("traktor") || prod.to_lowercase().contains("kontrol");
 
                 if is_dj || is_ni || is_mx2 {
@@ -1526,6 +1531,38 @@ mod tests {
         assert_eq!(led_pkt[0], 0x80);
         assert_eq!(led_pkt[1 + 29], mx2_colors::GREEN_FULL); // left.play lit in vibrant green
         assert_eq!(led_pkt[1 + 74], mx2_colors::GREEN_FULL); // left.bottom.leds.1 green on active loop
+    }
+
+    #[test]
+    fn hidraw_matches_known_ni_ids_only() {
+        assert!(ni_hidraw_descriptor("HID_ID=0003:0000046D:00002420\nHID_NAME=Logitech MX2").is_none());
+        assert!(ni_hidraw_descriptor("HID_ID=0003:000017CC:0000FFFF\nHID_NAME=Traktor MX2").is_none());
+        for pid in [TRAKTOR_MX2_PID, TRAKTOR_MX4_PID, 0x2200] {
+            let uevent = format!("HID_ID=0003:000017CC:{pid:08X}");
+            assert_eq!(ni_hidraw_descriptor(&uevent).unwrap().pid, pid);
+        }
+    }
+
+    #[test]
+    fn stem_mutes_light_the_corresponding_pad_on_each_deck() {
+        let mut bus = PropertyBus::new_traktor_pro4_default();
+        let mut mx2 = Mx2HidDriver::new();
+        for (deck, first_pad) in [(1, 20), (2, 50)] {
+            bus.register(&format!("app.traktor.decks.{deck}.pad_mode"), PropValue::Int(1), None, None, "Pad Mode");
+            for stem in 1..=4 {
+                let key = format!("app.traktor.decks.{deck}.stems.{stem}.muted");
+                assert!(bus.set(&key, PropValue::Bool(true)));
+                let report = mx2.encode_led_report(
+                    &bus,
+                    Mx2BottomShellState::DefaultGlow,
+                    Mx2BottomShellState::DefaultGlow,
+                );
+                for pad in 1..=4 {
+                    assert_eq!(report[first_pad + pad] == mx2_colors::RED_DIM, pad == stem);
+                }
+                assert!(bus.set(&key, PropValue::Bool(false)));
+            }
+        }
     }
 
     #[test]

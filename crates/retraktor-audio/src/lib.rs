@@ -161,20 +161,19 @@ impl FourDeckAudioEngine {
     }
 
     /// Computes Crossfader Left/Right gains for `crossfader` in `0.0..=1.0` and `crossfader_curve`
-    /// (`0.0 = Smooth`, `0.5 = Steep`, `1.0 = Scratch cut`).
+    /// (`< 0.55` Smooth, `0.55..0.9` Steep, `>= 0.9` Scratch cut). Every curve is a flat-top DJ blend:
+    /// both sides sit at unity from their own end through the center and fade only across the far half.
     pub fn crossfader_gains(&self) -> (f32, f32) {
-        let x = self.crossfader.clamp(0.0, 1.0);
-        if self.crossfader_curve >= 0.9 {
-            // Scratch sharp cut with 5% cut-in lag
-            let left = if x <= 0.95 { 1.0 } else { (1.0 - x) * 20.0 };
-            let right = if x >= 0.05 { 1.0 } else { x * 20.0 };
-            (left.clamp(0.0, 1.0), right.clamp(0.0, 1.0))
-        } else {
-            // Constant-power / steep blend
-            let left = (1.0 - x).sqrt();
-            let right = x.sqrt();
-            (left, right)
+        let x = if self.crossfader.is_finite() { self.crossfader.clamp(0.0, 1.0) } else { 0.5 };
+        let curve = if self.crossfader_curve.is_finite() { self.crossfader_curve } else { 0.5 };
+        if curve >= 0.9 {
+            // Scratch: cut in over the outer 5% of travel.
+            return (((1.0 - x) * 20.0).clamp(0.0, 1.0), (x * 20.0).clamp(0.0, 1.0));
         }
+        // Smooth fades gently across the far half; Steep holds longer and drops near the end.
+        let shape = if curve < 0.55 { 0.85 } else { 0.35 };
+        let fade = |t: f32| t.clamp(0.0, 1.0).powf(shape);
+        (fade((1.0 - x) * 2.0), fade(x * 2.0))
     }
 
     /// Synchronizes deck/mixer state from [`PropertyBus`] into the audio engine and writes
@@ -252,6 +251,15 @@ impl FourDeckAudioEngine {
 
     /// Processes a single stereo frame across all 4 decks, returning `(master_l, master_r, cue_l, cue_r)`.
     pub fn process_frame(&mut self, deck_inputs: [(f32, f32); 4]) -> (f32, f32, f32, f32) {
+        self.process_frame_with_fx(deck_inputs, |_| (0.0, 0.0))
+    }
+
+    /// Adds a stereo FX return from the post-fader deck signals before master gain and limiting.
+    pub fn process_frame_with_fx(
+        &mut self,
+        deck_inputs: [(f32, f32); 4],
+        fx_return: impl FnOnce([(f32, f32); 4]) -> (f32, f32),
+    ) -> (f32, f32, f32, f32) {
         let sr = self.routing.sample_rate as f64;
         let dt_sec = 1.0 / sr.max(1.0);
         let _phase = self.clock.advance(1, sr);
@@ -261,6 +269,7 @@ impl FourDeckAudioEngine {
         let mut master_r = 0.0_f32;
         let mut cue_l = 0.0_f32;
         let mut cue_r = 0.0_f32;
+        let mut post_fader = [(0.0, 0.0); 4];
 
         for (i, (in_l, in_r)) in deck_inputs.iter().copied().enumerate() {
             let strip = &mut self.strips[i];
@@ -269,7 +278,7 @@ impl FourDeckAudioEngine {
                 continue;
             }
             strip.transport.advance(dt_sec);
-            let (fl, fr) = strip.filter.process_stereo(in_l, in_r);
+            let (fl, fr) = strip.filter.process_at(in_l, in_r, sr as f32, self.clock.bpm as f32);
             let eq = &strip.eq;
             let (g_lo, g_mid, g_hi) = (eq.knob_to_linear(eq.low), eq.knob_to_linear(eq.mid), eq.knob_to_linear(eq.high));
             let (pre_l, pre_r) = strip.isolator.process_stereo(self.routing.sample_rate, fl, fr, g_lo, g_mid, g_hi);
@@ -288,12 +297,18 @@ impl FourDeckAudioEngine {
                 1.0
             };
 
-            let post_gain = strip.volume * xf_scalar * self.master_volume;
-            master_l += pre_l * post_gain;
-            master_r += pre_r * post_gain;
+            let post_gain = strip.volume * xf_scalar;
+            post_fader[i] = (pre_l * post_gain, pre_r * post_gain);
+            master_l += post_fader[i].0;
+            master_r += post_fader[i].1;
         }
 
-        let (lim_l, lim_r) = self.maximizer.process_stereo(master_l, master_r);
+        let (fx_l, fx_r) = fx_return(post_fader);
+        let (lim_l, lim_r) = self.maximizer.process_stereo_at(
+            (master_l + fx_l) * self.master_volume,
+            (master_r + fx_r) * self.master_volume,
+            sr as f32,
+        );
         self.last_master_peak = (lim_l.abs().clamp(0.0, 1.0), lim_r.abs().clamp(0.0, 1.0));
         (lim_l, lim_r, cue_l, cue_r)
     }
@@ -324,5 +339,28 @@ mod tests {
             .and_then(|v| v.as_f64())
             .unwrap_or(0.0);
         assert!(meter > 0.1);
+    }
+
+    #[test]
+    fn crossfader_curves_are_flat_top_with_distinct_shapes() {
+        let gains = |pos: f32, curve: f32| {
+            let mut e = FourDeckAudioEngine::default();
+            e.crossfader = pos;
+            e.crossfader_curve = curve;
+            e.crossfader_gains()
+        };
+        for curve in [0.5, 0.6, 0.95] {
+            assert_eq!(gains(0.0, curve), (1.0, 0.0), "curve {curve} left end");
+            assert_eq!(gains(0.5, curve), (1.0, 1.0), "curve {curve} center");
+            assert_eq!(gains(1.0, curve), (0.0, 1.0), "curve {curve} right end");
+        }
+        for curve in [0.5, 0.6] {
+            let (l, r) = gains(0.75, curve);
+            assert!(r == 1.0 && l < 1.0 && l > 0.0, "curve {curve} far-half fade: {l}");
+        }
+        let (smooth, steep) = (gains(0.25, 0.5).1, gains(0.25, 0.6).1);
+        assert!(steep > smooth + 0.1, "Smooth {smooth} vs Steep {steep}");
+        assert_eq!(gains(0.25, 0.95).1, 1.0, "scratch is fully in past 5%");
+        assert!((gains(0.02, 0.95).1 - 0.4).abs() < 1e-5, "scratch cut-in ramp");
     }
 }
