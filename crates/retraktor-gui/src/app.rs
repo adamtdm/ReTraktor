@@ -1,4 +1,4 @@
-use crate::audio::{AudioSystem, LoadedTrackAudio, PEAKS_PER_SEC};
+use crate::audio::{beat_phase_diff, AudioSystem, LoadedTrackAudio, PEAKS_PER_SEC};
 use crate::dot;
 use crate::library_ui::LibraryManager;
 use crate::preferences::{PreferencesDialog, PrefsTab};
@@ -1855,8 +1855,9 @@ impl ReTraktorApp {
                 state.engine.strips[d].xfader_left = self.channel_xfader_assign[d] == 0;
                 state.engine.strips[d].xfader_right = self.channel_xfader_assign[d] == 2;
 
-                let mut nudge = 0.0;
-                // Sync holds the tempo to the other deck (or the master tempo) and eases the beats together.
+                // Sync holds the tempo to the leader (or the master tempo) here; the audio callback keeps the beats
+                // together (`phase_lock`), every block, from its own playheads.
+                let mut lock = None;
                 let leader = sync_leader(self.tempo_master_deck, d);
                 if let (true, Some(other)) = (self.deck_sync_enabled[d], leader) {
                     if let Some((bpm, offset)) = grids[d] {
@@ -1864,23 +1865,18 @@ impl ReTraktorApp {
                             .map(|(b, _)| b * (1.0 + self.deck_pitch_fader[other] as f64 / 100.0))
                             .unwrap_or(self.master_tempo);
                         self.deck_pitch_fader[d] = ((sync_ratio(bpm, target) - 1.0) * 100.0) as f32;
-                        if let (Some((other_bpm, other_offset)), true, true) = (grids[other], state.is_playing[d], state.is_playing[other]) {
-                            // Either deck just started: jump onto the bar like SYNC does; after that only drift is nudged.
-                            if !self.sync_was_playing[d] || !self.sync_was_playing[other] {
+                        if let Some(leader_grid) = grids[other] {
+                            // Only this deck starting snaps it onto the bar; a deck already playing is never jumped.
+                            if state.is_playing[d] && !self.sync_was_playing[d] && state.is_playing[other] {
                                 snap_bars(&mut state, d, other);
                             }
-                            let fold = sync_octave(bpm, other_bpm);
-                            let behind = beat_phase_diff(
-                                (state.playhead_sec[other] - other_offset) * other_bpm / 60.0,
-                                (state.playhead_sec[d] - offset) * (bpm * fold) / 60.0,
-                                1.0,
-                            );
-                            nudge = (behind * 0.2).clamp(-0.03, 0.03);
+                            let grid = (bpm * sync_octave(bpm, leader_grid.0), offset);
+                            lock = Some(crate::audio::SyncLock { leader: other, grid, leader_grid });
                         }
                     }
                 }
-                let ratio = 1.0 + self.deck_pitch_fader[d] as f64 / 100.0 + nudge;
-                state.pitch_ratio[d] = ratio;
+                state.sync_follow[d] = lock;
+                state.pitch_ratio[d] = 1.0 + self.deck_pitch_fader[d] as f64 / 100.0;
 
                 let bpm = state.loaded_tracks[d]
                     .as_ref()
@@ -2982,6 +2978,7 @@ impl ReTraktorApp {
         if bpm(d) > 0.0 {
             self.deck_pitch_fader[d] = ((sync_ratio(bpm(d), target) - 1.0) * 100.0) as f32;
         }
+        state.sync_reset[d] = true; // a fresh SYNC drops any offset set by hand under the last one
         if let Some(o) = leader.filter(|&o| state.is_playing[o]) {
             snap_bars(&mut state, d, o);
         }
@@ -4871,13 +4868,6 @@ fn sync_ratio(bpm: f64, target: f64) -> f64 {
     target.max(20.0) / (bpm.max(20.0) * sync_octave(bpm, target))
 }
 
-/// How far (in beats, within ±period/2) a deck at `beats` must move forward to line up with the master
-/// every `period` beats: 1 for the beat, 4 for the bar.
-fn beat_phase_diff(master_beats: f64, beats: f64, period: f64) -> f64 {
-    let diff = (master_beats - beats).rem_euclid(period);
-    if diff > period / 2.0 { diff - period } else { diff }
-}
-
 /// Moves deck `d` so its bar lines meet `other`'s (at most two beats either way).
 /// shortcut: counts bars in each track's own beats, so a half-time pairing (70 under 140) lines up every other bar.
 /// Decodes a finished separation's stems on a worker and installs them on each listed deck that still holds
@@ -4941,6 +4931,7 @@ fn snap_bars(state: &mut crate::audio::AudioSharedState, d: usize, other: usize)
         let len = state.loaded_tracks[d].as_ref().map_or(0.0, |t| t.duration_sec);
         let from = state.playhead_sec[d];
         state.seek_by(d, (from + behind * 60.0 / scaled_bpm).clamp(0.0, len) - from);
+        state.sync_reset[d] = true;
     }
 }
 
@@ -6156,6 +6147,31 @@ mod sync_audio {
             assert!(bar_gap(&app).abs() < 1e-6, "beat jump left the bars {} beats apart", bar_gap(&app));
             assert!((app.audio.shared.lock().unwrap().pitch_ratio[1] - ratio).abs() < 1e-9);
         }
+    }
+
+    /// The leader starting never jumps a synced deck that is already playing (it may be on air); the callback's
+    /// phase lock brings it round gently instead. The UI hands that lock over with both grids.
+    #[test]
+    fn leader_starting_never_jumps_a_playing_synced_deck() {
+        let mut app = ReTraktorApp::default();
+        {
+            let mut s = app.audio.shared.lock().unwrap();
+            s.loaded_tracks[0] = Some(track(120.0));
+            s.loaded_tracks[1] = Some(track(130.0));
+            s.is_playing = [false, true, false, false];
+            s.playhead_sec = [10.0, 30.0 + 2.6 * 60.0 / 130.0, 0.0, 0.0];
+        }
+        app.tempo_master_deck = Some(0);
+        app.deck_sync_enabled[1] = true;
+        app.sync_audio_state();
+        let before = app.audio.shared.lock().unwrap().playhead_sec[1];
+        app.audio.shared.lock().unwrap().is_playing[0] = true;
+        app.sync_audio_state();
+        let s = app.audio.shared.lock().unwrap();
+        assert_eq!(s.playhead_sec[1], before, "B was jumped when A started");
+        let lock = s.sync_follow[1].expect("B hands its phase lock to the callback");
+        assert_eq!((lock.leader, lock.grid, lock.leader_grid), (0, (130.0, 0.0), (120.0, 0.0)));
+        assert!((s.pitch_ratio[1] - 120.0 / 130.0).abs() < 1e-6, "the UI sets the tempo; no nudge on top");
     }
 
     fn render(app: &ReTraktorApp, seconds: f64, block: usize, rate: u32) {

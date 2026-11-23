@@ -824,6 +824,14 @@ pub struct AudioSharedState {
     pub playhead_sec: [f64; 4],
     pending_seek: [Option<Seek>; 4],
     pub pitch_ratio: [f64; 4],
+    /// Phase lock, set by the UI for each synced deck: the deck it follows, and both beatgrids as
+    /// `(bpm, first beat sec)` with the follower's bpm already folded to the leader's octave.
+    pub sync_follow: [Option<SyncLock>; 4],
+    /// UI to callback: forget the deck's phase offset and correction (SYNC pressed, or it snapped on play).
+    pub sync_reset: [bool; 4],
+    /// Callback side: the speed factor phase correction applies, and the beat offset the DJ chose by hand.
+    sync_adjust: [f64; 4],
+    sync_user_offset: [f64; 4],
     pub loop_active: [bool; 4],
     pub loop_start_sec: [f64; 4],
     pub loop_len_sec: [f64; 4],
@@ -963,6 +971,10 @@ impl Default for AudioSharedState {
             playhead_sec: [0.0, 0.0, 0.0, 0.0],
             pending_seek: [None; 4],
             pitch_ratio: [1.0, 1.0, 1.0, 1.0],
+            sync_follow: [None; 4],
+            sync_reset: [false; 4],
+            sync_adjust: [1.0; 4],
+            sync_user_offset: [0.0; 4],
             loop_active: [false, false, false, false],
             loop_start_sec: [0.0, 0.0, 0.0, 0.0],
             loop_len_sec: [8.0, 8.0, 8.0, 8.0],
@@ -2219,6 +2231,7 @@ impl Renderer {
             tap.begin_block(sr);
         }
         jog_physics(&mut self.state, (output.len() / channels) as f64 / (sr as f64).max(1.0));
+        phase_lock(&mut self.state);
         self.mix(tap.as_deref_mut(), output, channels, sr, to_sample);
         if let Some(tap) = tap {
             tap.end_block();
@@ -2234,6 +2247,13 @@ impl Renderer {
         let r = &mut self.state;
         r.is_playing = s.is_playing;
         r.pitch_ratio = s.pitch_ratio;
+        r.sync_follow = s.sync_follow;
+        for d in 0..4 {
+            if std::mem::take(&mut s.sync_reset[d]) {
+                r.sync_adjust[d] = 1.0;
+                r.sync_user_offset[d] = 0.0;
+            }
+        }
         r.loop_active = s.loop_active;
         r.loop_start_sec = s.loop_start_sec;
         r.loop_len_sec = s.loop_len_sec;
@@ -2427,6 +2447,50 @@ fn settle_end(r: &mut AudioSharedState, mine: &Option<DeckPcm>, s: &mut AudioSha
     r.is_playing[d] = s.is_playing[d];
 }
 
+/// A synced deck's phase lock: who it follows and both beatgrids (see [`AudioSharedState::sync_follow`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SyncLock {
+    pub leader: usize,
+    pub grid: (f64, f64),
+    pub leader_grid: (f64, f64),
+}
+
+/// How far (in beats, within ±period/2) a deck at `beats` must move forward to line up with the leader
+/// every `period` beats: 1 for the beat, 4 for the bar.
+pub(crate) fn beat_phase_diff(leader_beats: f64, beats: f64, period: f64) -> f64 {
+    let diff = (leader_beats - beats).rem_euclid(period);
+    if diff > period / 2.0 { diff - period } else { diff }
+}
+
+/// Once per block, from the callback's own playheads: the speed factor that keeps each synced deck on its
+/// leader's beat. Mixxx's control loop (`BpmControl::calcSyncAdjustment`): errors under 1% of a beat are left
+/// alone; above that a proportional pull, changing at most 2% per block and never past ±5%. A hand on the jog
+/// (scratch or a pitch bend) is the DJ choosing an offset: it is adopted, not fought.
+fn phase_lock(r: &mut AudioSharedState) {
+    const DEADBAND: f64 = 0.01;
+    const GAIN: f64 = 0.7;
+    const STEP_CAP: f64 = 0.02;
+    const CAP: f64 = 0.05;
+    for d in 0..4 {
+        let Some(lock) = r.sync_follow[d].filter(|l| r.is_playing[d] && r.is_playing[l.leader]) else {
+            r.sync_adjust[d] = 1.0;
+            continue;
+        };
+        let beats = |playhead: f64, (bpm, first): (f64, f64)| (playhead - first) * bpm / 60.0;
+        let raw = beat_phase_diff(beats(r.playhead_sec[lock.leader], lock.leader_grid), beats(r.playhead_sec[d], lock.grid), 1.0);
+        let touched = |i: usize| r.scratch_active[i] || r.scratch_ramping[i] || r.jog_nudge_rate[i] != 0.0;
+        if touched(d) || touched(lock.leader) {
+            r.sync_user_offset[d] = raw;
+            r.sync_adjust[d] = 1.0;
+            continue;
+        }
+        let error = beat_phase_diff(raw - r.sync_user_offset[d], 0.0, 1.0);
+        let want = if error.abs() < DEADBAND { 0.0 } else { GAIN * error };
+        let last = r.sync_adjust[d] - 1.0;
+        r.sync_adjust[d] = 1.0 + (last + (want - last).clamp(-STEP_CAP, STEP_CAP)).clamp(-CAP, CAP);
+    }
+}
+
 /// One block of jog physics in the callback's state: the scratch filter observes the ticks that arrived (none
 /// is an observation too), and a released platter eases back to playing speed.
 fn jog_physics(r: &mut AudioSharedState, block_dt: f64) {
@@ -2537,7 +2601,7 @@ impl Renderer {
                 let effective_rate = if scratching {
                     state.scratch_rate[d]
                 } else {
-                    state.pitch_ratio[d] + state.jog_nudge_rate[d]
+                    state.pitch_ratio[d] * state.sync_adjust[d] + state.jog_nudge_rate[d]
                 };
 
                 let mut true_stems = None;
@@ -3451,6 +3515,74 @@ mod tests {
         out
     }
 
+    /// Decks A and B both at 120 BPM with grids at 0 s; B follows A, `behind` beats behind it.
+    fn synced_pair(behind: f64) -> (Arc<Mutex<AudioSharedState>>, Renderer) {
+        let shared = Arc::new(Mutex::new(AudioSharedState::default()));
+        {
+            let mut s = shared.lock().unwrap();
+            s.loaded_tracks[0] = Some(tone_track(440.0, 48_000, 30.0));
+            s.loaded_tracks[1] = Some(tone_track(330.0, 48_000, 30.0));
+            s.playhead_sec = [4.0, 4.0 - behind * 0.5, 0.0, 0.0];
+            s.is_playing = [true, true, false, false];
+            s.sync_follow[1] = Some(SyncLock { leader: 0, grid: (120.0, 0.0), leader_grid: (120.0, 0.0) });
+        }
+        let r = Renderer::new(Arc::clone(&shared), Arc::default(), Arc::default());
+        (shared, r)
+    }
+
+    /// B's distance from A's beat, in beats, as the callback has it.
+    fn phase_error(r: &Renderer) -> f64 {
+        let p = r.state.playhead_sec;
+        beat_phase_diff(p[0] * 2.0, p[1] * 2.0, 1.0)
+    }
+
+    /// The callback pulls a synced deck onto the beat by itself, no UI frames needed (a minimised or busy window
+    /// used to freeze the correction), never faster than ±5%, and leaves it at exactly its tempo once there.
+    #[test]
+    fn phase_lock_converges_in_the_callback_alone() {
+        for behind in [0.15, -0.3] {
+            let (_shared, mut r) = synced_pair(behind);
+            let mut fastest = 0.0f64;
+            for _ in 0..(48_000 * 4 / 128) {
+                block(&mut r);
+                fastest = fastest.max((r.state.sync_adjust[1] - 1.0).abs());
+            }
+            assert!(phase_error(&r).abs() < 0.011, "{behind}: still {} beats off", phase_error(&r));
+            assert!(fastest <= 0.05 + 1e-12, "{behind}: corrected at {fastest}");
+            assert_eq!(r.state.sync_adjust[1], 1.0, "{behind}: in phase, the deck plays at its tempo");
+        }
+        // Inside the 1% deadband nothing moves.
+        let (_shared, mut r) = synced_pair(0.005);
+        block(&mut r);
+        assert_eq!(r.state.sync_adjust[1], 1.0);
+    }
+
+    /// A pitch bend on the jog while synced is the DJ choosing an offset: the lock keeps it instead of undoing it.
+    /// SYNC pressed again (a reset) drops it.
+    #[test]
+    fn phase_lock_keeps_a_hand_nudge() {
+        let (shared, mut r) = synced_pair(0.0);
+        for _ in 0..20 {
+            block(&mut r);
+        }
+        // Bend B ahead for a while, then let the bend decay on its own.
+        shared.lock().unwrap().jog_nudge(1, 400, 1.0);
+        for _ in 0..(48_000 * 3 / 128) {
+            block(&mut r);
+        }
+        let chosen = phase_error(&r);
+        assert!(chosen.abs() > 0.02, "the bend moved B by {chosen} beats (past the 0.01 deadband)");
+        for _ in 0..(48_000 * 2 / 128) {
+            block(&mut r);
+        }
+        assert!((phase_error(&r) - chosen).abs() < 0.011, "kept {chosen}, now {}", phase_error(&r));
+        shared.lock().unwrap().sync_reset[1] = true;
+        for _ in 0..(48_000 * 4 / 128) {
+            block(&mut r);
+        }
+        assert!(phase_error(&r).abs() < 0.011, "a fresh SYNC locks to the beat again");
+    }
+
     /// After the UI held the lock for 100 callbacks (the deck played on to 1.27 s): a hot cue or click to 5 s
     /// lands on 5 s, also when 5 s is the very spot last published; a move by +2 s (beat jump, nudge, drag,
     /// sync) goes from where the deck had got to; a new track starts at 0 whatever the old one had played; a
@@ -3618,6 +3750,8 @@ mod tests {
     fn deck_reverb_rings_after_the_channel_fader_closes() {
         for enabled in [false, true] {
             let (shared, _, mut r) = playing_deck();
+            // Sample-exact silence checks: without the master limiter's 1.5 ms lookahead delay.
+            shared.lock().unwrap().limiter_enabled = false;
             shared.lock().unwrap().fx_enabled[0] = enabled;
             for _ in 0..64 {
                 block(&mut r);
@@ -3732,6 +3866,7 @@ mod tests {
                 let mut s = shared.lock().unwrap();
                 s.loaded_tracks[0] = Some(flat_track(frames, track_sr));
                 s.pitch_ratio[0] = pitch;
+                s.limiter_enabled = false; // frame-exact: no lookahead delay
                 s.start_playing(0);
             }
             let mut r = Renderer::new(Arc::clone(&shared), Arc::default(), Arc::default());
@@ -4083,6 +4218,7 @@ mod tests {
                 let mut t = flat_track(256, sr); // reads past these frames hold the last one: no minutes of PCM
                 t.duration_sec = secs;
                 s.loaded_tracks[0] = Some(t);
+                s.limiter_enabled = false; // frame-exact: no lookahead delay
                 s.is_playing[0] = true;
             }
             let mut r = Renderer::new(Arc::clone(&shared), Arc::default(), Arc::default());

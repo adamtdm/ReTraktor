@@ -92,6 +92,12 @@ fn percent_decode_path(s: &str) -> String {
 }
 
 fn main() -> eframe::Result<()> {
+    // Before any thread starts: PipeWire must play our channels as sent (main on 1–2, headphones on 3–4). Left to
+    // remix, it folds the cue pair into the speakers on a stereo device and copies the main mix into the headphones
+    // on a 4-out one, so both decks are heard whatever the crossfader says. A user's own PIPEWIRE_PROPS wins.
+    if std::env::var_os("PIPEWIRE_PROPS").is_none() {
+        std::env::set_var("PIPEWIRE_PROPS", "{ channelmix.disable = true stream.dont-remix = true }");
+    }
     let nml_files = nml_paths_from_args(std::env::args().skip(1));
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("ReTraktor")

@@ -168,11 +168,15 @@ pub struct ThreeBandIsolator {
     ch: [Lr4Bands; 2],
     g: (f32, f32),
     sr: u32,
+    /// Band gains as played, gliding to the knobs' gains (`None` until the first frame).
+    played: Option<[f32; 3]>,
+    glide: f32,
 }
 
 impl ThreeBandIsolator {
     pub const LOW_HZ: f32 = 300.0;
     pub const HIGH_HZ: f32 = 2500.0;
+    const GLIDE_SEC: f32 = 0.005;
 
     /// Applies linear band gains (`1.0` = unity, `0.0` = kill) to one stereo frame.
     pub fn process_stereo(&mut self, sr: u32, l: f32, r: f32, g_low: f32, g_mid: f32, g_high: f32) -> (f32, f32) {
@@ -180,8 +184,16 @@ impl ThreeBandIsolator {
             let fs = sr.max(1) as f32;
             let tan = |f: f32| (std::f32::consts::PI * f.min(fs * 0.45) / fs).tan();
             self.g = (tan(Self::LOW_HZ), tan(Self::HIGH_HZ));
+            self.glide = 1.0 - (-1.0 / (Self::GLIDE_SEC * fs)).exp();
             self.sr = sr;
         }
+        // A knob move glides over ~5 ms, as Mixxx ramps its EQ gains: a step in gain is heard as a click.
+        let want = [g_low, g_mid, g_high].map(|g| if g.is_finite() { g.max(0.0) } else { 1.0 });
+        let played = self.played.get_or_insert(want);
+        for (p, w) in played.iter_mut().zip(want) {
+            *p += (w - *p) * self.glide;
+        }
+        let [g_low, g_mid, g_high] = *played;
         let (glo, ghi) = self.g;
         let mix = |c: &mut Lr4Bands, x: f32| {
             let (lo, mid, hi) = c.split(x, glo, ghi);
@@ -764,17 +776,26 @@ impl StemSummer {
     }
 }
 
-/// Master Bus Ozone Maximizer & Brickwall Limiter modeled on Traktor Pro 4's `iZTraktorTDSP.dylib`
-/// (`_TestableDSP_Create` / `MOTHERSHIP_9_13_6`).
+/// Lookahead room: 2 ms at 192 kHz.
+const LIMITER_MAX_LOOKAHEAD: usize = 400;
+
+/// Master bus brickwall limiter. It sees each peak `LOOKAHEAD_SEC` early and turns down smoothly before it
+/// arrives, then lets go over `RELEASE_SEC`. A release shorter than a bass cycle would ride the waveform
+/// itself (the old 4 ms one added 13% distortion to a 60 Hz note pushed 6 dB over).
 #[derive(Debug, Clone)]
 pub struct OzoneMaximizerDsp {
     pub enabled: bool,
     pub boost_db: f32,
     pub ceiling_db: f32,
-    envelope: f32,
-    /// `(boost_db, ceiling_db, sample_rate)` that `cache` = `(pre_gain, ceiling, release)` was computed for.
+    gain: f32,
+    /// Delayed input frames and the gain each one needs, as rings of `cache.look` entries.
+    delay: [[f32; 2]; LIMITER_MAX_LOOKAHEAD],
+    need: [f32; LIMITER_MAX_LOOKAHEAD],
+    pos: usize,
+    /// `(boost_db, ceiling_db, sample_rate)` that `cache` was computed for.
     cache_key: (f32, f32, f32),
-    cache: (f32, f32, f32),
+    /// `(pre_gain, ceiling, attack coeff, release coeff, lookahead frames)`.
+    cache: (f32, f32, f32, f32, usize),
 }
 
 impl Default for OzoneMaximizerDsp {
@@ -783,19 +804,26 @@ impl Default for OzoneMaximizerDsp {
             enabled: true,
             boost_db: 0.0,
             ceiling_db: -0.1,
-            envelope: 0.0,
+            gain: 1.0,
+            delay: [[0.0; 2]; LIMITER_MAX_LOOKAHEAD],
+            need: [1.0; LIMITER_MAX_LOOKAHEAD],
+            pos: 0,
             cache_key: (f32::NAN, f32::NAN, f32::NAN),
-            cache: (1.0, 1.0, 0.995),
+            cache: (1.0, 1.0, 1.0, 1.0, 1),
         }
     }
 }
 
 impl OzoneMaximizerDsp {
+    const LOOKAHEAD_SEC: f32 = 0.0015;
+    const RELEASE_SEC: f32 = 0.15;
+
     /// One frame at 48 kHz; prefer [`Self::process_stereo_at`] with the real rate.
     pub fn process_stereo(&mut self, left: f32, right: f32) -> (f32, f32) {
         self.process_stereo_at(left, right, 48_000.0)
     }
 
+    /// One frame through the limiter, delayed by the lookahead (1.5 ms) whether or not it limits.
     pub fn process_stereo_at(&mut self, left: f32, right: f32, sample_rate: f32) -> (f32, f32) {
         let left = if left.is_finite() { left } else { 0.0 };
         let right = if right.is_finite() { right } else { 0.0 };
@@ -807,31 +835,29 @@ impl OzoneMaximizerDsp {
         let sr = if sample_rate.is_finite() { sample_rate.max(1.0) } else { 48_000.0 };
         let key = (boost_db, ceiling_db, sr);
         if key != self.cache_key {
-            // Release is 0.995 per sample at 48 kHz (~4 ms), kept the same length in time at other rates.
-            let release = 0.995_f32.powf(48_000.0 / sr);
-            self.cache = (10.0_f32.powf(boost_db / 20.0), 10.0_f32.powf(ceiling_db / 20.0), release);
+            let look = ((Self::LOOKAHEAD_SEC * sr).round() as usize).clamp(1, LIMITER_MAX_LOOKAHEAD);
+            // Attack settles (to 1%) within the lookahead, so the gain is down before the peak is played.
+            let attack = 1.0 - (-4.6 / look as f32).exp();
+            let release = 1.0 - (-1.0 / (Self::RELEASE_SEC * sr)).exp();
+            self.cache = (10.0_f32.powf(boost_db / 20.0), 10.0_f32.powf(ceiling_db / 20.0), attack, release, look);
             self.cache_key = key;
+            self.pos %= look;
         }
-        let (pre_gain, ceiling, release) = self.cache;
-        let l = left * pre_gain;
-        let r = right * pre_gain;
+        let (pre_gain, ceiling, attack, release, look) = self.cache;
+        let (l, r) = (left * pre_gain, right * pre_gain);
         let peak = l.abs().max(r.abs());
-        if peak > self.envelope {
-            self.envelope = peak;
-        } else {
-            self.envelope = self.envelope * release + peak * (1.0 - release);
-            if self.envelope < 1e-15 {
-                self.envelope = 0.0;
-            }
-        }
-        let atten = if self.envelope > ceiling {
-            ceiling / self.envelope
-        } else {
-            1.0
-        };
+        let out = self.delay[self.pos];
+        self.delay[self.pos] = [l, r];
+        self.need[self.pos] = if peak > ceiling { ceiling / peak } else { 1.0 };
+        self.pos = (self.pos + 1) % look;
+        // The lowest gain any frame still in the lookahead needs.
+        let target = self.need[..look].iter().copied().fold(1.0_f32, f32::min);
+        let coeff = if target < self.gain { attack } else { release };
+        self.gain += (target - self.gain) * coeff;
+        // The clamp only catches what the smoothed attack leaves over (a fraction of a dB, rarely).
         (
-            (l * atten).clamp(-ceiling, ceiling),
-            (r * atten).clamp(-ceiling, ceiling),
+            (out[0] * self.gain).clamp(-ceiling, ceiling),
+            (out[1] * self.gain).clamp(-ceiling, ceiling),
         )
     }
 }
@@ -1001,10 +1027,12 @@ mod tests {
 
     #[test]
     fn ozone_uses_cached_db_gains_and_holds_the_ceiling() {
+        // Output lags the input by the 1.5 ms lookahead; below the ceiling it is the boosted input exactly.
         let mut ozone = OzoneMaximizerDsp { boost_db: 6.0, ..Default::default() };
-        assert_eq!(ozone.process_stereo(0.1, -0.1), (0.1 * 10f32.powf(0.3), -0.1 * 10f32.powf(0.3)));
+        let steady = |oz: &mut OzoneMaximizerDsp, x: f32| (0..200).map(|_| oz.process_stereo(x, -x)).last().unwrap();
+        assert_eq!(steady(&mut ozone, 0.1), (0.1 * 10f32.powf(0.3), -0.1 * 10f32.powf(0.3)));
         ozone.boost_db = 3.0;
-        assert_eq!(ozone.process_stereo(0.1, 0.1).0, 0.1 * 10f32.powf(0.15));
+        assert_eq!(steady(&mut ozone, 0.1).0, 0.1 * 10f32.powf(0.15));
         let ceiling = 10f32.powf(-0.1 / 20.0);
         ozone.boost_db = 12.0;
         for i in 0..4800 {
@@ -1045,5 +1073,50 @@ mod tests {
         let mut ozone = OzoneMaximizerDsp { boost_db: 6.0, ..Default::default() };
         let (ol, or) = ozone.process_stereo(0.9, -0.9);
         assert!(ol.abs() <= 1.0 && or.abs() <= 1.0);
+    }
+
+    /// Limiting a bass note must turn it down, not distort it: the old 4 ms release rode each 60 Hz cycle (13% THD).
+    #[test]
+    fn limiting_bass_stays_clean() {
+        for (hz, amp) in [(60.0f32, 2.0f32), (60.0, 3.0), (1000.0, 2.0)] {
+            let mut m = OzoneMaximizerDsp::default();
+            let (sr, n) = (48_000.0, 48_000usize);
+            let out: Vec<f32> = (0..n).map(|i| m.process_stereo_at(amp * (i as f32 * hz * std::f32::consts::TAU / sr).sin(), 0.0, sr).0).collect();
+            let tail = &out[n / 2..];
+            let w = std::f32::consts::TAU * hz / sr;
+            let (mut re, mut im, mut tot) = (0.0f64, 0.0f64, 0.0f64);
+            for (i, &v) in tail.iter().enumerate() {
+                let t = (i + n / 2) as f32;
+                re += (v * (w * t).cos()) as f64;
+                im += (v * (w * t).sin()) as f64;
+                tot += (v * v) as f64;
+            }
+            let len = tail.len() as f64;
+            let fund = 2.0 * (re * re + im * im) / (len * len);
+            let thd = ((tot / len - fund).max(0.0) / fund).sqrt();
+            assert!(thd < 0.01, "{hz} Hz {amp}x over: THD {:.1}%", thd * 100.0);
+            assert!(tail.iter().all(|v| v.abs() <= 10f32.powf(-0.1 / 20.0)), "ceiling held");
+        }
+    }
+
+    /// Turning an EQ knob mid-note never steps the output: the gain glides, so neighbouring samples stay close.
+    #[test]
+    fn eq_knob_jump_is_click_free() {
+        let mut eq = ThreeBandIsolator::default();
+        let sr = 48_000u32;
+        let mut prev = 0.0f32;
+        let mut worst = 0.0f32;
+        for i in 0..sr as usize {
+            let x = (i as f32 * 80.0 * std::f32::consts::TAU / sr as f32).sin() * 0.5;
+            // Low knob slams from unity to +9 dB and back to kill, as a 12-bit pot jump or a kill button does.
+            let g = match i { 0..=11_999 => 1.0, 12_000..=23_999 => 2.82, _ => 0.0 };
+            let (y, _) = eq.process_stereo(sr, x, x, g, 1.0, 1.0);
+            if i > 100 {
+                worst = worst.max((y - prev).abs());
+            }
+            prev = y;
+        }
+        // An 80 Hz sine at its +9 dB level moves at most ~0.15 per sample; a hard gain step would jump ~0.9.
+        assert!(worst < 0.2, "gain step heard as a click: {worst}");
     }
 }

@@ -332,8 +332,12 @@ mod tests {
         let mut engine = FourDeckAudioEngine::default();
         engine.sync_with_property_bus(&mut bus);
 
-        let (ml, mr, _cl, _cr) =
-            engine.process_frame([(0.6, 0.6), (0.0, 0.0), (0.0, 0.0), (0.0, 0.0)]);
+        // A 220 Hz tone through Crush and the master; the limiter's 1.5 ms lookahead delays the first frames.
+        let (ml, mr) = (0..4800).fold((0.0f32, 0.0f32), |(pl, pr), i| {
+            let x = 0.6 * (i as f32 * 220.0 * std::f32::consts::TAU / 48_000.0).sin();
+            let (l, r, _, _) = engine.process_frame([(x, x), (0.0, 0.0), (0.0, 0.0), (0.0, 0.0)]);
+            (pl.max(l.abs()), pr.max(r.abs()))
+        });
         assert!(ml > 0.1 && mr > 0.1);
 
         engine.sync_with_property_bus(&mut bus);
