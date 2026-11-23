@@ -363,11 +363,13 @@ fn parse_entry_node(node: &XmlNode) -> NmlEntry {
     let tempo = node.child("TEMPO").map(|t| NmlTempo {
         bpm: t
             .attr("BPM")
-            .and_then(|v| v.parse().ok())
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|b| b.is_finite() && *b > 0.0)
             .unwrap_or(120.0),
         bpm_quality: t
             .attr("BPM_QUALITY")
-            .and_then(|v| v.parse().ok())
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|q| q.is_finite())
             .unwrap_or(100.0),
     });
     let loudness = node.child("LOUDNESS").map(|l| NmlLoudness {

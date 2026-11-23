@@ -120,6 +120,12 @@ pub struct ReTraktorApp {
     pub show_next_track_panel: bool,
     pub next_track_picks: Vec<(usize, f32, String)>,
     pub next_track_target_deck: usize,
+    /// The highlighted pick: arrows move it, Enter loads it.
+    pub next_track_selected: usize,
+    /// Digit keys handled by the Next Track picker stay suppressed for hotcues until released.
+    picker_swallowed_digits: [bool; 5],
+    /// Read when the picker opens, not every frame.
+    cached_ai_settings: crate::ai::AiSettings,
     pub ai_rerank_runner: Option<crate::ai::AiRerankRunner>,
     pub ai_rerank_status: Option<String>,
 
@@ -159,6 +165,9 @@ pub struct ReTraktorApp {
     pub fx2_dry_wet: f32,
     pub fx2_param: [f32; 3],
     pub fx2_on: bool,
+    pub fx_kind: [MixerFxKind; 2],
+    /// Which FX units (1, 2) each deck feeds.
+    pub deck_fx_assign: [[bool; 2]; 4],
 
     // Decks Performance State
     pub deck_pitch_fader: [f32; 4], // -8% to +8%
@@ -239,7 +248,7 @@ pub struct ReTraktorApp {
     pub mx2_hidraw_file: Option<File>,
     pub mx2_dev_node: Option<String>,
     pub mx2_model_name: Option<String>,
-    pub mx2_scan_counter: u32,
+    mx2_last_scan: Option<std::time::Instant>,
     pub mx2_access_status: Option<String>,
     pub mx2_packets_received: u64,
     pub mx2_last_report_id: Option<u8>,
@@ -254,6 +263,11 @@ pub struct ReTraktorApp {
     pub deck_scratch_active: [bool; 4],
     pub deck_turntable_mode: [bool; 4],
     pub jog_scratch_sensitivity: f32,
+    /// SHIFT held on the MX2 left / right deck.
+    deck_shift_held: [bool; 2],
+    /// Preferences as last applied, so a change on either side (Preferences or the deck / library) wins.
+    last_pref_jog_mode_turntable: bool,
+    last_pref_hide_missing: bool,
     pub custom_mappings: std::collections::HashMap<String, String>,
 
     // Exit Collection Save Prompt State
@@ -293,6 +307,9 @@ impl Default for ReTraktorApp {
             show_next_track_panel: false,
             next_track_picks: Vec::new(),
             next_track_target_deck: 2,
+            next_track_selected: 0,
+            picker_swallowed_digits: [false; 5],
+            cached_ai_settings: crate::ai::AiSettings::load(),
             ai_rerank_runner: None,
             ai_rerank_status: None,
             channel_gain: [0.5, 0.5, 0.5, 0.5],
@@ -329,6 +346,8 @@ impl Default for ReTraktorApp {
             fx2_dry_wet: 0.3,
             fx2_param: [0.5, 0.5, 0.5],
             fx2_on: false,
+            fx_kind: [MixerFxKind::Reverb, MixerFxKind::DualDelay],
+            deck_fx_assign: [[true, false], [false, true], [true, false], [false, true]],
             deck_pitch_fader: [0.0, 0.0, 0.0, 0.0],
             deck_flux_active: [false, false, false, false],
             deck_loop_active: [false, false, false, false],
@@ -388,7 +407,7 @@ impl Default for ReTraktorApp {
             mx2_hidraw_file: None,
             mx2_dev_node: None,
             mx2_model_name: None,
-            mx2_scan_counter: 0,
+            mx2_last_scan: None,
             mx2_access_status: None,
             mx2_packets_received: 0,
             mx2_last_report_id: None,
@@ -401,6 +420,9 @@ impl Default for ReTraktorApp {
             deck_scratch_active: [false; 4],
             deck_turntable_mode: [true; 4],
             jog_scratch_sensitivity: 1.0,
+            deck_shift_held: [false; 2],
+            last_pref_jog_mode_turntable: true, // deck_turntable_mode's default
+            last_pref_hide_missing: false,
             custom_mappings: std::collections::HashMap::new(),
             exit_confirmed: false,
             startup_scan_done: false,
@@ -431,8 +453,12 @@ fn legacy_action(a: &str) -> String {
 
 impl eframe::App for ReTraktorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Request 60 FPS continuous repaint for smooth scrolling waveforms and VU meters
-        ctx.request_repaint();
+        // Full frame rate only while something moves or hardware needs polling; otherwise a slow tick.
+        if self.needs_continuous_repaint() {
+            ctx.request_repaint();
+        } else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
         if self.shot.is_some() {
             self.screenshot_step(ctx);
         }
@@ -631,8 +657,17 @@ impl eframe::App for ReTraktorApp {
 
         // Synchronize visual remapper and controller settings from Preferences
         self.jog_scratch_sensitivity = self.preferences.jog_scratch_sensitivity;
-        self.deck_turntable_mode[0] = self.preferences.jog_mode_turntable;
-        self.deck_turntable_mode[1] = self.preferences.jog_mode_turntable;
+        // Only a changed preference resets the decks, so the MX2's TURNTABLE / JOG buttons stick.
+        if self.preferences.jog_mode_turntable != self.last_pref_jog_mode_turntable {
+            self.last_pref_jog_mode_turntable = self.preferences.jog_mode_turntable;
+            self.deck_turntable_mode[0] = self.preferences.jog_mode_turntable;
+            self.deck_turntable_mode[1] = self.preferences.jog_mode_turntable;
+            if !self.preferences.jog_mode_turntable {
+                self.jog_touch(0, false);
+                self.jog_touch(1, false);
+            }
+        }
+        self.sync_hide_missing();
         self.custom_mappings = self.preferences.mapping.action.clone();
         for entry in &self.preferences.generic_manager.active_mapping.entries {
             self.custom_mappings.insert(entry.control_id.clone(), entry.action.clone());
@@ -717,7 +752,6 @@ impl eframe::App for ReTraktorApp {
         self.preferences.audio_output_channels = self.audio.output_channels;
         self.preferences.audio_route = self.audio.output_route;
         self.preferences.audio_on_system_default = self.audio.on_system_default();
-        self.preferences.show(ctx);
 
         // Live Performance Shortcuts HUD Overlay
         render_shortcuts_hud(ctx, &mut self.show_shortcuts_hud);
@@ -1110,7 +1144,7 @@ impl ReTraktorApp {
             "eq_mid" => self.channel_eq_mid[d] = v,
             "eq_low" => self.channel_eq_low[d] = v,
             "filter" => self.channel_filter[d] = v,
-            "pitch" => self.deck_pitch_fader[d] = v * 16.0 - 8.0,
+            "pitch" => self.set_deck_pitch_fader(d, v * 16.0 - 8.0),
             "xfader" => self.crossfader_pos = v,
             "master_volume" => self.master_volume = v,
             "cue_mix" => self.cue_mix = v,
@@ -1119,6 +1153,34 @@ impl ReTraktorApp {
             "fx_mix" => self.fx1_dry_wet = v,
             _ => {}
         }
+    }
+
+    fn needs_continuous_repaint(&self) -> bool {
+        let engine_busy = self.audio.shared.lock().is_ok_and(|s| {
+            (0..4).any(|d| s.is_playing[d] || s.scratch_active[d] || s.scratch_ramping[d])
+        });
+        let generic_connected = self.preferences.generic_manager.discovered.lock().is_ok_and(|d| d.iter().any(|x| x.connected));
+        engine_busy
+            || self.preview.is_some()
+            || self.deck_loading.iter().chain(&self.deck_analysing).any(|&b| b)
+            || self.pattern_enabled
+            || self.recording.as_ref().is_some_and(|r| r.is_active())
+            || self.mx2_hidraw_file.is_some()
+            || generic_connected
+            || self.active_cheer.is_some()
+            || self.ai_rerank_runner.is_some()
+            || self.shot.is_some()
+    }
+
+    /// Hide-missing lives in Preferences and in the library toolbar ("Hiding missing ×", "Clear"): whichever changed wins.
+    /// Saved with the other preferences on close.
+    fn sync_hide_missing(&mut self) {
+        if self.preferences.hide_missing_files != self.last_pref_hide_missing {
+            self.library.hide_missing_files = self.preferences.hide_missing_files;
+        } else if self.library.hide_missing_files != self.last_pref_hide_missing {
+            self.preferences.hide_missing_files = self.library.hide_missing_files;
+        }
+        self.last_pref_hide_missing = self.preferences.hide_missing_files;
     }
 
     fn locked_decks(&self) -> [bool; 4] {
@@ -1403,6 +1465,10 @@ impl ReTraktorApp {
                     self.deck_hotcues[d] = self.deck_library_track(d).unwrap_or(&track).hotcue_pads();
                     self.deck_loop_active[d] = false;
                     self.deck_loop_exact_sec[d] = None;
+                    // A new track starts with every stem on, at full level, dry.
+                    self.deck_stem_muted[d] = [false; 4];
+                    self.deck_stem_volumes[d] = [1.0; 4];
+                    self.deck_stem_fx_send[d] = [false; 4];
                     self.library.finish_deck_load(d, track.id, stems_ready);
                     self.set_state.on_track_loaded(d, track.id);
                     self.library.status_message = format!("Loaded '{}' on deck {}", track.title, DECK_LETTERS[d]);
@@ -1764,6 +1830,12 @@ impl ReTraktorApp {
             state.stem_volumes = self.deck_stem_volumes;
             state.stem_muted = self.deck_stem_muted;
             state.stem_fx_send = self.deck_stem_fx_send;
+            state.fx_enabled = [self.fx1_on, self.fx2_on];
+            state.fx_kind = self.fx_kind;
+            state.fx_dry_wet = [self.fx1_dry_wet, self.fx2_dry_wet];
+            state.fx_params = [self.fx1_param, self.fx2_param];
+            state.deck_fx_assign = self.deck_fx_assign;
+            state.limiter_enabled = self.preferences.limiter_enabled;
 
             state.pattern_enabled = self.pattern_enabled;
             state.pattern_steps = self.pattern_steps;
@@ -1771,9 +1843,13 @@ impl ReTraktorApp {
             state.pattern_pitch = self.pattern_pitch;
             state.pattern_decay = self.pattern_decay;
 
-            // Only a known BPM is a grid to sync with; a track still being analysed has none yet.
-            let grids: [Option<(f64, f64)>; 4] =
-                std::array::from_fn(|i| state.loaded_tracks[i].as_ref().filter(|t| t.bpm > 0.0).map(|t| (t.bpm.max(20.0), t.grid_offset_sec)));
+            // Only a known finite BPM is a grid to sync with; a track still being analysed has none yet.
+            let grids: [Option<(f64, f64)>; 4] = std::array::from_fn(|i| {
+                state.loaded_tracks[i]
+                    .as_ref()
+                    .filter(|t| t.bpm.is_finite() && t.bpm > 0.0)
+                    .map(|t| (t.bpm.max(20.0), t.grid_offset_sec))
+            });
             for d in 0..4 {
                 state.channel_gain[d] = self.channel_gain[d];
                 state.engine.strips[d].volume = self.channel_volume[d];
@@ -1804,9 +1880,10 @@ impl ReTraktorApp {
                             if !self.sync_was_playing[d] || !self.sync_was_playing[other] {
                                 snap_bars(&mut state, d, other);
                             }
+                            let fold = sync_octave(bpm, other_bpm);
                             let behind = beat_phase_diff(
                                 (state.playhead_sec[other] - other_offset) * other_bpm / 60.0,
-                                (state.playhead_sec[d] - offset) * bpm / 60.0,
+                                (state.playhead_sec[d] - offset) * (bpm * fold) / 60.0,
                                 1.0,
                             );
                             nudge = (behind * 0.2).clamp(-0.03, 0.03);
@@ -1851,6 +1928,10 @@ impl ReTraktorApp {
                     &format!("app.traktor.decks.{idx}.flux.enabled"),
                     PropValue::Bool(self.deck_flux_active[d]),
                 );
+                self.bus.set(&format!("app.traktor.decks.{idx}.sync.enabled"), PropValue::Bool(self.deck_sync_enabled[d]));
+                for (s, &muted) in self.deck_stem_muted[d].iter().enumerate() {
+                    self.bus.set(&format!("app.traktor.decks.{idx}.stems.{}.muted", s + 1), PropValue::Bool(muted));
+                }
                 self.bus.set(
                     &format!("app.traktor.mixer.channels.{idx}.cue"),
                     PropValue::Bool(self.channel_cue[d]),
@@ -1935,8 +2016,9 @@ impl ReTraktorApp {
         }
 
         if self.mx2_hidraw_file.is_none() {
-            self.mx2_scan_counter = self.mx2_scan_counter.wrapping_add(1);
-            if self.mx2_scan_counter % 90 == 1 {
+            let due = self.mx2_last_scan.is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(1500));
+            if due {
+                self.mx2_last_scan = Some(std::time::Instant::now());
                 let detected = scan_linux_ni_hidraw_devices();
                 // Prefer Traktor MX2 if multiple NI devices are attached
                 if let Some(dev) = detected
@@ -2071,18 +2153,7 @@ impl ReTraktorApp {
                         return;
                     }
                     "jog:1" | "jog:2" => {
-                        let d = if act == "jog:2" { 1 } else { 0 };
-                        let sens = (self.jog_scratch_sensitivity as f64).clamp(0.2, 3.0);
-                        if let Ok(mut state) = self.audio.shared.lock() {
-                            if state.scratch_active[d] {
-                                let scaled_ticks = ((delta as f64) * sens).round() as i64;
-                                state.scratch_tick(d, scaled_ticks);
-                            } else {
-                                let nudge_sec = (delta as f64 / 1024.0) * 0.08 * sens;
-                                let from = state.playhead_sec[d];
-                                state.seek_by(d, (from + nudge_sec).max(0.0) - from);
-                            }
-                        }
+                        self.jog_turn(if act == "jog:2" { 1 } else { 0 }, delta);
                         return;
                     }
                     "loop_size:1" | "loop_size:2" => {
@@ -2101,17 +2172,7 @@ impl ReTraktorApp {
         if let SurfaceEvent::Button { ref control, pressed } = ev {
             if let Some(act) = self.custom_mappings.get(control) {
                 if act.starts_with("jog_touch:") || act == "jog:1" || act == "jog:2" {
-                    let d = if act.ends_with(":2") { 1 } else { 0 };
-                    if self.deck_turntable_mode[d] {
-                        self.deck_scratch_active[d] = pressed;
-                        if let Ok(mut state) = self.audio.shared.lock() {
-                            if pressed {
-                                state.enable_scratch(d, 1024, 33.333333333333336, 0.125, 0.125 / 32.0);
-                            } else {
-                                state.disable_scratch(d);
-                            }
-                        }
-                    }
+                    self.jog_touch(if act.ends_with(":2") { 1 } else { 0 }, pressed);
                     return;
                 }
             }
@@ -2193,8 +2254,8 @@ impl ReTraktorApp {
                     "surface.mixer.main.volume" => self.master_volume = v,
                     "surface.mixer.cue_mix" => self.cue_mix = v,
                     "surface.mixer.cue_vol" => self.cue_volume = v,
-                    "surface.left.pitch.fader" => self.deck_pitch_fader[0] = (v * 16.0) - 8.0,
-                    "surface.right.pitch.fader" => self.deck_pitch_fader[1] = (v * 16.0) - 8.0,
+                    "surface.left.pitch.fader" => self.set_deck_pitch_fader(0, v * 16.0 - 8.0),
+                    "surface.right.pitch.fader" => self.set_deck_pitch_fader(1, v * 16.0 - 8.0),
                     "surface.left.fx.knobs.1" => self.fx1_dry_wet = v,
                     "surface.left.fx.knobs.2" => self.fx1_param[0] = v,
                     "surface.left.fx.knobs.3" => self.fx1_param[1] = v,
@@ -2207,31 +2268,15 @@ impl ReTraktorApp {
                 }
             }
             SurfaceEvent::Button { control, pressed } => {
-                // Handle Capacitive Jogwheel Platter Touch (Scratching on/off)
+                // Held controls: platter touch (scratch on / off) and SHIFT, on press and release.
                 match control.as_str() {
-                    "surface.left.jogwheel.touch" => {
-                        if self.deck_turntable_mode[0] {
-                            self.deck_scratch_active[0] = pressed;
-                            if let Ok(mut state) = self.audio.shared.lock() {
-                                if pressed {
-                                    state.enable_scratch(0, 1024, 33.333333333333336, 0.125, 0.125 / 32.0);
-                                } else {
-                                    state.disable_scratch(0);
-                                }
-                            }
-                        }
-                        return;
-                    }
-                    "surface.right.jogwheel.touch" => {
-                        if self.deck_turntable_mode[1] {
-                            self.deck_scratch_active[1] = pressed;
-                            if let Ok(mut state) = self.audio.shared.lock() {
-                                if pressed {
-                                    state.enable_scratch(1, 1024, 33.333333333333336, 0.125, 0.125 / 32.0);
-                                } else {
-                                    state.disable_scratch(1);
-                                }
-                            }
+                    "surface.left.jogwheel.touch" => return self.jog_touch(0, pressed),
+                    "surface.right.jogwheel.touch" => return self.jog_touch(1, pressed),
+                    "surface.left.shift" | "surface.right.shift" => {
+                        let d = usize::from(control == "surface.right.shift");
+                        self.deck_shift_held[d] = pressed;
+                        if pressed && self.deck_scratch_active[d] {
+                            self.jog_touch(d, false);
                         }
                         return;
                     }
@@ -2249,6 +2294,15 @@ impl ReTraktorApp {
                     "surface.right.cue" => self.transport_cue(2, false),
                     "surface.left.sync" => self.sync_deck(1),
                     "surface.right.sync" => self.sync_deck(2),
+                    "surface.left.master" => self.toggle_master(0),
+                    "surface.right.master" => self.toggle_master(1),
+                    "surface.left.browse.encoder.push" | "surface.right.browse.encoder.push" => {
+                        if self.show_next_track_panel {
+                            self.load_next_pick(self.next_track_selected);
+                        } else {
+                            self.run_button_action("load", if control.starts_with("surface.left") { 1 } else { 2 }, "");
+                        }
+                    }
                     "surface.left.key_lock" => self.deck_keylock[0] ^= true,
                     "surface.right.key_lock" => self.deck_keylock[1] ^= true,
                     "surface.left.flux" => self.deck_flux_active[0] = !self.deck_flux_active[0],
@@ -2330,6 +2384,17 @@ impl ReTraktorApp {
                     }
                     "surface.left.fx.buttons.1" => self.fx1_on = !self.fx1_on,
                     "surface.right.fx.buttons.1" => self.fx2_on = !self.fx2_on,
+                    "surface.left.fx.buttons.2" => self.cycle_fx_kind(0),
+                    "surface.right.fx.buttons.2" => self.cycle_fx_kind(1),
+                    // Buttons 3 / 4 send deck A / B into this side's FX unit.
+                    "surface.left.fx.buttons.3" => self.deck_fx_assign[0][0] ^= true,
+                    "surface.left.fx.buttons.4" => self.deck_fx_assign[1][0] ^= true,
+                    "surface.right.fx.buttons.3" => self.deck_fx_assign[0][1] ^= true,
+                    "surface.right.fx.buttons.4" => self.deck_fx_assign[1][1] ^= true,
+                    "surface.mixer.channels.1.deck_fx_assign.1" => self.deck_fx_assign[0][0] ^= true,
+                    "surface.mixer.channels.1.deck_fx_assign.2" => self.deck_fx_assign[0][1] ^= true,
+                    "surface.mixer.channels.2.deck_fx_assign.1" => self.deck_fx_assign[1][0] ^= true,
+                    "surface.mixer.channels.2.deck_fx_assign.2" => self.deck_fx_assign[1][1] ^= true,
                     "surface.mixer.channels.1.cue" => self.channel_cue[0] = !self.channel_cue[0],
                     "surface.mixer.channels.2.cue" => self.channel_cue[1] = !self.channel_cue[1],
                     "surface.mixer.channels.1.channel_fx.on" => {
@@ -2342,63 +2407,31 @@ impl ReTraktorApp {
                         self.channel_fx_kind[0] = MixerFxKind::Filter;
                         self.channel_fx_kind[1] = MixerFxKind::Filter;
                     }
-                    "surface.mixer.channel_fx.fx1" => {
-                        self.channel_fx_kind[0] = MixerFxKind::Reverb;
-                        self.channel_fx_kind[1] = MixerFxKind::Reverb;
-                    }
-                    "surface.mixer.channel_fx.fx2" => {
-                        self.channel_fx_kind[0] = MixerFxKind::DualDelay;
-                        self.channel_fx_kind[1] = MixerFxKind::DualDelay;
-                    }
-                    "surface.mixer.channel_fx.fx3" => {
-                        self.channel_fx_kind[0] = MixerFxKind::Noise;
-                        self.channel_fx_kind[1] = MixerFxKind::Noise;
-                    }
-                    "surface.mixer.channel_fx.fx4" => {
-                        self.channel_fx_kind[0] = MixerFxKind::TimeGater;
-                        self.channel_fx_kind[1] = MixerFxKind::TimeGater;
-                    }
-                    s if s.starts_with("surface.left.pads.") => {
-                        if let Ok(pad) = s.trim_start_matches("surface.left.pads.").parse::<u8>() {
-                            self.trigger_performance_pad(1, pad);
+                    // FX1–FX4 pick the effects chosen in Preferences > Effects.
+                    s if s.starts_with("surface.mixer.channel_fx.fx") => {
+                        if let Some(&slot) = s["surface.mixer.channel_fx.fx".len()..].parse::<usize>().ok().and_then(|n| self.preferences.mixer_fx_slots.get(n.wrapping_sub(1))) {
+                            let kind = MixerFxKind::from_i64(slot as i64);
+                            self.channel_fx_kind[0] = kind;
+                            self.channel_fx_kind[1] = kind;
                         }
                     }
-                    s if s.starts_with("surface.right.pads.") => {
-                        if let Ok(pad) = s.trim_start_matches("surface.right.pads.").parse::<u8>() {
-                            self.trigger_performance_pad(2, pad);
+                    s if s.starts_with("surface.left.pads.") || s.starts_with("surface.right.pads.") => {
+                        let d = if s.starts_with("surface.left") { 0 } else { 1 };
+                        if let Ok(pad) = s.rsplit('.').next().unwrap_or_default().parse::<u8>() {
+                            // SHIFT + a hotcue pad deletes that cue so it can be set again.
+                            if self.deck_shift_held[d] && self.deck_pad_mode[d] == DeckPadMode::Hotcues {
+                                self.clear_deck_hotcue(d, pad);
+                            } else {
+                                self.trigger_performance_pad(d + 1, pad);
+                            }
                         }
                     }
                     _ => {}
                 }
             }
             SurfaceEvent::Encoder { control, delta } => match control.as_str() {
-                "surface.left.jogwheel.rotation" => {
-                    let sens = (self.jog_scratch_sensitivity as f64).clamp(0.2, 3.0);
-                    if let Ok(mut state) = self.audio.shared.lock() {
-                        if state.scratch_active[0] {
-                            let scaled_ticks = ((delta as f64) * sens).round() as i64;
-                            state.scratch_tick(0, scaled_ticks);
-                        } else {
-                            // Nudge / Phase bend when outer rim is turned without touching top
-                            let nudge_sec = (delta as f64 / 1024.0) * 0.08 * sens;
-                            let from = state.playhead_sec[0];
-                            state.seek_by(0, (from + nudge_sec).max(0.0) - from);
-                        }
-                    }
-                }
-                "surface.right.jogwheel.rotation" => {
-                    let sens = (self.jog_scratch_sensitivity as f64).clamp(0.2, 3.0);
-                    if let Ok(mut state) = self.audio.shared.lock() {
-                        if state.scratch_active[1] {
-                            let scaled_ticks = ((delta as f64) * sens).round() as i64;
-                            state.scratch_tick(1, scaled_ticks);
-                        } else {
-                            let nudge_sec = (delta as f64 / 1024.0) * 0.08 * sens;
-                            let from = state.playhead_sec[1];
-                            state.seek_by(1, (from + nudge_sec).max(0.0) - from);
-                        }
-                    }
-                }
+                "surface.left.jogwheel.rotation" => self.jog_turn(0, delta),
+                "surface.right.jogwheel.rotation" => self.jog_turn(1, delta),
                 "surface.left.loop_size" => {
                     if delta != 0 {
                         self.resize_loop(0, delta > 0);
@@ -2409,15 +2442,17 @@ impl ReTraktorApp {
                         self.resize_loop(1, delta > 0);
                     }
                 }
-                "surface.left.browse.encoder" => {
-                    if delta > 0 {
-                        self.library.select_next_track();
-                    } else if delta < 0 {
-                        self.library.select_prev_track();
-                    }
-                }
-                "surface.right.browse.encoder" => {
-                    if delta > 0 {
+                "surface.left.browse.encoder" | "surface.right.browse.encoder" => {
+                    if self.show_next_track_panel {
+                        let len = self.next_track_picks.len();
+                        if len > 0 {
+                            if delta > 0 {
+                                self.next_track_selected = (self.next_track_selected + 1).min(len - 1);
+                            } else if delta < 0 {
+                                self.next_track_selected = self.next_track_selected.saturating_sub(1);
+                            }
+                        }
+                    } else if delta > 0 {
                         self.library.select_next_track();
                     } else if delta < 0 {
                         self.library.select_prev_track();
@@ -2426,6 +2461,48 @@ impl ReTraktorApp {
                 _ => {}
             },
         }
+    }
+
+    /// Platter turned: SHIFT scrubs fast, a touched platter in turntable mode scratches, otherwise it bends
+    /// a playing deck's tempo or nudges a paused one.
+    fn jog_turn(&mut self, d: usize, delta: i64) {
+        let sens = (self.jog_scratch_sensitivity as f64).clamp(0.2, 3.0);
+        let shift = self.deck_shift_held[d.min(1)];
+        if let Ok(mut state) = self.audio.shared.lock() {
+            if shift {
+                state.fast_scrub(d, delta, sens);
+            } else if state.scratch_active[d] {
+                state.scratch_tick_scaled(d, delta, sens);
+            } else {
+                state.jog_nudge(d, delta, sens);
+            }
+        }
+    }
+
+    /// Platter top touched / let go: scratch on / off, in turntable mode only.
+    /// Holding SHIFT bypasses scratch engagement so SHIFT + platter top scrubs without muting playback;
+    /// releasing an active scratch always succeeds even if Vinyl mode was turned off mid-touch.
+    fn jog_touch(&mut self, d: usize, pressed: bool) {
+        if pressed && (!self.deck_turntable_mode[d] || self.deck_shift_held[d.min(1)]) {
+            return;
+        }
+        if !pressed && !self.deck_scratch_active[d] {
+            return;
+        }
+        self.deck_scratch_active[d] = pressed;
+        if let Ok(mut state) = self.audio.shared.lock() {
+            if pressed {
+                state.enable_scratch(d, retraktor_hid::TRAKTOR_MX2_JOG_TICKS_PER_REV as u32, 33.333333333333336, 0.125, 0.125 / 32.0);
+            } else {
+                state.disable_scratch(d);
+            }
+        }
+    }
+
+    /// Steps FX unit `u` through every effect.
+    fn cycle_fx_kind(&mut self, u: usize) {
+        self.fx_kind[u] = MixerFxKind::from_i64((self.fx_kind[u] as i64 + 1) % FX_SHORT.len() as i64);
+        self.library.status_message = format!("FX {}: {}", u + 1, crate::preferences::FX_NAMES[self.fx_kind[u] as usize]);
     }
 
     fn trigger_performance_pad(&mut self, deck_idx: usize, pad_num: u8) {
@@ -2437,12 +2514,8 @@ impl ReTraktorApp {
             }
             DeckPadMode::Stems => {
                 if pad_idx < 4 {
-                    self.deck_stem_muted[d][pad_idx] = !self.deck_stem_muted[d][pad_idx];
-                    let prop = format!("app.traktor.decks.{}.stems.{}.muted", d + 1, pad_idx);
-                    self.bus.set(&prop, PropValue::Bool(self.deck_stem_muted[d][pad_idx]));
-                    if let Ok(mut state) = self.audio.shared.lock() {
-                        state.stem_muted[d][pad_idx] = self.deck_stem_muted[d][pad_idx];
-                    }
+                    // The engine and the MX2 LEDs follow in sync_audio_state.
+                    self.deck_stem_muted[d][pad_idx] ^= true;
                 } else {
                     let s = pad_idx - 4;
                     self.deck_stem_fx_send[d][s] = !self.deck_stem_fx_send[d][s];
@@ -2535,11 +2608,32 @@ impl ReTraktorApp {
             }
         }
 
-        if self.show_next_track_panel && !self.show_shortcuts_hud && ctx.input(|i| i.key_pressed(Key::Enter)) {
-            if let Some(&(id, _, _)) = self.next_track_picks.first() {
-                let locked = self.locked_decks();
-                self.library.load_to_deck(self.next_track_target_deck, id, locked);
-                self.show_next_track_panel = false;
+        const PICKER_DIGITS: [Key; 5] = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5];
+        ctx.input(|i| {
+            for (idx, &k) in PICKER_DIGITS.iter().enumerate() {
+                if !i.key_down(k) {
+                    self.picker_swallowed_digits[idx] = false;
+                }
+            }
+        });
+
+        if self.show_next_track_panel && !self.show_shortcuts_hud && !typing {
+            let last = self.next_track_picks.len().saturating_sub(1);
+            let (down, up, enter, digit) = ctx.input(|i| {
+                let digit = PICKER_DIGITS.iter().position(|&k| i.key_pressed(k));
+                (i.key_pressed(Key::ArrowDown), i.key_pressed(Key::ArrowUp), i.key_pressed(Key::Enter), digit)
+            });
+            if down {
+                self.next_track_selected = (self.next_track_selected + 1).min(last);
+            }
+            if up {
+                self.next_track_selected = self.next_track_selected.saturating_sub(1);
+            }
+            if let Some(d_idx) = digit {
+                self.picker_swallowed_digits[d_idx] = true;
+            }
+            if let Some(pick) = digit.or(enter.then_some(self.next_track_selected)) {
+                self.load_next_pick(pick);
             }
         }
 
@@ -2582,7 +2676,7 @@ impl ReTraktorApp {
                 }
 
                 // Hotcues 1..4 on Deck A (1..4) and Deck B (5..8)
-                for (key, d_idx, cue) in [
+                for (slot_idx, (key, d_idx, cue)) in [
                     (Key::Num1, 1, 1u8),
                     (Key::Num2, 1, 2),
                     (Key::Num3, 1, 3),
@@ -2591,9 +2685,20 @@ impl ReTraktorApp {
                     (Key::Num6, 2, 2),
                     (Key::Num7, 2, 3),
                     (Key::Num8, 2, 4),
-                ] {
-                    if !shift && i.key_pressed(key) {
-                        self.press_hotcue(d_idx, cue);
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    if slot_idx < 5 && self.picker_swallowed_digits[slot_idx] {
+                        continue;
+                    }
+                    if i.key_pressed(key) {
+                        // Shift deletes the cue, so the pad can be set again.
+                        if shift {
+                            self.clear_deck_hotcue(d_idx - 1, cue);
+                        } else {
+                            self.press_hotcue(d_idx, cue);
+                        }
                     }
                 }
 
@@ -3004,24 +3109,93 @@ impl ReTraktorApp {
         self.deck_auto_cue_status[d] = Some(status);
     }
 
+    /// SYNC on: this deck jumps to the leader's tempo (and bar, when the leader plays) at once. The leader is the
+    /// MASTER deck, or else the other loaded deck (a playing one first), which becomes MASTER so this deck never
+    /// pulls it along. sync_audio_state keeps it locked from then on.
     fn sync_deck(&mut self, deck_idx: usize) {
         let d = (deck_idx.saturating_sub(1)).min(3);
         self.deck_sync_enabled[d] = !self.deck_sync_enabled[d];
-
-        // Update PropertyBus for hardware LED backlight
-        let bus_key = format!("app.traktor.decks.{}.sync.enabled", d + 1);
-        self.bus.set(&bus_key, PropValue::Bool(self.deck_sync_enabled[d]));
-
         if !self.deck_sync_enabled[d] {
             return;
         }
-
-        // Tempo follows in sync_audio_state; here the deck jumps straight onto the other deck's beat.
-        let Some(other) = sync_leader(self.tempo_master_deck, d) else { return };
-        if let Ok(mut state) = self.audio.shared.lock() {
-            if state.is_playing[other] {
-                snap_bars(&mut state, d, other);
+        let Ok(mut state) = self.audio.shared.lock() else { return };
+        let bpm = |i: usize| state.loaded_tracks[i].as_ref().map(|t| t.bpm).filter(|b| b.is_finite() && *b > 0.0).unwrap_or(0.0);
+        let pitched = |i: usize| bpm(i) * (1.0 + self.deck_pitch_fader[i] as f64 / 100.0);
+        // Preserve an explicit Master selection (even while its BPM is unknown); only promote a leader when free.
+        let leader = match self.tempo_master_deck {
+            Some(m) if m == d => return,
+            Some(m) => (bpm(m) > 0.0).then_some(m),
+            None => {
+                let partner = if d == 0 { 1 } else { 0 };
+                let other = (0..4)
+                    .find(|&i| i != d && state.is_playing[i] && bpm(i) > 0.0)
+                    .or((bpm(partner) > 0.0).then_some(partner));
+                if let Some(o) = other {
+                    self.tempo_master_deck = Some(o);
+                    self.master_tempo = pitched(o);
+                }
+                other
             }
+        };
+        let target = leader.map_or(self.master_tempo, pitched);
+        if bpm(d) > 0.0 {
+            self.deck_pitch_fader[d] = ((sync_ratio(bpm(d), target) - 1.0) * 100.0) as f32;
+        }
+        if let Some(o) = leader.filter(|&o| state.is_playing[o]) {
+            snap_bars(&mut state, d, o);
+        }
+    }
+
+    /// MASTER: this deck's live tempo becomes the clock; pressed again, the clock is free.
+    fn toggle_master(&mut self, d: usize) {
+        if self.tempo_master_deck == Some(d) {
+            self.tempo_master_deck = None;
+            return;
+        }
+        self.tempo_master_deck = Some(d);
+        let bpm = self.audio.shared.lock().ok().and_then(|s| s.loaded_tracks[d].as_ref().map(|t| t.bpm)).filter(|b| b.is_finite() && *b > 0.0).unwrap_or(0.0);
+        if bpm > 0.0 {
+            self.master_tempo = bpm * (1.0 + self.deck_pitch_fader[d] as f64 / 100.0);
+        }
+    }
+
+    /// A pitch fader moved (on screen or on the controller). On a deck in a sync group (synced, or the deck others
+    /// follow) the whole connected group takes the new tempo, so sync never pulls the fader back.
+    fn set_deck_pitch_fader(&mut self, d: usize, pitch: f32) {
+        self.deck_pitch_fader[d] = pitch;
+        let mut group = [false; 4];
+        group[d] = true;
+        for _ in 0..4 {
+            for i in 0..4 {
+                if let Some(l) = self.deck_sync_enabled[i].then(|| sync_leader(self.tempo_master_deck, i)).flatten() {
+                    if group[i] || group[l] {
+                        group[i] = true;
+                        group[l] = true;
+                    }
+                }
+            }
+        }
+        if !group.iter().enumerate().any(|(i, &in_group)| i != d && in_group) && !self.deck_sync_enabled[d] {
+            return;
+        }
+        let Ok(state) = self.audio.shared.lock() else { return };
+        let bpm = |i: usize| state.loaded_tracks[i].as_ref().map(|t| t.bpm).filter(|b| b.is_finite() && *b > 0.0).unwrap_or(0.0);
+        if bpm(d) <= 0.0 {
+            return;
+        }
+        let target = bpm(d) * (1.0 + pitch as f64 / 100.0);
+        self.master_tempo = target;
+        for o in (0..4).filter(|&o| o != d && group[o] && bpm(o) > 0.0) {
+            self.deck_pitch_fader[o] = ((sync_ratio(bpm(o), target) - 1.0) * 100.0) as f32;
+        }
+    }
+
+    /// The pitch fader as drawn on a deck; a move goes through `set_deck_pitch_fader`.
+    fn deck_pitch_fader_ui(&mut self, ui: &mut Ui, d: usize) {
+        let mut pitch = self.deck_pitch_fader[d];
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| pitch_fader(ui, &mut pitch));
+        if pitch != self.deck_pitch_fader[d] {
+            self.set_deck_pitch_fader(d, pitch);
         }
     }
 
@@ -3164,12 +3338,15 @@ impl ReTraktorApp {
     /// in the centre, Deck B strip mirrored on the right (`ON`, `FX`, `FILTER`, `GAIN`, `B`) plus utilities.
     fn show_top_bar(&mut self, ui: &mut Ui) {
         let screen_w = ui.ctx().screen_rect().width();
-        let roomy = screen_w >= 1180.0;
-        let show_rec = screen_w >= 1080.0;
+        let roomy = screen_w >= 1320.0;
+        let show_rec = screen_w >= 1120.0;
+        let show_next = screen_w >= 1180.0;
+        let show_ctl = screen_w >= 1220.0;
+        let gap = if screen_w < 1300.0 { 4.0 } else { 6.0 };
 
         panel(TraktorTheme::BG_PANEL()).show(ui, |ui| {
             row(ui, 56.0, |ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.spacing_mut().item_spacing.x = gap;
 
                 self.deck_strip(ui, 0);
                 ui.separator();
@@ -3188,7 +3365,7 @@ impl ReTraktorApp {
                             (TraktorLayout::Set, "Set", "F5"),
                         ] {
                             let label = if roomy { lay.label() } else { short };
-                            let min_w = if roomy { 46.0 } else { 36.0 };
+                            let min_w = if roomy { 46.0 } else { 34.0 };
                             if pill(ui, label, self.layout == lay, TraktorTheme::ROW_SELECTED(), min_w)
                                 .on_hover_text(format!("{} layout ({key})", lay.label()))
                                 .clicked()
@@ -3218,7 +3395,7 @@ impl ReTraktorApp {
                         }
 
                         let next_fill = if self.show_next_track_panel { TraktorTheme::ACCENT() } else { TraktorTheme::ROW_SELECTED() };
-                        if roomy && pill(ui, "NEXT", self.show_next_track_panel, next_fill, 0.0)
+                        if show_next && pill(ui, "NEXT", self.show_next_track_panel, next_fill, 0.0)
                             .on_hover_text("Suggest next track for the idle deck (N)")
                             .clicked()
                         {
@@ -3253,7 +3430,7 @@ impl ReTraktorApp {
                 });
                 // ---- Right: utilities + mirrored Deck B strip (ON/OFF + FX | FILTER | GAIN | B) ----
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
+                    ui.spacing_mut().item_spacing.x = gap;
                     // Same order in a right-to-left layout mirrors the strip.
                     self.deck_strip(ui, 1);
                     ui.separator();
@@ -3289,7 +3466,7 @@ impl ReTraktorApp {
                         self.rec_button(ui, show_rec);
                     }
 
-                    if roomy {
+                    if show_ctl {
                         let (ctl_label, ctl_ok, ctl_tab, controller_tip) = if let Some(ref node) = self.mx2_dev_node {
                             ("MX2", true, PrefsTab::Controllers, format!("Traktor MX2 connected ({node}). Click for controller settings"))
                         } else {
@@ -3346,16 +3523,16 @@ impl ReTraktorApp {
             };
             if icon_pill(ui, Icon::Dot, &rec_label, rec_fill, rec_fg, Vec2::new(0.0, HIT))
                 .on_hover_text(if is_rec {
-                    "Stop and save recording, CUE & tracklist to ~/Music/ReTraktor"
+                    format!("Stop and save recording, CUE & tracklist to {}", self.preferences.recording_dir.display())
                 } else {
-                    "Record master mix to ~/Music/ReTraktor (WAV, CUE & TXT)"
+                    format!("Record master mix to {} (WAV, CUE & TXT)", self.preferences.recording_dir.display())
                 })
                 .clicked()
             {
                 match rec_state {
                     None => {
-                        let home = env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("."));
-                        self.start_recording(&home.join("Music").join("ReTraktor"));
+                        let dir = recording_dir(&self.preferences.recording_dir);
+                        self.start_recording(&dir);
                     }
                     Some((true, _, _)) => self.stop_recording(),
                     Some((_, true, _)) => {
@@ -3369,8 +3546,10 @@ impl ReTraktorApp {
         }
     }
 
-    /// One deck's top-bar strip: letter, then GAIN, FILTER and FX as dot rings with the FX on/off lamp.
+    /// One deck's top-bar strip: letter, then GAIN, Mixer FX (`FLT`/`REV`/…) and Deck FX (`REV`/`DLY`/…)
+    /// as dot rings with right-click effect pickers and the FX on/off lamp.
     fn deck_strip(&mut self, ui: &mut Ui, d: usize) {
+        use crate::preferences::FX_NAMES;
         let col = TraktorTheme::deck_color(d + 1);
         let letter = DECK_LETTERS[d];
         let shift = if d == 1 { "Shift+" } else { "" };
@@ -3378,20 +3557,31 @@ impl ReTraktorApp {
         let gain_txt = dot::format_db(self.channel_gain[d], 0.5);
         dot::dot_ring(ui, &mut self.channel_gain[d], 0.0, 1.0, 0.5, &gain_txt, "GAIN", col, true)
             .on_hover_text(format!("Deck {letter} input gain. {KNOB_TIP}"));
+        let mfx_idx = self.channel_fx_kind[d] as usize;
         let filter_txt = dot::format_filter_val(self.channel_filter[d], self.channel_filter_on[d]);
-        let filter = dot::dot_ring(ui, &mut self.channel_filter[d], 0.0, 1.0, 0.5, &filter_txt, "FILTER", col, self.channel_filter_on[d])
-            .on_hover_text(format!("Deck {letter} filter ({shift}F or right-click turns it on or off). {KNOB_TIP}"));
+        let filter = dot::dot_ring(ui, &mut self.channel_filter[d], 0.0, 1.0, 0.5, &filter_txt, FX_SHORT[mfx_idx], col, self.channel_filter_on[d])
+            .on_hover_text(format!("Deck {letter} mixer FX ({}). {shift}F toggles on/off · right-click to choose effect. {KNOB_TIP}", FX_NAMES[mfx_idx]));
         if filter.changed() {
             self.channel_filter_on[d] = (self.channel_filter[d] - 0.5).abs() > 0.02;
         }
-        if filter.secondary_clicked() {
-            self.channel_filter_on[d] ^= true;
-        }
+        let mfx_kind = &mut self.channel_fx_kind[d];
+        let mfx_on = &mut self.channel_filter_on[d];
+        filter.context_menu(|ui| {
+            if ui.selectable_label(*mfx_on, if *mfx_on { "Turn mixer FX off" } else { "Turn mixer FX on" }).clicked() {
+                *mfx_on = !*mfx_on;
+                ui.close_menu();
+            }
+            ui.separator();
+            fx_menu_items(ui, mfx_kind);
+        });
         let (mix, fx_on) = if d == 0 { (&mut self.fx1_dry_wet, &mut self.fx1_on) } else { (&mut self.fx2_dry_wet, &mut self.fx2_on) };
+        let dfx_idx = self.fx_kind[d] as usize;
         let fx_txt = format!("{}", (*mix * 100.0).round() as i32);
-        dot::dot_ring(ui, mix, 0.0, 1.0, 0.3, &fx_txt, "FX", col, *fx_on)
-            .on_hover_text(format!("Deck {letter} effect amount. {KNOB_TIP}"));
-        dot::dot_lamp(ui, fx_on, col, &format!("Deck {letter} effect on or off ({shift}D)"));
+        let fx_ring = dot::dot_ring(ui, mix, 0.0, 1.0, 0.3, &fx_txt, FX_SHORT[dfx_idx], col, *fx_on)
+            .on_hover_text(format!("FX unit {} ({}) amount. Right-click to choose effect. {KNOB_TIP}", d + 1, FX_NAMES[dfx_idx]));
+        let dfx_kind = &mut self.fx_kind[d];
+        fx_ring.context_menu(|ui| fx_menu_items(ui, dfx_kind));
+        dot::dot_lamp(ui, fx_on, col, &format!("FX unit {} ({}) on or off ({shift}D)", d + 1, FX_NAMES[dfx_idx]));
     }
 
     /// 16-step pattern player (drum machine locked to the master tempo).
@@ -4141,14 +4331,7 @@ impl ReTraktorApp {
                     .on_hover_text("Make this deck's tempo the master clock; click again to release")
                     .clicked()
                 {
-                    if self.tempo_master_deck == Some(d) {
-                        self.tempo_master_deck = None;
-                    } else {
-                        self.tempo_master_deck = Some(d);
-                        if bpm > 0.0 {
-                            self.master_tempo = bpm;
-                        }
-                    }
+                    self.toggle_master(d);
                 }
                 self.stem_buttons(ui, d);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -4275,7 +4458,7 @@ impl ReTraktorApp {
                 }
                 pitch_inline = ui.available_width() >= 120.0;
                 if pitch_inline {
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| pitch_fader(ui, &mut self.deck_pitch_fader[d]));
+                    self.deck_pitch_fader_ui(ui, d);
                 }
             });
             // 7b. Beat jump, with the pitch fader beside it when the transport row had no room for it.
@@ -4283,13 +4466,13 @@ impl ReTraktorApp {
                 self.beat_jump_controls(ui, d, &deck);
                 if !pitch_inline && ui.available_width() >= 120.0 {
                     pitch_inline = true;
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| pitch_fader(ui, &mut self.deck_pitch_fader[d]));
+                    self.deck_pitch_fader_ui(ui, d);
                 }
             });
             if !pitch_inline {
                 ui.horizontal(|ui| {
                     ui.label(caps("PITCH"));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| pitch_fader(ui, &mut self.deck_pitch_fader[d]));
+                    self.deck_pitch_fader_ui(ui, d);
                 });
             }
 
@@ -4531,6 +4714,8 @@ impl ReTraktorApp {
             }
         };
         self.next_track_target_deck = idle_d + 1;
+        self.next_track_selected = 0;
+        self.cached_ai_settings = crate::ai::AiSettings::load();
 
         let live_ref_opt = self.deck_track_ids[live_d]
             .and_then(|id| self.library.track(id).cloned())
@@ -4575,6 +4760,7 @@ impl ReTraktorApp {
                         }
                         if !new_picks.is_empty() {
                             self.next_track_picks = new_picks;
+                            self.next_track_selected = 0;
                         }
                         self.ai_rerank_status = None;
                         self.ai_rerank_runner = None;
@@ -4594,7 +4780,7 @@ impl ReTraktorApp {
         let deck_letter = if self.next_track_target_deck == 1 { "A" } else { "B" };
         let deck_accent = if self.next_track_target_deck == 1 { TraktorTheme::DECK_A() } else { TraktorTheme::DECK_B() };
 
-        let mut load_id = None;
+        let mut load_pick = None;
 
         egui::Window::new("Suggest next track")
             .open(&mut self.show_next_track_panel)
@@ -4625,8 +4811,7 @@ impl ReTraktorApp {
                     );
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let ai_settings = crate::ai::AiSettings::load();
-                        if ai_settings.is_configured() {
+                        if self.cached_ai_settings.is_configured() {
                             let is_busy = self.ai_rerank_runner.is_some();
                             let ai_btn = egui::Button::new(
                                 RichText::new(if is_busy { "AI THINKING…" } else { "✦ ASK AI" })
@@ -4654,7 +4839,7 @@ impl ReTraktorApp {
                                     let live_brief = crate::ai::TrackBrief::from_ui(&live_ref);
                                     let prompt = crate::ai::build_rerank_prompt(&live_brief, &candidates);
                                     self.ai_rerank_status = Some("Asking AI model to evaluate flow…".to_string());
-                                    self.ai_rerank_runner = Some(crate::ai::AiRerankRunner::start(ai_settings, prompt, candidates));
+                                    self.ai_rerank_runner = Some(crate::ai::AiRerankRunner::start(self.cached_ai_settings.clone(), prompt, candidates));
                                 }
                             }
                         }
@@ -4678,7 +4863,7 @@ impl ReTraktorApp {
                             let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 34.0), Sense::click());
                             let hovered = resp.hovered();
 
-                            let bg = if rank == 0 {
+                            let bg = if rank == self.next_track_selected {
                                 TraktorTheme::ROW_SELECTED().gamma_multiply(0.35)
                             } else if hovered {
                                 TraktorTheme::BG_PANEL_ALT()
@@ -4730,8 +4915,11 @@ impl ReTraktorApp {
                                 TraktorTheme::TEXT_SECONDARY(),
                             );
 
+                            if resp.clicked() {
+                                self.next_track_selected = rank;
+                            }
                             if resp.double_clicked() {
-                                load_id = Some(id);
+                                load_pick = Some(rank);
                             }
                         }
                     }
@@ -4742,12 +4930,12 @@ impl ReTraktorApp {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new("Enter loads the top pick · double-click loads any row · Esc closes")
+                        RichText::new("↑/↓ select · Enter or 1–5 loads · Esc closes")
                             .color(TraktorTheme::TEXT_SECONDARY())
                             .font(egui::FontId::proportional(11.0)),
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if let Some(&(top_id, _, _)) = self.next_track_picks.first() {
+                        if !self.next_track_picks.is_empty() {
                             let btn = egui::Button::new(
                                 RichText::new(format!("LOAD TO DECK {deck_letter} (↵)"))
                                     .color(crate::theme::on(TraktorTheme::ROW_SELECTED()))
@@ -4757,16 +4945,26 @@ impl ReTraktorApp {
                             .rounding(4.0)
                             .min_size(Vec2::new(140.0, 24.0));
                             if ui.add(btn).clicked() {
-                                load_id = Some(top_id);
+                                load_pick = Some(self.next_track_selected);
                             }
                         }
                     });
                 });
             });
 
-        if let Some(id) = load_id {
-            let locked = self.locked_decks();
-            self.library.load_to_deck(self.next_track_target_deck, id, locked);
+        if let Some(pick) = load_pick {
+            self.load_next_pick(pick);
+        }
+    }
+
+    /// Loads pick `pick` (0-based) onto the picker's deck and closes the picker only if the load was accepted.
+    fn load_next_pick(&mut self, pick: usize) {
+        let Some(&(id, _, _)) = self.next_track_picks.get(pick) else { return };
+        let locked = self.locked_decks();
+        let before = self.library.pending_loads.len();
+        self.library.load_to_deck(self.next_track_target_deck, id, locked);
+        if self.library.pending_loads.len() > before {
+            self.drain_pending_loads();
             self.show_next_track_panel = false;
         }
     }
@@ -4844,15 +5042,29 @@ fn key_text(key: &str, analysing: bool) -> &str {
     }
 }
 
-fn sync_ratio(bpm: f64, target: f64) -> f64 {
+/// Power-of-two octave fold bringing `bpm` within `√2` of `target` (e.g. `2.0` for 70 synced to 140).
+fn sync_octave(bpm: f64, target: f64) -> f64 {
+    if !(bpm.is_finite() && bpm > 0.0 && target.is_finite() && target > 0.0) {
+        return 1.0;
+    }
+    let mut fold = 1.0;
     let mut ratio = target.max(20.0) / bpm.max(20.0);
     while ratio > std::f64::consts::SQRT_2 {
         ratio /= 2.0;
+        fold *= 2.0;
     }
     while ratio < std::f64::consts::FRAC_1_SQRT_2 {
         ratio *= 2.0;
+        fold /= 2.0;
     }
-    ratio
+    fold
+}
+
+fn sync_ratio(bpm: f64, target: f64) -> f64 {
+    if !(bpm.is_finite() && bpm > 0.0 && target.is_finite() && target > 0.0) {
+        return 1.0;
+    }
+    target.max(20.0) / (bpm.max(20.0) * sync_octave(bpm, target))
 }
 
 /// How far (in beats, within ±period/2) a deck at `beats` must move forward to line up with the master
@@ -4885,23 +5097,46 @@ fn install_stems(
                 loaded.pcm_other = stemmed.pcm_other.clone();
                 loaded.pcm_vocals = stemmed.pcm_vocals.clone();
                 loaded.stem_peaks = Arc::clone(&stemmed.stem_peaks);
+                // Each deck draws its stems at its own latched gain, as load_stems_from_dir does.
+                loaded.played_stem_peaks = if (loaded.auto_gain - 1.0).abs() < 1e-4 {
+                    Arc::clone(&stemmed.stem_peaks)
+                } else {
+                    stemmed.stem_peaks.iter().map(|p| p.map(|m| (m * loaded.auto_gain).clamp(0.04, 1.0))).collect()
+                };
                 loaded.stems_ready = true;
             }
         }
     })
 }
 
+/// Where REC saves: the Preferences folder with a leading `~` expanded, or ~/Music/ReTraktor when it is empty.
+fn recording_dir(pref: &std::path::Path) -> PathBuf {
+    let home = env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("."));
+    match pref.strip_prefix("~") {
+        _ if pref.as_os_str().is_empty() => home.join("Music").join("ReTraktor"),
+        Ok(rest) => home.join(rest),
+        Err(_) => pref.to_path_buf(),
+    }
+}
+
 fn snap_bars(state: &mut crate::audio::AudioSharedState, d: usize, other: usize) {
-    let grid = |i: usize| state.loaded_tracks[i].as_ref().filter(|t| t.bpm > 0.0).map(|t| (t.bpm.max(20.0), t.grid_offset_sec));
+    let grid = |i: usize| {
+        state.loaded_tracks[i]
+            .as_ref()
+            .filter(|t| t.bpm.is_finite() && t.bpm > 0.0)
+            .map(|t| (t.bpm.max(20.0), t.grid_offset_sec))
+    };
     if let (Some((bpm, offset)), Some((other_bpm, other_offset))) = (grid(d), grid(other)) {
+        let fold = sync_octave(bpm, other_bpm);
+        let scaled_bpm = bpm * fold;
         let behind = beat_phase_diff(
             (state.playhead_sec[other] - other_offset) * other_bpm / 60.0,
-            (state.playhead_sec[d] - offset) * bpm / 60.0,
+            (state.playhead_sec[d] - offset) * scaled_bpm / 60.0,
             4.0,
         );
         let len = state.loaded_tracks[d].as_ref().map_or(0.0, |t| t.duration_sec);
         let from = state.playhead_sec[d];
-        state.seek_by(d, (from + behind * 60.0 / bpm).clamp(0.0, len) - from);
+        state.seek_by(d, (from + behind * 60.0 / scaled_bpm).clamp(0.0, len) - from);
     }
 }
 
@@ -5158,17 +5393,17 @@ fn lamp(ui: &mut Ui, label: &str, ok: bool) -> egui::Response {
     ring(ui, resp)
 }
 
-/// One FX unit in the top bar: on/off, dry/wet and one amount knob. The arcs light up with the unit.
-fn fx_unit(ui: &mut Ui, n: u8, enabled: &mut bool, dry_wet: &mut f32, amount: &mut f32, amount_label: &str, amount_name: &str) {
-    if pill(ui, &format!("FX {n}"), *enabled, TraktorTheme::ACCENT(), 40.0)
-        .on_hover_text(format!("FX unit {n} on / off"))
-        .clicked()
-    {
-        *enabled = !*enabled;
+/// Short effect names for the deck strip, in `MixerFxKind` order.
+const FX_SHORT: [&str; 9] = ["FLT", "REV", "DLY", "NOI", "GAT", "FLG", "BRB", "DOT", "CRU"];
+
+/// Lists every effect in a context menu, setting `kind` on click.
+fn fx_menu_items(ui: &mut Ui, kind: &mut MixerFxKind) {
+    for (i, name) in crate::preferences::FX_NAMES.iter().enumerate() {
+        if ui.selectable_label(*kind as usize == i, *name).clicked() {
+            *kind = MixerFxKind::from_i64(i as i64);
+            ui.close_menu();
+        }
     }
-    let arc = if *enabled { TraktorTheme::ACCENT() } else { TraktorTheme::TEXT_MUTED() };
-    rotary_knob_sized(ui, dry_wet, 0.0, 1.0, 0.3, "D/W", arc, 28.0).on_hover_text(format!("FX {n} dry / wet mix. {KNOB_TIP}"));
-    rotary_knob_sized(ui, amount, 0.0, 1.0, 0.5, amount_label, arc, 28.0).on_hover_text(format!("FX {n} {amount_name}. {KNOB_TIP}"));
 }
 
 /// Pitch fader and its reset. Call inside a right-to-left layout: the fader takes the width that is left.
@@ -5773,6 +6008,284 @@ mod sync_audio {
                 Some((n.name()?.to_string(), n.role(), r, n.is_disabled()))
             })
             .collect()
+    }
+
+    fn key(key: Key, shift: bool) -> egui::Event {
+        let modifiers = if shift { egui::Modifiers::SHIFT } else { egui::Modifiers::NONE };
+        egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }
+    }
+
+    fn button(app: &mut ReTraktorApp, control: &str, pressed: bool) {
+        app.apply_mx2_surface_event(SurfaceEvent::Button { control: control.into(), pressed });
+    }
+
+    /// Library tracks 1..=n on real files, so loads are queued.
+    fn loadable_library(app: &mut ReTraktorApp, n: usize) {
+        let file = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        app.library.tracks = (1..=n)
+            .map(|id| crate::library_ui::UiTrackEntry { id, title: format!("Track {id}"), file_path: Some(file.clone()), ..Default::default() })
+            .collect();
+        app.library.rebuild_index();
+    }
+
+    /// SYNC on B makes the playing A the master and jumps B to its tempo; then either pitch fader moves both decks,
+    /// sync_audio_state keeps what the fader set, and an unsynced deck's fader moves only itself.
+    #[test]
+    fn synced_pitch_faders_move_both_decks_together() {
+        let mut app = ReTraktorApp::default();
+        {
+            let mut s = app.audio.shared.lock().unwrap();
+            s.loaded_tracks = [Some(track(120.0)), Some(track(130.0)), Some(track(100.0)), None];
+            s.is_playing = [true, false, false, false];
+        }
+        let bpm_of = |app: &ReTraktorApp, d: usize, base: f64| base * app.audio.shared.lock().unwrap().pitch_ratio[d];
+        app.sync_deck(2);
+        assert_eq!(app.tempo_master_deck, Some(0), "the playing deck leads");
+        assert!((130.0 * (1.0 + app.deck_pitch_fader[1] as f64 / 100.0) - 120.0).abs() < 1e-3, "B didn't jump to A's tempo at once");
+        assert_eq!(app.deck_pitch_fader[0], 0.0, "SYNC on B moved A");
+
+        // B's fader (synced) to 126 BPM: A follows.
+        app.set_deck_pitch_fader(1, ((126.0 / 130.0 - 1.0) * 100.0) as f32);
+        app.sync_audio_state();
+        assert!((bpm_of(&app, 0, 120.0) - 126.0).abs() < 1e-3 && (bpm_of(&app, 1, 130.0) - 126.0).abs() < 1e-3);
+        assert!((app.master_tempo - 126.0).abs() < 1e-3);
+        // A's fader (the master) back to 0: B follows.
+        app.set_deck_pitch_fader(0, 0.0);
+        app.sync_audio_state();
+        assert!((bpm_of(&app, 0, 120.0) - 120.0).abs() < 1e-3 && (bpm_of(&app, 1, 130.0) - 120.0).abs() < 1e-3);
+        // C, unsynced, moves alone.
+        app.set_deck_pitch_fader(2, 5.0);
+        app.sync_audio_state();
+        assert!((bpm_of(&app, 0, 120.0) - 120.0).abs() < 1e-3 && (bpm_of(&app, 2, 100.0) - 105.0).abs() < 1e-3);
+
+        // MASTER on C takes C's pitched tempo; again releases it.
+        app.toggle_master(2);
+        assert_eq!(app.tempo_master_deck, Some(2));
+        assert!((app.master_tempo - 105.0).abs() < 1e-3);
+        app.toggle_master(2);
+        assert_eq!(app.tempo_master_deck, None);
+    }
+
+    /// A new track on a deck starts with every stem on, at full level and dry.
+    #[test]
+    fn loading_a_track_resets_its_decks_stems() {
+        let mut app = ReTraktorApp::default();
+        app.deck_stem_muted[0] = [true; 4];
+        app.deck_stem_volumes[0] = [0.2; 4];
+        app.deck_stem_fx_send[0] = [true; 4];
+        app.deck_stem_muted[1] = [true; 4];
+        app.load_generation[0] = 1;
+        let entry = crate::library_ui::UiTrackEntry { id: 7, title: "New".into(), bpm: 120.0, musical_key: "8A".into(), ..Default::default() };
+        app.load_channel.0.send(DeckResult::Loaded(0, 1, entry, Ok(track(120.0)))).unwrap();
+        app.finish_loads();
+        assert_eq!(app.deck_track_ids[0], Some(7));
+        assert_eq!((app.deck_stem_muted[0], app.deck_stem_volumes[0], app.deck_stem_fx_send[0]), ([false; 4], [1.0; 4], [false; 4]));
+        assert_eq!(app.deck_stem_muted[1], [true; 4], "the other deck's stems changed");
+    }
+
+    /// MX2: SHIFT + hotcue pad deletes the cue, browse push loads the selection onto that side's deck, SHIFT + platter
+    /// scrubs fast, and the stem and sync LEDs read 1-indexed bus keys.
+    #[test]
+    fn mx2_shift_pads_browse_push_shift_jog_and_stem_leds() {
+        let mut app = ReTraktorApp::default();
+        app.audio.shared.lock().unwrap().loaded_tracks[0] = Some(track(120.0));
+        assert!(app.deck_hotcues[0].iter().any(|p| p.slot == 1));
+        button(&mut app, "surface.left.shift", true);
+        button(&mut app, "surface.left.pads.1", true);
+        assert!(!app.deck_hotcues[0].iter().any(|p| p.slot == 1), "SHIFT + pad 1 kept the cue");
+        button(&mut app, "surface.left.shift", false);
+        button(&mut app, "surface.left.pads.1", true);
+        assert!(app.deck_hotcues[0].iter().any(|p| p.slot == 1), "pad 1 didn't set the cue again");
+
+        // Platter on the paused deck: a gentle nudge, with SHIFT a fast scrub (96 ticks = 0.6 s).
+        let turn = |app: &mut ReTraktorApp| {
+            let before = app.audio.shared.lock().unwrap().playhead_sec[0];
+            app.apply_mx2_surface_event(SurfaceEvent::Encoder { control: "surface.left.jogwheel.rotation".into(), delta: 96 });
+            app.audio.shared.lock().unwrap().playhead_sec[0] - before
+        };
+        app.audio.shared.lock().unwrap().playhead_sec[0] = 10.0;
+        let nudge = turn(&mut app);
+        assert!(nudge > 0.0 && nudge < 0.05, "nudge moved {nudge}");
+        button(&mut app, "surface.left.shift", true);
+        assert!((turn(&mut app) - 0.6).abs() < 1e-9);
+        button(&mut app, "surface.left.shift", false);
+
+        loadable_library(&mut app, 2);
+        app.library.selected_track_id = Some(2);
+        button(&mut app, "surface.right.browse.encoder.push", true);
+        assert!(app.deck_loading[1] && app.load_generation == [0, 1, 0, 0], "right push didn't load deck B");
+        button(&mut app, "surface.left.browse.encoder.push", true);
+        assert!(app.deck_loading[0] && app.load_generation == [1, 1, 0, 0], "left push didn't load deck A");
+
+        app.deck_stem_muted[0][0] = true;
+        app.deck_sync_enabled[1] = true;
+        app.sync_audio_state();
+        let lit = |app: &ReTraktorApp, key: &str| app.bus.get(key).and_then(|v| v.as_bool()).unwrap();
+        assert!(lit(&app, "app.traktor.decks.1.stems.1.muted") && !lit(&app, "app.traktor.decks.1.stems.4.muted"));
+        assert!(lit(&app, "app.traktor.decks.2.sync.enabled") && !lit(&app, "app.traktor.decks.1.sync.enabled"));
+    }
+
+    /// Regression checks for Codex review findings: explicit Master preserved while unanalysed, 4-deck connected
+    /// sync pitch fader, half-time 70/140 zero phase wobble, infinite BPM guard, and scratch release on Vinyl-off / Shift.
+    #[test]
+    fn sync_edge_cases_and_scratch_release_hold() {
+        assert_eq!(sync_ratio(120.0, f64::INFINITY), 1.0);
+        assert_eq!(sync_ratio(f64::INFINITY, 120.0), 1.0);
+
+        // Explicit Master A (unanalysed) stays Master when B syncs with C playing.
+        let mut app = ReTraktorApp::default();
+        {
+            let mut s = app.audio.shared.lock().unwrap();
+            s.loaded_tracks[0] = Some(track(0.0));
+            s.loaded_tracks[1] = Some(track(128.0));
+            s.loaded_tracks[2] = Some(track(132.0));
+            s.is_playing[2] = true;
+        }
+        app.master_tempo = 124.0;
+        app.toggle_master(0);
+        app.sync_deck(2);
+        assert_eq!(app.tempo_master_deck, Some(0));
+        assert!((128.0 * (1.0 + app.deck_pitch_fader[1] as f64 / 100.0) - 124.0).abs() < 0.05);
+
+        // 4-deck connected sync: A & C synced to B, then B released -> moving C's fader updates A, B, and C together.
+        let mut app = ReTraktorApp::default();
+        {
+            let mut s = app.audio.shared.lock().unwrap();
+            s.loaded_tracks[0] = Some(track(120.0));
+            s.loaded_tracks[1] = Some(track(120.0));
+            s.loaded_tracks[2] = Some(track(120.0));
+        }
+        app.toggle_master(1);
+        app.sync_deck(1);
+        app.sync_deck(3);
+        app.toggle_master(1); // release B
+        app.set_deck_pitch_fader(2, 5.0);
+        app.sync_audio_state();
+        assert!((app.deck_pitch_fader[0] - 5.0).abs() < 0.05);
+        assert!((app.deck_pitch_fader[1] - 5.0).abs() < 0.05);
+        assert!((app.deck_pitch_fader[2] - 5.0).abs() < 0.05);
+
+        // Half-time sync (70 synced to 140) aligned on beat 1 -> zero speed wobble.
+        let mut app = ReTraktorApp::default();
+        {
+            let mut s = app.audio.shared.lock().unwrap();
+            s.loaded_tracks[0] = Some(track(140.0));
+            s.loaded_tracks[1] = Some(track(70.0));
+            s.is_playing = [true, true, false, false];
+            let one_master_beat = 60.0 / 140.0;
+            s.playhead_sec[0] = one_master_beat;
+            s.playhead_sec[1] = one_master_beat;
+        }
+        app.toggle_master(0);
+        app.sync_deck(2);
+        app.sync_was_playing = [true, true, false, false];
+        app.sync_audio_state();
+        let ratio = app.audio.shared.lock().unwrap().pitch_ratio[1];
+        assert!((ratio - 1.0).abs() < 1e-4, "half-time aligned deck got spurious nudge: {ratio}");
+
+        // Scratch releases cleanly even when Vinyl mode is turned off mid-touch or Shift is pressed mid-touch.
+        let mut app = ReTraktorApp::default();
+        app.deck_turntable_mode[0] = true;
+        button(&mut app, "surface.left.jogwheel.touch", true);
+        assert!(app.audio.shared.lock().unwrap().scratch_active[0]);
+        app.deck_turntable_mode[0] = false;
+        button(&mut app, "surface.left.jogwheel.touch", false);
+        assert!(!app.audio.shared.lock().unwrap().scratch_active[0]);
+
+        app.deck_turntable_mode[0] = true;
+        button(&mut app, "surface.left.jogwheel.touch", true);
+        button(&mut app, "surface.left.shift", true);
+        assert!(!app.audio.shared.lock().unwrap().scratch_active[0]);
+    }
+
+    /// The picker: arrows and Enter load the highlighted pick, a digit loads that pick, both onto the picker's deck.
+    #[test]
+    fn next_track_picker_keys_choose_and_load() {
+        let ctx = egui::Context::default();
+        let mut app = ReTraktorApp::default();
+        loadable_library(&mut app, 5);
+        let press = |app: &mut ReTraktorApp, events| {
+            let _ = ctx.run(egui::RawInput { events, ..Default::default() }, |ctx| app.handle_keyboard_shortcuts(ctx));
+        };
+        let open = |app: &mut ReTraktorApp| {
+            app.show_next_track_panel = true;
+            app.next_track_picks = (1..=5).map(|id| (id, 1.0, String::new())).collect();
+            app.next_track_selected = 0;
+            app.next_track_target_deck = 2;
+        };
+        open(&mut app);
+        press(&mut app, vec![key(Key::ArrowDown, false)]);
+        press(&mut app, vec![key(Key::ArrowDown, false)]);
+        press(&mut app, vec![key(Key::ArrowUp, false)]);
+        assert_eq!(app.next_track_selected, 1);
+        press(&mut app, vec![key(Key::Enter, false)]);
+        assert!(!app.show_next_track_panel && app.deck_loading[1]);
+        assert_eq!(app.library.status_message, "Loading 'Track 2' on deck B");
+
+        open(&mut app);
+        press(&mut app, vec![key(Key::Num3, false)]);
+        assert!(!app.show_next_track_panel && app.load_generation[1] == 2);
+        assert_eq!(app.library.status_message, "Loading 'Track 3' on deck B");
+        assert!(!app.deck_loading[0], "a picker digit reached deck A's hotcues");
+    }
+
+    /// Hide-missing: Preferences and the library toolbar each win when they change.
+    #[test]
+    fn hide_missing_follows_preferences_and_the_library_toolbar() {
+        let mut app = ReTraktorApp::default();
+        app.preferences.hide_missing_files = true;
+        app.sync_hide_missing();
+        assert!(app.library.hide_missing_files);
+        app.library.hide_missing_files = false; // "Hiding missing ×"
+        app.sync_hide_missing();
+        assert!(!app.preferences.hide_missing_files);
+        app.sync_hide_missing();
+        assert!(!app.library.hide_missing_files && !app.preferences.hide_missing_files, "it flipped back");
+    }
+
+    /// The FX units, their deck assigns and the limiter reach the engine, from the screen and the MX2 alike.
+    #[test]
+    fn fx_units_assigns_and_limiter_reach_the_engine() {
+        let mut app = ReTraktorApp::default();
+        app.preferences.limiter_enabled = false;
+        button(&mut app, "surface.left.fx.buttons.1", true);
+        button(&mut app, "surface.left.fx.buttons.2", true);
+        button(&mut app, "surface.right.fx.buttons.4", true);
+        button(&mut app, "surface.mixer.channels.2.deck_fx_assign.1", true);
+        button(&mut app, "surface.mixer.channel_fx.fx4", true);
+        app.fx2_param = [0.1, 0.2, 0.3];
+        app.sync_audio_state();
+        let s = app.audio.shared.lock().unwrap();
+        assert_eq!(s.fx_enabled, [true, false]);
+        assert_eq!(s.fx_kind, [MixerFxKind::DualDelay, MixerFxKind::DualDelay], "FX 1 didn't step on from Reverb");
+        assert_eq!(s.deck_fx_assign[1], [true, false], "deck B: right button 4 left FX 2, mixer assign joined FX 1");
+        assert_eq!(s.fx_params[1], [0.1, 0.2, 0.3]);
+        assert!(!s.limiter_enabled);
+        assert_eq!(s.engine.strips[0].filter.kind, MixerFxKind::TimeGater, "FX4 isn't Preferences slot 4");
+    }
+
+    /// Top-bar controls stay on screen and never overlap across minimum (1024), intermediate (1180), and default (1280) widths.
+    #[test]
+    fn deck_strip_fx_pills_fit_the_smallest_window() {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        ctx.enable_accesskit();
+        let mut app = ReTraktorApp::default();
+        app.channel_fx_kind[1] = MixerFxKind::Crush;
+        for width in [1024.0_f32, 1180.0, 1280.0] {
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(width, 640.0));
+            let nodes = workspace_frame(&ctx, &mut app, screen, 0.0, Vec::new());
+            let top: Vec<&Node> = nodes
+                .iter()
+                .filter(|n| n.2.bottom() < 72.0 && matches!(n.1, egui::accesskit::Role::Button | egui::accesskit::Role::Label))
+                .collect();
+            for (i, a) in top.iter().enumerate() {
+                assert!(screen.contains_rect(a.2), "w={width}: {} off screen at {:?}", a.0, a.2);
+                for b in &top[i + 1..] {
+                    assert!(!a.2.shrink(0.5).intersects(b.2.shrink(0.5)), "w={width}: {} ({:?}) overlaps {} ({:?})", a.0, a.2, b.0, b.2);
+                }
+            }
+        }
     }
 
     /// SYNC on B (130) under A (120): the audio callback really plays B at 120/130, with key lock off and on.
@@ -6758,7 +7271,7 @@ mod sync_audio {
             deck.pcm_stereo = Arc::new(
                 (0..44_100 * 4)
                     .flat_map(|i| {
-                        let v = (i as f32 * 300.0 * std::f32::consts::TAU / 44_100.0).sin() * 0.5;
+                        let v = (i as f32 * 300.0 * std::f32::consts::TAU / 44_100.0).sin() * 0.8;
                         [v, v]
                     })
                     .collect(),
@@ -8486,14 +8999,14 @@ mod sync_audio {
         assert_eq!(&app.deck_hotcues[0], &pads, "the pads changed");
     }
 
-    /// The top bar from the 1024 px minimum window across its breakpoints (REC from 1080 px, full labels, NEXT and
-    /// the controller lamp from 1180 px) to the 1280 px default and 1440 px, at rest and while recording: no two of
+    /// The top bar from the 1024 px minimum window across its breakpoints (REC from 1120 px, NEXT from 1180 px, the
+    /// controller lamp from 1220 px, full labels from 1320 px) to 1440 px, at rest and while recording: no two of
     /// its controls overlap, buttons or knobs alike (every rectangle egui lets a click or drag reach), and SNAP,
-    /// PAT(TERN), the tempo nudge, REC and, from 1180 px, NEXT and the lamp are all on screen to press.
+    /// PAT(TERN), the tempo nudge, REC, NEXT and the lamp are all on screen to press from their widths.
     #[test]
     fn top_bar_controls_never_overlap() {
         let mut failures = Vec::new();
-        for width in [1024.0, 1079.0, 1080.0, 1179.0, 1180.0, 1280.0, 1440.0] {
+        for width in [1024.0, 1119.0, 1120.0, 1179.0, 1180.0, 1219.0, 1220.0, 1280.0, 1319.0, 1320.0, 1440.0] {
             for recording in [false, true] {
                 let ctx = egui::Context::default();
                 crate::theme::install_fonts(&ctx);
@@ -8531,8 +9044,9 @@ mod sync_audio {
                     }
                 }
                 let wanted = ["Snap to beat", "PAT", "−", "+"].into_iter()
-                    .chain((width >= 1080.0 || recording).then_some("REC"))
-                    .chain((width >= 1180.0).then_some(["NEXT", "MX2"]).into_iter().flatten());
+                    .chain((width >= 1120.0 || recording).then_some("REC"))
+                    .chain((width >= 1180.0).then_some("NEXT"))
+                    .chain((width >= 1220.0).then_some("MX2"));
                 for name in wanted {
                     if !nodes.iter().any(|n| n.0.trim_start().starts_with(name) && n.2.max.y < 72.0 && screen.contains_rect(n.2)) {
                         failures.push(format!("{case}: no {name}"));

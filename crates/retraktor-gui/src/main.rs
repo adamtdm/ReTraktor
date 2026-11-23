@@ -37,15 +37,29 @@ fn shot_window_size() -> Option<Vec2> {
     Some(Vec2::new(w?, h?))
 }
 
+/// Decodes the embedded 256×256 PNG icon for the window/dock icon on X11 & Wayland.
+fn load_app_icon() -> Option<egui::IconData> {
+    let bytes: &[u8] = include_bytes!("../../../assets/retraktor.png");
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::ALPHA);
+    let mut reader = decoder.read_info().ok()?;
+    let mut buf = vec![0; reader.output_buffer_size()?];
+    let info = reader.next_frame(&mut buf).ok()?;
+    buf.truncate(info.buffer_size());
+    Some(egui::IconData { rgba: buf, width: info.width, height: info.height })
+}
+
 fn main() -> eframe::Result<()> {
-    let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("ReTraktor")
-            .with_inner_size(shot_window_size().unwrap_or(Vec2::new(1280.0, 820.0)))
-            .with_min_inner_size(Vec2::new(1024.0, 640.0))
-            .with_active(true),
-        ..Default::default()
-    };
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("ReTraktor")
+        .with_app_id("retraktor")
+        .with_inner_size(shot_window_size().unwrap_or(Vec2::new(1280.0, 820.0)))
+        .with_min_inner_size(Vec2::new(1024.0, 640.0))
+        .with_active(true);
+    if let Some(icon) = load_app_icon() {
+        viewport = viewport.with_icon(std::sync::Arc::new(icon));
+    }
+    let native_options = eframe::NativeOptions { viewport, ..Default::default() };
 
     eframe::run_native(
         "ReTraktor",

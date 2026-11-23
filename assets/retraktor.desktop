@@ -9,3 +9,4 @@ Type=Application
 Categories=AudioVideo;Audio;Mixer;Sequencer;Midi;
 Keywords=traktor;dj;music;audio;kontrol;mixer;midi;pipewire;
 StartupNotify=true
+StartupWMClass=retraktor

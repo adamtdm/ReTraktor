@@ -77,91 +77,61 @@ impl DemucsManager {
         PathBuf::from(home).join(".local/share/retraktor/venv")
     }
 
-    /// Finds the Demucs executable (checks local venv first, then system PATH).
+    /// Finds the Demucs entry point without starting Python.
     pub fn find_demucs_binary() -> Option<PathBuf> {
         let venv_dir = Self::venv_path();
+        let venv_py = venv_dir.join("bin/python3");
+        if is_executable(&venv_py)
+            && fs::read_dir(venv_dir.join("lib")).is_ok_and(|entries| {
+                entries.flatten().any(|entry| {
+                    entry.path().join("site-packages/demucs/__main__.py").is_file()
+                })
+            })
+        {
+            return Some(venv_py);
+        }
 
-        // 1. Check local dedicated venv binary
         let venv_bin = venv_dir.join("bin/demucs");
-        if venv_bin.is_file() {
+        if is_executable(&venv_bin) {
             return Some(venv_bin);
         }
 
-        // 1b. Check if python3 in venv has demucs module installed and create wrapper
-        let venv_py = venv_dir.join("bin/python3");
-        if venv_py.is_file() {
-            if let Ok(test) = Command::new(&venv_py).args(["-m", "demucs", "--help"]).output() {
-                if test.status.success() {
-                    let wrapper = format!(
-                        "#!/usr/bin/env bash\nexec \"{}\" -m demucs \"$@\"\n",
-                        venv_py.display()
-                    );
-                    let _ = fs::write(&venv_bin, wrapper);
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        let _ = fs::set_permissions(&venv_bin, fs::Permissions::from_mode(0o755));
-                    }
-                    return Some(venv_bin);
-                }
-            }
-        }
-
-        // 2. Check system PATH via `which demucs`
-        if let Ok(out) = Command::new("which").arg("demucs").output() {
-            if out.status.success() {
-                let path_str = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                let p = PathBuf::from(path_str);
-                if p.is_file() {
-                    return Some(p);
-                }
-            }
-        }
-
-        // 3. Check ~/.local/bin/demucs
-        let home = std::env::var("HOME").unwrap_or_default();
-        let local_bin = PathBuf::from(&home).join(".local/bin/demucs");
-        if local_bin.is_file() {
-            return Some(local_bin);
-        }
-
-        None
+        std::env::var_os("PATH")
+            .iter()
+            .flat_map(std::env::split_paths)
+            .map(|dir| dir.join("demucs"))
+            .chain(std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/bin/demucs")))
+            .find(|path| is_executable(path))
     }
 
     /// Refreshes and updates the installation status.
     pub fn refresh_status(&self) {
-        if let Some(bin) = Self::find_demucs_binary() {
-            // Verify execution
-            let test = Command::new(&bin).arg("--help").output();
-            if test.as_ref().map(|o| o.status.success()).unwrap_or(false) {
-                let mut state = self.install_state.lock().unwrap();
-                *state = DemucsInstallState::Ready {
-                    binary_path: bin,
-                    version: "HTDemucs v4 (Meta AI)".to_string(),
-                };
-                return;
-            }
-        }
-
-        let mut state = self.install_state.lock().unwrap();
+        let bin = Self::find_demucs_binary();
+        let mut state = self.install_state.lock().unwrap_or_else(|e| e.into_inner());
         if !matches!(*state, DemucsInstallState::Installing { .. }) {
-            *state = DemucsInstallState::NotInstalled;
+            *state = match bin {
+                Some(binary_path) => DemucsInstallState::Ready {
+                    binary_path,
+                    version: "HTDemucs v4 (Meta AI)".to_string(),
+                },
+                None => DemucsInstallState::NotInstalled,
+            };
         }
     }
 
     /// Returns true if Demucs is installed and ready for separation.
     pub fn is_installed(&self) -> bool {
-        matches!(*self.install_state.lock().unwrap(), DemucsInstallState::Ready { .. })
+        matches!(*self.install_state.lock().unwrap_or_else(|e| e.into_inner()), DemucsInstallState::Ready { .. })
     }
 
     /// Returns a copy of the current install state.
     pub fn get_install_state(&self) -> DemucsInstallState {
-        self.install_state.lock().unwrap().clone()
+        self.install_state.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Polls the separation worker and returns the current status along with a human-readable description if running.
     pub fn poll_separation(&self) -> (DemucsSeparationStatus, Option<String>) {
-        let status = self.separation_status.lock().unwrap().clone();
+        let status = self.separation_status.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let desc = match &status {
             DemucsSeparationStatus::Running { track_title, percent, .. } => {
                 Some(format!("Separating '{}' ({:.0}%)", track_title, percent * 100.0))
@@ -216,7 +186,7 @@ impl DemucsManager {
     /// Spawns the background installer in an isolated thread.
     pub fn start_background_install(&self) {
         {
-            let mut state = self.install_state.lock().unwrap();
+            let mut state = self.install_state.lock().unwrap_or_else(|e| e.into_inner());
             if matches!(*state, DemucsInstallState::Installing { .. }) {
                 return; // Already installing
             }
@@ -400,16 +370,9 @@ impl DemucsManager {
 
             // 6. Verify installation
             update("Verifying Demucs neural inference engine...", 0.95);
-            let demucs_bin = venv_dir.join("bin/demucs");
-
-            let mut verified = false;
-            if demucs_bin.is_file() {
-                if let Ok(out) = Command::new(&demucs_bin).arg("--help").output() {
-                    if out.status.success() {
-                        verified = true;
-                    }
-                }
-            }
+            let mut demucs_bin = venv_dir.join("bin/demucs");
+            let mut verified = demucs_bin.is_file()
+                && Command::new(&demucs_bin).arg("--help").output().is_ok_and(|out| out.status.success());
 
             if !verified && python_bin.is_file() {
                 let test = Command::new(&python_bin)
@@ -417,16 +380,7 @@ impl DemucsManager {
                     .output();
                 match test {
                     Ok(out) if out.status.success() => {
-                        let wrapper = format!(
-                            "#!/usr/bin/env bash\nexec \"{}\" -m demucs \"$@\"\n",
-                            python_bin.display()
-                        );
-                        let _ = fs::write(&demucs_bin, wrapper);
-                        #[cfg(unix)]
-                        {
-                            use std::os::unix::fs::PermissionsExt;
-                            let _ = fs::set_permissions(&demucs_bin, fs::Permissions::from_mode(0o755));
-                        }
+                        demucs_bin = python_bin;
                         verified = true;
                     }
                     Ok(out) => {
@@ -471,9 +425,12 @@ impl DemucsManager {
         track_title: &str,
         audio_path: &Path,
     ) -> bool {
-        let demucs_bin = match Self::find_demucs_binary() {
-            Some(b) => b,
-            None => return false,
+        let demucs_bin = match self.get_install_state() {
+            DemucsInstallState::Ready { binary_path, .. } if is_executable(&binary_path) => binary_path,
+            _ => match Self::find_demucs_binary() {
+                Some(binary_path) => binary_path,
+                None => return false,
+            },
         };
 
         if !audio_path.is_file() {
@@ -482,7 +439,7 @@ impl DemucsManager {
 
         // If stems are already cached, mark completed immediately!
         if let Some(stem_dir) = Self::get_cached_stem_dir(audio_path) {
-            let mut status = self.separation_status.lock().unwrap();
+            let mut status = self.separation_status.lock().unwrap_or_else(|e| e.into_inner());
             *status = DemucsSeparationStatus::Completed {
                 track_id,
                 stem_dir,
@@ -491,7 +448,7 @@ impl DemucsManager {
         }
 
         {
-            let mut status = self.separation_status.lock().unwrap();
+            let mut status = self.separation_status.lock().unwrap_or_else(|e| e.into_inner());
             *status = DemucsSeparationStatus::Running {
                 track_id,
                 track_title: track_title.to_string(),
@@ -508,11 +465,8 @@ impl DemucsManager {
             let _ = fs::create_dir_all(&cache_root);
 
             // Execute Demucs with `nice -n 10` so audio playback is NEVER starved of CPU
-            let mut cmd = Command::new("nice");
+            let mut cmd = demucs_nice_command(&demucs_bin);
             cmd.args([
-                "-n",
-                "10",
-                demucs_bin.to_str().unwrap_or("demucs"),
                 "-n",
                 "htdemucs",
                 // 2 jobs: ~20% faster on a 4-thread laptop (103 s -> 83 s per 30 s of audio); 4 needs more RAM for little gain.
@@ -520,9 +474,8 @@ impl DemucsManager {
                 "2",
                 "--flac",
                 "-o",
-                cache_root.to_str().unwrap_or("/tmp"),
             ]);
-            cmd.arg(&audio_path_buf);
+            cmd.arg(&cache_root).arg(&audio_path_buf);
             cmd.stdout(Stdio::null());
             cmd.stderr(Stdio::piped());
 
@@ -542,20 +495,14 @@ impl DemucsManager {
             // Demucs writes progress to stderr (tqdm)
             if let Some(stderr) = child.stderr.take() {
                 let reader = BufReader::new(stderr);
-                for line in reader.lines().flatten() {
-                    // Look for percentage in tqdm output, e.g. " 45%|"
-                    if let Some(pct_idx) = line.find('%') {
-                        if pct_idx >= 3 {
-                            let num_str = &line[pct_idx - 3..pct_idx].trim();
-                            if let Ok(pct) = num_str.parse::<f32>() {
-                                if let Ok(mut st) = status_clone.lock() {
-                                    *st = DemucsSeparationStatus::Running {
-                                        track_id,
-                                        track_title: track_title_string.clone(),
-                                        percent: (pct / 100.0).clamp(0.05, 0.98),
-                                    };
-                                }
-                            }
+                for line in reader.lines().map_while(Result::ok) {
+                    if let Some(percent) = line.rsplit('\r').find_map(parse_progress) {
+                        if let Ok(mut st) = status_clone.lock() {
+                            *st = DemucsSeparationStatus::Running {
+                                track_id,
+                                track_title: track_title_string.clone(),
+                                percent,
+                            };
                         }
                     }
                 }
@@ -586,9 +533,48 @@ impl DemucsManager {
     }
 }
 
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    path.metadata().is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+fn demucs_nice_command(binary: &Path) -> Command {
+    let mut cmd = Command::new("nice");
+    cmd.args(["-n", "10"]).arg(binary);
+    if binary.file_name().is_some_and(|name| name == "python3") {
+        cmd.args(["-m", "demucs"]);
+    }
+    cmd
+}
+
+fn parse_progress(line: &str) -> Option<f32> {
+    let (prefix, _) = line.split_once('%')?;
+    let start = prefix.trim_end_matches(|c: char| c.is_ascii_digit()).len();
+    let percent = prefix[start..].parse::<u8>().ok()?;
+    (percent <= 100).then_some(f32::from(percent) / 100.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_tqdm_progress_at_utf8_boundaries() {
+        assert_eq!(parse_progress(" 42%|████ |"), Some(0.42));
+        assert_eq!(parse_progress("100%|██|"), Some(1.0));
+        assert_eq!(parse_progress("3%|█|"), Some(0.03));
+        assert_eq!(parse_progress("█42%|"), Some(0.42));
+        assert_eq!(parse_progress("█%|"), None);
+    }
+
+    #[test]
+    fn demucs_python_path_with_shell_metacharacters_is_one_argument() {
+        let binary = Path::new("/home/DJ's \"mix\" $(name)/venv/bin/python3");
+        let cmd = demucs_nice_command(binary);
+        let args: Vec<_> = cmd.get_args().collect();
+        assert_eq!(args, ["-n", "10", binary.to_str().unwrap(), "-m", "demucs"]);
+    }
 
     #[test]
     fn cache_names_include_source_path() {

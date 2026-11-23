@@ -10,7 +10,7 @@
 
 use eframe::egui::{self, Pos2, RichText, Sense, Stroke, Ui, Vec2};
 use retraktor_core::SurfaceEvent;
-use retraktor_hid::{lookup_ni_device, NI_USB_VID, TRAKTOR_MX2_PID};
+use retraktor_hid::{lookup_ni_device, NI_USB_VID, TRAKTOR_MX2_PID, TRAKTOR_MX4_PID};
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Read;
@@ -36,12 +36,18 @@ pub struct MidiParserState {
     data_buf: [u8; 2],
     data_len: usize,
     expected_len: usize,
-    /// Pending 14-bit CC MSB bytes: `[channel (0..15)][msb_cc (0..31)]`.
-    pending_msb: [[Option<u8>; 32]; 16],
-    /// Tracks recent values per CC to classify relative encoders (centered on 64 or 0/127).
+    /// Most recent possible 14-bit CC MSB (channel, CC, value).
+    pending_msb: Option<(u8, u8, u8)>,
     cc_history: HashMap<(u8, u8), Vec<u8>>,
-    /// Dynamically learned or detected relative encoder CCs.
-    cc_is_relative: HashMap<(u8, u8), bool>,
+    cc_modes: HashMap<(u8, u8), CcMode>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CcMode {
+    Absolute,
+    Relative,
+    Centered,
+    Signed,
 }
 
 impl MidiParserState {
@@ -51,7 +57,70 @@ impl MidiParserState {
 
     /// Explicitly mark a CC as a relative encoder.
     pub fn set_relative(&mut self, ch: u8, cc: u8, relative: bool) {
-        self.cc_is_relative.insert((ch, cc), relative);
+        let mode = if relative { CcMode::Relative } else { CcMode::Absolute };
+        self.cc_modes.insert((ch, cc), mode);
+    }
+
+    fn cc_mode(&self, device: &str, ch: u8, cc: u8) -> Option<CcMode> {
+        self.cc_modes.get(&(ch, cc)).copied().or_else(|| {
+            if device == "ddj_flx4" {
+                // AlphaTheta's MIDI table uses offset binary for jogs and signed values for browse.
+                match (ch, cc) {
+                    (1 | 2, 33..=35 | 41) => Some(CcMode::Centered),
+                    (7, 64 | 100) => Some(CcMode::Signed),
+                    _ => Some(CcMode::Absolute),
+                }
+            } else {
+                None
+            }
+        })
+    }
+
+    fn unpaired_cc(&mut self, device: &str, ch: u8, cc: u8, val: u8) -> SurfaceEvent {
+        let key = (ch, cc);
+        let mode = self.cc_mode(device, ch, cc).unwrap_or_else(|| {
+            let history = self.cc_history.entry(key).or_default();
+            history.push(val);
+            if history.len() > 6 {
+                history.remove(0);
+            }
+            let mode = if history.contains(&63) && history.contains(&65)
+                && history.iter().all(|&v| (60..=68).contains(&v) && v != 64)
+            {
+                CcMode::Centered
+            } else if history.contains(&1) && history.contains(&127)
+                && history.iter().all(|&v| v <= 5 || v >= 123)
+            {
+                CcMode::Signed
+            } else {
+                return CcMode::Absolute;
+            };
+            self.cc_modes.insert(key, mode);
+            mode
+        });
+
+        let control = format!("midi.{device}.ch{ch}.cc{cc}");
+        let delta = match mode {
+            CcMode::Absolute => {
+                return SurfaceEvent::Fader { control, value: f64::from(val) / 127.0 };
+            }
+            CcMode::Centered => i64::from(val) - 64,
+            CcMode::Relative if (58..=70).contains(&val) => {
+                self.cc_modes.insert(key, CcMode::Centered);
+                i64::from(val) - 64
+            }
+            CcMode::Relative => {
+                self.cc_modes.insert(key, CcMode::Signed);
+                i64::from(val) - if val < 64 { 0 } else { 128 }
+            }
+            CcMode::Signed => i64::from(val) - if val < 64 { 0 } else { 128 },
+        };
+        SurfaceEvent::Encoder { control, delta }
+    }
+
+    fn flush_msb(&mut self, device: &str) -> Option<SurfaceEvent> {
+        let (ch, cc, val) = self.pending_msb.take()?;
+        Some(self.unpaired_cc(device, ch, cc, val))
     }
 }
 
@@ -62,7 +131,8 @@ impl MidiParserState {
 /// - System Realtime bytes (`0xF8..=0xFF`) are ignored and do not interrupt running status or data bytes.
 /// - System Exclusive (`0xF0..0xF7`) streams are safely skipped.
 /// - Note On with velocity 0 is decoded as Note Off (`pressed: false`).
-/// - 14-bit CC pairs (MSB `0..=31` followed by LSB `32..=63`) are combined.
+/// - Adjacent 14-bit CC pairs (MSB `0..=31` followed by its LSB `32..=63`) are combined.
+///   A trailing possible MSB is held for the next chunk or an idle flush.
 /// - Relative encoders sending 63/65 (centered on 64) or 1/127 (centered on 0) emit [`SurfaceEvent::Encoder`].
 pub fn parse_midi_bytes(
     state: &mut MidiParserState,
@@ -79,12 +149,14 @@ pub fn parse_midi_bytes(
 
         // 2. System Exclusive handling
         if b == 0xF0 {
+            events.extend(state.flush_msb(device));
             state.in_sysex = true;
             state.running_status = None;
             state.data_len = 0;
             continue;
         }
         if b == 0xF7 {
+            events.extend(state.flush_msb(device));
             state.in_sysex = false;
             continue;
         }
@@ -102,6 +174,7 @@ pub fn parse_midi_bytes(
         if b >= 0x80 {
             if (0xF1..=0xF6).contains(&b) {
                 // System common message (clears running status)
+                events.extend(state.flush_msb(device));
                 state.running_status = None;
                 state.data_len = 0;
                 continue;
@@ -129,8 +202,28 @@ pub fn parse_midi_bytes(
         }
 
         if state.data_len == state.expected_len {
+            state.data_len = 0;
             let ch = (status & 0x0F) + 1; // 1-based (1..=16)
             let msg_type = status & 0xF0;
+
+            let [cc, val] = state.data_buf;
+
+            if let Some((msb_ch, msb_cc, msb)) = state.pending_msb {
+                if msg_type == 0xB0
+                    && ch == msb_ch
+                    && cc == msb_cc + 32
+                    && matches!(state.cc_mode(device, ch, cc), None | Some(CcMode::Absolute))
+                {
+                    state.pending_msb = None;
+                    let value = (u16::from(msb) << 7) | u16::from(val);
+                    events.push(SurfaceEvent::Fader {
+                        control: format!("midi.{device}.ch{ch}.cc{msb_cc}"),
+                        value: f64::from(value) / 16383.0,
+                    });
+                    continue;
+                }
+                events.extend(state.flush_msb(device));
+            }
 
             match msg_type {
                 0x80 => {
@@ -152,71 +245,12 @@ pub fn parse_midi_bytes(
                     });
                 }
                 0xB0 => {
-                    // Control Change
-                    let cc = state.data_buf[0];
-                    let val = state.data_buf[1];
-
-                    // Track relative encoder pattern (centered around 64 or 0/127)
-                    let hist = state.cc_history.entry((ch, cc)).or_default();
-                    hist.push(val);
-                    if hist.len() > 6 {
-                        hist.remove(0);
-                    }
-
-                    let is_rel = state.cc_is_relative.get(&(ch, cc)).copied().unwrap_or_else(|| {
-                        if hist.len() >= 2 {
-                            let all_64_centered = hist.iter().all(|&v| (60..=68).contains(&v) && v != 64);
-                            let all_0_centered = hist.iter().all(|&v| v <= 5 || v >= 123);
-                            all_64_centered || all_0_centered
-                        } else {
-                            false
-                        }
-                    });
-
-                    if is_rel {
-                        state.cc_is_relative.insert((ch, cc), true);
-                        let delta = if (58..=70).contains(&val) {
-                            // 64-centered: 65 is +1, 63 is -1
-                            (val as i32) - 64
-                        } else if val < 64 {
-                            val as i32
-                        } else {
-                            (val as i32) - 128
-                        };
-                        events.push(SurfaceEvent::Encoder {
-                            control: format!("midi.{device}.ch{ch}.cc{cc}"),
-                            delta: delta as i64,
-                        });
-                    } else if cc < 32 {
-                        // 14-bit CC MSB
-                        state.pending_msb[(ch - 1) as usize][cc as usize] = Some(val);
-                        // Emit 7-bit normalized fallback
-                        events.push(SurfaceEvent::Fader {
-                            control: format!("midi.{device}.ch{ch}.cc{cc}"),
-                            value: val as f64 / 127.0,
-                        });
-                    } else if (32..64).contains(&cc) {
-                        // 14-bit CC LSB
-                        let msb_cc = cc - 32;
-                        if let Some(msb) = state.pending_msb[(ch - 1) as usize][msb_cc as usize] {
-                            let val14 = ((msb as u16) << 7) | (val as u16);
-                            let norm = (val14 as f64) / 16383.0;
-                            events.push(SurfaceEvent::Fader {
-                                control: format!("midi.{device}.ch{ch}.cc{msb_cc}"),
-                                value: norm,
-                            });
-                        } else {
-                            events.push(SurfaceEvent::Fader {
-                                control: format!("midi.{device}.ch{ch}.cc{cc}"),
-                                value: val as f64 / 127.0,
-                            });
-                        }
+                    if cc < 32
+                        && matches!(state.cc_mode(device, ch, cc), None | Some(CcMode::Absolute))
+                    {
+                        state.pending_msb = Some((ch, cc, val));
                     } else {
-                        // Standard CC (>= 64)
-                        events.push(SurfaceEvent::Fader {
-                            control: format!("midi.{device}.ch{ch}.cc{cc}"),
-                            value: val as f64 / 127.0,
-                        });
+                        events.push(state.unpaired_cc(device, ch, cc, val));
                     }
                 }
                 0xE0 => {
@@ -232,9 +266,6 @@ pub fn parse_midi_bytes(
                 }
                 _ => {}
             }
-
-            // Reset data buffer for the next message under running status
-            state.data_len = 0;
         }
     }
 
@@ -296,7 +327,8 @@ pub fn diff_hid_reports(
     while b + 1 < len {
         let p_u16 = u16::from_le_bytes([prev_payload[b], prev_payload[b + 1]]);
         let c_u16 = u16::from_le_bytes([curr_payload[b], curr_payload[b + 1]]);
-        if p_u16 != c_u16 {
+        // shortcut: ambiguous one-bit changes emit only a button until layouts identify analog offsets.
+        if (p_u16 ^ c_u16).count_ones() > 1 {
             let delta = (c_u16 as i32 - p_u16 as i32).abs();
             // Smooth movement (analog knob/fader/jog ADC delta)
             if delta < 2048 {
@@ -581,6 +613,7 @@ pub struct DiscoveredDevice {
     pub dev_node: String,
     pub protocol: DeviceProtocol,
     pub connected: bool,
+    pid: u16,
 }
 
 /// Discovers connected ALSA raw MIDI devices (`/dev/snd/midiC*D*`).
@@ -611,13 +644,14 @@ pub fn scan_linux_alsa_midi_devices() -> Vec<DiscoveredDevice> {
             }
         }
 
-        let slug = slugify(&card_name);
+        let slug = midi_device_slug(&card_name);
         found.push(DiscoveredDevice {
             name: card_name,
             slug,
             dev_node,
             protocol: DeviceProtocol::Midi,
             connected: true,
+            pid: 0,
         });
     }
 
@@ -625,7 +659,15 @@ pub fn scan_linux_alsa_midi_devices() -> Vec<DiscoveredDevice> {
     found
 }
 
-/// Discovers connected Native Instruments HID devices that are NOT the MX2.
+fn midi_device_slug(name: &str) -> String {
+    let slug = slugify(name);
+    if slug.contains("flx4") {
+        return "ddj_flx4".to_string();
+    }
+    slug
+}
+
+/// Discovers connected Native Instruments HID devices outside the MX2/MX4 driver.
 pub fn scan_linux_generic_ni_hid_devices() -> Vec<DiscoveredDevice> {
     let mut found = Vec::new();
     let Ok(entries) = std::fs::read_dir("/sys/class/hidraw") else {
@@ -655,7 +697,7 @@ pub fn scan_linux_generic_ni_hid_devices() -> Vec<DiscoveredDevice> {
             }
         }
 
-        if dev_vid == NI_USB_VID && dev_pid != TRAKTOR_MX2_PID {
+        if dev_vid == NI_USB_VID && !matches!(dev_pid, TRAKTOR_MX2_PID | TRAKTOR_MX4_PID) {
             let model = lookup_ni_device(dev_vid, dev_pid)
                 .map(|d| d.model.to_string())
                 .unwrap_or_else(|| if !hid_name.is_empty() { hid_name } else { format!("NI Device {dev_pid:04x}") });
@@ -666,6 +708,7 @@ pub fn scan_linux_generic_ni_hid_devices() -> Vec<DiscoveredDevice> {
                 dev_node: format!("/dev/{name}"),
                 protocol: DeviceProtocol::GenericNiHid,
                 connected: true,
+                pid: dev_pid,
             });
         }
     }
@@ -784,7 +827,7 @@ fn run_hardware_worker(
     stop: Arc<AtomicBool>,
     discovered_out: Arc<Mutex<Vec<DiscoveredDevice>>>,
 ) {
-    let mut midi_parsers: HashMap<String, (MidiParserState, std::fs::File)> = HashMap::new();
+    let mut midi_parsers: HashMap<String, (String, MidiParserState, std::fs::File)> = HashMap::new();
     let mut hid_decoders: HashMap<String, (u16, Vec<u8>, HidAnalogTracker, std::fs::File)> = HashMap::new();
     let mut last_scan = std::time::Instant::now();
 
@@ -814,7 +857,7 @@ fn run_hardware_worker(
                         opts.custom_flags(0x0800); // O_NONBLOCK
                     }
                     if let Ok(file) = opts.open(&dev.dev_node) {
-                        midi_parsers.insert(dev.dev_node, (MidiParserState::new(), file));
+                        midi_parsers.insert(dev.dev_node, (dev.slug, MidiParserState::new(), file));
                     }
                 }
             }
@@ -830,11 +873,9 @@ fn run_hardware_worker(
                         opts.custom_flags(0x0800); // O_NONBLOCK
                     }
                     if let Ok(file) = opts.open(&dev.dev_node) {
-                        // Extract PID if known, default 0x2200 (X1 MK3)
-                        let pid = lookup_ni_device_pid(&dev.name).unwrap_or(0x2200);
                         hid_decoders.insert(
                             dev.dev_node,
-                            (pid, Vec::new(), HidAnalogTracker::default(), file),
+                            (dev.pid, Vec::new(), HidAnalogTracker::default(), file),
                         );
                     }
                 }
@@ -843,7 +884,7 @@ fn run_hardware_worker(
 
         // 2. Poll open MIDI devices
         let mut midi_dead = Vec::new();
-        for (node, (state, file)) in midi_parsers.iter_mut() {
+        for (node, (slug, state, file)) in midi_parsers.iter_mut() {
             let mut buf = [0u8; 256];
             match file.read(&mut buf) {
                 Ok(0) => {
@@ -851,16 +892,17 @@ fn run_hardware_worker(
                     midi_dead.push(node.clone());
                 }
                 Ok(n) => {
-                    let slug = node
-                        .strip_prefix("/dev/snd/")
-                        .unwrap_or("midi")
-                        .to_lowercase();
-                    let evs = parse_midi_bytes(state, &slug, &buf[..n]);
+                    let evs = parse_midi_bytes(state, slug, &buf[..n]);
                     for ev in evs {
                         let _ = tx.send(ev);
                     }
                 }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // shortcut: pairs must arrive within one poll interval or use a device-specific layout.
+                    if let Some(ev) = state.flush_msb(slug) {
+                        let _ = tx.send(ev);
+                    }
+                }
                 Err(ref e) if e.kind() == std::io::ErrorKind::BrokenPipe || e.kind() == std::io::ErrorKind::NotConnected => {
                     midi_dead.push(node.clone());
                 }
@@ -903,15 +945,6 @@ fn run_hardware_worker(
         // Sleep 5ms to avoid spinning
         std::thread::sleep(Duration::from_millis(5));
     }
-}
-
-fn lookup_ni_device_pid(name: &str) -> Option<u16> {
-    for dev in retraktor_hid::NI_DEVICES.iter() {
-        if name.contains(dev.model) {
-            return Some(dev.pid);
-        }
-    }
-    None
 }
 
 // ============================================================================
@@ -1375,16 +1408,80 @@ mod tests {
         // Channel 1, CC 0 (MSB) = 64 (0x40), CC 32 (LSB) = 0 (0x00)
         // 14-bit value = (64 << 7) | 0 = 8192
         // Normalized = 8192 / 16383 ≈ 0.50003
-        let bytes = [0xB0, 0, 64, 0xB0, 32, 0];
-        let evs = parse_midi_bytes(&mut state, "test", &bytes);
-        assert_eq!(evs.len(), 2); // 7-bit MSB fallback + 14-bit combined event
-        match &evs[1] {
-            SurfaceEvent::Fader { control, value } => {
-                assert_eq!(control, "midi.test.ch1.cc0");
-                assert!((*value - 0.5).abs() < 0.001);
-            }
-            _ => panic!("Expected Fader event for 14-bit CC pair"),
+        assert!(parse_midi_bytes(&mut state, "test", &[0xB0, 0, 64]).is_empty());
+        assert_eq!(
+            parse_midi_bytes(&mut state, "test", &[0xF8, 32, 0]),
+            vec![SurfaceEvent::Fader {
+                control: "midi.test.ch1.cc0".into(),
+                value: 8192.0 / 16383.0,
+            }]
+        );
+        assert_eq!(
+            parse_midi_bytes(&mut state, "test", &[32, 80]),
+            vec![SurfaceEvent::Fader {
+                control: "midi.test.ch1.cc32".into(),
+                value: 80.0 / 127.0,
+            }]
+        );
+    }
+
+    #[test]
+    fn midi_msb_expires_on_an_intervening_message_or_idle() {
+        let mut state = MidiParserState::new();
+        let msb = SurfaceEvent::Fader {
+            control: "midi.test.ch1.cc0".into(),
+            value: 64.0 / 127.0,
+        };
+        let lsb = SurfaceEvent::Fader {
+            control: "midi.test.ch1.cc32".into(),
+            value: 80.0 / 127.0,
+        };
+        let events = parse_midi_bytes(&mut state, "test", &[0xB0, 0, 64, 0x90, 11, 127, 0xB0, 32, 80]);
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0], msb);
+        assert_eq!(events[2], lsb);
+
+        assert!(parse_midi_bytes(&mut state, "test", &[0, 64]).is_empty());
+        assert_eq!(state.flush_msb("test"), Some(msb));
+        assert_eq!(parse_midi_bytes(&mut state, "test", &[32, 80]), vec![lsb]);
+    }
+
+    #[test]
+    fn flx4_discovered_slug_and_first_encoder_ticks_match_preset() {
+        let slug = midi_device_slug("Pioneer DDJ-FLX4");
+        assert_eq!(midi_device_slug("DDJFLX4"), slug);
+        let mut state = MidiParserState::new();
+        let preset = flx4_default_mapping();
+        for (bytes, control, delta) in [
+            ([0xB0, 34, 65], "midi.ddj_flx4.ch1.cc34", 1),
+            ([0xB0, 34, 50], "midi.ddj_flx4.ch1.cc34", -14),
+            ([0xB6, 64, 1], "midi.ddj_flx4.ch7.cc64", 1),
+            ([0xB6, 64, 127], "midi.ddj_flx4.ch7.cc64", -1),
+        ] {
+            assert_eq!(
+                parse_midi_bytes(&mut state, &slug, &bytes),
+                vec![SurfaceEvent::Encoder { control: control.into(), delta }]
+            );
+            assert!(preset.entries.iter().any(|entry| entry.control_id == control));
         }
+    }
+
+    #[test]
+    fn detected_relative_encoding_is_used_for_larger_ticks() {
+        let mut state = MidiParserState::new();
+        parse_midi_bytes(&mut state, "test", &[0xB0, 70, 65]);
+        assert_eq!(
+            parse_midi_bytes(&mut state, "test", &[70, 63, 70, 50]),
+            vec![
+                SurfaceEvent::Encoder { control: "midi.test.ch1.cc70".into(), delta: -1 },
+                SurfaceEvent::Encoder { control: "midi.test.ch1.cc70".into(), delta: -14 },
+            ]
+        );
+        state.set_relative(1, 71, true);
+        assert_eq!(
+            parse_midi_bytes(&mut state, "test", &[71, 1]),
+            vec![SurfaceEvent::Encoder { control: "midi.test.ch1.cc71".into(), delta: 1 }]
+        );
     }
 
     #[test]
@@ -1392,7 +1489,8 @@ mod tests {
         let mut state = MidiParserState::new();
         // Sysex start (0xF0), junk payload, Sysex end (0xF7), followed by CC 19
         let bytes = [0xF0, 0x00, 0x20, 0x7F, 0xF7, 0xB0, 19, 127];
-        let evs = parse_midi_bytes(&mut state, "test", &bytes);
+        let mut evs = parse_midi_bytes(&mut state, "test", &bytes);
+        evs.extend(state.flush_msb("test"));
         assert_eq!(evs.len(), 1);
         match &evs[0] {
             SurfaceEvent::Fader { control, value } => {
@@ -1422,6 +1520,17 @@ mod tests {
             e,
             SurfaceEvent::Fader { control, .. } if control == "hid.2200.r1.a2"
         )));
+    }
+
+    #[test]
+    fn hid_single_bit_toggle_only_emits_a_button() {
+        let mut tracker = HidAnalogTracker::default();
+        let events = diff_hid_reports(0x2200, &[1, 0, 0], &[1, 4, 0], &mut tracker);
+        assert_eq!(events, vec![SurfaceEvent::Button {
+            control: "hid.2200.r1.b0.2".into(),
+            pressed: true,
+        }]);
+        assert!(tracker.ranges.is_empty());
     }
 
     #[test]
