@@ -1142,6 +1142,12 @@ impl AudioSharedState {
     }
 
     pub fn scratch_tick(&mut self, deck: usize, ticks: i64) {
+        self.scratch_tick_scaled(deck, ticks, 1.0);
+    }
+
+    /// Accumulates raw platter ticks within a burst before scaling by `sensitivity`, so fractional
+    /// sensitivity gives the same speed whether ticks arrive as many tiny reports or one larger report.
+    pub fn scratch_tick_scaled(&mut self, deck: usize, ticks: i64, sensitivity: f64) {
         let d = deck.min(3);
         if ticks == 0 || !self.scratch_active[d] {
             return;
@@ -1161,7 +1167,8 @@ impl AudioSharedState {
             self.scratch_burst_ticks[d] = ticks;
             self.scratch_last_tick_at[d] = Some(now);
         }
-        let velocity = (self.scratch_burst_ticks[d] as f64 * self.scratch_dx_per_tick[d] / self.scratch_burst_dt[d]).clamp(-6.0, 6.0);
+        let scaled = self.scratch_burst_ticks[d] as f64 * sensitivity.clamp(0.1, 4.0);
+        let velocity = (scaled * self.scratch_dx_per_tick[d] / self.scratch_burst_dt[d]).clamp(-6.0, 6.0);
         self.scratch_target_rate[d] = self.scratch_burst_base[d] * 0.45 + velocity * 0.55;
         self.scratch_idle_sec[d] = 0.0;
         self.scratch_tick_serial[d] = self.scratch_tick_serial[d].wrapping_add(1);

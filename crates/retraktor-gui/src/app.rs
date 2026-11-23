@@ -122,6 +122,8 @@ pub struct ReTraktorApp {
     pub next_track_target_deck: usize,
     /// The highlighted pick: arrows move it, Enter loads it.
     pub next_track_selected: usize,
+    /// Digit keys handled by the Next Track picker stay suppressed for hotcues until released.
+    picker_swallowed_digits: [bool; 5],
     /// Read when the picker opens, not every frame.
     cached_ai_settings: crate::ai::AiSettings,
     pub ai_rerank_runner: Option<crate::ai::AiRerankRunner>,
@@ -299,6 +301,7 @@ impl Default for ReTraktorApp {
             next_track_picks: Vec::new(),
             next_track_target_deck: 2,
             next_track_selected: 0,
+            picker_swallowed_digits: [false; 5],
             cached_ai_settings: crate::ai::AiSettings::load(),
             ai_rerank_runner: None,
             ai_rerank_status: None,
@@ -650,6 +653,10 @@ impl eframe::App for ReTraktorApp {
             self.last_pref_jog_mode_turntable = self.preferences.jog_mode_turntable;
             self.deck_turntable_mode[0] = self.preferences.jog_mode_turntable;
             self.deck_turntable_mode[1] = self.preferences.jog_mode_turntable;
+            if !self.preferences.jog_mode_turntable {
+                self.jog_touch(0, false);
+                self.jog_touch(1, false);
+            }
         }
         self.sync_hide_missing();
         self.custom_mappings = self.preferences.mapping.action.clone();
@@ -1818,9 +1825,13 @@ impl ReTraktorApp {
             state.pattern_pitch = self.pattern_pitch;
             state.pattern_decay = self.pattern_decay;
 
-            // Only a known BPM is a grid to sync with; a track still being analysed has none yet.
-            let grids: [Option<(f64, f64)>; 4] =
-                std::array::from_fn(|i| state.loaded_tracks[i].as_ref().filter(|t| t.bpm > 0.0).map(|t| (t.bpm.max(20.0), t.grid_offset_sec)));
+            // Only a known finite BPM is a grid to sync with; a track still being analysed has none yet.
+            let grids: [Option<(f64, f64)>; 4] = std::array::from_fn(|i| {
+                state.loaded_tracks[i]
+                    .as_ref()
+                    .filter(|t| t.bpm.is_finite() && t.bpm > 0.0)
+                    .map(|t| (t.bpm.max(20.0), t.grid_offset_sec))
+            });
             for d in 0..4 {
                 state.channel_gain[d] = self.channel_gain[d];
                 state.engine.strips[d].volume = self.channel_volume[d];
@@ -1851,9 +1862,10 @@ impl ReTraktorApp {
                             if !self.sync_was_playing[d] || !self.sync_was_playing[other] {
                                 snap_bars(&mut state, d, other);
                             }
+                            let fold = sync_octave(bpm, other_bpm);
                             let behind = beat_phase_diff(
                                 (state.playhead_sec[other] - other_offset) * other_bpm / 60.0,
-                                (state.playhead_sec[d] - offset) * bpm / 60.0,
+                                (state.playhead_sec[d] - offset) * (bpm * fold) / 60.0,
                                 1.0,
                             );
                             nudge = (behind * 0.2).clamp(-0.03, 0.03);
@@ -2245,7 +2257,11 @@ impl ReTraktorApp {
                     "surface.left.jogwheel.touch" => return self.jog_touch(0, pressed),
                     "surface.right.jogwheel.touch" => return self.jog_touch(1, pressed),
                     "surface.left.shift" | "surface.right.shift" => {
-                        self.deck_shift_held[usize::from(control == "surface.right.shift")] = pressed;
+                        let d = usize::from(control == "surface.right.shift");
+                        self.deck_shift_held[d] = pressed;
+                        if pressed && self.deck_scratch_active[d] {
+                            self.jog_touch(d, false);
+                        }
                         return;
                     }
                     _ => {}
@@ -2444,7 +2460,7 @@ impl ReTraktorApp {
             if shift {
                 state.fast_scrub(d, delta, sens);
             } else if state.scratch_active[d] {
-                state.scratch_tick(d, (delta as f64 * sens).round() as i64);
+                state.scratch_tick_scaled(d, delta, sens);
             } else {
                 state.jog_nudge(d, delta, sens);
             }
@@ -2452,12 +2468,10 @@ impl ReTraktorApp {
     }
 
     /// Platter top touched / let go: scratch on / off, in turntable mode only.
-    /// Holding SHIFT bypasses scratch engagement so SHIFT + platter top scrubs without muting playback.
+    /// Holding SHIFT bypasses scratch engagement so SHIFT + platter top scrubs without muting playback;
+    /// releasing an active scratch always succeeds even if Vinyl mode was turned off mid-touch.
     fn jog_touch(&mut self, d: usize, pressed: bool) {
-        if !self.deck_turntable_mode[d] {
-            return;
-        }
-        if pressed && self.deck_shift_held[d.min(1)] {
+        if pressed && (!self.deck_turntable_mode[d] || self.deck_shift_held[d.min(1)]) {
             return;
         }
         if !pressed && !self.deck_scratch_active[d] {
@@ -2582,10 +2596,19 @@ impl ReTraktorApp {
             }
         }
 
-        if self.show_next_track_panel && !self.show_shortcuts_hud {
+        const PICKER_DIGITS: [Key; 5] = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5];
+        ctx.input(|i| {
+            for (idx, &k) in PICKER_DIGITS.iter().enumerate() {
+                if !i.key_down(k) {
+                    self.picker_swallowed_digits[idx] = false;
+                }
+            }
+        });
+
+        if self.show_next_track_panel && !self.show_shortcuts_hud && !typing {
             let last = self.next_track_picks.len().saturating_sub(1);
             let (down, up, enter, digit) = ctx.input(|i| {
-                let digit = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5].iter().position(|&k| i.key_pressed(k));
+                let digit = PICKER_DIGITS.iter().position(|&k| i.key_pressed(k));
                 (i.key_pressed(Key::ArrowDown), i.key_pressed(Key::ArrowUp), i.key_pressed(Key::Enter), digit)
             });
             if down {
@@ -2593,6 +2616,9 @@ impl ReTraktorApp {
             }
             if up {
                 self.next_track_selected = self.next_track_selected.saturating_sub(1);
+            }
+            if let Some(d_idx) = digit {
+                self.picker_swallowed_digits[d_idx] = true;
             }
             if let Some(pick) = digit.or(enter.then_some(self.next_track_selected)) {
                 self.load_next_pick(pick);
@@ -2638,7 +2664,7 @@ impl ReTraktorApp {
                 }
 
                 // Hotcues 1..4 on Deck A (1..4) and Deck B (5..8)
-                for (key, d_idx, cue) in [
+                for (slot_idx, (key, d_idx, cue)) in [
                     (Key::Num1, 1, 1u8),
                     (Key::Num2, 1, 2),
                     (Key::Num3, 1, 3),
@@ -2647,7 +2673,13 @@ impl ReTraktorApp {
                     (Key::Num6, 2, 2),
                     (Key::Num7, 2, 3),
                     (Key::Num8, 2, 4),
-                ] {
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    if slot_idx < 5 && self.picker_swallowed_digits[slot_idx] {
+                        continue;
+                    }
                     if i.key_pressed(key) {
                         // Shift deletes the cue, so the pad can be set again.
                         if shift {
@@ -2921,11 +2953,13 @@ impl ReTraktorApp {
             return;
         }
         let Ok(mut state) = self.audio.shared.lock() else { return };
-        let bpm = |i: usize| state.loaded_tracks[i].as_ref().map_or(0.0, |t| t.bpm);
+        let bpm = |i: usize| state.loaded_tracks[i].as_ref().map(|t| t.bpm).filter(|b| b.is_finite() && *b > 0.0).unwrap_or(0.0);
         let pitched = |i: usize| bpm(i) * (1.0 + self.deck_pitch_fader[i] as f64 / 100.0);
+        // Preserve an explicit Master selection (even while its BPM is unknown); only promote a leader when free.
         let leader = match self.tempo_master_deck {
-            Some(m) if m != d && bpm(m) > 0.0 => Some(m),
-            _ => {
+            Some(m) if m == d => return,
+            Some(m) => (bpm(m) > 0.0).then_some(m),
+            None => {
                 let partner = if d == 0 { 1 } else { 0 };
                 let other = (0..4)
                     .find(|&i| i != d && state.is_playing[i] && bpm(i) > 0.0)
@@ -2953,29 +2987,39 @@ impl ReTraktorApp {
             return;
         }
         self.tempo_master_deck = Some(d);
-        let bpm = self.audio.shared.lock().ok().and_then(|s| s.loaded_tracks[d].as_ref().map(|t| t.bpm)).unwrap_or(0.0);
+        let bpm = self.audio.shared.lock().ok().and_then(|s| s.loaded_tracks[d].as_ref().map(|t| t.bpm)).filter(|b| b.is_finite() && *b > 0.0).unwrap_or(0.0);
         if bpm > 0.0 {
             self.master_tempo = bpm * (1.0 + self.deck_pitch_fader[d] as f64 / 100.0);
         }
     }
 
     /// A pitch fader moved (on screen or on the controller). On a deck in a sync group (synced, or the deck others
-    /// follow) the whole group takes the new tempo, so sync never pulls the fader back.
+    /// follow) the whole connected group takes the new tempo, so sync never pulls the fader back.
     fn set_deck_pitch_fader(&mut self, d: usize, pitch: f32) {
         self.deck_pitch_fader[d] = pitch;
-        let leads = (0..4).any(|o| o != d && self.deck_sync_enabled[o] && sync_leader(self.tempo_master_deck, o) == Some(d));
-        if !(self.deck_sync_enabled[d] || leads) {
+        let mut group = [false; 4];
+        group[d] = true;
+        for _ in 0..4 {
+            for i in 0..4 {
+                if let Some(l) = self.deck_sync_enabled[i].then(|| sync_leader(self.tempo_master_deck, i)).flatten() {
+                    if group[i] || group[l] {
+                        group[i] = true;
+                        group[l] = true;
+                    }
+                }
+            }
+        }
+        if !group.iter().enumerate().any(|(i, &in_group)| i != d && in_group) && !self.deck_sync_enabled[d] {
             return;
         }
         let Ok(state) = self.audio.shared.lock() else { return };
-        let bpm = |i: usize| state.loaded_tracks[i].as_ref().map_or(0.0, |t| t.bpm);
+        let bpm = |i: usize| state.loaded_tracks[i].as_ref().map(|t| t.bpm).filter(|b| b.is_finite() && *b > 0.0).unwrap_or(0.0);
         if bpm(d) <= 0.0 {
             return;
         }
         let target = bpm(d) * (1.0 + pitch as f64 / 100.0);
         self.master_tempo = target;
-        let my_leader = sync_leader(self.tempo_master_deck, d);
-        for o in (0..4).filter(|&o| o != d && (self.deck_sync_enabled[o] || self.tempo_master_deck == Some(o) || my_leader == Some(o)) && bpm(o) > 0.0) {
+        for o in (0..4).filter(|&o| o != d && group[o] && bpm(o) > 0.0) {
             self.deck_pitch_fader[o] = ((sync_ratio(bpm(o), target) - 1.0) * 100.0) as f32;
         }
     }
@@ -4733,13 +4777,16 @@ impl ReTraktorApp {
         }
     }
 
-    /// Loads pick `pick` (0-based) onto the picker's deck and closes the picker; no such pick, nothing happens.
+    /// Loads pick `pick` (0-based) onto the picker's deck and closes the picker only if the load was accepted.
     fn load_next_pick(&mut self, pick: usize) {
         let Some(&(id, _, _)) = self.next_track_picks.get(pick) else { return };
         let locked = self.locked_decks();
+        let before = self.library.pending_loads.len();
         self.library.load_to_deck(self.next_track_target_deck, id, locked);
-        self.drain_pending_loads();
-        self.show_next_track_panel = false;
+        if self.library.pending_loads.len() > before {
+            self.drain_pending_loads();
+            self.show_next_track_panel = false;
+        }
     }
 }
 
@@ -4792,15 +4839,29 @@ fn key_text(key: &str, analysing: bool) -> &str {
     }
 }
 
-fn sync_ratio(bpm: f64, target: f64) -> f64 {
+/// Power-of-two octave fold bringing `bpm` within `√2` of `target` (e.g. `2.0` for 70 synced to 140).
+fn sync_octave(bpm: f64, target: f64) -> f64 {
+    if !(bpm.is_finite() && bpm > 0.0 && target.is_finite() && target > 0.0) {
+        return 1.0;
+    }
+    let mut fold = 1.0;
     let mut ratio = target.max(20.0) / bpm.max(20.0);
     while ratio > std::f64::consts::SQRT_2 {
         ratio /= 2.0;
+        fold *= 2.0;
     }
     while ratio < std::f64::consts::FRAC_1_SQRT_2 {
         ratio *= 2.0;
+        fold /= 2.0;
     }
-    ratio
+    fold
+}
+
+fn sync_ratio(bpm: f64, target: f64) -> f64 {
+    if !(bpm.is_finite() && bpm > 0.0 && target.is_finite() && target > 0.0) {
+        return 1.0;
+    }
+    target.max(20.0) / (bpm.max(20.0) * sync_octave(bpm, target))
 }
 
 /// How far (in beats, within ±period/2) a deck at `beats` must move forward to line up with the master
@@ -4856,16 +4917,23 @@ fn recording_dir(pref: &std::path::Path) -> PathBuf {
 }
 
 fn snap_bars(state: &mut crate::audio::AudioSharedState, d: usize, other: usize) {
-    let grid = |i: usize| state.loaded_tracks[i].as_ref().filter(|t| t.bpm > 0.0).map(|t| (t.bpm.max(20.0), t.grid_offset_sec));
+    let grid = |i: usize| {
+        state.loaded_tracks[i]
+            .as_ref()
+            .filter(|t| t.bpm.is_finite() && t.bpm > 0.0)
+            .map(|t| (t.bpm.max(20.0), t.grid_offset_sec))
+    };
     if let (Some((bpm, offset)), Some((other_bpm, other_offset))) = (grid(d), grid(other)) {
+        let fold = sync_octave(bpm, other_bpm);
+        let scaled_bpm = bpm * fold;
         let behind = beat_phase_diff(
             (state.playhead_sec[other] - other_offset) * other_bpm / 60.0,
-            (state.playhead_sec[d] - offset) * bpm / 60.0,
+            (state.playhead_sec[d] - offset) * scaled_bpm / 60.0,
             4.0,
         );
         let len = state.loaded_tracks[d].as_ref().map_or(0.0, |t| t.duration_sec);
         let from = state.playhead_sec[d];
-        state.seek_by(d, (from + behind * 60.0 / bpm).clamp(0.0, len) - from);
+        state.seek_by(d, (from + behind * 60.0 / scaled_bpm).clamp(0.0, len) - from);
     }
 }
 
@@ -5851,6 +5919,79 @@ mod sync_audio {
         let lit = |app: &ReTraktorApp, key: &str| app.bus.get(key).and_then(|v| v.as_bool()).unwrap();
         assert!(lit(&app, "app.traktor.decks.1.stems.1.muted") && !lit(&app, "app.traktor.decks.1.stems.4.muted"));
         assert!(lit(&app, "app.traktor.decks.2.sync.enabled") && !lit(&app, "app.traktor.decks.1.sync.enabled"));
+    }
+
+    /// Regression checks for Codex review findings: explicit Master preserved while unanalysed, 4-deck connected
+    /// sync pitch fader, half-time 70/140 zero phase wobble, infinite BPM guard, and scratch release on Vinyl-off / Shift.
+    #[test]
+    fn sync_edge_cases_and_scratch_release_hold() {
+        assert_eq!(sync_ratio(120.0, f64::INFINITY), 1.0);
+        assert_eq!(sync_ratio(f64::INFINITY, 120.0), 1.0);
+
+        // Explicit Master A (unanalysed) stays Master when B syncs with C playing.
+        let mut app = ReTraktorApp::default();
+        {
+            let mut s = app.audio.shared.lock().unwrap();
+            s.loaded_tracks[0] = Some(track(0.0));
+            s.loaded_tracks[1] = Some(track(128.0));
+            s.loaded_tracks[2] = Some(track(132.0));
+            s.is_playing[2] = true;
+        }
+        app.master_tempo = 124.0;
+        app.toggle_master(0);
+        app.sync_deck(2);
+        assert_eq!(app.tempo_master_deck, Some(0));
+        assert!((128.0 * (1.0 + app.deck_pitch_fader[1] as f64 / 100.0) - 124.0).abs() < 0.05);
+
+        // 4-deck connected sync: A & C synced to B, then B released -> moving C's fader updates A, B, and C together.
+        let mut app = ReTraktorApp::default();
+        {
+            let mut s = app.audio.shared.lock().unwrap();
+            s.loaded_tracks[0] = Some(track(120.0));
+            s.loaded_tracks[1] = Some(track(120.0));
+            s.loaded_tracks[2] = Some(track(120.0));
+        }
+        app.toggle_master(1);
+        app.sync_deck(1);
+        app.sync_deck(3);
+        app.toggle_master(1); // release B
+        app.set_deck_pitch_fader(2, 5.0);
+        app.sync_audio_state();
+        assert!((app.deck_pitch_fader[0] - 5.0).abs() < 0.05);
+        assert!((app.deck_pitch_fader[1] - 5.0).abs() < 0.05);
+        assert!((app.deck_pitch_fader[2] - 5.0).abs() < 0.05);
+
+        // Half-time sync (70 synced to 140) aligned on beat 1 -> zero speed wobble.
+        let mut app = ReTraktorApp::default();
+        {
+            let mut s = app.audio.shared.lock().unwrap();
+            s.loaded_tracks[0] = Some(track(140.0));
+            s.loaded_tracks[1] = Some(track(70.0));
+            s.is_playing = [true, true, false, false];
+            let one_master_beat = 60.0 / 140.0;
+            s.playhead_sec[0] = one_master_beat;
+            s.playhead_sec[1] = one_master_beat;
+        }
+        app.toggle_master(0);
+        app.sync_deck(2);
+        app.sync_was_playing = [true, true, false, false];
+        app.sync_audio_state();
+        let ratio = app.audio.shared.lock().unwrap().pitch_ratio[1];
+        assert!((ratio - 1.0).abs() < 1e-4, "half-time aligned deck got spurious nudge: {ratio}");
+
+        // Scratch releases cleanly even when Vinyl mode is turned off mid-touch or Shift is pressed mid-touch.
+        let mut app = ReTraktorApp::default();
+        app.deck_turntable_mode[0] = true;
+        button(&mut app, "surface.left.jogwheel.touch", true);
+        assert!(app.audio.shared.lock().unwrap().scratch_active[0]);
+        app.deck_turntable_mode[0] = false;
+        button(&mut app, "surface.left.jogwheel.touch", false);
+        assert!(!app.audio.shared.lock().unwrap().scratch_active[0]);
+
+        app.deck_turntable_mode[0] = true;
+        button(&mut app, "surface.left.jogwheel.touch", true);
+        button(&mut app, "surface.left.shift", true);
+        assert!(!app.audio.shared.lock().unwrap().scratch_active[0]);
     }
 
     /// The picker: arrows and Enter load the highlighted pick, a digit loads that pick, both onto the picker's deck.
