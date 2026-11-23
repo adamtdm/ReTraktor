@@ -67,7 +67,8 @@ impl UiTrackEntry {
             title: e.title.clone(),
             artist: e.artist.clone(),
             album: e.album_title.clone().unwrap_or_default(),
-            bpm: e.tempo.as_ref().map_or(0.0, |t| t.bpm),
+            // A corrupt TEMPO (infinite, NaN, not positive) is read as not analysed.
+            bpm: e.tempo.as_ref().map(|t| t.bpm).filter(|b| b.is_finite() && *b > 0.0).unwrap_or(0.0),
             musical_key: key.to_string(),
             duration_sec: e.playtime_sec.unwrap_or(0.0),
             genre: e.genre.clone().unwrap_or_default(),
@@ -838,8 +839,12 @@ pub struct LibraryManager {
     pub overview_clicked: Option<(usize, f64)>,
     /// Set by the app while help, the picker or Preferences is on top: browser keys stay inert.
     pub keys_blocked: bool,
+    /// The track whose row a held primary press began on, until that press becomes a drag or ends.
+    drag_press: Option<usize>,
     /// A refused load, shown on the deck itself for a few seconds.
     pub deck_refused: [Option<std::time::Instant>; 4],
+    /// Set by the app: decks in Remix mode, which take samples into their cells, never a track.
+    pub remix_decks: [bool; 4],
     pub status_message: String,
     pub stem_job_progress: Option<(usize, f32)>,
     /// Tracks waiting for Demucs, run one at a time (two at once would exhaust RAM on a laptop).
@@ -922,7 +927,9 @@ impl LibraryManager {
             visible_rows: Vec::new(),
             overview_clicked: None,
             keys_blocked: false,
+            drag_press: None,
             deck_refused: [None; 4],
+            remix_decks: [false; 4],
             status_message: String::new(),
             stem_job_progress: None,
             stem_queue: Default::default(),
@@ -2005,11 +2012,19 @@ impl LibraryManager {
         self.version += 1;
     }
 
+    /// Deck `d` (0..4) no longer holds a library track (it became a Remix deck); Suggestions stop following it.
+    pub fn clear_deck_track(&mut self, d: usize) {
+        self.deck_tracks[d] = None;
+    }
+
     /// Queues `id` for loading onto deck `deck` (1..=4) after safety checks.
     pub fn load_to_deck(&mut self, deck: usize, id: usize, locked: [bool; 4]) {
         let d = deck.clamp(1, 4) - 1;
         let Some(t) = self.track(id).cloned() else { return };
-        if locked[d] {
+        if self.remix_decks[d] {
+            self.status_message = format!("Deck {} is a Remix deck: drop samples on its cells, or switch it to TRACK", DECK_NAMES[d]);
+            self.deck_refused[d] = Some(std::time::Instant::now());
+        } else if locked[d] {
             self.status_message = format!("Deck {} is playing and locked — not loaded", DECK_NAMES[d]);
             self.deck_refused[d] = Some(std::time::Instant::now());
         } else if !t.file_path.as_ref().is_some_and(|p| p.is_file()) {
@@ -2081,8 +2096,9 @@ impl LibraryManager {
                 self.selected_track_id = Some(id);
             }
             Action::Load(deck, id) => self.load_to_deck(deck, id, locked),
-            Action::LoadAuto(id) => match (0..deck_count).find(|&d| !locked[d]) {
+            Action::LoadAuto(id) => match (0..deck_count).find(|&d| !locked[d] && !self.remix_decks[d]) {
                 Some(d) => self.load_to_deck(d + 1, id, locked),
+                None if self.remix_decks.iter().any(|&r| r) => self.status_message = "No deck free for a track: the others are playing and locked or in Remix mode".to_string(),
                 None => self.status_message = "All decks are playing and locked".to_string(),
             },
             Action::AddToPlaylist(ids, pl) => self.add_to_playlist(&ids, pl),
@@ -2732,8 +2748,14 @@ impl LibraryManager {
             let sel = self.selected_track_id;
             ui.label(RichText::new("Load").color(TraktorTheme::TEXT_SECONDARY()));
             for (d, name) in DECK_NAMES.iter().enumerate().take(deck_count) {
-                let enabled = sel.is_some() && !locked[d];
-                let why = if sel.is_none() { "Select a track first".to_string() } else { format!("Deck {name} is playing and locked") };
+                let enabled = sel.is_some() && !locked[d] && !self.remix_decks[d];
+                let why = if sel.is_none() {
+                    "Select a track first".to_string()
+                } else if self.remix_decks[d] {
+                    format!("Deck {name} is a Remix deck: drop samples on its cells")
+                } else {
+                    format!("Deck {name} is playing and locked")
+                };
                 if ui.add_enabled(enabled, egui::Button::new(*name)).on_hover_text(format!("Load the selected track on deck {name}")).on_disabled_hover_text(why).clicked() {
                     if let Some(id) = sel {
                         self.load_to_deck(d + 1, id, locked);
@@ -3047,6 +3069,12 @@ impl LibraryManager {
             }
         }
 
+        // egui hit-tests a press where the pointer is at the end of that frame, so in a slow frame a press and the
+        // first moves grab the row above, or none: a drag belongs to the row under the press itself.
+        let row_gap = ui.spacing().item_spacing.y;
+        let (pressed, press_origin, decided, held) =
+            ui.input(|i| (i.pointer.primary_pressed(), i.pointer.press_origin(), i.pointer.is_decidedly_dragging(), i.pointer.primary_down()));
+        let (mut pressed_row, mut cell_dragged) = (None, false);
         let mut table = TableBuilder::new(ui)
             .striped(true)
             .resizable(true)
@@ -3069,7 +3097,7 @@ impl LibraryManager {
         table
             .header(22.0, |mut header| {
                 for &c in &cols {
-                    header.col(|ui| {
+                    let (_, cell) = header.col(|ui| {
                         let sortable = c != SortColumn::Preview;
                         // Plain label + whole-cell interact: a Button named "Preview" would shadow the toolbar toggle, and an exact-size allocation stops the remainder column shrinking.
                         let r = ui.interact(ui.max_rect(), ui.id().with(("col_hdr", c)), Sense::click());
@@ -3086,9 +3114,11 @@ impl LibraryManager {
                         let r = if sortable { r.on_hover_cursor(egui::CursorIcon::PointingHand) } else { r };
                         r.on_hover_text(hint).context_menu(|ui| column_menu(ui, columns));
                     });
+                    cell_dragged |= cell.dragged();
                 }
             })
-            .body(|body| {
+            .body(|mut body| {
+                let body_clip = body.ui_mut().clip_rect();
                 body.rows(ROW_H, self.view.len(), |mut row| {
                     let r = row.index();
                     let t = &self.tracks[self.view[r]];
@@ -3172,9 +3202,12 @@ impl LibraryManager {
                         // Shift sends it to deck B; plain double-click takes the first free deck.
                         actions.push(if ui_modifiers(&row_resp).shift { Action::Load(2, t.id) } else { Action::LoadAuto(t.id) });
                     }
-                    if row_resp.drag_started() {
-                        row_resp.dnd_set_drag_payload(DragTracks(self.selected_or(t.id)));
+                    // The visible row plus half the gap to its neighbours, and only where no window or menu covers it.
+                    let band = resp.rect.expand2(egui::vec2(0.0, row_gap / 2.0)).intersect(body_clip);
+                    if pressed && press_origin.is_some_and(|p| band.contains(p) && resp.ctx.layer_id_at(p) == Some(resp.layer_id)) {
+                        pressed_row = Some(t.id);
                     }
+                    cell_dragged |= resp.dragged();
                     // Right-clicking the waveform opens the row's menu too.
                     let resp = match wave {
                         Some(w) => resp.union(w),
@@ -3250,6 +3283,30 @@ impl LibraryManager {
                 });
             });
         self.visible_rows = visible;
+        // Escape cancels a press egui hasn't made a drag yet, before it looks at this frame's presses: so do we.
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.drag_press = None;
+        }
+        if pressed {
+            self.drag_press = pressed_row;
+        }
+        if !held {
+            self.drag_press = None;
+        }
+        // A drag is decided frames after its press, by the cell under the pointer then: a header cell (its label isn't
+        // selectable, so it doesn't take drags) if the first frame already left the rows. Anything else egui gave the
+        // press, such as a column edge, keeps it, and a touch held still opens the row's menu instead (egui's long
+        // touch). That first decided frame settles the press either way.
+        // shortcut: a slow first frame that ends on another draggable control drags that control, not the track, upgrade
+        // to holding back the moves after a press in raw_input_hook if that shows up, which would fix every widget.
+        if decided {
+            if let Some(id) = self.drag_press.take() {
+                let long_touch = ui.ctx().interaction_snapshot(|s| s.long_touched.is_some());
+                if !long_touch && (cell_dragged || ui.ctx().dragged_id().is_none()) {
+                    egui::DragAndDrop::set_payload(ui.ctx(), DragTracks(self.selected_or(id)));
+                }
+            }
+        }
         if preview_click.is_some() {
             self.overview_clicked = preview_click;
         }

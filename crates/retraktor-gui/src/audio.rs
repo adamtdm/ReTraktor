@@ -4,6 +4,7 @@ use cpal::traits::StreamTrait;
 use retraktor_audio::FourDeckAudioEngine;
 use crate::keylock::KeyLock;
 use crate::recorder::RecorderTap;
+use crate::remix::{self, Launch, RemixColumn, RemixEngine, RemixRequest, RemixSample};
 use retraktor_dsp::{DeckFxUnit, MixerFxKind};
 use std::collections::HashMap;
 use std::f32::consts::PI;
@@ -392,6 +393,9 @@ pub(crate) struct AudioFile {
     pub header_frames: Option<u64>,
     /// Reused for every packet, so decoding allocates only when a packet is larger than any before.
     samples: Option<SampleBuffer<f32>>,
+    /// A packet failed to read (other than at the end of the file) or to decode. [`AudioFile::next_stereo`] still
+    /// ends or skips there as it always has; a caller that needs the whole file checks this.
+    pub damaged: bool,
 }
 
 /// Where an [`AudioFile`]'s packets come from.
@@ -429,7 +433,7 @@ impl AudioFile {
         #[cfg(test)]
         if let Some((_, stream)) = TEST_STREAMS.lock().unwrap_or_else(PoisonError::into_inner).iter().find(|(p, _)| p == path) {
             let (rate, header_frames) = (stream.rate, stream.header_frames);
-            return Ok(Self { source: AudioSource::Script(Arc::clone(stream), 0), track_id: 0, time_base: None, start_ts: 0, sample_rate: rate, header_frames, samples: None });
+            return Ok(Self { source: AudioSource::Script(Arc::clone(stream), 0), track_id: 0, time_base: None, start_ts: 0, sample_rate: rate, header_frames, samples: None, damaged: false });
         }
         let file = File::open(path).map_err(|e| format!("Failed to open {}: {e}", path.display()))?;
         let mss = MediaSourceStream::new(Box::new(file), Default::default());
@@ -451,7 +455,7 @@ impl AudioFile {
             return Err(format!("Unsupported sample rate {sample_rate} Hz in {}", path.display()));
         }
         let source = AudioSource::Symphonia { format, decoder };
-        let mut file = Self { source, track_id, time_base: params.time_base, start_ts: params.start_ts, sample_rate, header_frames: None, samples: None };
+        let mut file = Self { source, track_id, time_base: params.time_base, start_ts: params.start_ts, sample_rate, header_frames: None, samples: None, damaged: false };
         // The stated length is in the container's own ticks (an MP4's media duration, for one).
         file.header_frames = params.n_frames.map(|n| file.ts_to_frames(n)).filter(|&n| n > 0);
         Ok(file)
@@ -508,7 +512,7 @@ impl AudioFile {
 
     /// Decodes the next packet of the track onto `out` as interleaved stereo (mono doubled, channels past two
     /// dropped). Returns the frame it starts at, or `None` at the end or on a read error. Packets that fail to
-    /// decode are skipped, as before.
+    /// decode are skipped, as before. A read error or a skipped packet sets [`AudioFile::damaged`].
     pub fn next_stereo(&mut self, out: &mut Vec<f32>) -> Option<u64> {
         let (format, decoder) = match &mut self.source {
             AudioSource::Symphonia { format, decoder } => (format, decoder),
@@ -521,11 +525,21 @@ impl AudioFile {
             }
         };
         loop {
-            let packet = format.next_packet().ok()?;
+            let packet = match format.next_packet() {
+                Ok(packet) => packet,
+                Err(e) => {
+                    let end = matches!(&e, symphonia::core::errors::Error::IoError(io) if io.kind() == std::io::ErrorKind::UnexpectedEof);
+                    self.damaged |= !end;
+                    return None;
+                }
+            };
             if packet.track_id() != self.track_id {
                 continue;
             }
-            let Ok(decoded) = decoder.decode(&packet) else { continue };
+            let Ok(decoded) = decoder.decode(&packet) else {
+                self.damaged = true;
+                continue;
+            };
             let spec = *decoded.spec();
             let ch = spec.channels.count().max(1);
             if !self.samples.as_ref().is_some_and(|b| b.capacity() >= decoded.capacity() * ch) {
@@ -588,6 +602,47 @@ impl AudioFile {
 /// slack absorbs the roundoff of a playhead summed frame by frame, far less than any output frame.
 fn at_track_end(playhead_sec: f64, duration_sec: f64) -> bool {
     playhead_sec >= duration_sec - 1e-9
+}
+
+/// A tempo usable for sync, loops and beat timing: finite and 20–400 BPM (the range a grid edit keeps to).
+/// Anything else, from a corrupt tag or import, counts as unknown.
+pub(crate) fn valid_bpm(bpm: f64) -> Option<f64> {
+    (bpm.is_finite() && (20.0..=400.0).contains(&bpm)).then_some(bpm)
+}
+
+/// The speed that plays music at `bpm` at the `target` tempo, folded by octaves to within about ±41%, so a
+/// half- or double-time pairing plays at its own speed (SYNC, and remix loops following the master). It runs in
+/// the audio callback: a tempo that isn't finite and positive gives 1, and the folding is a fixed amount of work.
+pub(crate) fn sync_ratio(bpm: f64, target: f64) -> f64 {
+    if !(bpm.is_finite() && bpm > 0.0 && target.is_finite() && target > 0.0) {
+        return 1.0;
+    }
+    let ratio = target.max(20.0) / bpm.max(20.0);
+    if !ratio.is_finite() || ratio <= 0.0 {
+        return 1.0;
+    }
+    // Whole octaves at once (the exponent of a finite ratio is within ±1100), then at most one step either way.
+    let mut ratio = ratio / 2f64.powi(ratio.log2().round() as i32);
+    if !(0.5..=2.0).contains(&ratio) {
+        return 1.0;
+    }
+    while ratio > std::f64::consts::SQRT_2 {
+        ratio /= 2.0;
+    }
+    while ratio < std::f64::consts::FRAC_1_SQRT_2 {
+        ratio *= 2.0;
+    }
+    ratio
+}
+
+/// The power-of-two fold `sync_ratio` applies (2 for 70 synced to 140), so beat phases of a half- or double-time
+/// pairing compare in the same beats; 1 for a tempo that isn't finite and positive. Fixed work, like `sync_ratio`.
+pub(crate) fn sync_octave(bpm: f64, target: f64) -> f64 {
+    if !(bpm.is_finite() && bpm > 0.0 && target.is_finite() && target > 0.0) {
+        return 1.0;
+    }
+    let unfolded = target.max(20.0) / bpm.max(20.0);
+    2f64.powi((unfolded / sync_ratio(bpm, target)).log2().round() as i32)
 }
 
 /// Mixxx / xwax-based Alpha-Beta tracking filter for authentic turntable physics simulation.
@@ -916,6 +971,24 @@ pub struct AudioSharedState {
     preview_seek: Option<f64>,
     /// Published by the callback: how far it has got through the preview of that serial.
     pub preview_progress: PreviewProgress,
+
+    /// Per deck and remix column: the newest launch or stop asked for, until the callback takes it at a handoff.
+    remix_requests: [[Option<RemixRequest>; remix::COLUMNS]; 4],
+    /// The track whose beatgrid times remix launches, while it plays: (deck, BPM, grid offset in seconds). Without
+    /// one the callback counts beats itself at the master tempo (`engine.clock.bpm`).
+    pub remix_clock: Option<(usize, f64, f64)>,
+    /// Published by the callback: what each remix column plays and has waiting.
+    pub remix_status: [[RemixColumn; remix::COLUMNS]; 4],
+    /// Each deck's remix column filter knobs (`RemixBank::filter`, 0.5 off).
+    pub remix_filter: [[f32; remix::COLUMNS]; 4],
+    /// Each deck's remix column Key Locks (`RemixBank::keylock`).
+    pub remix_keylock: [[bool; remix::COLUMNS]; 4],
+    /// Each deck's remix cells' (sample id, tuning) (`RemixBank::tunings`).
+    pub remix_tunings: [[[(u64, i8); remix::ROWS]; remix::COLUMNS]; 4],
+    /// The callback's beat count, carried to the next stream on a reopen.
+    remix_beat: f64,
+    /// A closing stream's remix columns, playing on in the next one.
+    remix_resume: Option<RemixEngine>,
 }
 
 /// Audio handed back by the callback, of whatever kind, to be dropped off the real-time path.
@@ -933,8 +1006,8 @@ pub struct PreviewProgress {
     pub ended: bool,
 }
 
-/// Room for this many released track buffers between two UI frames (5 per deck with stems).
-const RETIRED_CAPACITY: usize = 64;
+/// Room for this many released buffers between two UI frames (5 per deck with stems, plus remix samples).
+const RETIRED_CAPACITY: usize = 128;
 
 impl Default for AudioSharedState {
     fn default() -> Self {
@@ -1029,6 +1102,14 @@ impl Default for AudioSharedState {
             preview_serial: 0,
             preview_seek: None,
             preview_progress: PreviewProgress::default(),
+            remix_requests: Default::default(),
+            remix_clock: None,
+            remix_status: Default::default(),
+            remix_filter: [[0.5; remix::COLUMNS]; 4],
+            remix_keylock: [[false; remix::COLUMNS]; 4],
+            remix_tunings: [[[(0, 0); remix::ROWS]; remix::COLUMNS]; 4],
+            remix_beat: 0.0,
+            remix_resume: None,
         }
     }
 }
@@ -1208,6 +1289,70 @@ impl AudioSharedState {
         self.scratch_ramping[d] = false;
         self.scratch_changed[d] = true;
     }
+
+    /// Plays `sample` in remix column `column` of deck `d`, replacing what the column plays, from the next beat
+    /// (`on_beat`) or at once. A newer launch or stop for the column, before the callback takes this, replaces it.
+    pub fn remix_launch(&mut self, d: usize, column: usize, row: usize, sample: Arc<RemixSample>, looped: bool, on_beat: bool) {
+        let launch = Launch { sample, row: row as u8, looped, tune: 0 }; // its tuning comes from `remix_tunings`
+        self.remix_requests[d][column] = Some(RemixRequest { launch: Some(launch), on_beat });
+    }
+
+    /// Stops remix column `column` of deck `d` (with a short fade), from the next beat or at once.
+    pub fn remix_stop(&mut self, d: usize, column: usize, on_beat: bool) {
+        self.remix_requests[d][column] = Some(RemixRequest { launch: None, on_beat });
+    }
+
+    /// Remix column `column` of deck `d` as last published, with a request the callback hasn't taken yet shown as
+    /// waiting.
+    pub fn remix_column(&self, d: usize, column: usize) -> RemixColumn {
+        let mut status = self.remix_status[d][column];
+        if let Some(request) = &self.remix_requests[d][column] {
+            status.queued = Some(request.launch.as_ref().map(|l| l.row));
+        }
+        status
+    }
+
+    /// Whether any remix column of deck `d` plays or waits to start. A column playing with a stop waiting for its
+    /// beat is still on air until the callback actually stops it.
+    pub fn remix_active(&self, d: usize) -> bool {
+        self.remix_on_air(d, false)
+    }
+
+    /// [`AudioSharedState::remix_active`] with no output running: a stop asked for is as good as done (a stalled
+    /// stream may never get to it), so it doesn't hold the deck in Remix mode.
+    pub fn remix_active_offline(&self, d: usize) -> bool {
+        self.remix_on_air(d, true)
+    }
+
+    fn remix_on_air(&self, d: usize, stop_settles: bool) -> bool {
+        (0..remix::COLUMNS).any(|c| {
+            let column = self.remix_column(d, c);
+            let stopping = stop_settles && column.queued == Some(None);
+            (column.playing.is_some() && !stopping) || column.queued.is_some_and(|q| q.is_some())
+        })
+    }
+
+    /// With no output running to take them (no stream, or its device gone), on the UI thread: a launch asked for is
+    /// dropped, so it is never heard as a surprise when a stream opens again, and a stop silences its column now in
+    /// the columns a closed stream handed on. Columns that were playing stay, to play on in the next stream.
+    pub fn settle_remix_offline(&mut self) {
+        for d in 0..4 {
+            for c in 0..remix::COLUMNS {
+                let Some(request) = self.remix_requests[d][c].take() else { continue };
+                if request.launch.is_some() {
+                    continue; // dropped here, off the real-time path
+                }
+                match self.remix_resume.as_mut() {
+                    Some(handed_on) => {
+                        handed_on.columns[d][c] = Default::default();
+                        self.remix_status[d][c] = RemixColumn::default();
+                    }
+                    // A stream that stopped calling back still holds its columns: the stop waits for it.
+                    None => self.remix_requests[d][c] = Some(request),
+                }
+            }
+        }
+    }
 }
 
 /// Headphone signal: the cue bus blended toward the main mix, then the headphone level.
@@ -1243,6 +1388,9 @@ pub struct AudioSystem {
     /// Test builds: how many times the output was (re)opened.
     #[cfg(test)]
     pub opens: usize,
+    /// Test builds: act as if no output stream were running ([`AudioSystem::output_running`]).
+    #[cfg(test)]
+    pub test_output_lost: bool,
 }
 
 /// An output the user can pick; `id` is what Preferences stores ("" = system default).
@@ -1465,6 +1613,8 @@ impl AudioSystem {
             test_renderer: Mutex::new(None),
             #[cfg(test)]
             opens: 0,
+            #[cfg(test)]
+            test_output_lost: false,
         }
     }
 
@@ -1641,6 +1791,16 @@ impl AudioSystem {
         self.on_system_default
     }
 
+    /// Whether an output stream is running to play remix launches: one is open and hasn't reported its device gone.
+    pub fn output_running(&self) -> bool {
+        #[cfg(test)]
+        return !self.test_output_lost;
+        #[cfg(not(test))]
+        {
+            stream_running(self.hw_active.load(Ordering::Relaxed), &self.stats)
+        }
+    }
+
     /// Plays `route` from the stream's next block, both pairs switching together, or, from `open`, from the
     /// new stream's first block. A system-default output keeps to [`OutputRoute::on_system_default`].
     pub fn reroute(&mut self, route: OutputRoute) {
@@ -1739,6 +1899,9 @@ pub struct AudioStats {
     /// Other stream errors, and the kind of the latest as an index into [`STREAM_ERROR_KINDS`] (its length = other).
     pub stream_errors: AtomicU64,
     pub last_error_kind: AtomicUsize,
+    /// This stream reported its device gone. Latched for the stream's life: a later, different error (or a quiet
+    /// spell) doesn't bring the device back. A new stream starts with fresh stats.
+    device_gone: AtomicBool,
 }
 
 /// Stream error kinds the UI can name; anything else is reported as "other".
@@ -1760,8 +1923,21 @@ impl AudioStats {
             let index = STREAM_ERROR_KINDS.iter().position(|k| *k == kind).unwrap_or(STREAM_ERROR_KINDS.len());
             self.last_error_kind.store(index, Ordering::Relaxed);
             self.stream_errors.fetch_add(1, Ordering::Relaxed);
+            if kind == cpal::ErrorKind::DeviceNotAvailable {
+                self.device_gone.store(true, Ordering::Relaxed);
+            }
         }
     }
+
+    /// Whether this stream has reported its device gone, ever (see `device_gone`).
+    pub fn device_gone(&self) -> bool {
+        self.device_gone.load(Ordering::Relaxed)
+    }
+}
+
+/// Whether a stream can play remix launches: one is running (`hw_active`) and hasn't reported its device gone.
+fn stream_running(hw_active: bool, stats: &AudioStats) -> bool {
+    hw_active && !stats.device_gone()
 }
 
 /// One deck's audio as the callback holds it: references to the loaded track's PCM, never copies.
@@ -2151,6 +2327,7 @@ pub(crate) struct Renderer {
     deck_fx: [DeckFxUnit; 2],
     pattern_noise: u32,
     preview: PreviewPlayer,
+    remix: RemixEngine,
     generation: u64,
 }
 
@@ -2167,6 +2344,7 @@ impl Renderer {
             deck_fx: Default::default(),
             pattern_noise: 0x9e37_79b9,
             preview: PreviewPlayer::default(),
+            remix: RemixEngine::default(),
             generation: 0,
         };
         let shared = Arc::clone(&renderer.shared);
@@ -2177,6 +2355,11 @@ impl Renderer {
         s.pending_seek = [None; 4];
         renderer.state.playhead_sec = s.playhead_sec;
         renderer.state.pattern_phase_sec = s.pattern_phase_sec;
+        // Remix cells play on from where the last stream left them, on its beat count.
+        match s.remix_resume.take() {
+            Some(remix) => renderer.remix = remix,
+            None => renderer.remix.clock = remix::BeatClock::starting_at(s.remix_beat),
+        }
         renderer.state.scratch_active = s.scratch_active;
         renderer.state.scratch_rate = s.scratch_rate;
         renderer.state.scratch_target_rate = s.scratch_target_rate;
@@ -2262,6 +2445,12 @@ impl Renderer {
         r.pattern_decay = s.pattern_decay;
         r.engine.master_volume = s.engine.master_volume;
         r.engine.clock.bpm = s.engine.clock.bpm;
+        r.remix_clock = s.remix_clock;
+        self.remix.filter = s.remix_filter;
+        self.remix.keylock = s.remix_keylock;
+        self.remix.tunings = s.remix_tunings;
+        self.remix.take_requests(&mut s.remix_requests, &mut s.retired);
+        self.remix.retune();
         for (mine, ui) in r.engine.strips.iter_mut().zip(&s.engine.strips) {
             mine.volume = ui.volume;
             mine.cue_enabled = ui.cue_enabled;
@@ -2373,13 +2562,15 @@ impl Renderer {
         }
         s.jog_nudge_rate = r.jog_nudge_rate;
         s.preview_progress = self.preview.progress();
+        self.remix.publish(&mut s.remix_status);
+        s.remix_beat = self.remix.clock.next;
     }
 }
 
 impl Drop for Renderer {
     /// When the stream closes (a reopen, a device change, quitting), off the real-time path: hand the latest
-    /// playheads to whoever plays next, the fallback clock or a new stream, even if the last blocks found the lock
-    /// busy, and give back the track audio to be freed by the UI thread.
+    /// playheads and remix columns to whoever plays next, the fallback clock or a new stream, even if the last
+    /// blocks found the lock busy, and give back the track audio to be freed by the UI thread.
     fn drop(&mut self) {
         let shared = Arc::clone(&self.shared);
         let mut s = shared.lock().unwrap_or_else(PoisonError::into_inner);
@@ -2394,6 +2585,13 @@ impl Drop for Renderer {
             }
             s.pattern_phase_sec = self.state.pattern_phase_sec;
             s.preview_progress = self.preview.progress();
+            // Remix columns carry on in the next stream, as the decks do; what they had finished with is freed.
+            self.remix.release_retiring(&mut s.retired);
+            self.remix.publish(&mut s.remix_status);
+            s.remix_beat = self.remix.clock.next;
+            s.remix_resume = Some(std::mem::take(&mut self.remix));
+        } else {
+            self.remix.release_all(&mut s.retired);
         }
         for t in self.tracks.iter_mut().filter_map(Option::take) {
             s.retired.extend(t.buffers().into_iter().flatten().map(|b| Arc::clone(b) as Retired));
@@ -2507,6 +2705,7 @@ impl Renderer {
     ) {
         let state = &mut self.state;
         let tracks = &self.tracks;
+        let remix = &mut self.remix;
         let frames = output.len() / channels;
         let dt = 1.0 / (sr as f64).max(1.0);
         output.fill(to_sample(0.0));
@@ -2518,6 +2717,23 @@ impl Renderer {
 
         for f in 0..frames {
             let mut deck_samples: [(f32, f32); 4] = [(0.0, 0.0); 4];
+
+            // Remix cells, timed by the reference track's beat as it stands at this frame, before the decks move on;
+            // with no track, by a sounding Pattern Player's beat (it steps its phase before playing it), so a first loop
+            // lands on its kick; with neither, by the callback's own clock. Values that aren't sane are no reference.
+            let sane = |r: &(usize, f64, f64)| r.1.is_finite() && r.2.is_finite() && r.2 > 0.0;
+            let reference = state
+                .remix_clock
+                .filter(|&(d, bpm, offset)| state.is_playing[d] && tracks[d].is_some() && valid_bpm(bpm).is_some() && offset.is_finite())
+                .map(|(d, bpm, offset)| (d, (state.playhead_sec[d] - offset) * bpm / 60.0, bpm * state.pitch_ratio[d]))
+                .filter(sane)
+                .or_else(|| {
+                    let bpm = state.engine.clock.bpm.max(40.0); // as the Pattern Player times its steps
+                    Some((remix::PATTERN_CLOCK, (state.pattern_phase_sec + dt) * bpm / 60.0, bpm)).filter(|r| state.pattern_enabled && sane(r))
+                });
+            let clock_bpm = valid_bpm(state.engine.clock.bpm).unwrap_or(120.0);
+            let mut remix_out = [(0.0_f32, 0.0_f32); 4];
+            let remix_sounding = remix.frame(reference, clock_bpm, sr, &mut remix_out);
 
             for d in 0..4 {
                 let scratching = state.scratch_active[d] || state.scratch_ramping[d];
@@ -2714,6 +2930,14 @@ impl Renderer {
                 } else if state.playhead_sec[d] < 0.0 {
                     state.playhead_sec[d] = 0.0;
                 }
+            }
+
+            // A remix deck plays through its own channel like a track: channel gain, then EQ, cue, fader, recorder.
+            for d in (0..4).filter(|&d| remix_sounding[d]) {
+                let gain = (state.channel_gain[d] * 2.0).clamp(0.0, 2.0);
+                deck_samples[d].0 += remix_out[d].0 * gain;
+                deck_samples[d].1 += remix_out[d].1 * gain;
+                state.engine.strips[d].playing = true;
             }
 
             // 3. 16-Step Pattern Player (Master Clock Synced Drum Machine)
@@ -4278,6 +4502,21 @@ mod tests {
         stats.stream_error(cpal::ErrorKind::InvalidInput);
         assert_eq!((stats.xruns.load(Ordering::Relaxed), stats.stream_errors.load(Ordering::Relaxed)), (1, 2));
         assert_eq!(stats.last_error_kind.load(Ordering::Relaxed), STREAM_ERROR_KINDS.len(), "an unlisted kind is other");
+
+        // The production check for remix launches: ordinary errors leave a stream usable; a device gone stays gone
+        // for that stream, even once a different error is the latest; a fresh stream (fresh stats) is usable again.
+        let fresh = AudioStats::default();
+        assert!(stream_running(true, &fresh) && !stream_running(false, &fresh), "no stream running");
+        for recoverable in [cpal::ErrorKind::Xrun, cpal::ErrorKind::BackendError, cpal::ErrorKind::InvalidInput] {
+            fresh.stream_error(recoverable);
+        }
+        assert!(stream_running(true, &fresh), "a recoverable error stopped launches");
+        assert!(!stream_running(true, &stats), "the device is gone");
+        assert!(STREAM_ERROR_KINDS.get(stats.last_error_kind.load(Ordering::Relaxed)) != Some(&cpal::ErrorKind::DeviceNotAvailable));
+        stats.stream_error(cpal::ErrorKind::BackendError);
+        assert_eq!(STREAM_ERROR_KINDS[stats.last_error_kind.load(Ordering::Relaxed)], cpal::ErrorKind::BackendError, "the latest kind is kept for diagnostics");
+        assert!(!stream_running(true, &stats), "a later error brought back a dead stream");
+        assert!(stream_running(true, &AudioStats::default()), "a new stream starts usable");
     }
 
     #[test]
@@ -5110,5 +5349,678 @@ mod tests {
         let sinks = graph_sinks(&dump);
         assert_eq!(sinks.len(), 1);
         assert_eq!(sinks[0].channels, 4);
+    }
+
+    /// A remix test sample: a tone starting at its peak (`cos`) or at zero (`sin`), at its own rate.
+    fn remix_tone(name: &str, hz: f32, peak_start: bool, secs: f64, rate: u32, bpm: f64, budget: &Arc<remix::SampleBudget>) -> Arc<RemixSample> {
+        let frames = (secs * rate as f64).round() as usize;
+        let pcm = (0..frames)
+            .flat_map(|i| {
+                let phase = i as f32 * hz * std::f32::consts::TAU / rate as f32;
+                let v = 0.3 * if peak_start { phase.cos() } else { phase.sin() };
+                [v, v]
+            })
+            .collect();
+        Arc::new(RemixSample::from_pcm(name, pcm, rate, bpm, budget).unwrap())
+    }
+
+    /// What one run of the remix demo launches on deck B, and how.
+    #[derive(Clone, Copy, Default)]
+    struct DemoRun {
+        looped: bool,
+        vocal: bool,
+        replace: bool,
+        fader_up: bool,
+        record: bool,
+        /// Deck B's column 1 low-pass and column 2 high-pass, set before the start.
+        filter: bool,
+        /// Deck B's column 1 Key Lock on, its first loop tuned +2 and the replacement -3, set before the start.
+        tuned: bool,
+    }
+
+    /// The first remix demo through the real callback, 1.3 s at `rate` in `block`-frame buffers on a 4-channel
+    /// card (main 1–2, headphones 3–4). Deck A plays a 120 BPM track from 1.01 s (beat 2.02). Deck B is on cue with
+    /// its fader down (or up): its loop (column 1, a 44.1 kHz tagged 4-beat loop) waits for A's next beat (3, at
+    /// 0.49 s), its vocal (column 2, a one-shot) starts at once. A replacement loop asked for in column 1 at 0.6 s
+    /// lands on beat 4 (0.99 s), with the UI holding the lock from 0.7 to 1.1 s. Returns the output, the
+    /// recording if made, and the columns as published at the end.
+    fn remix_demo(rate: u32, block: usize, run: DemoRun) -> (Vec<f32>, Option<Vec<i16>>, [[RemixColumn; remix::COLUMNS]; 4]) {
+        let budget = remix::SampleBudget::new(remix::BANK_BUDGET_BYTES);
+        let first_loop = remix_tone("loop", 1000.0, true, 2.0, 44_100, 120.0, &budget);
+        let second_loop = remix_tone("loop 2", 1500.0, false, 2.0, 44_100, 120.0, &budget);
+        let vocal = remix_tone("vocal", 700.0, false, 3.0, 48_000, 0.0, &budget);
+        let loop_ids = (first_loop.id, second_loop.id);
+        let shared = Arc::new(Mutex::new(AudioSharedState::default()));
+        {
+            let mut s = shared.lock().unwrap();
+            s.loaded_tracks[0] = Some(tone_track(440.0, rate, 12.0));
+            s.playhead_sec[0] = 1.01;
+            s.is_playing[0] = true;
+            s.remix_clock = Some((0, 120.0, 0.0));
+            s.engine.strips[1].cue_enabled = true;
+            s.engine.strips[1].volume = if run.fader_up { 0.85 } else { 0.0 };
+            if run.looped {
+                s.remix_launch(1, 0, 0, first_loop, true, true);
+            }
+            if run.vocal {
+                s.remix_launch(1, 1, 4, vocal, false, false);
+            }
+            if run.filter {
+                s.remix_filter[1] = [0.2, 0.85, 0.5, 0.5];
+            }
+            if run.tuned {
+                s.remix_keylock[1][0] = true;
+                s.remix_tunings[1][0][0] = (loop_ids.0, 2);
+                s.remix_tunings[1][0][1] = (loop_ids.1, -3);
+            }
+        }
+        let recorder: Arc<Mutex<Option<RecorderTap>>> = Arc::default();
+        let rec = run.record.then(|| start_take(&recorder, &format!("remix-{rate}-{block}")));
+        let mut renderer = Renderer::new(Arc::clone(&shared), Arc::default(), Arc::clone(&recorder));
+        let total = (1.3 * rate as f64) as usize;
+        let mut out = Vec::with_capacity(total * 4);
+        let (mut done, mut posted) = (0, false);
+        let mut held = None;
+        let at = |sec: f64| (sec * rate as f64) as usize;
+        while done < total {
+            if run.replace && !posted && done >= at(0.6) {
+                shared.lock().unwrap().remix_launch(1, 0, 1, Arc::clone(&second_loop), true, true);
+                posted = true;
+            }
+            let hold = posted && done >= at(0.7) && done < at(1.1);
+            if hold && held.is_none() {
+                held = Some(shared.lock().unwrap());
+            } else if !hold {
+                held = None;
+            }
+            let mut buf = vec![0.0f32; block.min(total - done) * 4];
+            renderer.render(&mut buf, 4, rate, |x| x);
+            done += buf.len() / 4;
+            out.extend(buf);
+        }
+        drop(held);
+        let status = shared.lock().unwrap().remix_status;
+        let take = rec.map(|rec| finish_take(&recorder, rec).1);
+        (out, take, status)
+    }
+
+    /// The first remix demo (see [`remix_demo`]), at 44.1 and 48 kHz and in 64- to 1024-frame buffers: the loop
+    /// starts on A's beat 3 and the replacement on beat 4, to the frame, through the UI's hold over beat 4; the
+    /// replacement leaves the vocal's column playing and cross-fades with no step; every buffer size plays the
+    /// same samples. With B's fader down, B is in the headphones only: the main mix is deck A's alone, sample for
+    /// sample. With it up, the recording is the main mix, remix included.
+    #[test]
+    fn remix_demo_lands_on_the_tracks_beat() {
+        for rate in [44_100u32, 48_000] {
+            let beat_frame = |beat: f64| (beat - 2.02) * 0.5 * rate as f64;
+            let first_difference = |a: &[f32], b: &[f32]| a.iter().zip(b).position(|(x, y)| x != y).map(|i| (i / 4) as f64);
+            let phones = |out: &[f32]| out.chunks(4).flat_map(|f| [f[2], f[3]]).collect::<Vec<f32>>();
+            let main = |out: &[f32]| out.chunks(4).flat_map(|f| [f[0], f[1]]).collect::<Vec<f32>>();
+            let demo = DemoRun { looped: true, vocal: true, ..Default::default() };
+
+            let (track_only, ..) = remix_demo(rate, 128, DemoRun::default());
+            let (vocal_only, ..) = remix_demo(rate, 128, DemoRun { vocal: true, ..Default::default() });
+            let (no_replace, ..) = remix_demo(rate, 128, demo);
+            let onset = first_difference(&vocal_only, &no_replace).expect("the loop never started");
+            assert!((onset - beat_frame(3.0)).abs() <= 1.0, "{rate} Hz: loop at frame {onset}, A's beat 3 at {}", beat_frame(3.0));
+
+            let mut first: Option<Vec<f32>> = None;
+            for block in [64usize, 128, 333, 1024] {
+                let (out, _, status) = remix_demo(rate, block, DemoRun { replace: true, ..demo });
+                let swap = first_difference(&no_replace, &out).expect("the replacement never landed");
+                assert!((swap - beat_frame(4.0)).abs() <= 1.0, "{rate} Hz, {block}: replaced at {swap}, beat 4 at {}", beat_frame(4.0));
+                assert_eq!(status[1][0].playing.map(|p| p.0), Some(1), "{rate} Hz, {block}: column 1 plays the replacement");
+                assert_eq!(status[1][1].playing.map(|p| p.0), Some(4), "{rate} Hz, {block}: the vocal plays on");
+                assert!(status.iter().enumerate().all(|(d, cols)| d == 1 || cols.iter().all(|c| *c == RemixColumn::default())));
+                // No step at the swap beyond the three tones' own slopes (a hard cut of a 0.3 tone would be up to 0.24).
+                let ph = phones(&out);
+                let window = &ph[2 * (swap as usize - 50)..2 * (swap as usize + 300)];
+                let biggest = window.windows(3).step_by(2).map(|w| (w[2] - w[0]).abs()).fold(0.0f32, f32::max);
+                assert!(biggest < 0.12, "{rate} Hz, {block}: a step of {biggest} at the swap");
+                assert_eq!(main(&out), main(&track_only), "{rate} Hz, {block}: B's fader is down, so the main mix is A's alone");
+                assert!(ph[..2 * onset as usize].iter().zip(phones(&vocal_only).iter()).all(|(a, b)| a == b));
+                match &first {
+                    None => first = Some(out),
+                    Some(f) => assert!(f == &out, "{rate} Hz: {block}-frame buffers play different samples"),
+                }
+            }
+
+            // With the column filters and column 1's Key Lock and tunings on, every buffer size still plays the same
+            // samples, and only deck B changes.
+            let unfiltered = first.take().unwrap();
+            let mut filtered: Option<Vec<f32>> = None;
+            for block in [64usize, 333, 1024] {
+                let (out, _, _) = remix_demo(rate, block, DemoRun { replace: true, filter: true, tuned: true, ..demo });
+                assert!(out.iter().all(|x| x.is_finite()));
+                assert_eq!(main(&out), main(&track_only), "{rate} Hz, {block}: the filters reached the main mix");
+                match &filtered {
+                    None => filtered = Some(out),
+                    Some(f) => assert!(f == &out, "{rate} Hz: filtered {block}-frame buffers play different samples"),
+                }
+            }
+            assert_ne!(phones(&filtered.unwrap()), phones(&unfiltered), "{rate} Hz: the filters did nothing");
+
+            let (out, take, _) = remix_demo(rate, 333, DemoRun { replace: true, fader_up: true, record: true, ..demo });
+            let take = take.unwrap();
+            let heard: Vec<i16> = main(&out).into_iter().map(pcm_i16).collect();
+            assert_eq!(take, heard, "{rate} Hz: the recording is the main mix");
+            assert_ne!(main(&out), main(&track_only), "{rate} Hz: with the fader up, B is in the main mix");
+        }
+    }
+
+    /// Renders `secs` of the callback at 48 kHz, `block` frames at a time, on a 4-channel card, after `setup`: deck B
+    /// (on cue, fader down) is asked for a loop on the next beat. `at` runs once between blocks after that many
+    /// frames. Returns the first frame B is heard in the headphones, the frame `at` ran and whether every sample
+    /// out was finite.
+    fn remix_onset(block: usize, secs: f64, setup: impl FnOnce(&mut AudioSharedState), at: Option<(usize, &dyn Fn(&mut AudioSharedState))>) -> (Option<usize>, usize, bool) {
+        let budget = remix::SampleBudget::new(remix::BANK_BUDGET_BYTES);
+        let shared = Arc::new(Mutex::new(AudioSharedState::default()));
+        {
+            let mut s = shared.lock().unwrap();
+            s.engine.strips[1].cue_enabled = true;
+            s.engine.strips[1].volume = 0.0;
+            s.remix_launch(1, 0, 0, remix_tone("loop", 1000.0, true, 2.0, 48_000, 120.0, &budget), true, true);
+            setup(&mut s);
+        }
+        let mut renderer = Renderer::new(Arc::clone(&shared), Arc::default(), Arc::default());
+        let total = (secs * 48_000.0) as usize;
+        let (mut done, mut ran, mut onset, mut finite) = (0, usize::MAX, None, true);
+        while done < total {
+            if let Some((_, action)) = at.filter(|(frame, _)| done >= *frame && ran == usize::MAX) {
+                action(&mut shared.lock().unwrap());
+                ran = done;
+            }
+            let mut buf = vec![0.0f32; block.min(total - done) * 4];
+            renderer.render(&mut buf, 4, 48_000, |x| x);
+            finite &= buf.iter().all(|x| x.is_finite());
+            if onset.is_none() {
+                onset = buf.chunks(4).position(|f| f[2] != 0.0 || f[3] != 0.0).map(|i| done + i);
+            }
+            done += buf.len() / 4;
+        }
+        (onset, ran, finite)
+    }
+
+    /// A launch waiting for A's next beat when the DJ hot-cues A into the middle of beat 15 waits for beat 16 (a
+    /// quarter of a second at 120 BPM), not the next frame, to the frame in any buffer size.
+    #[test]
+    fn remix_launch_after_a_seek_waits_for_the_next_real_beat() {
+        let seek: &dyn Fn(&mut AudioSharedState) = &|s| s.seek_to(0, 7.75); // beat 15.5
+        for block in [64usize, 333, 1024] {
+            let (onset, ran, finite) = remix_onset(
+                block,
+                0.6,
+                |s| {
+                    s.loaded_tracks[0] = Some(tone_track(440.0, 48_000, 12.0));
+                    s.playhead_sec[0] = 1.01;
+                    s.is_playing[0] = true;
+                    s.remix_clock = Some((0, 120.0, 0.0));
+                },
+                Some((4800, seek)),
+            );
+            let onset = onset.expect("the loop never started");
+            assert!(finite && ran < 24_000);
+            assert!((onset as i64 - (ran + 12_000) as i64).abs() <= 1, "{block}: heard at {onset}, beat 16 at {}", ran + 12_000);
+        }
+    }
+
+    /// With no track playing, a sounding Pattern Player's beat times the launch, so the loop lands on its kick
+    /// (step 4 here). A playing track's beatgrid still comes first. A corrupt reference tempo or master tempo falls
+    /// back to the callback's own clock at a sane tempo, with nothing but finite samples out.
+    #[test]
+    fn remix_follows_the_pattern_player_then_its_own_clock() {
+        let pattern = |s: &mut AudioSharedState| {
+            s.pattern_enabled = true;
+            s.pattern_phase_sec = 0.3; // step 2.4 at 120 BPM
+            s.engine.clock.bpm = 120.0;
+        };
+        // The frame the Pattern Player plays step 4, its next kick, worked out as it steps.
+        let (mut phase, step_dur) = (0.3f64, 60.0 / 120.0 / 4.0);
+        let kick = (0..48_000).find(|_| {
+            phase += 1.0 / 48_000.0;
+            ((phase / step_dur).floor() as usize) % 16 == 4
+        });
+        for block in [64usize, 1024] {
+            let (onset, _, _) = remix_onset(block, 0.5, pattern, None);
+            assert_eq!(onset.zip(kick).map(|(o, k)| (o as i64 - k as i64).abs() <= 1), Some(true), "{block}: heard at {onset:?}, kick at {kick:?}");
+        }
+        let (onset, _, _) = remix_onset(128, 0.6, |s| {
+            pattern(s);
+            s.loaded_tracks[0] = Some(tone_track(440.0, 48_000, 12.0));
+            s.playhead_sec[0] = 1.01;
+            s.is_playing[0] = true;
+            s.remix_clock = Some((0, 120.0, 0.0));
+        }, None);
+        assert!(onset.is_some_and(|o| (o as i64 - 23_520).abs() <= 1), "with a track playing, its beat 3 leads: {onset:?}");
+
+        for (bpm, offset, clock) in [(f64::INFINITY, 0.0, f64::NAN), (120.0, f64::NAN, f64::INFINITY), (1e300, 0.0, 0.0)] {
+            let (onset, _, finite) = remix_onset(256, 0.6, |s| {
+                s.loaded_tracks[0] = Some(tone_track(440.0, 48_000, 12.0));
+                s.is_playing[0] = true;
+                s.remix_clock = Some((0, bpm, offset));
+                s.engine.clock.bpm = clock;
+            }, None);
+            assert!(finite, "({bpm}, {offset}, {clock}): a non-finite sample");
+            assert!(onset.is_some_and(|o| o <= 24_001), "({bpm}, {offset}, {clock}): no launch within a beat at 120: {onset:?}");
+        }
+    }
+
+    /// The callback never touches the heap with remix columns running: launches on the beat and at once,
+    /// replacements, one-shots running out, stops, busy blocks across beats, the UI freeing what was handed back,
+    /// and a reopen whose new callback plays the columns on.
+    #[test]
+    fn remix_callback_never_allocates_or_frees() {
+        let budget = remix::SampleBudget::new(remix::BANK_BUDGET_BYTES);
+        let loops = [remix_tone("a", 500.0, true, 2.0, 44_100, 120.0, &budget), remix_tone("b", 600.0, false, 1.0, 48_000, 124.0, &budget)];
+        let shot = remix_tone("shot", 900.0, true, 0.05, 96_000, 0.0, &budget);
+        let shared = Arc::new(Mutex::new(AudioSharedState::default()));
+        {
+            let mut s = shared.lock().unwrap();
+            s.loaded_tracks[0] = Some(tone_track(440.0, 48_000, 30.0));
+            s.is_playing[0] = true;
+            s.remix_clock = Some((0, 120.0, 0.0));
+            s.pitch_ratio[0] = 1.03;
+        }
+        let (stats, recorder) = (Arc::new(AudioStats::default()), Arc::default());
+        let mut renderer = Some(Renderer::new(Arc::clone(&shared), Arc::clone(&stats), Arc::clone(&recorder)));
+        let mut calls = 0;
+        for round in 0..2 {
+            if round == 1 {
+                // A reopen: the old callback closes (off the real-time path) and the new one plays the columns on.
+                drop(renderer.take());
+                renderer = Some(Renderer::new(Arc::clone(&shared), Arc::clone(&stats), Arc::clone(&recorder)));
+            }
+            let r = renderer.as_mut().unwrap();
+            for block in 0..150 {
+                {
+                    let mut s = shared.lock().unwrap();
+                    match block % 25 {
+                        _ if block >= 100 => {}
+                        0 => {
+                            s.remix_launch(2, 0, 0, Arc::clone(&loops[0]), true, true);
+                            s.remix_launch(2, 1, 1, Arc::clone(&shot), false, false);
+                            s.remix_launch(3, 2, 2, Arc::clone(&loops[1]), true, false);
+                            // Owned by the callback alone once taken: dropping it there would show as a heap call.
+                            let only_here = remix_tone("only here", 800.0, true, 0.2, 48_000, 0.0, &budget);
+                            s.remix_launch(3, 1, 7, only_here, false, true);
+                        }
+                        12 => {
+                            s.remix_launch(2, 0, 5, Arc::clone(&loops[1]), true, true);
+                            s.remix_stop(3, 2, true);
+                            s.remix_launch(2, 1, 1, Arc::clone(&shot), false, true);
+                        }
+                        20 if block % 50 == 20 => (0..4).for_each(|c| s.remix_stop(2, c, false)),
+                        _ => {}
+                    }
+                    if block == 100 {
+                        // Still playing at the reopen, with nothing else asked of its column.
+                        s.remix_launch(2, 3, 3, Arc::clone(&loops[0]), true, false);
+                    }
+                    // Column filters swept, reset and crossed over through launches, stops and tails.
+                    s.remix_filter[2] = [[0.5, 0.0, 1.0, 0.3][block % 4], [0.9, 0.5][block % 2], 0.1, 0.5];
+                    s.remix_filter[3][1] = if block % 10 < 5 { 0.7 } else { 0.5 };
+                    // Key Locks switched and cells retuned live, also on the sounds fading out under replacements.
+                    s.remix_keylock[2] = [block % 3 == 0, true, block % 7 < 3, false];
+                    s.remix_keylock[3] = [false, block % 5 < 2, true, false];
+                    s.remix_tunings[2][0][0] = (loops[0].id, (block % 25) as i8 - 12);
+                    s.remix_tunings[2][0][5] = (loops[1].id, 5);
+                    s.remix_tunings[2][1][1] = (shot.id, 2);
+                    s.remix_tunings[3][2][2] = (loops[1].id, if block % 2 == 0 { -7 } else { 12 });
+                }
+                let held = ((block / 5) % 3 == 1).then(|| shared.lock().unwrap());
+                let frames = if block % 4 == 0 { 1024 } else { 128 };
+                let (mut f, mut i) = (vec![0.0f32; frames * 2], vec![0i16; frames * 2]);
+                COUNTING.with(|c| c.set(true));
+                if block % 2 == 0 { r.render(&mut f, 2, 48_000, |x| x) } else { r.render(&mut i, 2, 48_000, pcm_i16) }
+                COUNTING.with(|c| c.set(false));
+                calls += 1;
+                drop(held);
+                if block % 9 == 8 {
+                    drop(shared.lock().unwrap().take_retired()); // a UI frame
+                }
+                if round == 1 && block == 0 {
+                    assert_eq!(shared.lock().unwrap().remix_status[2][3].playing, Some((3, loops[0].id)), "the reopened stream dropped deck C's loop");
+                }
+            }
+        }
+        assert_eq!(HEAP_CALLS.with(|n| n.get()), 0, "heap calls in {calls} callbacks");
+        assert!(stats.busy_blocks.load(Ordering::Relaxed) > 50);
+        // Stopped and freed: the samples are the test's own again.
+        {
+            let mut s = shared.lock().unwrap();
+            (0..4).for_each(|c| (0..4).for_each(|d| s.remix_stop(d, c, false)));
+        }
+        for _ in 0..4 {
+            let mut buf = vec![0.0f32; 1024 * 2];
+            renderer.as_mut().unwrap().render(&mut buf, 2, 48_000, |x| x);
+            drop(shared.lock().unwrap().take_retired());
+        }
+        drop(renderer);
+        drop(shared.lock().unwrap().take_retired());
+        for s in loops.iter().chain([&shot]) {
+            assert_eq!(Arc::strong_count(s), 1, "{} still held", s.name);
+        }
+    }
+
+    /// Measurements for review, not a pass/fail test: Deck C's Remix columns through the real callback, at 44.1 and
+    /// 48 kHz. Writes a plain-text report to `RETRAKTOR_MEASURE_OUT` (and stdout):
+    /// `RETRAKTOR_MEASURE_OUT=report.txt cargo test --release -p retraktor-gui remix_measurements -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn remix_measurements() {
+        use std::fmt::Write;
+        let budget = remix::SampleBudget::new(remix::BANK_BUDGET_BYTES);
+        let tau = std::f32::consts::TAU;
+        // A 4-beat loop at 120 BPM in a 44.1 kHz file: a 0.2 sine at 440 Hz, silent for its first 100 ms (the marker).
+        let marked: Vec<f32> = (0..88_200).flat_map(|i| [if i < 4410 { 0.0 } else { 0.2 * (i as f32 * 440.0 * tau / 44_100.0).sin() }; 2]).collect();
+        let marked = Arc::new(RemixSample::from_pcm("marked loop", marked, 44_100, 120.0, &budget).unwrap());
+        // A kick: 0.25 s of a 60 Hz sine falling away, a one-shot.
+        let kick: Vec<f32> = (0..11_025).flat_map(|i| [0.3 * (-(i as f32) / 2000.0).exp() * (i as f32 * 60.0 * tau / 44_100.0).sin(); 2]).collect();
+        let kick = Arc::new(RemixSample::from_pcm("kick", kick, 44_100, 0.0, &budget).unwrap());
+        // Treble (5 kHz) left, bass (100 Hz) right, a 4-beat loop.
+        let stereo: Vec<f32> = (0..88_200).flat_map(|i| { let t = i as f32 * tau / 44_100.0; [0.2 * (5000.0 * t).sin(), 0.2 * (100.0 * t).sin()] }).collect();
+        let stereo = Arc::new(RemixSample::from_pcm("stereo loop", stereo, 44_100, 120.0, &budget).unwrap());
+
+        /// Renders `secs` of the main output (L, R) in `block`-frame buffers after `setup`; `live` runs before each block
+        /// with the frame it starts at. Returns the frames and each callback's time.
+        fn render(rate: u32, block: usize, secs: f64, setup: &dyn Fn(&mut AudioSharedState), live: &mut dyn FnMut(usize, &mut AudioSharedState)) -> (Vec<(f32, f32)>, Vec<f64>) {
+            let shared = Arc::new(Mutex::new(AudioSharedState::default()));
+            setup(&mut shared.lock().unwrap());
+            let mut renderer = Renderer::new(Arc::clone(&shared), Arc::default(), Arc::default());
+            let total = (secs * rate as f64) as usize;
+            let (mut out, mut times) = (Vec::with_capacity(total), Vec::new());
+            let mut buf = vec![0.0f32; block * 2];
+            while out.len() < total {
+                live(out.len(), &mut shared.lock().unwrap());
+                let t0 = std::time::Instant::now();
+                renderer.render(&mut buf, 2, rate, |x| x);
+                times.push(t0.elapsed().as_secs_f64());
+                out.extend(buf.chunks(2).map(|f| (f[0], f[1])));
+                drop(shared.lock().unwrap().take_retired());
+            }
+            out.truncate(total);
+            (out, times)
+        }
+        let deck_c = |s: &mut AudioSharedState, bpm: f64| {
+            s.engine.clock.bpm = bpm;
+            s.engine.strips[2].volume = 1.0;
+        };
+        let hz = |out: &[(f32, f32)], rate: u32| out.windows(2).filter(|w| w[0].0 < 0.0 && w[1].0 >= 0.0).count() as f64 * rate as f64 / out.len() as f64;
+        let markers = |out: &[(f32, f32)], rate: u32| {
+            let ms = rate as usize / 1000;
+            let peaks: Vec<f32> = out.chunks(ms).map(|c| c.iter().fold(0.0f32, |m, f| m.max(f.0.abs()))).collect();
+            (1..peaks.len().saturating_sub(20)).filter(|&i| peaks[i - 1] >= 0.01 && peaks[i..i + 20].iter().all(|&p| p < 0.01)).map(|i| (i * ms) as f64 / rate as f64).collect::<Vec<f64>>()
+        };
+        let level = |v: &[f32]| (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32).sqrt();
+        let mut r = String::new();
+        let profile = if cfg!(debug_assertions) { "debug (unoptimized; timings not representative)" } else { "release (optimized)" };
+        writeln!(r, "Remix column filter and Key Lock measurements, build profile: {profile}").unwrap();
+        writeln!(r, "Deck C, main output L. Loop: 4 beats at 120 BPM, 44.1 kHz file, 440 Hz, a 100 ms silent marker at its start.").unwrap();
+
+        writeln!(r, "\n1. Pitch and loop period (column 2), kick one-shot in column 1 at the start").unwrap();
+        writeln!(r, "rate   BPM  keylock tune  Hz (ideal)          period s (ideal)    marker errors ms").unwrap();
+        for rate in [44_100u32, 48_000] {
+            for bpm in [120.0, 144.0] {
+                let period = 240.0 / bpm;
+                for (keylock, tune) in [(false, 0i8), (false, 2), (true, 0), (true, 2)] {
+                    let (m, k) = (Arc::clone(&marked), Arc::clone(&kick));
+                    let setup = move |s: &mut AudioSharedState| {
+                        deck_c(s, bpm);
+                        s.remix_keylock[2][1] = keylock;
+                        s.remix_tunings[2][1][4] = (m.id, tune);
+                        s.remix_launch(2, 1, 4, Arc::clone(&m), true, false);
+                        s.remix_launch(2, 0, 0, Arc::clone(&k), false, false);
+                    };
+                    let (out, _) = render(rate, 256, 3.3 * period, &setup, &mut |_, _| {});
+                    let ideal_hz = if keylock { 440.0 * 2f64.powf(tune as f64 / 12.0) } else { 440.0 * bpm / 120.0 };
+                    let mid: Vec<f64> = (0..3).map(|n| { let a = ((n as f64 + 0.2) * period * rate as f64) as usize; hz(&out[a..a + (0.6 * period * rate as f64) as usize], rate) }).collect();
+                    let marks = markers(&out, rate);
+                    let errors: Vec<String> = marks.iter().enumerate().map(|(n, t)| format!("{:+.2}", (t - (n + 1) as f64 * period) * 1000.0)).collect();
+                    let measured = if marks.len() > 1 { (marks[marks.len() - 1] - marks[0]) / (marks.len() - 1) as f64 } else { f64::NAN };
+                    writeln!(r, "{rate}  {bpm:>3}  {keylock:<7} {tune:+}    {:>7.2} ({ideal_hz:>7.2})   {measured:.5} ({period:.5})   {}", mid.iter().sum::<f64>() / 3.0, errors.join(" ")).unwrap();
+                }
+            }
+        }
+
+        writeln!(r, "\n2. Kick unaffected: |(kick + tuned loop) - kick alone - tuned loop alone| over the kick's 0.25 s").unwrap();
+        for rate in [44_100u32, 48_000] {
+            let run = |with_kick: bool, with_loop: bool| {
+                let (m, k) = (Arc::clone(&marked), Arc::clone(&kick));
+                let setup = move |s: &mut AudioSharedState| {
+                    deck_c(s, 144.0);
+                    s.remix_keylock[2][1] = true;
+                    s.remix_tunings[2][1][4] = (m.id, 2);
+                    s.remix_filter[2][1] = 0.3;
+                    if with_loop {
+                        s.remix_launch(2, 1, 4, Arc::clone(&m), true, false);
+                    }
+                    if with_kick {
+                        s.remix_launch(2, 0, 0, Arc::clone(&k), false, false);
+                    }
+                };
+                render(rate, 256, 0.3, &setup, &mut |_, _| {}).0
+            };
+            let (both, kick_only, loop_only) = (run(true, true), run(true, false), run(false, true));
+            let n = (0.25 * rate as f64) as usize;
+            let worst = (0..n).map(|i| (both[i].0 - kick_only[i].0 - loop_only[i].0).abs()).fold(0.0f32, f32::max);
+            let peak = kick_only[..n].iter().fold(0.0f32, |m, f| m.max(f.0.abs()));
+            writeln!(r, "{rate} Hz: largest difference {worst:.2e} (kick peak {peak:.3}; column 2 key-locked +2 with its filter at 0.3)").unwrap();
+        }
+
+        writeln!(r, "\n3. Block boundaries: column 2 key-locked +2, filter 0.25, at 144 BPM; largest difference to 64-frame buffers").unwrap();
+        for rate in [44_100u32, 48_000] {
+            let m = Arc::clone(&marked);
+            let setup = move |s: &mut AudioSharedState| {
+                deck_c(s, 144.0);
+                s.remix_keylock[2][1] = true;
+                s.remix_tunings[2][1][4] = (m.id, 2);
+                s.remix_filter[2][1] = 0.25;
+                s.remix_launch(2, 1, 4, Arc::clone(&m), true, false);
+            };
+            let first = render(rate, 64, 2.0, &setup, &mut |_, _| {}).0;
+            for block in [128usize, 333, 1024] {
+                let out = render(rate, block, 2.0, &setup, &mut |_, _| {}).0;
+                let worst = first.iter().zip(&out).map(|(a, b)| (a.0 - b.0).abs().max((a.1 - b.1).abs())).fold(0.0f32, f32::max);
+                writeln!(r, "{rate} Hz, {block}-frame buffers: {worst:e}").unwrap();
+            }
+        }
+
+        writeln!(r, "\n4. Column filter on a stereo loop (treble 5 kHz left, bass 100 Hz right), levels relative to the filter off").unwrap();
+        for rate in [44_100u32, 48_000] {
+            let at = |knob: f32| {
+                let st = Arc::clone(&stereo);
+                let setup = move |s: &mut AudioSharedState| {
+                    deck_c(s, 120.0);
+                    s.remix_filter[2][2] = knob;
+                    s.remix_launch(2, 2, 0, Arc::clone(&st), true, false);
+                };
+                let out = render(rate, 256, 0.5, &setup, &mut |_, _| {}).0;
+                let tail = &out[out.len() / 2..];
+                (level(&tail.iter().map(|f| f.0).collect::<Vec<_>>()), level(&tail.iter().map(|f| f.1).collect::<Vec<_>>()))
+            };
+            let off = at(0.5);
+            for knob in [0.2f32, 0.8] {
+                let (l, rr) = at(knob);
+                writeln!(r, "{rate} Hz, knob {knob} ({} at {}): treble {:.4}, bass {:.4}", if knob < 0.5 { "low-pass" } else { "high-pass" }, remix::filter_hz_text(knob), l / off.0, rr / off.1).unwrap();
+            }
+            // Reset: at 0.8 for 0.3 s, then off; frames until the output is exactly the never-filtered output.
+            let st = Arc::clone(&stereo);
+            let setup = move |s: &mut AudioSharedState| {
+                deck_c(s, 120.0);
+                s.remix_launch(2, 2, 0, Arc::clone(&st), true, false);
+            };
+            let switch = (0.3 * rate as f64) as usize / 64 * 64;
+            let plain = render(rate, 64, 0.6, &setup, &mut |_, _| {}).0;
+            let reset = render(rate, 64, 0.6, &setup, &mut |f, s| s.remix_filter[2][2] = if f < switch { 0.8 } else { 0.5 }).0;
+            let last_diff = (switch..plain.len()).rev().find(|&i| plain[i] != reset[i]).map_or(0, |i| i + 1 - switch);
+            let step = reset.windows(2).skip(switch - 10).take(2000).map(|w| (w[1].0 - w[0].0).abs()).fold(0.0f32, f32::max);
+            // From 25 ms on the column's own output is exact; what is left at the main output is the deck channel's
+            // EQ (a crossover with memory) still carrying the earlier, filtered input.
+            let after = switch + rate as usize / 40 + 64;
+            let residue = (after..plain.len()).map(|i| (plain[i].0 - reset[i].0).abs().max((plain[i].1 - reset[i].1).abs())).fold(0.0f32, f32::max);
+            writeln!(r, "{rate} Hz reset from 0.8: main output bit-exact again {last_diff} frames ({:.1} ms) after; from 25 ms on it differs by at most {residue:.1e} (the channel EQ's memory); largest frame step around the reset {step:.4}", last_diff as f64 * 1000.0 / rate as f64).unwrap();
+        }
+
+        writeln!(r, "\n5. Live: Key Lock and tuning changed every 0.25 s while column 2 plays at 120 BPM (off, on, +3, off, on, -12, on +2)").unwrap();
+        for rate in [44_100u32, 48_000] {
+            let m = Arc::clone(&marked);
+            let setup = move |s: &mut AudioSharedState| {
+                deck_c(s, 120.0);
+                s.remix_tunings[2][1][4] = (m.id, 0);
+                s.remix_launch(2, 1, 4, Arc::clone(&m), true, false);
+            };
+            let steps = [(false, 0i8), (true, 0), (true, 3), (false, 3), (true, 3), (true, -12), (true, 2)];
+            let id = marked.id;
+            let quarter = rate as usize / 4;
+            let (live, _) = render(rate, 333, 6.5, &setup, &mut |f, s| {
+                let (k, t) = steps[(f / quarter).min(steps.len() - 1)];
+                s.remix_keylock[2][1] = k;
+                s.remix_tunings[2][1][4] = (id, t);
+            });
+            let (still, _) = render(rate, 333, 6.5, &setup, &mut |_, _| {});
+            // Steps outside the marker gaps: a 0.2 sine at 440 Hz moves up to 0.2 * 2π * 440 / rate, twice that an octave up.
+            let step = live.windows(2).map(|w| (w[1].0 - w[0].0).abs()).fold(0.0f32, f32::max);
+            let slope = 0.2 * tau * 440.0 / rate as f32;
+            let (a, b) = (markers(&live, rate), markers(&still, rate));
+            let shifts: Vec<String> = a.iter().zip(&b).map(|(x, y)| format!("{:+.2}", (x - y) * 1000.0)).collect();
+            writeln!(r, "{rate} Hz: largest frame step {step:.4} (the tone's own up to {slope:.4}, {:.4} at +3); loop markers vs unchanged run, ms: {}", slope * 2f32.powf(0.25), shifts.join(" ")).unwrap();
+        }
+
+        writeln!(r, "\n6. Percussive: the kick one-shot (60 Hz, falling away over 0.25 s) at 120 BPM, Key Lock off vs on +2").unwrap();
+        for rate in [44_100u32, 48_000] {
+            let shot = |keylock: bool, tune: i8| {
+                let k = Arc::clone(&kick);
+                let setup = move |s: &mut AudioSharedState| {
+                    deck_c(s, 120.0);
+                    s.remix_keylock[2][0] = keylock;
+                    s.remix_tunings[2][0][0] = (k.id, tune);
+                    s.remix_launch(2, 0, 0, Arc::clone(&k), false, false);
+                };
+                render(rate, 128, 0.4, &setup, &mut |_, _| {}).0
+            };
+            let (plain, locked) = (shot(false, 0), shot(true, 2));
+            let onset = |o: &[(f32, f32)]| o.iter().position(|f| f.0.abs() > 0.01).unwrap_or(usize::MAX);
+            let peak = |o: &[(f32, f32)], n: usize| o[..n].iter().fold(0.0f32, |m, f| m.max(f.0.abs()));
+            let length = |o: &[(f32, f32)]| o.iter().rposition(|f| f.0 != 0.0).map_or(0, |i| i + 1);
+            let attack = (0.01 * rate as f64) as usize;
+            let (o1, o2) = (onset(&plain), onset(&locked));
+            writeln!(
+                r,
+                "{rate} Hz: onset frame {o1} vs {o2}; peak in the first 10 ms {:.4} vs {:.4}; overall peak {:.4} vs {:.4}; sounding {:.1} ms vs {:.1} ms (incl. the filter's rest); pitch {:.1} Hz vs {:.1} Hz (ideal 60.0 and {:.1})",
+                peak(&plain, o1 + attack),
+                peak(&locked, o2 + attack),
+                peak(&plain, plain.len()),
+                peak(&locked, locked.len()),
+                length(&plain) as f64 * 1000.0 / rate as f64,
+                length(&locked) as f64 * 1000.0 / rate as f64,
+                hz(&plain[(0.03 * rate as f64) as usize..(0.2 * rate as f64) as usize], rate),
+                hz(&locked[(0.03 * rate as f64) as usize..(0.2 * rate as f64) as usize], rate),
+                60.0 * 2f64.powf(2.0 / 12.0)
+            )
+            .unwrap();
+        }
+
+        writeln!(r, "\n7. Callback cost at 48 kHz (whole callback: decks idle, Remix columns, mixer, master), per buffer").unwrap();
+        writeln!(r, "No audio device: these are the callback's own compute times. 'Over budget' counts callbacks that took longer than").unwrap();
+        writeln!(r, "their buffer lasts (each would be a dropout if the device needed it then); scheduling delay before a callback runs").unwrap();
+        writeln!(r, "isn't measured. Run under the shared build queue (one core, nice 10, idle I/O, other work on the machine).").unwrap();
+        let rate = 48_000u32;
+        let beat = move |bpm: f64| (60.0 / bpm * rate as f64) as usize;
+        let loops: Vec<Arc<RemixSample>> = (0..4).map(|i| Arc::clone(if i % 2 == 0 { &marked } else { &stereo })).collect();
+        let fired = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        type Live = Box<dyn FnMut(usize, &mut AudioSharedState)>;
+        type Case<'a> = (&'a str, Box<dyn Fn(&mut AudioSharedState)>, Box<dyn Fn() -> Live>, bool);
+        let (m, k) = (Arc::clone(&marked), Arc::clone(&kick));
+        let two = move |s: &mut AudioSharedState| {
+            deck_c(s, 144.0);
+            s.remix_keylock[2][1] = true;
+            s.remix_tunings[2][1][4] = (m.id, 2);
+            s.remix_launch(2, 1, 4, Arc::clone(&m), true, false);
+        };
+        // The kick again on every beat (asked during each beat, it lands on the next), throughout.
+        let kicks = move || -> Live {
+            let k = Arc::clone(&k);
+            let mut asked = usize::MAX;
+            Box::new(move |f: usize, s: &mut AudioSharedState| {
+                if f / beat(144.0) != asked {
+                    asked = f / beat(144.0);
+                    s.remix_launch(2, 0, 0, Arc::clone(&k), false, true);
+                }
+            })
+        };
+        let l1 = loops.clone();
+        let all = move |s: &mut AudioSharedState| {
+            for d in 0..4 {
+                s.engine.clock.bpm = 144.0;
+                s.engine.strips[d].volume = 1.0;
+                for c in 0..4 {
+                    s.remix_keylock[d][c] = true;
+                    s.remix_tunings[d][c][c] = (l1[c].id, 2);
+                    s.remix_filter[d][c] = 0.3;
+                    s.remix_launch(d, c, c, Arc::clone(&l1[c]), true, true);
+                }
+            }
+        };
+        // At the first buffer from 1 s on, every column is replaced (on the next beat, 1.25 s), so 32 voices stretch
+        // through the crossfade.
+        let (l2, count) = (loops.clone(), std::rc::Rc::clone(&fired));
+        let replace = move || -> Live {
+            let (l2, count) = (l2.clone(), std::rc::Rc::clone(&count));
+            let mut done = false;
+            Box::new(move |f: usize, s: &mut AudioSharedState| {
+                if !done && f >= rate as usize {
+                    done = true;
+                    count.set(count.get() + 1);
+                    for d in 0..4 {
+                        for c in 0..4 {
+                            s.remix_tunings[d][c][c + 4] = (l2[(c + 1) % 4].id, -5);
+                            s.remix_launch(d, c, c + 4, Arc::clone(&l2[(c + 1) % 4]), true, true);
+                        }
+                    }
+                }
+            })
+        };
+        let cases: Vec<Case> = vec![
+            ("two columns: kick on every beat + loop key-locked +2", Box::new(two), Box::new(kicks), false),
+            ("worst: 16 columns key-locked +2, filtered, launched together, all replaced on one beat", Box::new(all), Box::new(replace), true),
+        ];
+        for (name, setup, live, replaces) in cases {
+            for block in [64usize, 128, 256] {
+                for take in 1..=2 {
+                    fired.set(0);
+                    let mut live = live();
+                    let (_, times) = render(rate, block, 3.0, &*setup, &mut |f, s| live(f, s));
+                    assert_eq!(fired.get(), replaces as usize, "{name}, {block}: the replacement didn't fire once");
+                    let budget_s = block as f64 / rate as f64;
+                    let mut sorted = times[2..].to_vec();
+                    sorted.sort_by(f64::total_cmp);
+                    let mean = sorted.iter().sum::<f64>() / sorted.len() as f64;
+                    let p99 = sorted[(sorted.len() as f64 * 0.99) as usize];
+                    let max = *sorted.last().unwrap();
+                    let over = times.iter().filter(|&&t| t > budget_s).count();
+                    // The three slowest buffers and when they started (launches land at 0.417 s, replacements at 1.25 s).
+                    let mut slowest: Vec<(usize, f64)> = times.iter().copied().enumerate().collect();
+                    slowest.sort_by(|a, b| b.1.total_cmp(&a.1));
+                    let at: Vec<String> = slowest.iter().take(3).map(|(i, t)| format!("{:.3} ms at {:.3} s", t * 1e3, (i * block) as f64 / rate as f64)).collect();
+                    writeln!(
+                        r,
+                        "{name}, {block} frames (budget {:.3} ms), take {take}: mean {:.3} ms ({:.1}%), p99 {:.3} ms, max {:.3} ms ({:.1}%), over budget {over} of {}; slowest: {}",
+                        budget_s * 1e3,
+                        mean * 1e3,
+                        100.0 * mean / budget_s,
+                        p99 * 1e3,
+                        max * 1e3,
+                        100.0 * max / budget_s,
+                        times.len(),
+                        at.join(", ")
+                    )
+                    .unwrap();
+                }
+            }
+        }
+        print!("{r}");
+        if let Ok(path) = std::env::var("RETRAKTOR_MEASURE_OUT") {
+            std::fs::write(path, &r).unwrap();
+        }
     }
 }

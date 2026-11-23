@@ -27,6 +27,8 @@ pub struct KeyLock {
     /// Alignment scratch, reserved up front so the audio callback never allocates (see `best_start`).
     reference: Vec<f32>,
     candidates: Vec<f32>,
+    /// Frames into its first hop that the next priming starts output at (see [`KeyLock::reset_staggered`]).
+    phase: usize,
 }
 
 impl Default for KeyLock {
@@ -34,7 +36,7 @@ impl Default for KeyLock {
         // Periodic Hann: two half-overlapping windows sum to exactly 1.
         let window = (0..GRAIN).map(|i| 0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / GRAIN as f32).cos()).collect();
         let (reference, candidates) = (Vec::with_capacity(MAX_SPAN), Vec::with_capacity(MAX_SPAN + 2 * MAX_TOLERANCE / 4));
-        Self { acc: vec![[0.0; MAX_SOURCES * 2]; GRAIN], window, pos: 0, next_cont: None, reference, candidates }
+        Self { acc: vec![[0.0; MAX_SOURCES * 2]; GRAIN], window, pos: 0, next_cont: None, reference, candidates, phase: 0 }
     }
 }
 
@@ -51,7 +53,16 @@ impl KeyLock {
     pub fn reset(&mut self) {
         self.pos = 0;
         self.next_cont = None;
+        self.phase = 0;
         self.acc.iter_mut().for_each(|f| *f = [0.0; MAX_SOURCES * 2]);
+    }
+
+    /// [`KeyLock::reset`], with this stretcher's grain work falling `slot` of `slots` parts of a hop later than a
+    /// plain reset's: its first hop is that much shorter (the output is the same), so many stretchers started on the
+    /// same frame spread their grain work over the hop instead of all doing it on one frame.
+    pub fn reset_staggered(&mut self, slot: usize, slots: usize) {
+        self.reset();
+        self.phase = slot % slots.max(1) * HOP / slots.max(1);
     }
 
     /// The next output frame for each source.
@@ -72,10 +83,13 @@ impl KeyLock {
             let start = match self.next_cont {
                 Some(cont) => self.best_start(sources[0], cont, playhead, step, loop_frames, high_quality),
                 None => {
-                    // Prime with the second half of a grain that would have started one hop earlier.
-                    let prev = playhead - HOP as f64 * step;
+                    // Prime with the second half of a grain that would have started one hop earlier, both placed so
+                    // that output `phase` (0 after a plain reset) is the playhead.
+                    let start = playhead - self.phase as f64 * step;
+                    let prev = start - HOP as f64 * step;
                     self.add_grain(sources, n_src, prev, step, loop_frames, HOP);
-                    playhead
+                    self.pos = std::mem::take(&mut self.phase);
+                    start
                 }
             };
             self.add_grain(sources, n_src, start, step, loop_frames, 0);
@@ -197,6 +211,24 @@ mod tests {
             // No dropouts: the level stays steady once primed.
             let quiet = out[HOP..].chunks(256).filter(|c| c.iter().fold(0.0f32, |m, x| m.max(x.abs())) < 0.3).count();
             assert_eq!(quiet, 0, "rate {rate}: level dips");
+        }
+    }
+
+    /// A staggered start plays the same source frames as a plain one (its first hop is just shorter), and from the
+    /// next hop on keeps the pitch.
+    #[test]
+    fn a_staggered_start_reproduces_the_source_too() {
+        let sr = 48_000;
+        let src = sine(440.0, sr, 2.0);
+        for slot in [1usize, 7, 31] {
+            let mut kl = KeyLock::default();
+            kl.reset_staggered(slot, 32);
+            let start = 10_000.0;
+            for i in 0..3_000 {
+                let got = kl.next(&[&src], start + i as f64, 1.0, None, false)[0].0;
+                let want = src[(10_000 + i) * 2];
+                assert!((got - want).abs() < 1e-3, "slot {slot}, frame {i}: {got} vs {want}");
+            }
         }
     }
 

@@ -6,8 +6,9 @@
 //!   Linux POSIX path <-> Traktor `/:` path normalization.
 //! - [`tsi`]: `.tsi` `TraktorSettings` XML + Base64-encoded Big-Endian FourCC TLV (`DIOM`, `DEVS`,
 //!   `DEVI`, `DDCB`, `CMAS`, `CMAI`, `CMAD`) controller mapping parser and builder.
-//! - [`trak`]: `.stem.m4a` MP4 `stem` atom JSON metadata parser/serializer and `.trak` archive
-//!   manifest inspector.
+//! - [`trak`]: `.stem.m4a` MP4 `stem` atom JSON metadata parser/serializer and the Traktor Remix
+//!   Set (`.trak`) reader (its cells and where each sample's audio sits in the archive) and the
+//!   pieces a writer assembles one from.
 //! - [`stripes`]: Binary waveform Stripe (`STRP`) and Transient (`TRNS`) cache reader/writer.
 
 pub mod nml;
@@ -16,6 +17,10 @@ pub mod stripes;
 pub mod trak;
 pub mod tsi;
 pub mod xml;
+
+// The shared `.trak` test fixture names this crate as the GUI's tests do.
+#[cfg(test)]
+extern crate self as retraktor_formats;
 
 pub use nml::{
     NmlCollection, NmlCue, NmlEntry, NmlLocation, NmlLoudness, NmlPlaylistNode, NmlTempo,
