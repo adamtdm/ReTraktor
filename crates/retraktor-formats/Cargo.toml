@@ -6,4 +6,5 @@ license.workspace = true
 description = "Clean-room parsers and serializers for Traktor .nml collections, .tsi controller mappings, and .trak/.stem.m4a containers"
 
 [dependencies]
+lofty = "0.22"
 retraktor-core = { path = "../retraktor-core" }

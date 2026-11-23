@@ -3283,6 +3283,7 @@ dependencies = [
 name = "retraktor-formats"
 version = "0.2.0"
 dependencies = [
+ "lofty",
  "retraktor-core",
 ]
 

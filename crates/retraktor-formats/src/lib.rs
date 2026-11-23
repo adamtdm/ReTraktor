@@ -12,6 +12,7 @@
 
 pub mod nml;
 pub mod rekordbox;
+pub mod serato;
 pub mod stripes;
 pub mod trak;
 pub mod tsi;
