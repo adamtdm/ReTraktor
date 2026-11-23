@@ -2895,6 +2895,15 @@ impl ReTraktorApp {
             return;
         }
         if let Some(&(_, cue_sec)) = self.deck_hotcue_slots(d).iter().find(|(id, _)| *id == cue_num) {
+            // A loop cue (Traktor's saved loop) starts its loop there, as long as the loop it was saved with.
+            let loop_beats = self.deck_library_track(d).and_then(|t| {
+                let c = t.cues.iter().find(|c| c.hotcue + 1 == cue_num as i64 && c.cue_type == retraktor_core::CueType::Loop)?;
+                (c.len_ms > 0.0 && t.bpm > 0.0).then(|| (c.len_ms / 1000.0 * t.bpm / 60.0).round().clamp(1.0, 32.0) as u32)
+            });
+            if let Some(beats) = loop_beats {
+                // shortcut: loops round to whole beats (1–32), as the deck's loop size does; sub-beat loop cues need a finer size.
+                (self.deck_loop_size_beats[d], self.deck_loop_active[d], self.deck_loop_start_sec[d]) = (beats, true, cue_sec);
+            }
             if let Ok(mut state) = self.audio.shared.lock() {
                 state.seek_to(d, cue_sec);
             }
@@ -5650,6 +5659,25 @@ mod tests {
         app.clear_deck_hotcue(1, 1);
         assert_eq!(app.deck_hotcue_slots(1), [(4, 45.0), (3, 30.0)]);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A Traktor loop cue on a pad starts a loop of its saved length at its start; a plain cue only jumps.
+    #[test]
+    fn a_loop_cue_pad_starts_its_loop() {
+        let mut app = ReTraktorApp::default();
+        let cue = |hotcue, cue_type, start_ms, len_ms| retraktor_formats::nml::NmlCue {
+            name: String::new(), displ_order: 0, cue_type, start_ms, len_ms, repeats: -1, hotcue, grid_bpm: None,
+        };
+        // 16 beats at 132 BPM is 7.27 s.
+        let cues = vec![cue(0, retraktor_core::CueType::Cue, 1000.0, 0.0), cue(1, retraktor_core::CueType::Loop, 60_000.0, 7272.727)];
+        app.library.tracks.push(crate::library_ui::UiTrackEntry { id: 7, bpm: 132.0, cues, ..Default::default() });
+        app.library.rebuild_index();
+        app.deck_track_ids[0] = Some(7);
+        app.jump_to_cue(1, 1);
+        assert!(!app.deck_loop_active[0], "a plain cue started a loop");
+        app.jump_to_cue(1, 2);
+        assert_eq!((app.deck_loop_active[0], app.deck_loop_size_beats[0], app.deck_loop_start_sec[0]), (true, 16, 60.0));
+        assert_eq!(app.audio.shared.lock().unwrap().playhead_sec[0], 60.0);
     }
 
     /// Auto gain is read when a deck load lands: switching it on leaves the track on air alone and
