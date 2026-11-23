@@ -358,6 +358,9 @@ pub(crate) struct AudioFile {
     pub header_frames: Option<u64>,
     /// Reused for every packet, so decoding allocates only when a packet is larger than any before.
     samples: Option<SampleBuffer<f32>>,
+    /// A packet failed to read (other than at the end of the file) or to decode. [`AudioFile::next_stereo`] still
+    /// ends or skips there as it always has; a caller that needs the whole file checks this.
+    pub damaged: bool,
 }
 
 /// Where an [`AudioFile`]'s packets come from.
@@ -395,7 +398,7 @@ impl AudioFile {
         #[cfg(test)]
         if let Some((_, stream)) = TEST_STREAMS.lock().unwrap_or_else(PoisonError::into_inner).iter().find(|(p, _)| p == path) {
             let (rate, header_frames) = (stream.rate, stream.header_frames);
-            return Ok(Self { source: AudioSource::Script(Arc::clone(stream), 0), track_id: 0, time_base: None, start_ts: 0, sample_rate: rate, header_frames, samples: None });
+            return Ok(Self { source: AudioSource::Script(Arc::clone(stream), 0), track_id: 0, time_base: None, start_ts: 0, sample_rate: rate, header_frames, samples: None, damaged: false });
         }
         let file = File::open(path).map_err(|e| format!("Failed to open {}: {e}", path.display()))?;
         let mss = MediaSourceStream::new(Box::new(file), Default::default());
@@ -417,7 +420,7 @@ impl AudioFile {
             return Err(format!("Unsupported sample rate {sample_rate} Hz in {}", path.display()));
         }
         let source = AudioSource::Symphonia { format, decoder };
-        let mut file = Self { source, track_id, time_base: params.time_base, start_ts: params.start_ts, sample_rate, header_frames: None, samples: None };
+        let mut file = Self { source, track_id, time_base: params.time_base, start_ts: params.start_ts, sample_rate, header_frames: None, samples: None, damaged: false };
         // The stated length is in the container's own ticks (an MP4's media duration, for one).
         file.header_frames = params.n_frames.map(|n| file.ts_to_frames(n)).filter(|&n| n > 0);
         Ok(file)
@@ -474,7 +477,7 @@ impl AudioFile {
 
     /// Decodes the next packet of the track onto `out` as interleaved stereo (mono doubled, channels past two
     /// dropped). Returns the frame it starts at, or `None` at the end or on a read error. Packets that fail to
-    /// decode are skipped, as before.
+    /// decode are skipped, as before. A read error or a skipped packet sets [`AudioFile::damaged`].
     pub fn next_stereo(&mut self, out: &mut Vec<f32>) -> Option<u64> {
         let (format, decoder) = match &mut self.source {
             AudioSource::Symphonia { format, decoder } => (format, decoder),
@@ -487,11 +490,21 @@ impl AudioFile {
             }
         };
         loop {
-            let packet = format.next_packet().ok()?;
+            let packet = match format.next_packet() {
+                Ok(packet) => packet,
+                Err(e) => {
+                    let end = matches!(&e, symphonia::core::errors::Error::IoError(io) if io.kind() == std::io::ErrorKind::UnexpectedEof);
+                    self.damaged |= !end;
+                    return None;
+                }
+            };
             if packet.track_id() != self.track_id {
                 continue;
             }
-            let Ok(decoded) = decoder.decode(&packet) else { continue };
+            let Ok(decoded) = decoder.decode(&packet) else {
+                self.damaged = true;
+                continue;
+            };
             let spec = *decoded.spec();
             let ch = spec.channels.count().max(1);
             if !self.samples.as_ref().is_some_and(|b| b.capacity() >= decoded.capacity() * ch) {

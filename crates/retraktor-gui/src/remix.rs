@@ -113,8 +113,10 @@ impl RemixSample {
     /// Decodes `path` for a cell. Refuses a file longer than [`MAX_SAMPLE_SEC`] as soon as its decoded audio
     /// passes that (a header's length is only an estimate, so it decides nothing), and stops as soon as the bank's
     /// memory would run out or `cancelled` says the cell no longer wants it, so a whole track is never decoded just
-    /// to be thrown away.
-    pub fn decode(path: &Path, name: &str, library_bpm: f64, budget: &Arc<SampleBudget>, cancelled: &dyn Fn() -> bool) -> Result<Self, String> {
+    /// to be thrown away. With `whole`, a file is also refused unless it decodes without a damaged packet to exactly
+    /// the length its header states (an imported set's FLAC or WAV, whose header is exact): a file cut short isn't
+    /// taken as a shorter sample.
+    pub fn decode(path: &Path, name: &str, library_bpm: f64, budget: &Arc<SampleBudget>, cancelled: &dyn Fn() -> bool, whole: bool) -> Result<Self, String> {
         let mut file = AudioFile::open(path)?;
         let max_samples = (MAX_SAMPLE_SEC * file.sample_rate as f64) as usize * 2;
         let too_long = || format!("'{name}' is longer than {MAX_SAMPLE_SEC:.0} s: remix cells take samples (load whole tracks on a Track deck)");
@@ -144,10 +146,15 @@ impl RemixSample {
             }
             pcm.extend_from_slice(&packet);
         };
-        if outcome.is_ok() && pcm.is_empty() {
-            budget.give_back(taken);
-            return Err(format!("No audio decoded from '{name}'"));
-        }
+        let frames = (pcm.len() / 2) as u64;
+        let outcome = outcome.and_then(|()| match file.header_frames {
+            _ if pcm.is_empty() => Err(format!("No audio decoded from '{name}'")),
+            stated if whole && (file.damaged || stated != Some(frames)) => {
+                let stated = stated.map_or("an unstated number of".to_string(), |n| n.to_string());
+                Err(format!("'{name}' is damaged or cut short: {frames} frames decoded of {stated} in its header"))
+            }
+            _ => Ok(()),
+        });
         if let Err(e) = outcome {
             budget.give_back(taken);
             return Err(e);
@@ -234,8 +241,158 @@ pub fn captures_dir() -> Result<PathBuf, String> {
 
 fn captures_dir_in(home: Option<std::ffi::OsString>) -> Result<PathBuf, String> {
     let home = home.map(PathBuf::from).filter(|home| home.is_absolute() && home.to_str().is_some());
-    let home = home.ok_or("there is no home folder a set can name (HOME isn't an absolute UTF-8 path), so a capture has nowhere to be saved")?;
+    let home = home.ok_or("there is no home folder a set can name (HOME isn't an absolute UTF-8 path), so captured and imported samples have nowhere to be saved")?;
     Ok(home.join("Music").join("ReTraktor").join("Captures"))
+}
+
+/// Where imported Traktor Remix Sets keep their samples: `~/Music/ReTraktor/Remix Sets`, a new folder per import
+/// ([`import_trak`]). Refused as [`captures_dir`] is.
+pub fn imports_dir() -> Result<PathBuf, String> {
+    captures_dir().map(|dir| dir.with_file_name("Remix Sets"))
+}
+
+/// The folder of samples one import copied out of a Remix Set, owned by that import's result: dropped without
+/// [`Imported::keep`] (the import failed, was cancelled or superseded, or its deck couldn't take it), the folder is
+/// removed with everything in it. Only that import ever wrote there.
+pub struct Imported {
+    dir: PathBuf,
+    /// What of the set ReTraktor doesn't carry over (settings, shortened names), for the status line (empty: nothing).
+    pub notes: String,
+    kept: bool,
+}
+
+impl Imported {
+    /// The deck took the samples: they stay for good, for a saved set to name. Returns their folder.
+    pub fn keep(mut self) -> PathBuf {
+        self.kept = true;
+        std::mem::take(&mut self.dir)
+    }
+}
+
+impl Drop for Imported {
+    fn drop(&mut self) {
+        if !self.kept {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+}
+
+/// The most bytes of samples one import copies out of a set: no bank holds more audio than this.
+/// shortcut: caps the files' bytes, not their decoded audio, raise it if multichannel sets need more.
+const MAX_IMPORT_BYTES: u64 = BANK_BUDGET_BYTES as u64;
+
+/// Imports the Traktor Remix Set (`.trak`) at `path`, which is only read, into a new bank, all or nothing: each
+/// filled cell in its place with its name, as a loop or a one-shot, Q as the set has it and page 1 showing. Each
+/// sample file the cells play is copied out once, under its exact name in the set, into a new folder in `root` that
+/// only this import writes to (cells sharing a file share its copy), then decoded whole ([`RemixSample::decode`]).
+/// A synced cell keeps its BPM; an unsynced one plays at its own speed. On any failure, or once `cancelled`, the
+/// folder is removed again; on success the returned [`Imported`] owns it. Errors read on their own.
+pub fn import_trak(path: &Path, root: &Path, budget: &Arc<SampleBudget>, cancelled: &dyn Fn() -> bool) -> Result<(RemixBank, Imported), Vec<String>> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let file_name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+    let mut file = std::fs::File::open(path).map_err(|e| vec![format!("'{file_name}' can't be read ({e})")])?;
+    let set = retraktor_formats::trak::read_remix_set(&mut file).map_err(|e| vec![format!("'{file_name}' {e}")])?;
+    let mut files: Vec<&retraktor_formats::trak::TrakMember> = Vec::new();
+    for cell in &set.cells {
+        if !files.iter().any(|m| m.name == cell.file) {
+            files.extend(set.members.iter().find(|m| m.name == cell.file));
+        }
+    }
+    if files.iter().map(|m| m.size).sum::<u64>() > MAX_IMPORT_BYTES {
+        return Err(vec![format!("'{file_name}' holds more sample data than a deck's whole sample memory ({} MiB)", MAX_IMPORT_BYTES >> 20)]);
+    }
+
+    let refused = |e: std::io::Error| vec![format!("can't make a folder for the set's samples in {} ({e})", root.display())];
+    std::fs::create_dir_all(root).map_err(refused)?;
+    let stem = file_stem_text(&Path::new(&file_name).file_stem().map_or_else(String::new, |s| s.to_string_lossy().into_owned()));
+    let base = format!("{stem} {}", crate::setlist::format_recording_timestamp(std::time::SystemTime::now()));
+    let mut imported = None;
+    for n in 1..=1000 {
+        let dir = root.join(if n == 1 { base.clone() } else { format!("{base}_{n}") });
+        match std::fs::create_dir(&dir) {
+            Ok(()) => {
+                imported = Some(Imported { dir, notes: String::new(), kept: false });
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(refused(e)),
+        }
+    }
+    let mut imported = imported.ok_or_else(|| vec![format!("can't make a folder for the set's samples in {}: every name for '{base}' is taken", root.display())])?;
+
+    for member in files {
+        if cancelled() {
+            return Err(vec!["Cancelled".into()]);
+        }
+        // A new file under a name read_remix_set checked is plain: never one that was there, never outside the folder.
+        let to = imported.dir.join(&member.name);
+        let copied = (|| -> std::io::Result<()> {
+            let mut out = std::fs::File::create_new(&to)?;
+            file.seek(SeekFrom::Start(member.offset))?;
+            let mut source = (&mut file).take(member.size);
+            let mut head = vec![0u8; member.size.min(WAV_HEAD_BYTES as u64) as usize];
+            source.read_exact(&mut head)?;
+            let head_len = head.len() as u64;
+            out.write_all(&standard_wav_head(&head, member.size).unwrap_or(head))?;
+            if head_len + std::io::copy(&mut source, &mut out)? != member.size {
+                return Err(std::io::ErrorKind::UnexpectedEof.into());
+            }
+            out.sync_all()
+        })();
+        copied.map_err(|e| vec![format!("'{}' couldn't be copied out of '{file_name}' to {} ({e})", member.name, imported.dir.display())])?;
+    }
+    if let Ok(dir) = std::fs::File::open(&imported.dir) {
+        let _ = dir.sync_all(); // the new names last through a power cut
+    }
+
+    let mut bank = RemixBank { quantize: set.quantize, ..Default::default() };
+    for cell in &set.cells {
+        let bpm = if cell.synced { cell.bpm } else { 0.0 };
+        let sample = RemixSample::decode(&imported.dir.join(&cell.file), &cell.name, bpm, budget, cancelled, true).map_err(|e| {
+            vec![format!("cell {}.{} (page {}) '{}' from '{}': {e}", cell.column + 1, cell.row + 1, cell.row / PAGE_ROWS + 1, cell.name, cell.file)]
+        })?;
+        bank.cells[cell.column][cell.row] = Some(RemixCell { sample: Arc::new(sample), looped: cell.looped });
+    }
+    let mut unapplied: Vec<&str> = set.cells.iter().flat_map(|c| c.unapplied.iter().copied()).collect();
+    unapplied.sort_unstable();
+    unapplied.dedup();
+    let mut notes = Vec::new();
+    let differing = set.cells.iter().filter(|c| !c.unapplied.is_empty()).count();
+    if differing > 0 {
+        notes.push(format!("Traktor settings not applied on {differing} cells: {}", unapplied.join(", ")));
+    }
+    let renamed = set.cells.iter().filter(|c| c.name_shortened).count();
+    if renamed > 0 {
+        let most = retraktor_formats::trak::MAX_CELL_NAME_CHARS;
+        notes.push(format!("{renamed} cell names cut to {most} characters or cleaned of control characters, so pads and saved sets can show them"));
+    }
+    imported.notes = notes.join(". ");
+    Ok((bank, imported))
+}
+
+/// Bytes of a WAV's start that [`standard_wav_head`] looks at.
+const WAV_HEAD_BYTES: usize = 40;
+
+/// The start of a WAV copy that the decoder reads, for the one non-standard header seen in NI's own sets (19 WAVs
+/// of *Drums and Beatbox*): a plain PCM (format 1) `fmt ` chunk of 20 bytes whose last four are zero, as the first
+/// chunk of a RIFF whose size is exactly the file's. The decoder takes a PCM `fmt ` of 16, 18 or 40 bytes only, so
+/// the copy starts with the same 16 format bytes in a 16-byte chunk and a RIFF size 4 smaller; every byte after the
+/// chunk (the audio and any other chunk) is copied unchanged. `None` (copy it as it is) for anything else.
+fn standard_wav_head(head: &[u8], file_size: u64) -> Option<Vec<u8>> {
+    let u32_at = |at: usize| u32::from_le_bytes(head[at..at + 4].try_into().unwrap());
+    let odd = head.len() == WAV_HEAD_BYTES
+        && &head[..4] == b"RIFF"
+        && u64::from(u32_at(4)) + 8 == file_size
+        && &head[8..16] == b"WAVEfmt "
+        && u32_at(16) == 20
+        && head[20..22] == [1, 0]
+        && head[36..40] == [0; 4];
+    odd.then(|| {
+        let mut standard = head[..36].to_vec();
+        standard[4..8].copy_from_slice(&(u32_at(4) - 4).to_le_bytes());
+        standard[16..20].copy_from_slice(&16u32.to_le_bytes());
+        standard
+    })
 }
 
 /// The most bytes of a track title in a capture's file name: with the loop, time, a `_n` and the temporary file's
@@ -337,6 +494,19 @@ fn float_wav_header(frames: usize, rate: u32) -> Vec<u8> {
     h.extend_from_slice(&data.to_le_bytes());
     h
 }
+
+/// Tests only: `pcm` (interleaved stereo at `rate`) as the bytes of a float WAV file.
+#[cfg(test)]
+pub(crate) fn test_wav(pcm: &[f32], rate: u32) -> Vec<u8> {
+    let mut wav = float_wav_header(pcm.len() / 2, rate);
+    wav.extend(pcm.iter().flat_map(|s| s.to_le_bytes()));
+    wav
+}
+
+/// Tests only: synthetic Traktor Remix Sets, shared with `retraktor-formats`' tests (no NI audio needed).
+#[cfg(test)]
+#[path = "../../retraktor-formats/tests/support/trak_fixture.rs"]
+pub(crate) mod trak_fixture;
 
 fn bank_full() -> String {
     format!("Remix sample memory ({} MiB) is full: clear some cells first", BANK_BUDGET_BYTES >> 20)
@@ -510,7 +680,7 @@ impl RemixLoader {
                         continue; // superseded or cancelled while queued
                     }
                     let (captured, result) = match &job.source {
-                        JobSource::File { path, name, bpm } => (false, RemixSample::decode(path, name, *bpm, &budget, &outdated)),
+                        JobSource::File { path, name, bpm } => (false, RemixSample::decode(path, name, *bpm, &budget, &outdated, false)),
                         JobSource::Capture { source, dir } => (true, RemixSample::capture(source, dir, &budget, &outdated)),
                     };
                     let done = LoadedCell { deck: job.deck, column: job.column, row: job.row, generation: job.generation, captured, result: result.map(Arc::new) };
@@ -816,7 +986,7 @@ pub fn stage(set: &RemixSet, budget: &Arc<SampleBudget>, cancelled: &dyn Fn() ->
     }
     let mut bank = RemixBank { quantize: set.quantize, page: set.page, ..Default::default() };
     for c in &set.cells {
-        let sample = RemixSample::decode(Path::new(&c.path), &c.name, c.bpm, budget, cancelled).map_err(|e| vec![format!("{}: {} ({e})", c.label(), c.path)])?;
+        let sample = RemixSample::decode(Path::new(&c.path), &c.name, c.bpm, budget, cancelled, false).map_err(|e| vec![format!("{}: {} ({e})", c.label(), c.path)])?;
         bank.cells[c.column][c.row] = Some(RemixCell { sample: Arc::new(sample), looped: c.looped });
     }
     Ok(bank)
@@ -836,6 +1006,9 @@ pub struct SetJob {
     pub contents: BankContents,
     /// Save: the set as it was when asked.
     pub snapshot: Option<RemixSet>,
+    /// Whether the deck was a Remix deck, and its track load generation, when asked: an open lands only on the deck
+    /// as it was, never over a track loaded or a mode switched since.
+    pub deck: (bool, u64),
     /// Its desktop chooser is still open.
     pub choosing: bool,
 }
@@ -845,8 +1018,9 @@ pub enum SetDone {
     /// The desktop chooser closed: the file picked, or none when cancelled.
     Chosen(Option<PathBuf>),
     Saved(PathBuf, Result<(), String>),
-    /// The set at that path decoded into a bank, or every reason it can't be.
-    Staged(PathBuf, Result<RemixBank, Vec<String>>),
+    /// The set at that path decoded into a bank (with the samples an imported Traktor set copied out, removed unless
+    /// kept), or every reason it can't be.
+    Staged(PathBuf, Result<(RemixBank, Option<Imported>), Vec<String>>),
 }
 
 /// Why a deck's last open or save failed, kept on the deck until dismissed or a later one succeeds.
@@ -869,22 +1043,35 @@ pub struct RemixSets {
     writer: Option<mpsc::Sender<(usize, u64, PathBuf, RemixSet, bool)>>,
     /// Saves accepted whose outcome the UI hasn't taken yet.
     writes_pending: usize,
+    /// Where an imported Traktor set's samples go ([`imports_dir`]), or why there is nowhere.
+    pub imports: Result<PathBuf, String>,
+    /// Staging workers that may still run, joined by [`RemixSets::shut_down`].
+    stagers: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for RemixSets {
+    fn drop(&mut self) {
+        self.shut_down();
+    }
 }
 
 impl Default for RemixSets {
     fn default() -> Self {
         let (jobs, reports, tickets) = Default::default();
-        Self { jobs, reports, tickets, next_ticket: 0, done: mpsc::channel(), writer: None, writes_pending: 0 }
+        Self { jobs, reports, tickets, next_ticket: 0, done: mpsc::channel(), writer: None, writes_pending: 0, imports: imports_dir(), stagers: Vec::new() }
     }
 }
 
+/// A Traktor Remix Set file: `Electric Vice.trak`.
+pub const TRAK_EXTENSION: &str = "trak";
+
 impl RemixSets {
-    /// Starts deck `d`'s job, superseding any it had, and opens the chooser for it.
-    pub fn start(&mut self, d: usize, action: SetAction, contents: BankContents, snapshot: Option<RemixSet>) -> u64 {
+    /// Starts deck `d`'s job, superseding any it had, and opens the chooser for it. `deck`: see [`SetJob::deck`].
+    pub fn start(&mut self, d: usize, action: SetAction, contents: BankContents, snapshot: Option<RemixSet>, deck: (bool, u64)) -> u64 {
         self.next_ticket += 1;
         let ticket = self.next_ticket;
         self.tickets[d].store(ticket, Ordering::Release);
-        self.jobs[d] = Some(SetJob { ticket, action, contents, snapshot, choosing: true });
+        self.jobs[d] = Some(SetJob { ticket, action, contents, snapshot, deck, choosing: true });
         if cfg!(test) {
             return ticket; // tests answer for the chooser
         }
@@ -892,11 +1079,22 @@ impl RemixSets {
         let letter = (b'A' + d as u8) as char;
         std::thread::spawn(move || {
             let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_default();
-            let dialog = rfd::FileDialog::new().set_directory(&home).add_filter("ReTraktor remix set", &[SET_EXTENSION]);
-            // The desktop's save chooser asks before replacing an existing file.
+            let dialog = rfd::FileDialog::new().set_directory(&home);
+            // The desktop's save chooser asks before replacing an existing file. Only ReTraktor's own sets are saved.
             let picked = match action {
-                SetAction::Save => dialog.set_title(format!("Save deck {letter}'s remix set")).set_file_name(format!("Deck {letter} remix set.{SET_EXTENSION}")).save_file(),
-                SetAction::Open => dialog.set_title(format!("Open a remix set onto deck {letter} (replaces its cells)")).pick_file(),
+                SetAction::Save => dialog
+                    .add_filter("ReTraktor remix set", &[SET_EXTENSION])
+                    .set_title(format!("Save deck {letter}'s remix set"))
+                    .set_file_name(format!("Deck {letter} remix set.{SET_EXTENSION}"))
+                    .save_file(),
+                SetAction::Open => dialog
+                    .add_filter("Remix sets (ReTraktor .remixset, Traktor .trak)", &[SET_EXTENSION, TRAK_EXTENSION])
+                    .set_title(if deck.0 {
+                        format!("Open a remix set onto deck {letter} (replaces its cells)")
+                    } else {
+                        format!("Open a remix set onto deck {letter} (it becomes a Remix deck; a stopped track there is unloaded)")
+                    })
+                    .pick_file(),
             };
             let _ = tx.send((d, ticket, SetDone::Chosen(picked)));
         });
@@ -929,17 +1127,38 @@ impl RemixSets {
         self.writes_pending > 0
     }
 
-    /// Reads and decodes the set at `path` for deck `d`'s job `ticket` on a worker, stopping once superseded.
-    pub fn stage(&self, d: usize, ticket: u64, path: PathBuf, budget: &Arc<SampleBudget>) {
-        let (tx, tickets, budget) = (self.done.0.clone(), Arc::clone(&self.tickets), Arc::clone(budget));
-        std::thread::spawn(move || {
+    /// Reads and decodes the set at `path` (a Traktor `.trak` is imported, [`import_trak`]) for deck `d`'s job
+    /// `ticket` on a worker, stopping once superseded.
+    pub fn stage(&mut self, d: usize, ticket: u64, path: PathBuf, budget: &Arc<SampleBudget>) {
+        let (tx, tickets, budget, imports) = (self.done.0.clone(), Arc::clone(&self.tickets), Arc::clone(budget), self.imports.clone());
+        self.stagers.retain(|worker| !worker.is_finished());
+        self.stagers.push(std::thread::spawn(move || {
             let cancelled = || tickets[d].load(Ordering::Acquire) != ticket;
-            let result = read_set(&path).map_err(|e| vec![format!("The set {e}")]).and_then(|set| stage(&set, &budget, &cancelled));
-            // A superseded result is freed here, off the UI thread.
+            let result = if path.extension().is_some_and(|e| e.eq_ignore_ascii_case(TRAK_EXTENSION)) {
+                imports.map_err(|e| vec![e]).and_then(|root| import_trak(&path, &root, &budget, &cancelled)).map(|(bank, imported)| (bank, Some(imported)))
+            } else {
+                read_set(&path).map_err(|e| vec![format!("The set {e}")]).and_then(|set| stage(&set, &budget, &cancelled)).map(|bank| (bank, None))
+            };
+            // A superseded result (and any samples it copied out) is freed here, off the UI thread.
             if !cancelled() {
                 let _ = tx.send((d, ticket, SetDone::Staged(path, result)));
             }
-        });
+        }));
+    }
+
+    /// Ends every staging worker as the app closes (also on drop): each one, superseded ones too, is cancelled and
+    /// waited for, so an import stops between files or packets and removes the folder it was filling. Results not yet
+    /// taken are dropped here, removing any samples no deck took. File choosers aren't waited for (they hold no
+    /// files), and neither is the set writer, whose saves the close already waits on.
+    /// shortcut: a killed process skips this, leaving a partly filled folder in Remix Sets, sweep them at startup if that matters.
+    pub fn shut_down(&mut self) {
+        for ticket in self.tickets.iter() {
+            ticket.store(0, Ordering::Release);
+        }
+        for worker in self.stagers.drain(..) {
+            let _ = worker.join();
+        }
+        drop(self.poll());
     }
 
     /// Queues `set` to be written to `path` (see [`write_set`] for `replace`) for deck `d`'s job `ticket`, after
@@ -1379,7 +1598,7 @@ mod tests {
         let short = dir.join("remix-short.test");
         register_test_stream(&short, TestStream { rate, header_frames: Some(4000), packets: packets(4, 1000), seekable: true });
         let b = budget();
-        let s = RemixSample::decode(&short, "short", 120.0, &b, &|| false).unwrap();
+        let s = RemixSample::decode(&short, "short", 120.0, &b, &|| false, false).unwrap();
         assert_eq!((s.frames(), s.sample_rate, s.bpm, s.fits_beats), (4000, rate, Some(120.0), true), "4 s at 120 BPM = 8 beats");
         assert_eq!(b.used(), 4000 * 2 * 4);
         drop(s);
@@ -1388,7 +1607,7 @@ mod tests {
         for (name, header) in [("remix-overstated-header.test", 15 * 60 * 1000), ("remix-absurd-header.test", u64::MAX)] {
             let path = dir.join(name);
             register_test_stream(&path, TestStream { rate, header_frames: Some(header), packets: packets(4, 1000), seekable: true });
-            let s = RemixSample::decode(&path, "short", 0.0, &b, &|| false).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let s = RemixSample::decode(&path, "short", 0.0, &b, &|| false, false).unwrap_or_else(|e| panic!("{name}: {e}"));
             assert_eq!(s.frames(), 4000, "{name}");
         }
         assert_eq!(b.used(), 0);
@@ -1397,18 +1616,18 @@ mod tests {
         for (name, header) in [("remix-long-stream.test", None), ("remix-long-stated.test", Some(900_000))] {
             let path = dir.join(name);
             register_test_stream(&path, TestStream { rate, header_frames: header, packets: packets(900, 1000), seekable: true });
-            let e = RemixSample::decode(&path, "mix", 0.0, &b, &|| false).err().unwrap();
+            let e = RemixSample::decode(&path, "mix", 0.0, &b, &|| false, false).err().unwrap();
             assert!(e.contains("longer than 60 s"), "{name}: {e}");
             assert_eq!(b.used(), 0);
         }
 
         // A load the cell no longer wants stops and gives everything back.
-        let e = RemixSample::decode(&short, "short", 0.0, &b, &|| true).err().unwrap();
+        let e = RemixSample::decode(&short, "short", 0.0, &b, &|| true, false).err().unwrap();
         assert_eq!((e.as_str(), b.used()), ("Cancelled", 0));
 
         // A bank with room for 3 s: a 4 s sample stops on the way and leaves nothing taken.
         let small = SampleBudget::new(3000 * 2 * 4);
-        let e = RemixSample::decode(&short, "short", 0.0, &small, &|| false).err().unwrap();
+        let e = RemixSample::decode(&short, "short", 0.0, &small, &|| false, false).err().unwrap();
         assert!(e.contains("full"), "{e}");
         assert_eq!(small.used(), 0);
         let held = RemixSample::from_pcm("held", vec![0.0; 2000 * 2], rate, 0.0, &small).unwrap();
@@ -2028,5 +2247,238 @@ mod tests {
         assert_eq!(names(), [kept.file_name().unwrap().to_string_lossy()], "an unclaimed capture stayed, or the kept one went");
         assert!(banks[0].cells[0][0].as_ref().is_some_and(|c| c.sample.source == kept));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A set storing its files in another order than its cells: a synced loop (one beat of 0.5 s at 120 BPM), a
+    /// one-shot, and an unsynced loop sharing the first loop's file. Imported, each cell sits in its place with its
+    /// name, loop or one-shot and tempo (the unsynced loop at its own speed) and the exact audio, each file copied
+    /// once into a new folder, the .trak untouched. A WAV cut short or a cancelled import is refused and leaves no
+    /// folder or memory behind; a second import takes a folder of its own, removed unless kept.
+    #[test]
+    fn a_traktor_set_imports_whole_or_leaves_nothing() {
+        use trak_fixture::{archive, grid, nisound, Cell};
+        let dir = std::env::temp_dir().join(format!("retraktor-trak-import-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.join("Remix Sets");
+        let rate = 8000;
+        let loop_pcm: Vec<f32> = (0..4000).flat_map(|i| [i as f32 / 8000.0, -0.25]).collect();
+        let shot_pcm = vec![0.5f32; 2 * 1000];
+        let cells = [
+            (0, 0, Cell { file: "loop.wav", name: "Trance Kick", play_type: 0, synced: true, bpm: 120.0 }),
+            (1, 6, Cell { file: "shot.wav", name: "Hi Reverse", play_type: 1, synced: false, bpm: 0.0 }),
+            (3, 15, Cell { file: "loop.wav", name: "Free loop", play_type: 0, synced: false, bpm: 98.0 }),
+        ];
+        let set = |shot: &[u8]| archive(&[("shot.wav", shot), ("loop.wav", &test_wav(&loop_pcm, rate)), ("NISOUND", &nisound(true, &grid(&cells), 3))]);
+        let trak = dir.join("Electric Test.trak");
+        let bytes = set(&test_wav(&shot_pcm, rate));
+        std::fs::write(&trak, &bytes).unwrap();
+        let folders = || std::fs::read_dir(&root).map_or(0, |d| d.count());
+        let b = budget();
+
+        let (bank, imported) = import_trak(&trak, &root, &b, &|| false).unwrap_or_else(|e| panic!("{e:?}"));
+        assert!(bank.quantize && bank.page == 0 && bank.contents().1.len() == 3);
+        let cell = |c: usize, r: usize| bank.cells[c][r].as_ref().unwrap_or_else(|| panic!("cell {}.{} is empty", c + 1, r + 1));
+        let (kick, shot, free) = (cell(0, 0), cell(1, 6), cell(3, 15));
+        assert_eq!((kick.sample.name.as_str(), kick.looped, kick.sample.bpm, kick.sample.fits_beats), ("Trance Kick", true, Some(120.0), true));
+        assert_eq!((shot.sample.name.as_str(), shot.looped, shot.sample.bpm), ("Hi Reverse", false, None));
+        assert_eq!((free.sample.name.as_str(), free.looped, free.sample.bpm, free.sample.library_bpm), ("Free loop", true, None, 0.0));
+        assert!(kick.sample.pcm == loop_pcm && free.sample.pcm == loop_pcm && shot.sample.pcm == shot_pcm, "not the set's exact audio");
+        let folder = kick.sample.source.parent().unwrap().to_path_buf();
+        assert_eq!((free.sample.source.as_path(), shot.sample.source.parent()), (kick.sample.source.as_path(), Some(folder.as_path())));
+        let mut files: Vec<_> = std::fs::read_dir(&folder).unwrap().map(|e| e.unwrap().file_name()).collect();
+        files.sort();
+        assert_eq!(files, ["loop.wav", "shot.wav"]);
+        assert!(std::fs::read(folder.join("loop.wav")).unwrap() == test_wav(&loop_pcm, rate), "a standard WAV's copy isn't byte for byte");
+        assert_eq!(imported.keep(), folder);
+        let used = b.used();
+
+        // Its header promises 1000 frames and only 750 are there: refused, not taken as a shorter sample.
+        let mut cut = test_wav(&shot_pcm, rate);
+        cut.truncate(cut.len() - 250 * 8);
+        std::fs::write(&trak, set(&cut)).unwrap();
+        let e = import_trak(&trak, &root, &b, &|| false).err().unwrap().join("\n");
+        assert!(e.contains("cell 2.7 (page 2) 'Hi Reverse' from 'shot.wav'") && e.contains("cut short"), "{e}");
+        std::fs::write(&trak, &bytes).unwrap();
+        assert_eq!(import_trak(&trak, &root, &b, &|| true).err().unwrap(), ["Cancelled"]);
+        assert_eq!((folders(), b.used()), (1, used), "a refused import left files or memory behind");
+
+        let before = std::fs::read(folder.join("shot.wav")).unwrap();
+        let (_, again) = import_trak(&trak, &root, &b, &|| false).unwrap();
+        assert_eq!(folders(), 2);
+        drop(again);
+        assert_eq!(folders(), 1, "an import nobody kept left its folder");
+        assert_eq!(std::fs::read(folder.join("shot.wav")).unwrap(), before);
+        assert_eq!(std::fs::read(&trak).unwrap(), bytes, "the .trak changed");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A 16-bit PCM WAV whose `fmt ` chunk is 20 bytes, its last `extension` (zero in NI's own sets), then the audio
+    /// and a `LIST` chunk.
+    fn wav_with_20_byte_fmt(frames: &[[i16; 2]], rate: u32, extension: [u8; 4]) -> Vec<u8> {
+        let mut wav = b"RIFF\0\0\0\0WAVEfmt ".to_vec();
+        wav.extend(20u32.to_le_bytes());
+        for field in [1u16, 2] {
+            wav.extend(field.to_le_bytes());
+        }
+        wav.extend(rate.to_le_bytes());
+        wav.extend((rate * 4).to_le_bytes());
+        for field in [4u16, 16] {
+            wav.extend(field.to_le_bytes());
+        }
+        wav.extend(extension);
+        wav.extend(b"data");
+        wav.extend((frames.len() as u32 * 4).to_le_bytes());
+        wav.extend(frames.iter().flatten().flat_map(|s| s.to_le_bytes()));
+        wav.extend(b"LIST\x04\0\0\0INFO");
+        let riff = (wav.len() - 8) as u32;
+        wav[4..8].copy_from_slice(&riff.to_le_bytes());
+        wav
+    }
+
+    /// NI's *Drums and Beatbox* stores WAVs with a 20-byte PCM `fmt ` chunk the decoder doesn't read. Its copy gets the
+    /// same format in a standard 16-byte chunk and a RIFF size 4 smaller, every byte after it (audio, LIST) unchanged;
+    /// it decodes to the stored audio and reopens from a saved set. The same chunk with a nonzero extension isn't the
+    /// observed case: copied as it is, and the set is refused.
+    #[test]
+    fn a_wav_with_a_20_byte_format_chunk_imports_and_reopens() {
+        use trak_fixture::{archive, grid, nisound, Cell};
+        let dir = std::env::temp_dir().join(format!("retraktor-trak-fmt20-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let frames: Vec<[i16; 2]> = (0..3000).map(|i| [i as i16 * 7, -(i as i16)]).collect();
+        let odd = wav_with_20_byte_fmt(&frames, 44_100, [0; 4]);
+        let cells = [(0, 14, Cell { file: "ClosedHH.wav", name: "ClosedHH", play_type: 1, synced: false, bpm: 0.0 })];
+        let trak = dir.join("Beatbox.trak");
+        let write = |wav: &[u8]| std::fs::write(&trak, archive(&[("ClosedHH.wav", wav), ("NISOUND", &nisound(false, &grid(&cells), 3))])).unwrap();
+        write(&odd);
+        let b = budget();
+        let (bank, imported) = import_trak(&trak, &dir.join("Remix Sets"), &b, &|| false).unwrap_or_else(|e| panic!("{e:?}"));
+        let cell = bank.cells[0][14].as_ref().unwrap();
+        let mut standard = odd[..36].to_vec();
+        standard[4..8].copy_from_slice(&(odd.len() as u32 - 12).to_le_bytes());
+        standard[16..20].copy_from_slice(&16u32.to_le_bytes());
+        standard.extend(&odd[40..]);
+        assert!(std::fs::read(&cell.sample.source).unwrap() == standard, "the copy isn't the same WAV with a standard format chunk");
+        let want: Vec<f32> = frames.iter().flatten().map(|&s| s as f32 / 32768.0).collect();
+        assert!(cell.sample.pcm == want && cell.sample.sample_rate == 44_100, "not the stored audio");
+
+        let saved = dir.join("Beatbox.remixset");
+        write_set(&saved, &RemixSet::from_bank(&bank).unwrap(), false).unwrap();
+        let reopened = stage(&read_set(&saved).unwrap(), &b, &|| false).unwrap_or_else(|e| panic!("{e:?}"));
+        let again = reopened.cells[0][14].as_ref().unwrap();
+        assert!(again.sample.pcm == want && again.sample.name == "ClosedHH" && !again.looped);
+        drop(imported.keep());
+
+        write(&wav_with_20_byte_fmt(&frames, 44_100, [0, 0, 1, 0]));
+        let e = import_trak(&trak, &dir.join("Remix Sets"), &b, &|| false).err().unwrap().join("\n");
+        assert!(e.contains("cell 1.15 (page 4) 'ClosedHH'"), "{e}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Closing while sets import (one superseded, one under way, or one finished and not yet taken) cancels and waits
+    /// for every staging worker: no copied sample, folder or decoded audio is left behind.
+    #[test]
+    fn closing_mid_import_leaves_no_samples_behind() {
+        use trak_fixture::{archive, grid, nisound, Cell};
+        let dir = std::env::temp_dir().join(format!("retraktor-trak-close-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.join("Remix Sets");
+        let names: Vec<String> = (0..40).map(|i| format!("s{i}.wav")).collect();
+        let wav = test_wav(&vec![0.1f32; 2 * 16_000], 8000);
+        let cells: Vec<_> = names.iter().enumerate().map(|(i, n)| (i % COLUMNS, i / COLUMNS, Cell { file: n, name: n, play_type: 1, synced: false, bpm: 0.0 })).collect();
+        let set = nisound(false, &grid(&cells), 3);
+        let mut records: Vec<(&str, &[u8])> = names.iter().map(|n| (n.as_str(), wav.as_slice())).collect();
+        records.push(("NISOUND", &set));
+        let trak = dir.join("Big.trak");
+        std::fs::write(&trak, archive(&records)).unwrap();
+        let folders = || std::fs::read_dir(&root).map_or(0, |d| d.count());
+
+        let b = budget();
+        let mut sets = RemixSets::default();
+        sets.imports = Ok(root.clone());
+        for _ in 0..2 {
+            let ticket = sets.start(0, SetAction::Open, Default::default(), None, (true, 0));
+            sets.stage(0, ticket, trak.clone(), &b);
+        }
+        for _ in 0..400 {
+            if folders() > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        sets.shut_down();
+        assert!(sets.stagers.is_empty());
+        assert_eq!((folders(), b.used()), (0, 0), "closing left samples or audio behind");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Opt-in and local only (no NI audio is in the repository): imports every `.trak` in `RETRAKTOR_TRAK_DIR` through
+    /// the real importer into `RETRAKTOR_TRAK_OUT`, keeping what it copies, and lists every cell in `cells.tsv` there
+    /// for comparison with an independent reading of the same archives. Each bank is also saved as a .remixset there and
+    /// reopened natively. Fails naming each set that was refused or didn't reopen the same.
+    #[test]
+    #[ignore = "needs genuine Traktor Remix Sets: set RETRAKTOR_TRAK_DIR and RETRAKTOR_TRAK_OUT"]
+    fn genuine_traktor_sets_import_whole() {
+        let (Some(sets), Some(out)) = (std::env::var_os("RETRAKTOR_TRAK_DIR"), std::env::var_os("RETRAKTOR_TRAK_OUT")) else {
+            panic!("set RETRAKTOR_TRAK_DIR and RETRAKTOR_TRAK_OUT");
+        };
+        let out = PathBuf::from(out);
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(sets).unwrap().map(|e| e.unwrap().path()).filter(|p| p.extension().is_some_and(|e| e == TRAK_EXTENSION)).collect();
+        paths.sort();
+        assert!(!paths.is_empty(), "no .trak files");
+        let mut lines = vec!["archive\tcolumn\trow\tpage\tfile\tname\tlooped\tlibrary_bpm\tbpm\tframes\trate\tpath".to_string()];
+        let mut refused = Vec::new();
+        for path in &paths {
+            let b = budget();
+            let (bank, imported) = match import_trak(path, &out, &b, &|| false) {
+                Ok(done) => done,
+                Err(e) => {
+                    refused.push(format!("{}: {e:?}", path.display()));
+                    continue;
+                }
+            };
+            imported.keep();
+            let archive = path.file_name().unwrap().to_string_lossy();
+            for column in 0..COLUMNS {
+                for row in 0..ROWS {
+                    let Some(cell) = &bank.cells[column][row] else { continue };
+                    let s = &cell.sample;
+                    let file = s.source.file_name().unwrap().to_string_lossy();
+                    lines.push(format!(
+                        "{archive}\t{}\t{}\t{}\t{file}\t{}\t{}\t{}\t{:?}\t{}\t{}\t{}",
+                        column + 1,
+                        row + 1,
+                        row / PAGE_ROWS + 1,
+                        s.name,
+                        cell.looped,
+                        s.library_bpm,
+                        s.bpm,
+                        s.frames(),
+                        s.sample_rate,
+                        s.source.display()
+                    ));
+                }
+            }
+            // Saved as a .remixset and opened again natively, every cell plays the same audio.
+            let saved = out.join(format!("{archive}.remixset"));
+            write_set(&saved, &RemixSet::from_bank(&bank).unwrap(), false).unwrap();
+            match stage(&read_set(&saved).unwrap(), &b, &|| false) {
+                Ok(reopened) => {
+                    let same = (0..COLUMNS).flat_map(|c| (0..ROWS).map(move |r| (c, r))).all(|(c, r)| match (&bank.cells[c][r], &reopened.cells[c][r]) {
+                        (Some(a), Some(b)) => a.sample.pcm == b.sample.pcm && a.sample.name == b.sample.name && a.looped == b.looped && a.sample.bpm == b.sample.bpm,
+                        (None, None) => true,
+                        _ => false,
+                    });
+                    if !same {
+                        refused.push(format!("{archive}: the reopened .remixset differs"));
+                    }
+                }
+                Err(e) => refused.push(format!("{archive}: the saved .remixset doesn't reopen: {e:?}")),
+            }
+        }
+        std::fs::write(out.join("cells.tsv"), lines.join("\n") + "\n").unwrap();
+        assert!(refused.is_empty(), "refused:\n{}", refused.join("\n"));
     }
 }
