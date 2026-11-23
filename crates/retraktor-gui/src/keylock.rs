@@ -38,10 +38,11 @@ impl Default for KeyLock {
     }
 }
 
-/// Where in the source to read, folded back into an active loop.
+/// Where in the source to read, folded into an active loop from either side, so neither a grain nor the alignment
+/// search around the playhead reads music outside a loop shorter than a grain.
 fn wrap(p: f64, loop_frames: Option<(f64, f64)>) -> f64 {
     match loop_frames {
-        Some((start, len)) if len > 1.0 && p >= start + len => start + (p - start).rem_euclid(len),
+        Some((start, len)) if len >= 1.0 && (p < start || p >= start + len) => start + (p - start).rem_euclid(len),
         _ => p,
     }
 }
@@ -197,6 +198,23 @@ mod tests {
             // No dropouts: the level stays steady once primed.
             let quiet = out[HOP..].chunks(256).filter(|c| c.iter().fold(0.0f32, |m, x| m.max(x.abs())) < 0.3).count();
             assert_eq!(quiet, 0, "rate {rate}: level dips");
+        }
+    }
+
+    /// A loop shorter than a grain, with the music around it as loud in mono (so alignment can't tell them apart) but
+    /// different in stereo: once settled, only the loop's own audio is heard, never what lies before or after it.
+    #[test]
+    fn a_loop_shorter_than_a_grain_plays_only_itself() {
+        let (start, len) = (20_000usize, 600usize);
+        let src: Vec<f32> = (0..40_000).flat_map(|i| if (start..start + len).contains(&i) { [0.5, 0.5] } else { [1.0, 0.0] }).collect();
+        let mut kl = KeyLock::default();
+        let mut playhead = start as f64;
+        for i in 0..20 * HOP {
+            let (l, r) = kl.next(&[&src], playhead, 1.0, Some((start as f64, len as f64)), true)[0];
+            if i >= 2 * HOP {
+                assert!((l - 0.5).abs() < 1e-3 && (r - 0.5).abs() < 1e-3, "frame {i}: ({l}, {r}) is outside the loop");
+            }
+            playhead = start as f64 + (playhead + 1.0 - start as f64).rem_euclid(len as f64);
         }
     }
 
