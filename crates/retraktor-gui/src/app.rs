@@ -4,14 +4,14 @@ use crate::library_ui::LibraryManager;
 use crate::preferences::{PreferencesDialog, PrefsTab};
 use crate::theme::TraktorTheme;
 use crate::widgets::{
-    crossfader, deck_transport_bar, icon_button, render_shortcuts_hud, rotary_knob_sized,
+    crossfader, deck_transport_bar, empty_waveform_lane, icon_button, render_shortcuts_hud, rotary_knob_sized,
     scrolling_stem_waveforms, scrolling_waveform, stripe_overview, Icon, TransportAction,
 };
 use eframe::egui::{self, Align, Color32, Key, Layout, RichText, Sense, Stroke, Ui, Vec2};
 use retraktor_core::{PropValue, PropertyBus, SurfaceEvent};
 use retraktor_dsp::MixerFxKind;
 use retraktor_hid::{
-    scan_linux_ni_hidraw_devices, Mx2BottomShellState, Mx2HidDriver,
+    controller_rules::RuleCommand, scan_linux_ni_hidraw_devices, Mx2BottomShellState, Mx2HidDriver,
     TRAKTOR_MX2_PID,
 };
 use retraktor_library::KeyWheel;
@@ -59,6 +59,9 @@ struct Kept {
 /// How long a selection rests before its overview is decoded, so scrolling through the browser decodes nothing.
 const BROWSE_SETTLE: std::time::Duration = std::time::Duration::from_millis(150);
 
+/// One waveform zoom tick: the fourth root of 2.
+const WAVE_ZOOM_STEP: f32 = 1.189_207_1;
+
 /// Row waveforms kept in memory (8 KB each; finished ones are also in the stripe cache): many screens of browsing.
 const ROW_WAVEFORMS_KEPT: usize = 1000;
 
@@ -80,8 +83,8 @@ pub enum TraktorLayout {
 impl TraktorLayout {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Parallel => "Mix",
-            Self::FourDeck => "4-Deck",
+            Self::Parallel => "Stacked",
+            Self::FourDeck => "In Deck",
             Self::Timeline => "Timeline",
             Self::Browser => "Browser",
             Self::Set => "Set",
@@ -188,6 +191,11 @@ pub struct ReTraktorApp {
     pub deck_stem_muted: [[bool; 4]; 4],
     pub deck_stem_fx_send: [[bool; 4]; 4],
     pub deck_stem_view: [bool; 4],
+    /// Time zoom of each deck's scrolling waveform: 1 is the normal width, 2 shows half the seconds.
+    pub deck_wave_zoom: [f32; 4],
+    /// The layout a controller's `browser_only` left, or the deck layout last left from the toolbar or F3–F5,
+    /// so the browser button's second press goes back there.
+    layout_before_browser: Option<TraktorLayout>,
     pub deck_track_ids: [Option<usize>; 4],
     /// Per-deck "More": hotcue pads, pad modes, cue-play, flux and all loop sizes.
     pub deck_expanded: [bool; 4],
@@ -295,7 +303,7 @@ impl Default for ReTraktorApp {
             preferences: PreferencesDialog::load(),
             demucs: crate::demucs::DemucsManager::new(),
             bus,
-            layout: TraktorLayout::Browser, // Library first; switches to Mix on the first load
+            layout: TraktorLayout::Browser, // Library first; the first load opens the decks
             show_shortcuts_hud: false,
             show_next_track_panel: false,
             next_track_picks: Vec::new(),
@@ -365,6 +373,8 @@ impl Default for ReTraktorApp {
             deck_stem_muted: [[false; 4]; 4],
             deck_stem_fx_send: [[false; 4]; 4],
             deck_stem_view: [false, false, false, false],
+            deck_wave_zoom: [1.0; 4],
+            layout_before_browser: None,
             deck_expanded: [false; 4],
             deck_auto_cue_status: [None, None, None, None],
             deck_track_ids: [None; 4],
@@ -423,6 +433,22 @@ impl Default for ReTraktorApp {
             }),
             set_state: crate::setlist::SetUiState::default(),
         }
+    }
+}
+
+fn event_control(ev: &SurfaceEvent) -> &str {
+    match ev {
+        SurfaceEvent::Button { control, .. } | SurfaceEvent::Fader { control, .. } | SurfaceEvent::Encoder { control, .. } => control,
+    }
+}
+
+/// The same event under another control ID.
+fn with_control(ev: &SurfaceEvent, control: &str) -> SurfaceEvent {
+    let control = control.to_string();
+    match ev {
+        SurfaceEvent::Button { pressed, .. } => SurfaceEvent::Button { control, pressed: *pressed },
+        SurfaceEvent::Fader { value, .. } => SurfaceEvent::Fader { control, value: *value },
+        SurfaceEvent::Encoder { delta, .. } => SurfaceEvent::Encoder { control, delta: *delta },
     }
 }
 
@@ -578,7 +604,7 @@ impl eframe::App for ReTraktorApp {
                         self.show_browser_panel(ui);
                     }
                     TraktorLayout::FourDeck => {
-                        self.show_four_deck_layout(ui);
+                        self.show_four_deck_layout(ui, self.preferences.four_deck_mode, true);
                         self.show_browser_panel(ui);
                     }
                     TraktorLayout::Timeline => {
@@ -776,7 +802,7 @@ impl ReTraktorApp {
     }
 
     /// Dev-only: walks SHOT_STEPS (90 frames each after SHOT_WARM frames) saving a PNG per step, then exits.
-    /// Steps: Mix FourDeck Browser Timeline prefs prefs:<Tab> nav:Missing|Suggestions|Files loadA..loadD expandA expandAll stemsA pattern relocate wait.
+    /// Steps: Mix FourDeck layout:regular2|regular4|stacked2|stacked4 Browser Timeline prefs prefs:<Tab> nav:Missing|Suggestions|Files loadA..loadD expandA expandAll stemsA pattern relocate wait.
     fn screenshot_step(&mut self, ctx: &egui::Context) {
         let Some((dir, steps)) = self.shot.clone() else { return };
         let warm: usize = std::env::var("SHOT_WARM").ok().and_then(|v| v.parse().ok()).unwrap_or(300);
@@ -790,8 +816,9 @@ impl ReTraktorApp {
         use crate::library_ui::NavItem;
         match step.as_str() {
             "Mix" => self.layout = TraktorLayout::Parallel,
-            "FourDeck" => self.layout = TraktorLayout::FourDeck,
-            "Browser" => self.layout = TraktorLayout::Browser,
+            "FourDeck" => _ = self.run_button_action("layout", 1, "regular4"),
+            s if s.starts_with("layout:") => _ = self.run_button_action("layout", 1, &s[7..]),
+            "Browser" => self.show_layout(TraktorLayout::Browser),
             "Timeline" => {
                 self.preferences.is_open = false;
                 self.layout = TraktorLayout::Timeline;
@@ -1078,8 +1105,8 @@ impl ReTraktorApp {
         }
     }
 
-    /// Executes a mapped button action (`play:1`, `hotcue:2:5`, …). Unknown verbs are ignored.
-    fn run_button_action(&mut self, verb: &str, deck: usize, arg: &str) {
+    /// Executes a mapped button action (`play:1`, `hotcue:2:5`, …). Returns false for an unknown verb, which does nothing.
+    fn run_button_action(&mut self, verb: &str, deck: usize, arg: &str) -> bool {
         let d = deck.clamp(1, 4) - 1;
         let n: usize = arg.parse().unwrap_or(1);
         match verb {
@@ -1121,12 +1148,32 @@ impl ReTraktorApp {
             "keylock" => self.deck_keylock[d] ^= true,
             "fx_on" if deck == 2 => self.fx2_on ^= true,
             "fx_on" => self.fx1_on ^= true,
-            _ => {}
+            // Stays master when pressed again (unlike the MASTER button), at the deck's pitched tempo.
+            "tempo_master" if self.tempo_master_deck != Some(d) => self.toggle_master(d),
+            "tempo_master" => {}
+            "layout" => {
+                let (layout, four_decks) = match arg {
+                    "regular2" => (TraktorLayout::FourDeck, false),
+                    "regular4" => (TraktorLayout::FourDeck, true),
+                    "stacked2" => (TraktorLayout::Parallel, false),
+                    "stacked4" => (TraktorLayout::Parallel, true),
+                    _ => return false,
+                };
+                self.layout = layout;
+                self.preferences.four_deck_mode = four_decks;
+            }
+            "browser_only" if self.layout == TraktorLayout::Browser => self.layout = self.layout_before_browser.take().unwrap_or(TraktorLayout::Parallel),
+            "browser_only" => self.layout_before_browser = Some(std::mem::replace(&mut self.layout, TraktorLayout::Browser)),
+            // Four ticks double or halve the seconds shown; 1/4 to 4 times the normal width.
+            "zoom_in" => self.deck_wave_zoom[d] = (self.deck_wave_zoom[d] * WAVE_ZOOM_STEP).min(4.0),
+            "zoom_out" => self.deck_wave_zoom[d] = (self.deck_wave_zoom[d] / WAVE_ZOOM_STEP).max(0.25),
+            _ => return false,
         }
+        true
     }
 
-    /// Applies a mapped knob/fader value (0..=1).
-    fn set_mapped_value(&mut self, target: &str, deck: usize, v: f32) {
+    /// Applies a mapped knob/fader value (0..=1). Returns false for an unknown target, which does nothing.
+    fn set_mapped_value(&mut self, target: &str, deck: usize, v: f32) -> bool {
         let d = deck.clamp(1, 4) - 1;
         match target {
             "volume" => self.channel_volume[d] = v,
@@ -1142,7 +1189,46 @@ impl ReTraktorApp {
             "cue_vol" => self.cue_volume = v,
             "fx_mix" if deck == 2 => self.fx2_dry_wet = v,
             "fx_mix" => self.fx1_dry_wet = v,
-            _ => {}
+            _ => return false,
+        }
+        true
+    }
+
+    /// The current 0..=1 value of a `set_mapped_value` target.
+    fn mapped_value(&self, target: &str, deck: usize) -> Option<f32> {
+        let d = deck.clamp(1, 4) - 1;
+        Some(match target {
+            "volume" => self.channel_volume[d],
+            "gain" => self.channel_gain[d],
+            "eq_hi" => self.channel_eq_hi[d],
+            "eq_mid" => self.channel_eq_mid[d],
+            "eq_low" => self.channel_eq_low[d],
+            "filter" => self.channel_filter[d],
+            "pitch" => (self.deck_pitch_fader[d] + 8.0) / 16.0,
+            "xfader" => self.crossfader_pos,
+            "master_volume" => self.master_volume,
+            "cue_mix" => self.cue_mix,
+            "cue_vol" => self.cue_volume,
+            "fx_mix" if deck == 2 => self.fx2_dry_wet,
+            "fx_mix" => self.fx1_dry_wet,
+            _ => return None,
+        })
+    }
+
+    /// Executes what a controller rule asked for (see `retraktor_hid::controller_rules`).
+    fn run_rule_command(&mut self, command: RuleCommand) {
+        match command {
+            RuleCommand::Trigger { verb, index, arg } => {
+                self.run_button_action(verb, index.into(), &arg);
+            }
+            RuleCommand::Set { target, index, value } => {
+                self.set_mapped_value(target, index.into(), value);
+            }
+            RuleCommand::Adjust { target, index, delta } => {
+                if let Some(now) = self.mapped_value(target, index.into()) {
+                    self.set_mapped_value(target, index.into(), (now + delta).clamp(0.0, 1.0));
+                }
+            }
         }
     }
 
@@ -1435,7 +1521,9 @@ impl ReTraktorApp {
                     if !self.first_load_done {
                         self.first_load_done = true;
                         if self.layout == TraktorLayout::Browser {
-                            self.layout = TraktorLayout::Parallel;
+                            // The deck layout the DJ browsed from, else Stacked (Stacked2 or Stacked4 by deck count).
+                            let decks = self.layout_before_browser.take().filter(|l| matches!(l, TraktorLayout::Parallel | TraktorLayout::FourDeck));
+                            self.layout = decks.unwrap_or(TraktorLayout::Parallel);
                             switched = true;
                         }
                     }
@@ -1460,7 +1548,7 @@ impl ReTraktorApp {
                     self.set_state.on_track_loaded(d, track.id);
                     self.library.status_message = format!("Loaded '{}' on deck {}", track.title, DECK_LETTERS[d]);
                     if switched {
-                        self.library.status_message += " · opened the Mix view (F3 returns to the Browser)";
+                        self.library.status_message += &format!(" · opened the {} view (F3 returns to the Browser)", self.layout.label());
                     }
                 }
                 Err(e) => {
@@ -1940,6 +2028,20 @@ impl ReTraktorApp {
 
     /// Connects to a specific `/dev/hidraw*` endpoint for Traktor MX2 / Kontrol hardware.
     pub fn connect_hidraw_node(&mut self, dev_node: &str) {
+        self.connect_verified_hidraw(dev_node, retraktor_hid::hidraw_node_vid_pid(dev_node));
+    }
+
+    /// Only a node whose USB IDs are the MX2's gets MX2 report decoding and LED output; any other NI controller
+    /// stays on the read-only generic path (Preferences > Other controllers).
+    fn connect_verified_hidraw(&mut self, dev_node: &str, vid_pid: Option<(u16, u16)>) {
+        if vid_pid != Some((retraktor_hid::NI_USB_VID, TRAKTOR_MX2_PID)) {
+            let ids = vid_pid.map_or("unknown USB IDs".to_string(), |(vid, pid)| format!("{vid:04x}:{pid:04x}"));
+            self.mx2_access_status = Some(format!("{dev_node} is not a Traktor MX2 (17cc:2420, found {ids}); other NI controllers work under Other controllers"));
+            return;
+        }
+        // A fresh driver and no held modifiers, so nothing from an earlier connection carries over.
+        self.mx2_driver = Mx2HidDriver::new();
+        self.preferences.controller_rules.engine.reset_device("mx2");
         let mut opts = OpenOptions::new();
         opts.read(true).write(true);
         #[cfg(unix)]
@@ -1991,23 +2093,23 @@ impl ReTraktorApp {
     /// or other Traktor Kontrol surface, decodes Input Reports `0x01`/`0x02`/`0x03`, and writes
     /// Output Report `0x80` (105 LEDs + 6 RGB Bottom-Shell LEDs per deck).
     fn poll_mx2_hardware(&mut self) {
-        // Non-blocking poll of connected generic MIDI & NI HID controllers
+        // Non-blocking poll of connected generic MIDI & NI HID controllers, reading CCs the way the rules file says.
+        self.preferences.generic_manager.set_cc_modes(self.preferences.controller_rules.engine.rules().midi_cc_modes());
         let generic_events = self.preferences.generic_manager.poll_events();
         for ev in generic_events {
             self.apply_mx2_surface_event(ev);
         }
+        // Modifiers held on an unplugged controller are dropped, so its Shift can't stay stuck on.
+        let mx2_connected = self.mx2_hidraw_file.is_some();
+        let generic_connected = self.preferences.generic_manager.connected_device_keys();
+        self.preferences.controller_rules.engine.forget_disconnected(|d| (d == "mx2" && mx2_connected) || generic_connected.iter().any(|g| g == d));
 
         if self.mx2_hidraw_file.is_none() {
             let due = self.mx2_last_scan.is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(1500));
             if due {
                 self.mx2_last_scan = Some(std::time::Instant::now());
-                let detected = scan_linux_ni_hidraw_devices();
-                // Prefer Traktor MX2 if multiple NI devices are attached
-                if let Some(dev) = detected
-                    .iter()
-                    .find(|d| d.descriptor.pid == TRAKTOR_MX2_PID)
-                    .or_else(|| detected.first())
-                {
+                // Only an MX2 connects here; other NI hardware is read by the generic controller manager.
+                if let Some(dev) = scan_linux_ni_hidraw_devices().iter().find(|d| d.descriptor.pid == TRAKTOR_MX2_PID) {
                     self.connect_hidraw_node(&dev.dev_node);
                 }
             }
@@ -2066,6 +2168,7 @@ impl ReTraktorApp {
         if disconnected {
             self.mx2_hidraw_file = None;
             self.mx2_dev_node = None;
+            self.preferences.controller_rules.engine.reset_device("mx2");
             self.mx2_access_status = Some("Disconnected (USB cable unplugged)".to_string());
             return;
         }
@@ -2103,9 +2206,10 @@ impl ReTraktorApp {
             Mx2BottomShellState::DefaultGlow
         };
 
-        let led_report = self
+        let mut led_report = self
             .mx2_driver
             .encode_led_report(&self.bus, left_shell, right_shell);
+        self.preferences.controller_rules.engine.apply_mx2_led_overlay(&mut led_report);
         if let Some(ref mut file) = self.mx2_hidraw_file {
             let _ = file.write_all(&led_report);
         }
@@ -2121,6 +2225,23 @@ impl ReTraktorApp {
         if let Some(t) = touched {
             self.preferences.last_surface_control = Some(t);
         }
+
+        // The rules file comes first; with no matching rule, the simple mappings and built-in controls below run as before.
+        // IDs learned or written before stable MIDI port names (`midi.midic1d0…`) still work, but only when nothing
+        // uses the stable ID, so one press never runs two mappings.
+        let legacy = self.preferences.generic_manager.legacy_alias(event_control(&ev));
+        let engine = &mut self.preferences.controller_rules.engine;
+        let commands = engine.handle(&ev).or_else(|| legacy.as_ref().and_then(|alias| engine.handle(&with_control(&ev, alias))));
+        if let Some(commands) = commands {
+            for command in commands {
+                self.run_rule_command(command);
+            }
+            return;
+        }
+        let ev = match legacy {
+            Some(alias) if !self.custom_mappings.contains_key(event_control(&ev)) && self.custom_mappings.contains_key(&alias) => with_control(&ev, &alias),
+            _ => ev,
+        };
 
         // Handle Encoder actions (e.g. browse, jog turn, loop size)
         if let SurfaceEvent::Encoder { ref control, delta } = ev {
@@ -2173,8 +2294,12 @@ impl ReTraktorApp {
             match m {
                 Mapped::Nothing => {}
                 Mapped::Button { .. } if !pressed => {}
-                Mapped::Button { verb, deck, arg } => self.run_button_action(&verb, deck, &arg),
-                Mapped::Value { target, deck } => self.set_mapped_value(&target, deck, v),
+                Mapped::Button { verb, deck, arg } => {
+                    self.run_button_action(&verb, deck, &arg);
+                }
+                Mapped::Value { target, deck } => {
+                    self.set_mapped_value(&target, deck, v);
+                }
             }
             return;
         }
@@ -2359,13 +2484,8 @@ impl ReTraktorApp {
                         self.bus.set("app.traktor.decks.2.pad_mode", PropValue::Int(3));
                     }
 
-                    "surface.left.browse.view" | "surface.right.browse.view" => {
-                        self.layout = if self.layout == TraktorLayout::Browser {
-                            TraktorLayout::Parallel
-                        } else {
-                            TraktorLayout::Browser
-                        };
-                    }
+                    // The same toggle as a mapped browser button: back to the deck layout it left.
+                    "surface.left.browse.view" | "surface.right.browse.view" => _ = self.run_button_action("browser_only", 1, ""),
                     "surface.left.fx.buttons.1" => self.fx1_on = !self.fx1_on,
                     "surface.right.fx.buttons.1" => self.fx2_on = !self.fx2_on,
                     "surface.left.fx.buttons.2" => self.cycle_fx_kind(0),
@@ -2634,8 +2754,12 @@ impl ReTraktorApp {
             (Key::F5, TraktorLayout::Set),
         ] {
             if ctx.input(|i| i.key_pressed(key)) {
-                self.layout = lay;
-                self.preferences.four_deck_mode = lay == TraktorLayout::FourDeck;
+                // F1 and F2 pick their presets; F3 to F5 keep the deck preset for coming back.
+                match lay {
+                    TraktorLayout::Parallel => _ = self.run_button_action("layout", 1, "stacked2"),
+                    TraktorLayout::FourDeck => _ = self.run_button_action("layout", 1, "regular4"),
+                    other => self.show_layout(other),
+                }
             }
         }
 
@@ -3163,12 +3287,12 @@ impl ReTraktorApp {
                 self.deck_strip(ui, 0);
                 ui.separator();
 
-                // ---- Centre-left: compact layout tabs ----
+                // ---- Centre-left: deck layout preset, then the other layout tabs ----
                 ui.scope(|ui| {
                     ui.spacing_mut().item_spacing.x = 2.0;
+                    // Side by side they take 64 px more than stacked; from 1440 px the recorder's longest label still fits beside NEXT.
+                    self.deck_layout_selector(ui, screen_w >= 1440.0);
                     for (lay, short, key) in [
-                        (TraktorLayout::Parallel, "Mix", "F1"),
-                        (TraktorLayout::FourDeck, "4-Deck", "F2"),
                         (TraktorLayout::Browser, "Browse", "F3"),
                         (TraktorLayout::Timeline, "Timeline", "F4"),
                         (TraktorLayout::Set, "Set", "F5"),
@@ -3179,8 +3303,7 @@ impl ReTraktorApp {
                             .on_hover_text(format!("{} layout ({key})", lay.label()))
                             .clicked()
                         {
-                            self.layout = lay;
-                            self.preferences.four_deck_mode = lay == TraktorLayout::FourDeck;
+                            self.show_layout(lay);
                         }
                     }
                 });
@@ -3630,49 +3753,52 @@ impl ReTraktorApp {
         });
     }
 
-    /// Mix layout: full-width waveforms stacked so the beatgrids line up, then deck A | mixer | deck B.
+    /// Mix layout (Stacked2/4): full-width waveforms stacked so the beatgrids line up, then deck A | mixer | deck B,
+    /// or for four decks A and C | mixer | B and D.
     fn show_parallel_layout(&mut self, ui: &mut Ui) {
         let four_deck = self.layout == TraktorLayout::FourDeck || self.preferences.four_deck_mode;
-        let wave_h = mix_wave_height(ui) * if four_deck { 0.7 } else { 1.0 };
-
-        // Waveforms only for loaded decks; an empty deck's own panel already says how to load it.
         let decks = if four_deck { 4 } else { 2 };
-        let loaded: Vec<usize> = match self.audio.shared.lock() {
-            Ok(s) => (1..=decks).filter(|d| s.loaded_tracks[d - 1].is_some()).collect(),
-            Err(_) => Vec::new(),
-        };
-        if !loaded.is_empty() {
-            panel(TraktorTheme::BG_PANEL()).show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                for deck_idx in loaded {
-                    self.show_parallel_waveform_row(ui, deck_idx, TraktorTheme::deck_color(deck_idx), wave_h, false);
-                }
-            });
-        }
+        // Four lanes share the height of two. Stem lanes need room for their names, and all lanes keep one height.
+        let stems_shown = self.deck_stem_view[..decks].iter().any(|&on| on);
+        let wave_h = (mix_wave_height(ui) * if four_deck { 0.46 } else { 1.0 }).max(if stems_shown { STEM_LANES_MIN_H } else { 0.0 });
+
+        // A lane for every deck on screen, loaded or not, so no lane moves when another deck loads.
+        panel(TraktorTheme::BG_PANEL()).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            for deck_idx in 1..=decks {
+                self.show_parallel_waveform_row(ui, deck_idx, TraktorTheme::deck_color(deck_idx), wave_h, false);
+            }
+        });
 
         let idle = self.idle_deck();
         let locks = self.locked_decks();
         self.set_state.show_next_up_strip(ui, &mut self.library, idle, locks);
 
-        ui.horizontal_top(|ui| {
-            let mixer_w = (ui.available_width() * 0.38).clamp(380.0, 560.0);
-            let deck_w = ((ui.available_width() - mixer_w - 8.0) / 2.0).max(260.0);
-            // Deck panels stretch to the mixer's height (from the previous frame) so the row has one bottom edge.
-            let height_id = egui::Id::new("mix_row_height");
-            let row_h = ui.data(|d| d.get_temp::<f32>(height_id)).unwrap_or(0.0);
+        if four_deck {
+            self.show_four_deck_layout(ui, true, false);
+            return;
+        }
+        deck_scroll_area(ui, "mix_decks").show(ui, |ui| {
+            ui.horizontal_top(|ui| {
+                let mixer_w = (ui.available_width() * 0.3).clamp(380.0, 440.0);
+                let deck_w = ((ui.available_width() - mixer_w - 8.0) / 2.0).max(260.0);
+                // Deck panels stretch to the mixer's height (from the previous frame) so the row has one bottom edge.
+                let height_id = egui::Id::new("mix_row_height");
+                let row_h = ui.data(|d| d.get_temp::<f32>(height_id)).unwrap_or(0.0);
 
-            ui.allocate_ui_with_layout(Vec2::new(deck_w, row_h), Layout::top_down(Align::Min), |ui| {
-                ui.set_width(deck_w);
-                self.show_single_deck(ui, 1, TraktorTheme::DECK_A(), false, 0.0, row_h);
-            });
-            let mixer = ui.allocate_ui_with_layout(Vec2::new(mixer_w, 0.0), Layout::top_down(Align::Min), |ui| {
-                ui.set_width(mixer_w);
-                self.show_mixer_section(ui, true);
-            });
-            ui.data_mut(|d| d.insert_temp(height_id, mixer.response.rect.height()));
-            ui.allocate_ui_with_layout(Vec2::new(deck_w, row_h), Layout::top_down(Align::Min), |ui| {
-                ui.set_width(deck_w);
-                self.show_single_deck(ui, 2, TraktorTheme::DECK_B(), false, 0.0, row_h);
+                ui.allocate_ui_with_layout(Vec2::new(deck_w, row_h), Layout::top_down(Align::Min), |ui| {
+                    ui.set_width(deck_w);
+                    self.show_single_deck(ui, 1, TraktorTheme::DECK_A(), false, 0.0, row_h, false);
+                });
+                let mixer = ui.allocate_ui_with_layout(Vec2::new(mixer_w, 0.0), Layout::top_down(Align::Min), |ui| {
+                    ui.set_width(mixer_w);
+                    self.show_mixer_section(ui, true, 0.0);
+                });
+                ui.data_mut(|d| d.insert_temp(height_id, mixer.response.rect.height()));
+                ui.allocate_ui_with_layout(Vec2::new(deck_w, row_h), Layout::top_down(Align::Min), |ui| {
+                    ui.set_width(deck_w);
+                    self.show_single_deck(ui, 2, TraktorTheme::DECK_B(), false, 0.0, row_h, false);
+                });
             });
         });
     }
@@ -3688,9 +3814,14 @@ impl ReTraktorApp {
         let d = deck_idx - 1;
         let deck_letter = DECK_LETTERS[d.min(3)];
         let Some(deck) = self.deck_view(d) else {
-            row(ui, (height * 0.5).max(HIT), |ui| {
-                empty_deck_hint(ui, deck_letter, accent_color, "Drop a track here, or double-click one in the library");
-            });
+            const HINT: &str = "Drop a track here, or double-click one in the library";
+            if header {
+                row(ui, (height * 0.5).max(HIT), |ui| empty_deck_hint(ui, deck_letter, accent_color, HINT));
+            } else {
+                // A loaded lane's size, letter and playhead, so the stack keeps its shape. The deck panel below says how to load it.
+                empty_waveform_lane(ui, Some(deck_letter), "", height)
+                    .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, format!("Deck {deck_letter} lane, empty")));
+            }
             return;
         };
 
@@ -3768,6 +3899,7 @@ impl ReTraktorApp {
                 loop_len,
                 Some((deck_letter, accent_color)),
                 height,
+                self.deck_wave_zoom[d],
             )
         } else {
             scrolling_waveform(
@@ -3785,6 +3917,7 @@ impl ReTraktorApp {
                 loop_len,
                 Some((deck_letter, accent_color)),
                 height,
+                self.deck_wave_zoom[d],
             )
         };
         self.scrub_by_drag(d, &wave_resp, deck.duration_sec);
@@ -3793,7 +3926,8 @@ impl ReTraktorApp {
     /// Dragging a scrolling waveform moves the playhead.
     fn scrub_by_drag(&mut self, d: usize, wave_resp: &egui::Response, duration_sec: f64) {
         if wave_resp.dragged() {
-            let dt = -wave_resp.drag_delta().x as f64 / 85.0;
+            // The same seconds per pixel the zoomed waveform draws.
+            let dt = -wave_resp.drag_delta().x as f64 / (85.0 * self.deck_wave_zoom[d] as f64);
             if let Ok(mut state) = self.audio.shared.lock() {
                 let from = state.playhead_sec[d];
                 state.seek_by(d, (from + dt).clamp(0.0, duration_sec) - from);
@@ -3801,43 +3935,171 @@ impl ReTraktorApp {
         }
     }
 
-    /// 4-Deck layout: decks A + C | four-channel mixer | decks B + D, each deck with its own waveform.
-    fn show_four_deck_layout(&mut self, ui: &mut Ui) {
-        // Scrolls when C and D are taller than the window (1024 x 640), so every deck control stays reachable.
-        egui::ScrollArea::vertical().id_salt("four_deck").auto_shrink([false, true]).drag_to_scroll(false).show(ui, |ui| {
-            ui.horizontal_top(|ui| {
-                let mixer_w = (ui.available_width() * 0.36).clamp(460.0, 560.0);
-                let deck_w = ((ui.available_width() - mixer_w - 8.0) / 2.0).max(260.0);
-                // Shorter waveforms on short windows keep the browser on screen.
-                let wave_h = (36.0 + (ui.ctx().screen_rect().height() - 640.0) * 0.1).clamp(36.0, 80.0);
+    /// Whether decks C and D are on screen (and offered by the library): the Four decks preference, which the
+    /// `layout` action and the toolbar's deck count set, so every deck view and the library agree.
+    fn four_decks_shown(&self) -> bool {
+        self.preferences.four_deck_mode
+    }
 
-                // A and B differ in height when one shows tools or stems; pad the shorter one so C and D line up.
-                let heights_id = ui.id().with("four_deck_top_heights");
-                let prev: [f32; 2] = ui.ctx().data(|d| d.get_temp(heights_id)).unwrap_or([0.0; 2]);
-                let row_h = prev[0].max(prev[1]);
-                let mut now = [0.0f32; 2];
-                ui.allocate_ui_with_layout(Vec2::new(deck_w, 340.0), Layout::top_down(Align::Min), |ui| {
-                    ui.set_width(deck_w);
-                    now[0] = self.show_single_deck(ui, 1, TraktorTheme::DECK_A(), true, wave_h, 0.0);
-                    ui.add_space((row_h - now[0]).max(0.0));
-                    self.show_single_deck(ui, 3, TraktorTheme::DECK_C(), true, wave_h, 0.0);
-                });
+    /// Shows Browser, Timeline or Set. Leaving a deck layout remembers it (its 2 / 4 deck preset stays as it is), so
+    /// the browser button's second press and the layout picker go back to the same view.
+    fn show_layout(&mut self, layout: TraktorLayout) {
+        if layout != self.layout && matches!(self.layout, TraktorLayout::Parallel | TraktorLayout::FourDeck) {
+            self.layout_before_browser = Some(self.layout);
+        }
+        self.layout = layout;
+    }
+
+    /// The deck layout on screen, by its `layout` action mode, or None in Browser, Timeline and Set.
+    fn deck_layout_preset(&self) -> Option<&'static str> {
+        self.deck_preset_of(self.layout)
+    }
+
+    /// The deck preset `layout` shows with the current deck count, or None for Browser, Timeline and Set.
+    fn deck_preset_of(&self, layout: TraktorLayout) -> Option<&'static str> {
+        match layout {
+            TraktorLayout::FourDeck if self.preferences.four_deck_mode => Some("regular4"),
+            TraktorLayout::FourDeck => Some("regular2"),
+            TraktorLayout::Parallel if self.preferences.four_deck_mode => Some("stacked4"),
+            TraktorLayout::Parallel => Some("stacked2"),
+            _ => None,
+        }
+    }
+
+    /// The deck layout as two choices: Waveforms (In Deck: each deck shows its own; Stacked: full width above the
+    /// decks) and deck count (2 or 4 Decks). Away from the decks they show the deck view to come back to, unfilled,
+    /// and picking either, even the current choice, reopens the decks with the other choice kept. Side by side when
+    /// `side_by_side`, otherwise one above the other in the width of one.
+    fn deck_layout_selector(&mut self, ui: &mut Ui, side_by_side: bool) {
+        let active = self.deck_layout_preset().is_some();
+        // Away from the decks: the deck view the browser button returns to, else Stacked.
+        let shown = if active { Some(self.layout) } else { self.layout_before_browser };
+        let mut in_deck = shown == Some(TraktorLayout::FourDeck);
+        let mut four = self.preferences.four_deck_mode;
+        let away = if active { "" } else { ", not on screen" };
+        let mut picked = false;
+        let mut choice = |ui: &mut Ui, axis: &str, options: [(bool, &str); 2], value: &mut bool, help: &str| {
+            let current = options.iter().find(|o| o.0 == *value).map_or("", |o| o.1);
+            let combo = ui
+                .scope(|ui| {
+                    // Filled while a deck layout is on screen, like the active layout tab beside it.
+                    if active {
+                        let w = &mut ui.visuals_mut().widgets;
+                        w.inactive.weak_bg_fill = TraktorTheme::ROW_SELECTED();
+                        w.hovered.weak_bg_fill = TraktorTheme::ROW_SELECTED();
+                    }
+                    let fg = if active { on(TraktorTheme::ROW_SELECTED()) } else { TraktorTheme::TEXT_SECONDARY() };
+                    egui::ComboBox::from_id_salt(("deck_layout", axis))
+                        .selected_text(RichText::new(current).size(11.5).color(fg))
+                        .width(if side_by_side { 70.0 } else { 78.0 })
+                        .show_ui(ui, |ui| {
+                            for (option, label) in options {
+                                if ui.selectable_label(*value == option, label).clicked() {
+                                    *value = option;
+                                    picked = true;
+                                }
+                            }
+                        })
+                        .response
+                })
+                .inner;
+            let name = format!("{axis}: {current}{away}");
+            combo
+                .on_hover_text(if active { help.to_string() } else { format!("{help}. Picking one reopens the decks") })
+                .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::ComboBox, true, &name));
+        };
+        let mut both = |ui: &mut Ui| {
+            choice(ui, "Waveforms", [(true, "In Deck"), (false, "Stacked")], &mut in_deck,
+                "Waveforms. In Deck: each deck shows its own waveform. Stacked: the waveforms run full width above the decks (F1 2 Decks Stacked, F2 4 Decks In Deck)");
+            choice(ui, "Deck count", [(false, "2 Decks"), (true, "4 Decks")], &mut four,
+                "Deck count. 2 Decks: A and B. 4 Decks: A and B over C and D, also offered by the library");
+        };
+        if side_by_side {
+            both(ui);
+        } else {
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                both(ui);
+            });
+        }
+        if picked {
+            let mode = match (in_deck, four) {
+                (true, false) => "regular2",
+                (true, true) => "regular4",
+                (false, false) => "stacked2",
+                (false, true) => "stacked4",
+            };
+            self.run_button_action("layout", 1, mode);
+        }
+    }
+
+    /// Deck grid: decks A + C | mixer | decks B + D, or A | mixer | B without `four_decks`. The 4-Deck layout
+    /// (Regular2/4) gives each deck its own waveform; Stacked4 draws the waveforms above, so `deck_waveforms` is off.
+    /// The mixer runs the full height of the deck columns.
+    fn show_four_deck_layout(&mut self, ui: &mut Ui, four_decks: bool, deck_waveforms: bool) {
+        let visible_h = deck_area_height(ui);
+        deck_scroll_area(ui, "four_deck").show(ui, |ui| {
+            ui.horizontal_top(|ui| {
+                let mixer_w = (ui.available_width() * 0.3).clamp(380.0, 440.0);
+                let deck_w = ((ui.available_width() - mixer_w - 8.0) / 2.0).max(260.0);
+                // Shorter waveforms on short windows, and with two rows of decks, keep the browser on screen.
+                let screen_h = ui.ctx().screen_rect().height();
+                let wave_h = match (deck_waveforms, four_decks) {
+                    (false, _) => 0.0,
+                    (true, false) => (36.0 + (screen_h - 640.0) * 0.1).clamp(36.0, 80.0),
+                    (true, true) => (30.0 + (screen_h - 640.0) * 0.08).clamp(30.0, 64.0),
+                };
+
+                // Last frame's height of each loaded deck (0 while empty). A and B differ when one shows tools or
+                // stems; the shorter is padded so C and D line up. An empty deck takes its row's height (any loaded
+                // deck's when the whole row is empty), so it keeps a deck's size as a drop target.
+                let heights_id = ui.id().with("four_deck_heights");
+                let column_id = ui.id().with("four_deck_column");
+                let prev: [f32; 4] = ui.ctx().data(|d| d.get_temp(heights_id)).unwrap_or([0.0; 4]);
+                let prev_column: f32 = ui.ctx().data(|d| d.get_temp(column_id)).unwrap_or(0.0);
+                let any = prev.iter().copied().fold(0.0, f32::max);
+                let row_h = |a: f32, b: f32| if a.max(b) > 0.0 { a.max(b) } else { any };
+                let (top_h, bottom_h) = (row_h(prev[0], prev[1]), row_h(prev[2], prev[3]));
+                let mut now = [0.0f32; 4];
+                let mut column = |app: &mut Self, ui: &mut Ui, top: usize| {
+                    ui.allocate_ui_with_layout(Vec2::new(deck_w, 340.0), Layout::top_down(Align::Min), |ui| {
+                        ui.set_width(deck_w);
+                        let shown = app.grid_deck(ui, top, wave_h, top_h, four_decks, &mut now[top - 1]);
+                        if four_decks {
+                            ui.add_space((top_h - shown).max(0.0));
+                            app.grid_deck(ui, top + 2, wave_h, bottom_h, true, &mut now[top + 1]);
+                        }
+                    })
+                    .response
+                    .rect
+                    .height()
+                };
+                let left = column(self, ui, 1);
                 ui.allocate_ui_with_layout(Vec2::new(mixer_w, 340.0), Layout::top_down(Align::Min), |ui| {
                     ui.set_width(mixer_w);
-                    self.show_mixer_section(ui, false);
+                    // Down the deck columns, but no taller than the deck area, so the crossfader stays in view.
+                    self.show_mixer_section(ui, !four_decks, prev_column.min(visible_h));
                 });
-                ui.allocate_ui_with_layout(Vec2::new(deck_w, 340.0), Layout::top_down(Align::Min), |ui| {
-                    ui.set_width(deck_w);
-                    now[1] = self.show_single_deck(ui, 2, TraktorTheme::DECK_B(), true, wave_h, 0.0);
-                    ui.add_space((row_h - now[1]).max(0.0));
-                    self.show_single_deck(ui, 4, TraktorTheme::DECK_D(), true, wave_h, 0.0);
-                });
-                if now != prev {
-                    ui.ctx().data_mut(|d| d.insert_temp(heights_id, now));
+                let right = column(self, ui, 2);
+                if now != prev || left.max(right) != prev_column {
+                    ui.ctx().data_mut(|d| {
+                        d.insert_temp(heights_id, now);
+                        d.insert_temp(column_id, left.max(right));
+                    });
                     ui.ctx().request_repaint();
                 }
             });
         });
+    }
+
+    /// One deck of the grid, at least `row_h` tall while empty. Returns its drawn height, and stores a loaded deck's
+    /// height in `natural` (0 for an empty deck, so an empty deck's padding never feeds back into the row height).
+    fn grid_deck(&mut self, ui: &mut Ui, deck_idx: usize, wave_h: f32, row_h: f32, compact: bool, natural: &mut f32) -> f32 {
+        let loaded = self.audio.shared.lock().is_ok_and(|s| s.loaded_tracks[deck_idx - 1].is_some());
+        let min_h = if loaded { 0.0 } else { row_h };
+        let h = self.show_single_deck(ui, deck_idx, TraktorTheme::deck_color(deck_idx), wave_h > 0.0, wave_h, min_h, compact);
+        *natural = if loaded { h } else { 0.0 };
+        h
     }
 
     /// Browser layout: decks A and B as one-line strips either side of the crossfader.
@@ -3920,7 +4182,9 @@ impl ReTraktorApp {
         });
     }
 
-    /// `min_height` stretches the panel to line up with its neighbours (0 = as tall as its content).
+    /// `min_height` stretches the panel to line up with its neighbours (0 = as tall as its content). `compact` (four
+    /// decks on screen) keeps the readouts smaller so two rows of decks leave room for the library.
+    #[allow(clippy::too_many_arguments)]
     fn show_single_deck(
         &mut self,
         ui: &mut Ui,
@@ -3929,9 +4193,10 @@ impl ReTraktorApp {
         include_scrolling_waveform: bool,
         waveform_height: f32,
         min_height: f32,
+        compact: bool,
     ) -> f32 {
         let rect = ui
-            .scope(|ui| self.show_single_deck_inner(ui, deck_idx, accent_color, include_scrolling_waveform, waveform_height, min_height))
+            .scope(|ui| self.show_single_deck_inner(ui, deck_idx, accent_color, include_scrolling_waveform, waveform_height, min_height, compact))
             .response
             .rect;
         self.deck_drop(ui, rect, deck_idx);
@@ -3993,8 +4258,8 @@ impl ReTraktorApp {
         }
     }
 
-    /// An unloaded deck says how to load it, and shows nothing else.
-    fn show_empty_deck(&self, ui: &mut Ui, deck_idx: usize, accent: Color32, min_height: f32) {
+    /// An unloaded deck says how to load it, and shows nothing else but its empty waveform lane (`lane_h` > 0).
+    fn show_empty_deck(&self, ui: &mut Ui, deck_idx: usize, accent: Color32, min_height: f32, lane_h: f32) {
         panel(TraktorTheme::BG_PANEL()).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.set_min_height((min_height - 12.0).max(HIT));
@@ -4006,6 +4271,9 @@ impl ReTraktorApp {
                     ui.add(egui::Label::new(RichText::new("Drop a track here, or double-click one in the library").size(12.0).color(TraktorTheme::TEXT_SECONDARY())).truncate().selectable(false));
                 }
             });
+            if lane_h > 10.0 {
+                empty_waveform_lane(ui, None, "", lane_h);
+            }
         });
     }
 
@@ -4038,6 +4306,7 @@ impl ReTraktorApp {
         include_scrolling_waveform: bool,
         waveform_height: f32,
         min_height: f32,
+        compact: bool,
     ) {
         let d = deck_idx - 1;
         let deck_letter = DECK_LETTERS[d.min(3)];
@@ -4045,7 +4314,7 @@ impl ReTraktorApp {
         let loaded_t = crate::theme::fade(ui.ctx(), ("deck_loaded", d), is_loaded);
         let pads_t = crate::theme::fade(ui.ctx(), ("deck_pads", d), self.deck_expanded[d]);
         let Some(deck) = self.deck_view(d) else {
-            self.show_empty_deck(ui, deck_idx, accent_color, min_height);
+            self.show_empty_deck(ui, deck_idx, accent_color, min_height, if include_scrolling_waveform { waveform_height } else { 0.0 });
             return;
         };
         let bpm = deck.bpm;
@@ -4058,12 +4327,26 @@ impl ReTraktorApp {
         panel(TraktorTheme::BG_PANEL()).show(ui, |ui| {
             ui.set_min_height((min_height - 12.0).max(0.0));
             ui.multiply_opacity(loaded_t);
+            if compact {
+                ui.spacing_mut().item_spacing.y = 3.0;
+            }
 
-            // 1. Which deck, which track.
+            // 1. Which deck, which track. A compact deck with room carries its buttons (3.) on this line too.
+            let buttons_in_title = compact && !self.deck_stem_view[d] && ui.available_width() >= 400.0;
             ui.horizontal(|ui| {
                 deck_badge(ui, deck_letter, accent_color);
                 self.deck_notice(ui, d);
-                title_label(ui, &deck.title, &deck.artist);
+                if buttons_in_title {
+                    // What SYNC, KEY, MASTER, STEMS and TOOLS need; the title is cut to the rest.
+                    let title_w = (ui.available_width() - 236.0).max(60.0);
+                    ui.allocate_ui_with_layout(Vec2::new(title_w, HIT), Layout::left_to_right(Align::Center), |ui| {
+                        ui.set_width(title_w);
+                        title_label(ui, &deck.title, &deck.artist);
+                    });
+                    self.deck_buttons(ui, deck_idx);
+                } else {
+                    title_label(ui, &deck.title, &deck.artist);
+                }
             });
 
             // 2. Display: the numbers read at arm's length, as large as the deck's width allows.
@@ -4083,7 +4366,7 @@ impl ReTraktorApp {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 14.0;
                         let advance = ui.fonts(|f| f.glyph_width(&crate::theme::dot_font(100.0), '0')) / 100.0;
-                        let size = ((ui.available_width() - 3.0 * 14.0) / (20.0 * advance)).floor().clamp(16.0, 30.0);
+                        let size = ((ui.available_width() - 3.0 * 14.0) / (20.0 * advance)).floor().clamp(16.0, if compact { 20.0 } else { 30.0 });
                         let pitch_pct = self.deck_pitch_fader[d];
                         if bpm_reset_clicked(readout(ui, "BPM", &bpm_text(bpm, pitch_pct, self.deck_analysing[d]), size, ink)) {
                             self.reset_tempo(d);
@@ -4101,37 +4384,11 @@ impl ReTraktorApp {
             dot::paint_dot_wipe(ui.painter(), panel_rect, loaded_t, accent_color);
             dot::paint_dot_wipe(ui.painter(), panel_rect, looping, accent_color);
 
-            // 3. Sync, tempo master, stems; "MORE" discloses the performance pads.
-            ui.horizontal(|ui| {
-                if pill(ui, "SYNC", self.deck_sync_enabled[d], TraktorTheme::ACCENT(), 0.0)
-                    .on_hover_text("Match tempo and beat phase to the other deck")
-                    .clicked()
-                {
-                    self.sync_deck(deck_idx);
-                }
-                if pill(ui, "KEY", self.deck_keylock[d], TraktorTheme::KEYLOCK_ACTIVE(), 0.0)
-                    .on_hover_text("Key lock: change tempo without changing the musical key")
-                    .clicked()
-                {
-                    self.deck_keylock[d] ^= true;
-                }
-                if pill(ui, "MASTER", self.tempo_master_deck == Some(d), TraktorTheme::ROW_SELECTED(), 0.0)
-                    .on_hover_text("Make this deck's tempo the master clock; click again to release")
-                    .clicked()
-                {
-                    self.toggle_master(d);
-                }
-                self.stem_buttons(ui, d);
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let expanded = self.deck_expanded[d];
-                    if pill(ui, "TOOLS", expanded, TraktorTheme::ROW_SELECTED(), 0.0)
-                        .on_hover_text("Track tools: create stems, fix the beatgrid or tempo, auto cues")
-                        .clicked()
-                    {
-                        self.deck_expanded[d] = !expanded;
-                    }
-                });
-            });
+            // 3. Sync, key lock, tempo master, stems and tools, on their own line unless the title line has them.
+            if !buttons_in_title {
+                // Wraps when stem view adds its buttons to a narrow deck, rather than widening the deck past the mixer.
+                ui.horizontal_wrapped(|ui| self.deck_buttons(ui, deck_idx));
+            }
 
             // 4. Scrolling waveform (4-Deck; Mix draws them full width above).
             let cues = self.deck_hotcue_slots(d);
@@ -4153,7 +4410,8 @@ impl ReTraktorApp {
                         self.deck_loop_start_sec[d],
                         loop_len_sec,
                         None,
-                        waveform_height,
+                        waveform_height.max(STEM_LANES_MIN_H),
+                        self.deck_wave_zoom[d],
                     )
                 } else {
                     scrolling_waveform(
@@ -4171,14 +4429,15 @@ impl ReTraktorApp {
                         loop_len_sec,
                         None,
                         waveform_height,
+                        self.deck_wave_zoom[d],
                     )
                 };
                 self.scrub_by_drag(d, &wave_resp, deck.duration_sec);
             }
 
-            // 5. Stem mutes, while the stems view is on.
+            // 5. Stem mutes, while the stems view is on. A deck too narrow for all four wraps the last onto a second line.
             if self.deck_stem_view[d] {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     let gap = ui.spacing().item_spacing.x;
                     let w = (ui.available_width() - 10.0 * gap) / 4.0;
                     for (s, name) in ["DRUMS", "BASS", "OTHER", "VOCALS"].into_iter().enumerate() {
@@ -4361,10 +4620,43 @@ impl ReTraktorApp {
         });
     }
 
+    /// A deck's SYNC, KEY, MASTER and STEMS buttons, then TOOLS at the right edge.
+    fn deck_buttons(&mut self, ui: &mut Ui, deck_idx: usize) {
+        let d = deck_idx - 1;
+        if pill(ui, "SYNC", self.deck_sync_enabled[d], TraktorTheme::ACCENT(), 0.0)
+            .on_hover_text("Match tempo and beat phase to the other deck")
+            .clicked()
+        {
+            self.sync_deck(deck_idx);
+        }
+        if pill(ui, "KEY", self.deck_keylock[d], TraktorTheme::KEYLOCK_ACTIVE(), 0.0)
+            .on_hover_text("Key lock: change tempo without changing the musical key")
+            .clicked()
+        {
+            self.deck_keylock[d] ^= true;
+        }
+        if pill(ui, "MASTER", self.tempo_master_deck == Some(d), TraktorTheme::ROW_SELECTED(), 0.0)
+            .on_hover_text("Make this deck's tempo the master clock; click again to release")
+            .clicked()
+        {
+            self.toggle_master(d);
+        }
+        self.stem_buttons(ui, d);
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let expanded = self.deck_expanded[d];
+            if pill(ui, "TOOLS", expanded, TraktorTheme::ROW_SELECTED(), 0.0)
+                .on_hover_text("Track tools: create stems, fix the beatgrid or tempo, auto cues")
+                .clicked()
+            {
+                self.deck_expanded[d] = !expanded;
+            }
+        });
+    }
+
     /// Centre mixer, mirrored around the main meter: unified continuous dot-matrix canvas
     /// holding per-deck EQ/stems zones, channel fader-on-meter columns, MAIN meter,
-    /// and crossfader ribbon on a single continuous dot lattice.
-    fn show_mixer_section(&mut self, ui: &mut Ui, two_channel_only: bool) {
+    /// and crossfader ribbon on a single continuous dot lattice. At least `min_height` tall, panel included.
+    fn show_mixer_section(&mut self, ui: &mut Ui, two_channel_only: bool, min_height: f32) {
         // Live levels for the displays: band and stem peaks at the playhead, silent when stopped.
         let mut bands = [[0.0f32; 3]; 4];
         let mut stems = [[0.0f32; 4]; 4];
@@ -4450,14 +4742,14 @@ impl ReTraktorApp {
                 deck_sync_enabled: self.deck_sync_enabled,
                 in_key,
                 is_recording,
-                size: Vec2::new(ui.available_width(), h),
+                size: Vec2::new(ui.available_width(), h.max(min_height - 12.0)),
             };
             mixer.show(ui);
         });
     }
 
     fn show_browser_panel(&mut self, ui: &mut Ui) {
-        let avail_h = ui.available_height().max(160.0);
+        let avail_h = ui.available_height().max(LIBRARY_RESERVE - 8.0);
         panel(TraktorTheme::BG_PANEL()).show(ui, |ui| {
             ui.set_min_height(avail_h - 12.0);
             ui.horizontal_top(|ui| {
@@ -4469,7 +4761,7 @@ impl ReTraktorApp {
 
                 ui.separator();
 
-                let four_deck_mode = self.layout == TraktorLayout::FourDeck || self.preferences.four_deck_mode;
+                let four_deck_mode = self.four_decks_shown();
                 let locked_decks = self.locked_decks();
                 self.browser_preview_view();
                 self.library.show_browser_content(
@@ -5213,6 +5505,23 @@ fn pitch_fader(ui: &mut Ui, pitch: &mut f32) {
     ui.add(egui::Slider::new(pitch, -8.0..=8.0).clamping(egui::SliderClamping::Never).show_value(false)).on_hover_text("Pitch fader: tempo ±8%");
 }
 
+/// Height kept under the deck area for the library: its toolbars, column header and one track row, as Traktor's
+/// Stacked2 can leave it. The library takes more whenever the decks fit in less.
+const LIBRARY_RESERVE: f32 = 128.0;
+
+/// Lowest height of a four-lane stem waveform, so each stem's name and mute marks stay readable.
+const STEM_LANES_MIN_H: f32 = 48.0;
+
+/// The visible height of the deck area: what is left once the library keeps its reserve.
+fn deck_area_height(ui: &Ui) -> f32 {
+    (ui.available_height() - LIBRARY_RESERVE).max(120.0)
+}
+
+/// The deck area scrolls inside `deck_area_height`, so a short window or open tools never push the library off screen.
+fn deck_scroll_area(ui: &Ui, id: &str) -> egui::ScrollArea {
+    egui::ScrollArea::vertical().id_salt(id).auto_shrink([false, true]).drag_to_scroll(false).max_height(deck_area_height(ui))
+}
+
 /// Height of the full-width waveforms: 64 px at the minimum window, growing with the window.
 fn mix_wave_height(ui: &Ui) -> f32 {
     (64.0 + (ui.ctx().screen_rect().height() - 640.0) * 0.14).clamp(64.0, 124.0)
@@ -5222,6 +5531,192 @@ fn mix_wave_height(ui: &Ui) -> f32 {
 mod tests {
     use super::*;
     use crate::theme::Palette;
+
+    /// Generic MIDI through the real input path: software bytes through the parser with the rules' CC readings,
+    /// then the app's dispatch. An absolute fader is exact from its first message (a ramp through both ends and the
+    /// centre), a relative encoder moves by ticks from its first message, the stable port ID survives a card
+    /// renumber, and raw-node IDs from before still run, once.
+    #[test]
+    fn generic_midi_bytes_reach_rules_with_stable_ids_and_legacy_aliases() {
+        use crate::midi::{parse_midi_bytes, DeviceProtocol, DiscoveredDevice, MidiParserState};
+        use retraktor_hid::controller_rules::parse_rules;
+        let rules = parse_rules(
+            r#"{"format": "retraktor-controller-rules", "version": 1,
+            "midi_encoders": {"midi.xonek2.ch15.cc0": "twos_complement"},
+            "rules": [
+              {"input": "midi.xonek2.ch15.cc4", "do": [{"action": "volume", "deck": 1}, {"action": "eq_low", "deck": 1, "range": [1, 0]}]},
+              {"input": "midi.xonek2.ch15.cc0", "do": [{"action": "filter", "deck": 2, "step": 0.1}]},
+              {"input": "midi.xonek2.ch15.note36", "do": [{"action": "keylock", "deck": 1}]},
+              {"input": "midi.midic1d0.ch15.note38", "do": [{"action": "headphone", "deck": 1}]}]}"#,
+        )
+        .unwrap();
+        let mut app = ReTraktorApp::default();
+        app.preferences.controller_rules.engine.replace_rules(rules.clone());
+        let k2 = |node: &str, legacy: &str| DiscoveredDevice {
+            name: "XONEK2".into(),
+            slug: "xonek2".into(),
+            rule_device: "midi.xonek2".into(),
+            legacy_device: Some(legacy.into()),
+            dev_node: node.into(),
+            protocol: DeviceProtocol::Midi,
+            connected: true,
+            pid: 0,
+        };
+        app.preferences.generic_manager.devices = vec![k2("/dev/snd/midiC1D0", "midi.midic1d0")];
+        let mut parser = MidiParserState::new();
+        parser.set_cc_modes("xonek2", Some("midic1d0"), rules.midi_cc_modes());
+        // Each chunk is followed by the idle the reader sees, which sends a held coarse CC that has no fine half.
+        let feed = |app: &mut ReTraktorApp, parser: &mut MidiParserState, bytes: &[u8]| {
+            for ev in parse_midi_bytes(parser, "xonek2", bytes).into_iter().chain(parser.flush_msb("xonek2")) {
+                app.apply_mx2_surface_event(ev);
+            }
+        };
+
+        // Absolute fader, CC 4 on channel 15 (status 0xBE): exact from the very first message.
+        for v in [0u8, 1, 2, 63, 64, 65, 126, 127, 0] {
+            feed(&mut app, &mut parser, &[0xBE, 4, v]);
+            let want = v as f32 / 127.0;
+            assert!((app.channel_volume[0] - want).abs() < 1e-6, "volume {} after CC value {v}", app.channel_volume[0]);
+            assert!((app.channel_eq_low[0] - (1.0 - want)).abs() < 1e-6, "inverted bass EQ {} after {v}", app.channel_eq_low[0]);
+        }
+        // Relative encoder, CC 0 (two's complement): the first message is one tick, not a position.
+        app.channel_filter[1] = 0.5;
+        feed(&mut app, &mut parser, &[0xBE, 0, 1]);
+        assert!((app.channel_filter[1] - 0.6).abs() < 1e-6, "{}", app.channel_filter[1]);
+        feed(&mut app, &mut parser, &[0xBE, 0, 127, 0, 127]); // two ticks left, the second by running status
+        assert!((app.channel_filter[1] - 0.4).abs() < 1e-6, "{}", app.channel_filter[1]);
+
+        // A stable-ID rule runs once even with an old raw-node simple mapping on the same note; other raw-node
+        // mappings and rules still run, and Last control shows the stable ID to author with.
+        app.custom_mappings.insert("midi.midic1d0.ch15.note36".into(), "keylock:1".into());
+        app.custom_mappings.insert("midi.midic1d0.ch15.note37".into(), "keylock:2".into());
+        let tap = |app: &mut ReTraktorApp, parser: &mut MidiParserState, note: u8| feed(app, parser, &[0x9E, note, 127, 0x9E, note, 0]);
+        tap(&mut app, &mut parser, 36);
+        assert!(app.deck_keylock[0], "the press ran twice (rule and raw-node mapping) or not at all");
+        tap(&mut app, &mut parser, 37);
+        assert!(app.deck_keylock[1], "the raw-node simple mapping no longer runs");
+        tap(&mut app, &mut parser, 38);
+        assert!(app.channel_cue[0], "the raw-node rule no longer runs");
+        assert_eq!(app.preferences.last_surface_control.as_deref(), Some("midi.xonek2.ch15.note38"));
+
+        // The K2 becomes card 2: its stable ID still matches; the old card-1 raw-node IDs no longer name it.
+        app.preferences.generic_manager.devices = vec![k2("/dev/snd/midiC2D0", "midi.midic2d0")];
+        tap(&mut app, &mut parser, 36);
+        assert!(!app.deck_keylock[0], "the stable-ID rule stopped matching after the renumber");
+        tap(&mut app, &mut parser, 37);
+        assert!(app.deck_keylock[1], "a stale card-1 raw-node mapping ran for card 2");
+        assert_eq!(app.preferences.generic_manager.connected_device_keys(), vec!["midi.xonek2".to_string(), "midi.midic2d0".to_string()]);
+    }
+
+    /// Only a node with the MX2's USB IDs connects as an MX2, and each connection starts with a fresh driver and no
+    /// held modifiers.
+    #[test]
+    fn only_a_verified_mx2_connects_and_starts_fresh() {
+        use retraktor_hid::{controller_rules::parse_rules, controller_rules::EXAMPLE_RULES, NI_USB_VID};
+        let mut app = ReTraktorApp::default();
+        app.preferences.controller_rules.engine.replace_rules(parse_rules(EXAMPLE_RULES).unwrap());
+        let node = std::env::temp_dir().join(format!("retraktor-fake-hidraw-{}", std::process::id()));
+        std::fs::write(&node, b"").unwrap();
+        let node_str = node.to_str().unwrap().to_string();
+
+        app.connect_verified_hidraw(&node_str, Some((NI_USB_VID, 0x2200)));
+        assert!(app.mx2_hidraw_file.is_none(), "an X1 MK3 was connected as an MX2");
+        assert!(app.mx2_access_status.as_deref().unwrap_or("").contains("17cc:2200"));
+        app.connect_verified_hidraw(&node_str, None);
+        assert!(app.mx2_hidraw_file.is_none());
+
+        // A press seen on an earlier connection, and a held SHIFT, must not carry over.
+        let mut buttons = [0u8; 15];
+        buttons[0] = 0x01;
+        buttons[1] = 0x01; // left FX button 1 held
+        assert_eq!(app.mx2_driver.decode_input_report(&buttons).len(), 1);
+        assert!(app.mx2_driver.decode_input_report(&buttons).is_empty(), "the driver remembers held buttons");
+        app.apply_mx2_surface_event(SurfaceEvent::Button { control: "surface.left.shift".into(), pressed: true });
+        assert!(!app.preferences.controller_rules.engine.active_modifiers().is_empty());
+        app.connect_verified_hidraw(&node_str, Some((NI_USB_VID, TRAKTOR_MX2_PID)));
+        assert!(app.mx2_hidraw_file.is_some());
+        assert_eq!(app.mx2_driver.decode_input_report(&buttons).len(), 1, "the new connection reused the old driver state");
+        assert!(app.preferences.controller_rules.engine.active_modifiers().is_empty(), "SHIFT stayed held across connections");
+        std::fs::remove_file(&node).unwrap();
+    }
+
+    /// Controller rules through the real dispatch, with the shipped example file: held SHIFT changes a pad and lets
+    /// go cleanly, a latched layer beats a simple mapping and falls back to it, a macro knob drives two fields (one
+    /// inverted), an encoder nudges a value, SHIFT lights the pad, and every published action reaches the app.
+    #[test]
+    fn controller_rules_drive_the_app_through_real_dispatch() {
+        use retraktor_hid::controller_rules::{parse_rules, ActionKind, ACTIONS, EXAMPLE_RULES};
+        let mut app = ReTraktorApp::default();
+        app.preferences.controller_rules.engine.replace_rules(parse_rules(EXAMPLE_RULES).unwrap());
+        let tap = |app: &mut ReTraktorApp, control: &str| {
+            app.apply_mx2_surface_event(SurfaceEvent::Button { control: control.into(), pressed: true });
+            app.apply_mx2_surface_event(SurfaceEvent::Button { control: control.into(), pressed: false });
+        };
+        let pad_light = |app: &mut ReTraktorApp| {
+            let mut report = app.mx2_driver.encode_led_report(&app.bus, Mx2BottomShellState::DefaultGlow, Mx2BottomShellState::DefaultGlow);
+            app.preferences.controller_rules.engine.apply_mx2_led_overlay(&mut report);
+            report[1 + 20]
+        };
+
+        // Plain left pad 1 (Pattern mode): no rule matches, so the built-in pad toggles a pattern step.
+        app.deck_pad_mode[0] = DeckPadMode::Pattern;
+        let voice = app.pattern_selected_voice.min(3);
+        let step = app.pattern_steps[voice][0];
+        let native_light = pad_light(&mut app);
+        tap(&mut app, "surface.left.pads.1");
+        assert_ne!(app.pattern_steps[voice][0], step, "the plain pad did not fall back to the built-in pad");
+        assert!(!app.deck_stem_muted[0][0]);
+
+        // Held SHIFT: the same pad mutes drums instead, leaves the pattern alone, and lights orange.
+        app.apply_mx2_surface_event(SurfaceEvent::Button { control: "surface.left.shift".into(), pressed: true });
+        let pattern = app.pattern_steps;
+        tap(&mut app, "surface.left.pads.1");
+        assert!(app.deck_stem_muted[0][0], "SHIFT + pad 1 did not mute drums");
+        assert_eq!(app.pattern_steps, pattern);
+        assert_eq!(pad_light(&mut app), 0x0E, "SHIFT should light left pad 1 orange");
+
+        // SHIFT released: back to the plain pad and its own light.
+        app.apply_mx2_surface_event(SurfaceEvent::Button { control: "surface.left.shift".into(), pressed: false });
+        tap(&mut app, "surface.left.pads.1");
+        assert!(app.deck_stem_muted[0][0], "a plain press after SHIFT muted again");
+        assert_eq!(app.pattern_steps[voice][0], step, "the plain press did not reach the built-in pad");
+        assert_eq!(pad_light(&mut app), native_light);
+
+        // Right FAV latches the loop layer. A simple mapping on right pad 1 runs only while the layer is off.
+        app.custom_mappings.insert("surface.right.pads.1".into(), "keylock:2".into());
+        app.deck_loop_size_beats[1] = 4;
+        tap(&mut app, "surface.right.browse.favorite");
+        tap(&mut app, "surface.right.pads.1");
+        tap(&mut app, "surface.right.pads.1");
+        assert_eq!(app.deck_loop_size_beats[1], 1, "the loop layer did not halve deck B's loop twice");
+        assert!(!app.deck_keylock[1], "the simple mapping ran under the layer");
+        tap(&mut app, "surface.right.browse.favorite");
+        tap(&mut app, "surface.right.pads.1");
+        assert_eq!(app.deck_loop_size_beats[1], 1);
+        assert!(app.deck_keylock[1], "with the layer off, the simple mapping did not run");
+        // A control without rules keeps its built-in function.
+        tap(&mut app, "surface.left.key_lock");
+        assert!(app.deck_keylock[0]);
+
+        // The macro knob: filter from 0.5 up, bass EQ from 0.5 down (inverted), and the knob's own FX parameter untouched.
+        app.apply_mx2_surface_event(SurfaceEvent::Fader { control: "surface.left.fx.knobs.4".into(), value: 0.25 });
+        assert_eq!(app.channel_filter[0], 0.625);
+        assert!((app.channel_eq_low[0] - 0.4).abs() < 1e-6, "{}", app.channel_eq_low[0]);
+        assert_eq!(app.fx1_param[2], 0.5);
+        // Loop Move nudges the same filter by 0.02 a tick.
+        app.apply_mx2_surface_event(SurfaceEvent::Encoder { control: "surface.left.loop_move".into(), delta: 3 });
+        assert!((app.channel_filter[0] - 0.685).abs() < 1e-5, "{}", app.channel_filter[0]);
+
+        for a in ACTIONS {
+            let runs = match a.kind {
+                ActionKind::Trigger => app.run_button_action(a.verb, 1, match a.name { "pad_mode" => "stems", "layout" => "stacked4", _ => "1" }),
+                ActionKind::Continuous => app.set_mapped_value(a.verb, 1, 0.5) && app.mapped_value(a.verb, 1) == Some(0.5),
+                ActionKind::Encoder => ["browse_up", "browse_down", "loop_half", "loop_double", "zoom_in", "zoom_out"].iter().all(|v| app.run_button_action(v, 1, "")),
+                ActionKind::Modifier => true,
+            };
+            assert!(runs, "\"{}\" is published but the app does not run it", a.name);
+        }
+    }
 
     #[test]
     fn bpm_double_click_resets_tempo() {
@@ -5785,7 +6280,8 @@ mod sync_audio {
                 ui.spacing_mut().item_spacing = Vec2::new(4.0, 4.0);
                 app.show_top_bar(ui);
                 match app.layout {
-                    TraktorLayout::FourDeck => app.show_four_deck_layout(ui),
+                    TraktorLayout::FourDeck => app.show_four_deck_layout(ui, app.preferences.four_deck_mode, true),
+                    TraktorLayout::Browser => app.show_mini_decks_bar(ui),
                     TraktorLayout::Timeline => {
                         app.show_mini_decks_bar(ui);
                         app.show_timeline_studio_layout(ui);
@@ -7762,6 +8258,101 @@ mod sync_audio {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// An imported Traktor Xone K2 layout mapping through the real MIDI parser and dispatch: the two encoder
+    /// presses switch deck count and waveform arrangement (decks C and D are drawn in regular4 and stacked4 only),
+    /// the encoder zooms all four waveforms in time, the browser button goes to the Browser layout and
+    /// back (and the first loaded track reopens the preset it left, as the native View button does), and tempo_master
+    /// makes a deck the tempo master.
+    #[test]
+    fn imported_k2_layout_mapping_switches_layouts_zoom_and_browser() {
+        use crate::midi::{parse_midi_bytes, MidiParserState};
+        use retraktor_hid::{controller_rules::parse_rules, mapping_import};
+        let source = mapping_import::parse_source(&mapping_import::fixtures::traktor_three_devices(), "k2.tsi", None).unwrap();
+        let rules = parse_rules(&mapping_import::convert(&source, 2, "xonek2").unwrap().draft.unwrap()).unwrap();
+        let mut app = ReTraktorApp::default();
+        app.preferences.controller_rules.engine.replace_rules(rules.clone());
+        {
+            let mut s = app.audio.shared.lock().unwrap();
+            for d in 0..4 {
+                s.loaded_tracks[d] = Some(track(120.0));
+            }
+        }
+        app.deck_expanded = [true; 4];
+        let mut parser = MidiParserState::new();
+        parser.set_cc_modes("xonek2", None, rules.midi_cc_modes());
+        // The K2 sends on MIDI channel 14: note-on 0x9D, CC 0xBD.
+        let mut feed = |app: &mut ReTraktorApp, bytes: &[u8]| {
+            for ev in parse_midi_bytes(&mut parser, "xonek2", bytes) {
+                app.apply_mx2_surface_event(ev);
+            }
+        };
+        let tap = |note: u8| [0x9D, note, 127, 0x9D, note, 0];
+        let state = |app: &ReTraktorApp| (app.layout, app.preferences.four_deck_mode);
+        app.layout = TraktorLayout::Parallel;
+        app.preferences.four_deck_mode = false;
+
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1400.0, 900.0));
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        ctx.enable_accesskit();
+        let mut time = 0.0;
+        let mut deck_c_drawn = |app: &mut ReTraktorApp| {
+            time += 0.1;
+            workspace_frame(&ctx, app, screen, time, vec![]).iter().any(|n| n.0.starts_with("Deck C beat jump"))
+        };
+
+        feed(&mut app, &tap(13));
+        assert_eq!(state(&app), (TraktorLayout::FourDeck, true), "regular4");
+        assert!(deck_c_drawn(&mut app) && app.four_decks_shown());
+        feed(&mut app, &tap(13));
+        assert_eq!(state(&app), (TraktorLayout::FourDeck, false), "regular2");
+        assert!(!deck_c_drawn(&mut app), "regular2 still draws deck C");
+        assert!(!app.four_decks_shown(), "regular2 still offers decks C and D in the library");
+        feed(&mut app, &tap(15));
+        assert_eq!(state(&app), (TraktorLayout::Parallel, false), "stacked2");
+        assert!(!deck_c_drawn(&mut app), "stacked2 draws deck C");
+        feed(&mut app, &tap(13));
+        assert_eq!(state(&app), (TraktorLayout::Parallel, true), "stacked4");
+        assert!(deck_c_drawn(&mut app), "stacked4 has no deck C controls");
+
+        for _ in 0..4 {
+            feed(&mut app, &[0xBD, 20, 1]);
+        }
+        assert!(app.deck_wave_zoom.iter().all(|z| (z - 2.0).abs() < 1e-4), "four ticks right double the zoom: {:?}", app.deck_wave_zoom);
+        feed(&mut app, &[0xBD, 20, 127]);
+        assert!(app.deck_wave_zoom.iter().all(|z| (z - 2.0 / WAVE_ZOOM_STEP).abs() < 1e-4));
+        for _ in 0..40 {
+            feed(&mut app, &[0xBD, 20, 1]);
+        }
+        assert!(app.deck_wave_zoom.iter().all(|z| *z == 4.0), "zoom is bounded");
+
+        feed(&mut app, &tap(14));
+        assert_eq!(app.layout, TraktorLayout::Browser);
+        feed(&mut app, &tap(14));
+        assert_eq!(app.layout, TraktorLayout::Parallel, "the second press returns to the layout before");
+
+        // Regular4, the browser button, then the session's first loaded track: the decks reopen as Regular4, not Stacked.
+        app.run_button_action("layout", 1, "regular4");
+        feed(&mut app, &tap(14));
+        let entry = crate::library_ui::UiTrackEntry { id: 7, title: "First".into(), bpm: 120.0, musical_key: "8m".into(), ..Default::default() };
+        app.load_generation[0] = 1;
+        app.load_channel.0.send(DeckResult::Loaded(0, 1, entry, Ok(track(120.0)))).unwrap();
+        app.finish_loads();
+        assert_eq!(app.deck_layout_preset(), Some("regular4"), "the first load forgot Regular4");
+        assert!(app.library.status_message.ends_with("opened the In Deck view (F3 returns to the Browser)"), "{}", app.library.status_message);
+        // The native View button toggles the same way.
+        let view = |app: &mut ReTraktorApp| app.apply_mx2_surface_event(SurfaceEvent::Button { control: "surface.left.browse.view".into(), pressed: true });
+        view(&mut app);
+        assert_eq!(app.layout, TraktorLayout::Browser);
+        view(&mut app);
+        assert_eq!(app.deck_layout_preset(), Some("regular4"), "View returned elsewhere");
+
+        assert!(app.run_button_action("tempo_master", 2, ""));
+        assert_eq!((app.tempo_master_deck, app.master_tempo), (Some(1), 120.0));
+        assert!(app.run_button_action("tempo_master", 2, ""));
+        assert_eq!(app.tempo_master_deck, Some(1), "pressed again it stays master");
+    }
+
     /// The real Mix and 4-Deck layouts in the smallest window (1024 x 640) with Tools open on every deck:
     /// each loaded deck's JUMP arrows and size picker are on screen (C and D once the 4-Deck view scrolls),
     /// clicks jump, the picker changes the size, and an edge greys the arrow out.
@@ -7811,7 +8402,7 @@ mod sync_audio {
         let nodes = settle(&mut app, &mut frame, vec![]);
         assert_on_screen(&nodes, "AB", "Mix, Tools open");
 
-        app.layout = TraktorLayout::FourDeck;
+        app.run_button_action("layout", 1, "regular4");
         let nodes = settle(&mut app, &mut frame, vec![]);
         assert_on_screen(&nodes, "AB", "4-Deck top");
         // C and D sit below the window until the deck area scrolls.
@@ -7841,6 +8432,176 @@ mod sync_audio {
         assert!(fwd.3 && !node(&nodes, "Deck D beat jump back 16 beats").3, "forward should be disabled, back enabled");
         click(&mut app, &mut frame, fwd.2.center());
         assert_eq!(playhead(&app, 3), 92.0);
+    }
+
+    /// The toolbar's Waveforms and Deck count choices change one axis each, keep the other, reach all four deck layouts
+    /// as the controller's `layout` action does and name the active ones; away from the decks they name the deck view
+    /// to come back to, and picking one, even the current choice, reopens it. At 1024 x 640 the two sit one above the
+    /// other in the old single picker's width, so no other toolbar control moves; below 1440 they stay so, and from 1440 sit
+    /// side by side with room beside NEXT for the recorder's longest label. From 1280 no two toolbar controls overlap. Stacked lanes: one per deck on screen, in order, full width and one height, loaded
+    /// or not, and loading decks moves no other lane. Stacked4 draws decks C and D under the stack, Stacked2 doesn't.
+    /// At 1280 x 820, Stacked4 keeps every deck's transport row and Regular4 all four decks, A and B over C and D,
+    /// above the library's header and first row. Browse from Stacked4 keeps decks C and D, and the browser button returns to Stacked4.
+    #[test]
+    fn deck_layout_picker_and_stable_lanes() {
+        use egui::accesskit::Role;
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1280.0, 820.0));
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        ctx.enable_accesskit();
+        let mut app = ReTraktorApp::default();
+        let mut time = 0.0;
+        let mut frame = |app: &mut ReTraktorApp, events: Vec<egui::Event>| -> Vec<Node> {
+            time += 0.1;
+            workspace_frame(&ctx, app, screen, time, events)
+        };
+        let settle = |app: &mut ReTraktorApp, frame: &mut dyn FnMut(&mut ReTraktorApp, Vec<egui::Event>) -> Vec<Node>| {
+            (0..8).map(|_| frame(app, vec![])).last().unwrap()
+        };
+        let click = |app: &mut ReTraktorApp, frame: &mut dyn FnMut(&mut ReTraktorApp, Vec<egui::Event>) -> Vec<Node>, at: egui::Pos2| {
+            let button = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+            frame(app, vec![egui::Event::PointerMoved(at)]);
+            frame(app, vec![button(true)]);
+            frame(app, vec![button(false)]);
+        };
+        let node = |nodes: &[Node], name: &str| nodes.iter().find(|n| n.0 == name).map(|n| n.2).unwrap_or_else(|| panic!("no {name}"));
+        // Empty lanes by deck letter, top to bottom.
+        let empty_lanes = |nodes: &[Node]| {
+            let mut lanes: Vec<(char, egui::Rect)> =
+                nodes.iter().filter(|n| n.0.contains(" lane, empty")).map(|n| (n.0.chars().nth(5).unwrap(), n.2)).collect();
+            lanes.sort_by(|a, b| a.1.top().total_cmp(&b.1.top()));
+            lanes
+        };
+        let load = |app: &mut ReTraktorApp, decks: &[usize]| {
+            let mut s = app.audio.shared.lock().unwrap();
+            for &d in decks {
+                s.loaded_tracks[d] = Some(track(120.0));
+                s.playhead_sec[d] = 50.0;
+            }
+        };
+
+        let pick = |app: &mut ReTraktorApp, frame: &mut dyn FnMut(&mut ReTraktorApp, Vec<egui::Event>) -> Vec<Node>, axis: &str, label: &str| {
+            let nodes = (0..8).map(|_| frame(app, vec![])).last().unwrap();
+            let combo = nodes.iter().find(|n| n.0.starts_with(&format!("{axis}: "))).unwrap_or_else(|| panic!("no {axis} choice"));
+            click(app, frame, combo.2.center());
+            let menu = frame(app, vec![]);
+            let item = menu.iter().find(|n| n.0 == label && n.1 != Role::ComboBox).unwrap_or_else(|| panic!("no {label} item"));
+            click(app, frame, item.2.center());
+        };
+        // The app opens on the Browser with no deck view to return to: Stacked with the saved deck count.
+        app.preferences.four_deck_mode = false;
+        let nodes = settle(&mut app, &mut frame);
+        node(&nodes, "Waveforms: Stacked, not on screen");
+        node(&nodes, "Deck count: 2 Decks, not on screen");
+        for (axis, label, mode, waveforms, decks) in [
+            ("Deck count", "4 Decks", "stacked4", "Stacked", "4 Decks"),
+            ("Waveforms", "In Deck", "regular4", "In Deck", "4 Decks"),
+            ("Deck count", "2 Decks", "regular2", "In Deck", "2 Decks"),
+            ("Waveforms", "Stacked", "stacked2", "Stacked", "2 Decks"),
+        ] {
+            pick(&mut app, &mut frame, axis, label);
+            assert_eq!((app.deck_layout_preset(), app.four_decks_shown()), (Some(mode), decks == "4 Decks"), "{axis} {label}");
+            let nodes = settle(&mut app, &mut frame);
+            node(&nodes, &format!("Waveforms: {waveforms}"));
+            node(&nodes, &format!("Deck count: {decks}"));
+        }
+        // From Timeline, reselecting the remembered choice reopens it; from Browse, the other axis is kept.
+        app.run_button_action("layout", 1, "regular4");
+        app.show_layout(TraktorLayout::Timeline);
+        let nodes = settle(&mut app, &mut frame);
+        node(&nodes, "Waveforms: In Deck, not on screen");
+        node(&nodes, "Deck count: 4 Decks, not on screen");
+        pick(&mut app, &mut frame, "Waveforms", "In Deck");
+        assert_eq!(app.deck_layout_preset(), Some("regular4"), "reselecting In Deck from Timeline");
+        app.show_layout(TraktorLayout::Browser);
+        pick(&mut app, &mut frame, "Deck count", "2 Decks");
+        assert_eq!(app.deck_layout_preset(), Some("regular2"), "2 Decks from Browse");
+
+        // Fit: one above the other in one control's width below 1440, side by side from 1440, overlapping nothing.
+        for (w, h, stacked) in [(1024.0, 640.0, true), (1180.0, 720.0, true), (1280.0, 820.0, true), (1439.0, 900.0, true), (1440.0, 900.0, false)] {
+            let fit_ctx = egui::Context::default();
+            crate::theme::install_fonts(&fit_ctx);
+            fit_ctx.enable_accesskit();
+            let small = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(w, h));
+            let nodes = (0..8).map(|i| workspace_frame(&fit_ctx, &mut app, small, 100.0 + i as f64 * 0.1, vec![])).last().unwrap();
+            let waves = node(&nodes, "Waveforms: In Deck");
+            let count = node(&nodes, "Deck count: 2 Decks");
+            let browse = nodes.iter().find(|n| n.0.starts_with("Browse") && n.1 == Role::Button && n.2.bottom() < 64.0).expect("no Browse tab").2;
+            if stacked {
+                assert!(waves.bottom() <= count.top() && waves.left() == count.left() && waves.width() == count.width(), "{w}: {waves:?} {count:?}");
+            } else {
+                assert!(waves.right() <= count.left() && (waves.center().y - count.center().y).abs() < 0.5, "{w}: {waves:?} {count:?}");
+            }
+            // Stacked, the pair keeps the old picker's 78 px, so the Browse tab and everything after it stay put.
+            let gap = if stacked { browse.left() - waves.left() - 78.0 } else { browse.left() - count.right() };
+            assert!((gap - 2.0).abs() < 0.5 && waves.bottom() < 64.0 && count.bottom() < 64.0, "{w}: Browse at {browse:?}");
+            let toolbar: Vec<&Node> = nodes.iter().filter(|n| matches!(n.1, Role::Button | Role::ComboBox | Role::Slider) && n.2.bottom() < 64.0).collect();
+            for (i, a) in toolbar.iter().enumerate() {
+                assert!(a.2.right() <= w, "{w}: {} at {:?} is off screen", a.0, a.2);
+                for b in &toolbar[i + 1..] {
+                    // Below 1280 the centre already ran into the right-hand group with the old picker; only the pair must stay clear there.
+                    let checked = w >= 1280.0 || [a.2, b.2].iter().any(|r| *r == waves || *r == count);
+                    assert!(!checked || !a.2.shrink(0.5).intersects(b.2), "{w}: {} at {:?} overlaps {} at {:?}", a.0, a.2, b.0, b.2);
+                }
+            }
+            if !stacked {
+                // Recording or a failed save widens REC towards NEXT; the longest label must still fit in the gap.
+                let text_w = |t: &str| fit_ctx.fonts(|f| f.layout_no_wrap(t.into(), egui::FontId::proportional(11.5), Color32::WHITE).size().x);
+                let growth = ["REC 000:00", "RETRY SAVE", "SAVING…"].map(|t| text_w(t) - text_w("REC")).into_iter().fold(0.0, f32::max);
+                let next = node(&nodes, "NEXT");
+                let right = toolbar.iter().map(|n| n.2.left()).filter(|l| *l >= next.right()).fold(w, f32::min);
+                assert!(right - next.right() > growth, "{w}: {} px beside NEXT, the recorder grows {growth} px", right - next.right());
+                println!("fit {w}: {} px beside NEXT for {growth} px of recorder growth", right - next.right());
+            }
+            println!("fit {w}x{h}: Waveforms {waves:?}, Deck count {count:?}, Browse {browse:?}");
+        }
+
+        // Nothing loaded: Stacked2 has lanes A and B, Stacked4 A to D, full width and one height.
+        for (mode, letters) in [("stacked2", "AB"), ("stacked4", "ABCD")] {
+            app.run_button_action("layout", 1, mode);
+            let lanes = empty_lanes(&settle(&mut app, &mut frame));
+            assert_eq!(lanes.iter().map(|l| l.0).collect::<String>(), letters, "{mode}");
+            for (_, r) in &lanes {
+                assert!(r.width() > screen.width() - 40.0 && (r.height() - lanes[0].1.height()).abs() < 0.5, "{mode}: lane {r:?}");
+            }
+        }
+        let before = empty_lanes(&settle(&mut app, &mut frame));
+        load(&mut app, &[0, 2]);
+        let mixed = empty_lanes(&settle(&mut app, &mut frame));
+        assert_eq!(mixed, before.iter().filter(|l| "BD".contains(l.0)).copied().collect::<Vec<_>>(), "loading A and C moved lane B or D");
+
+        load(&mut app, &[1, 3]);
+        let nodes = settle(&mut app, &mut frame);
+        assert!(empty_lanes(&nodes).is_empty());
+        for letter in "ABCD".chars() {
+            node(&nodes, &format!("Deck {letter} beat jump forward 4 beats"));
+        }
+        // Stacked4 at 1280 x 820: every deck's transport row (CUE, with PLAY beside it) above the library's header and first row.
+        let cues: Vec<egui::Rect> = nodes.iter().filter(|n| n.0 == "CUE" && n.1 == Role::Button && n.2.top() > 80.0).map(|n| n.2).collect();
+        assert_eq!(cues.len(), 4, "Stacked4 CUE buttons: {cues:?}");
+        assert!(cues.iter().all(|r| r.bottom() <= screen.bottom() - LIBRARY_RESERVE), "Stacked4 hides a deck's CUE under the library: {cues:?}");
+
+        // Browsing from a four-deck view keeps decks C and D, and the browser button returns to the same preset.
+        // The tab reads "Browse" below the 1320 px full labels.
+        let browse = nodes.iter().find(|n| n.0.starts_with("Browse") && n.1 == Role::Button && n.2.bottom() < 64.0).expect("no Browse tab").2;
+        click(&mut app, &mut frame, browse.center());
+        assert_eq!((app.layout, app.four_decks_shown()), (TraktorLayout::Browser, true), "Browse from Stacked4");
+        let nodes = settle(&mut app, &mut frame);
+        node(&nodes, "Waveforms: Stacked, not on screen");
+        node(&nodes, "Deck count: 4 Decks, not on screen");
+        app.run_button_action("browser_only", 1, "");
+        assert_eq!(app.deck_layout_preset(), Some("stacked4"), "the browser button's return");
+        app.run_button_action("layout", 1, "stacked2");
+        let nodes = settle(&mut app, &mut frame);
+        assert!(!nodes.iter().any(|n| n.0.starts_with("Deck C ")), "Stacked2 draws deck C");
+
+        app.run_button_action("layout", 1, "regular4");
+        let nodes = settle(&mut app, &mut frame);
+        let jump = |letter: char| node(&nodes, &format!("Deck {letter} beat jump forward 4 beats"));
+        for letter in "ABCD".chars() {
+            assert!(jump(letter).bottom() <= screen.bottom() - LIBRARY_RESERVE, "Regular4: deck {letter}'s JUMP row at {:?} is in the library's rows", jump(letter));
+        }
+        assert!(jump('A').left() < jump('B').left() && jump('A').bottom() < jump('C').top() && jump('B').bottom() < jump('D').top());
     }
 
     #[test]

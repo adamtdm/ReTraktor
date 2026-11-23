@@ -8,3 +8,8 @@ description = "Traktor Kontrol & MX2 (0x17CC) USB HID/NHL report decoder, S4MK3 
 [dependencies]
 retraktor-core = { path = "../retraktor-core" }
 retraktor-formats = { path = "../retraktor-formats" }
+serde_json = "1.0"
+
+# renameat2(RENAME_EXCHANGE): swap an imported rules file into place and keep exactly what it displaced.
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1.1", features = ["fs"] }

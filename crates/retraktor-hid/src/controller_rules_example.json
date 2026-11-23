@@ -1,0 +1,84 @@
+{
+  "format": "retraktor-controller-rules",
+  "version": 1,
+  "comment": "Traktor MX2 example. Hold left SHIFT: left pads 1-4 mute stems (lit in stem colours). Left FX knob 4 is a macro: turning it up raises deck A's high-pass filter (heard while channel 1's FX ON button is lit) and cuts its bass EQ (always heard). Right FAV latches a loop layer for the right pads. Left Loop Move nudges deck A's filter.",
+  "rules": [
+    {
+      "name": "Left SHIFT is held",
+      "input": "surface.left.shift",
+      "do": [{ "action": "modifier", "name": "shift", "mode": "hold" }]
+    },
+    {
+      "name": "SHIFT + left pad 1 mutes drums",
+      "input": "surface.left.pads.1",
+      "when": { "shift": 1 },
+      "do": [{ "action": "stem", "deck": 1, "slot": 1 }]
+    },
+    {
+      "name": "SHIFT + left pad 2 mutes bass",
+      "input": "surface.left.pads.2",
+      "when": { "shift": 1 },
+      "do": [{ "action": "stem", "deck": 1, "slot": 2 }]
+    },
+    {
+      "name": "SHIFT + left pad 3 mutes other",
+      "input": "surface.left.pads.3",
+      "when": { "shift": 1 },
+      "do": [{ "action": "stem", "deck": 1, "slot": 3 }]
+    },
+    {
+      "name": "SHIFT + left pad 4 mutes vocals",
+      "input": "surface.left.pads.4",
+      "when": { "shift": 1 },
+      "do": [{ "action": "stem", "deck": 1, "slot": 4 }]
+    },
+    {
+      "name": "Macro: high-pass filter up, bass EQ down",
+      "input": "surface.left.fx.knobs.4",
+      "do": [
+        { "action": "filter", "deck": 1, "range": [0.5, 1.0] },
+        { "action": "eq_low", "deck": 1, "range": [0.5, 0.1] }
+      ]
+    },
+    {
+      "name": "Right FAV latches the loop layer",
+      "input": "surface.right.browse.favorite",
+      "do": [{ "action": "modifier", "name": "loops", "mode": "toggle" }]
+    },
+    {
+      "name": "Loop layer: right pad 1 halves the loop",
+      "input": "surface.right.pads.1",
+      "when": { "loops": 1 },
+      "do": [{ "action": "loop_half", "deck": 2 }]
+    },
+    {
+      "name": "Loop layer: right pad 2 doubles the loop",
+      "input": "surface.right.pads.2",
+      "when": { "loops": 1 },
+      "do": [{ "action": "loop_double", "deck": 2 }]
+    },
+    {
+      "name": "Loop layer: right pad 3 turns the filter on and loops",
+      "input": "surface.right.pads.3",
+      "when": { "loops": 1 },
+      "do": [
+        { "action": "filter_on", "deck": 2 },
+        { "action": "loop", "deck": 2 }
+      ]
+    },
+    {
+      "name": "Left Loop Move nudges deck A's filter",
+      "input": "surface.left.loop_move",
+      "do": [{ "action": "filter", "deck": 1, "step": 0.02 }]
+    }
+  ],
+  "leds": [
+    { "control": "surface.left.pads.1", "when": { "shift": 1 }, "colour": "orange" },
+    { "control": "surface.left.pads.2", "when": { "shift": 1 }, "colour": "blue" },
+    { "control": "surface.left.pads.3", "when": { "shift": 1 }, "colour": "cyan" },
+    { "control": "surface.left.pads.4", "when": { "shift": 1 }, "colour": "magenta" },
+    { "control": "surface.right.pads.1", "when": { "loops": 1 }, "colour": "green" },
+    { "control": "surface.right.pads.2", "when": { "loops": 1 }, "colour": "green" },
+    { "control": "surface.right.pads.3", "when": { "loops": 1 }, "colour": "amber" }
+  ]
+}

@@ -15,6 +15,7 @@ mod ai;
 mod app;
 mod audio;
 mod controller_map;
+mod rules_file;
 mod demucs;
 mod dot;
 mod keylock;

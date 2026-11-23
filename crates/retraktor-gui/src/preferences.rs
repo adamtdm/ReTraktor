@@ -181,6 +181,8 @@ pub struct PreferencesDialog {
     pub generic_manager: crate::midi::GenericControllerManager,
     /// Last control touched on the hardware (for "press to select").
     pub last_surface_control: Option<String>,
+    /// Controller rules file (~/.config/retraktor/controller-rules.json), run before the simple mappings.
+    pub controller_rules: crate::rules_file::RulesFile,
     pub ai_settings: crate::ai::AiSettings,
     pub ai_test_runner: Option<crate::ai::AiTestRunner>,
     pub ai_test_status: Option<Result<String, String>>,
@@ -193,6 +195,13 @@ impl Default for PreferencesDialog {
             .unwrap_or_else(|_| std::path::PathBuf::from("/"));
         // Only default to ~/Music when it exists; never scan the whole home folder.
         let default_music = Some(home.join("Music")).filter(|m| m.is_dir());
+        // Loaded before the generic controller reader starts, so it reads CCs the authored way from the first message.
+        // Unit tests never read or act on the user's own rules.
+        let controller_rules = if cfg!(test) {
+            crate::rules_file::RulesFile::unloaded(retraktor_hid::controller_rules::default_rules_path())
+        } else {
+            crate::rules_file::RulesFile::load(retraktor_hid::controller_rules::default_rules_path())
+        };
 
         Self {
             audio_output: None,
@@ -251,8 +260,9 @@ impl Default for PreferencesDialog {
             udev_command_copied: false,
             mapping: crate::controller_map::Mapping::load(),
             mapper: Default::default(),
-            generic_manager: Default::default(),
+            generic_manager: crate::midi::GenericControllerManager::with_cc_modes(controller_rules.engine.rules().midi_cc_modes().to_vec()),
             last_surface_control: None,
+            controller_rules,
         }
     }
 }
@@ -1266,6 +1276,8 @@ impl PreferencesDialog {
 
     fn show_controller_prefs(&mut self, ui: &mut Ui) {
         self.show_controllers_subtabs(ui);
+        let ports: Vec<String> = self.generic_manager.devices.iter().filter_map(|d| d.rule_device.strip_prefix("midi.")).map(str::to_string).collect();
+        crate::rules_file::show(ui, &mut self.controller_rules, self.last_surface_control.as_deref(), &ports);
         // 6. Line-drawn replica of the MX2: see and change what every control does.
         ui.add_space(8.0);
         let connected = self.mx2_connected_node.is_some();
@@ -1283,6 +1295,8 @@ impl PreferencesDialog {
 
     fn show_other_controllers_prefs(&mut self, ui: &mut Ui) {
         self.show_controllers_subtabs(ui);
+        let ports: Vec<String> = self.generic_manager.devices.iter().filter_map(|d| d.rule_device.strip_prefix("midi.")).map(str::to_string).collect();
+        crate::rules_file::show(ui, &mut self.controller_rules, self.last_surface_control.as_deref(), &ports);
         crate::midi::show_other_controllers_page(ui, &mut self.generic_manager, self.last_surface_control.as_deref());
     }
 

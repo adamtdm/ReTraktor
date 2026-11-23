@@ -1167,7 +1167,8 @@ impl<'a> ContinuousMixer<'a> {
         let dot_radius = 1.35_f32;
         let raw_cols = ((inner_rect.width() - dot_radius * 2.0).max(10.0) / pitch).round() as usize;
         let cols = (if raw_cols % 2 == 0 { raw_cols + 1 } else { raw_cols }).clamp(55, 141);
-        let rows = (((inner_rect.height() - dot_radius * 2.0).max(10.0) / pitch).round() as usize).clamp(26, 60);
+        // Up to 160 rows, so a mixer spanning both 4-Deck rows keeps square dots rather than stretching them apart.
+        let rows = (((inner_rect.height() - dot_radius * 2.0).max(10.0) / pitch).round() as usize).clamp(26, 160);
 
         let step_x = if cols > 1 { (inner_rect.width() - dot_radius * 2.0).max(1.0) / (cols - 1) as f32 } else { 0.0 };
         let step_y = if rows > 1 { (inner_rect.height() - dot_radius * 2.0).max(1.0) / (rows - 1) as f32 } else { 0.0 };
@@ -1622,7 +1623,11 @@ impl<'a> ContinuousMixer<'a> {
 
                     // Bottom label
                     if !is_compact {
-                        overlay_text(painter, &mut post, Pos2::new(slot_cx, footer_label_y), names[s], FontId::proportional(11.0), if muted { ink.gamma_multiply(0.55) } else { ink }, bg);
+                        // One letter when the stem's columns are narrower than its name, so neighbours never run together.
+                        let slot_w = (stem_w + 1) as f32 * step_x;
+                        let fits = painter.layout_no_wrap(names[s].to_owned(), FontId::proportional(11.0), ink).size().x + 2.0 <= slot_w;
+                        let name = if fits { names[s] } else { &names[s][..1] };
+                        overlay_text(painter, &mut post, Pos2::new(slot_cx, footer_label_y), name, FontId::proportional(11.0), if muted { ink.gamma_multiply(0.55) } else { ink }, bg);
                     }
 
                     let live = if anim { self.stem_peaks[d][s].clamp(0.0, 1.0) } else { 0.45 };

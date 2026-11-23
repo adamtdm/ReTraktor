@@ -10,7 +10,8 @@
 
 use eframe::egui::{self, Pos2, RichText, Sense, Stroke, Ui, Vec2};
 use retraktor_core::SurfaceEvent;
-use retraktor_hid::{lookup_ni_device, NI_USB_VID, TRAKTOR_MX2_PID, TRAKTOR_MX4_PID};
+use retraktor_hid::controller_rules::CcMode;
+use retraktor_hid::{lookup_ni_device, NI_USB_VID, TRAKTOR_MX2_PID};
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Read;
@@ -39,11 +40,17 @@ pub struct MidiParserState {
     /// Most recent possible 14-bit CC MSB (channel, CC, value).
     pending_msb: Option<(u8, u8, u8)>,
     cc_history: HashMap<(u8, u8), Vec<u8>>,
-    cc_modes: HashMap<(u8, u8), CcMode>,
+    /// Automatic readings: learned from the values, set with `set_relative`, or a known controller's table.
+    auto_modes: HashMap<(u8, u8), AutoMode>,
+    /// CCs whose reading the controller rules file decides: `(channel 1..=16, cc)`. These never use the guess.
+    rule_modes: HashMap<(u8, u8), CcMode>,
+    /// The port is a physical DDJ-FLX4, whatever its port ID (`ddj_flx4`, a second port, or a raw-node ID when two
+    /// FLX4s are attached), so its first jog and browse ticks read by AlphaTheta's table.
+    flx4: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
-enum CcMode {
+enum AutoMode {
     Absolute,
     Relative,
     Centered,
@@ -57,18 +64,18 @@ impl MidiParserState {
 
     /// Explicitly mark a CC as a relative encoder.
     pub fn set_relative(&mut self, ch: u8, cc: u8, relative: bool) {
-        let mode = if relative { CcMode::Relative } else { CcMode::Absolute };
-        self.cc_modes.insert((ch, cc), mode);
+        let mode = if relative { AutoMode::Relative } else { AutoMode::Absolute };
+        self.auto_modes.insert((ch, cc), mode);
     }
 
-    fn cc_mode(&self, device: &str, ch: u8, cc: u8) -> Option<CcMode> {
-        self.cc_modes.get(&(ch, cc)).copied().or_else(|| {
-            if device == "ddj_flx4" {
+    fn cc_mode(&self, device: &str, ch: u8, cc: u8) -> Option<AutoMode> {
+        self.auto_modes.get(&(ch, cc)).copied().or_else(|| {
+            if self.flx4 || device == "ddj_flx4" {
                 // AlphaTheta's MIDI table uses offset binary for jogs and signed values for browse.
                 match (ch, cc) {
-                    (1 | 2, 33..=35 | 41) => Some(CcMode::Centered),
-                    (7, 64 | 100) => Some(CcMode::Signed),
-                    _ => Some(CcMode::Absolute),
+                    (1 | 2, 33..=35 | 41) => Some(AutoMode::Centered),
+                    (7, 64 | 100) => Some(AutoMode::Signed),
+                    _ => Some(AutoMode::Absolute),
                 }
             } else {
                 None
@@ -76,8 +83,34 @@ impl MidiParserState {
         })
     }
 
-    fn unpaired_cc(&mut self, device: &str, ch: u8, cc: u8, val: u8) -> SurfaceEvent {
+    /// Whether this CC can be the coarse half of a 14-bit pair: absolute by the rules file, or not named there and
+    /// absolute or not yet known to the automatic reading.
+    fn may_pair(&self, device: &str, ch: u8, cc: u8) -> bool {
+        match self.rule_modes.get(&(ch, cc)) {
+            Some(mode) => *mode == CcMode::Absolute,
+            None => matches!(self.cc_mode(device, ch, cc), None | Some(AutoMode::Absolute)),
+        }
+    }
+
+    /// Whether this CC can be the fine half of a 14-bit pair. A fine-numbered CC the rules file names is a control
+    /// of its own (a knob 32 CCs above another), never another CC's fine half; a 14-bit fader is named by its
+    /// coarse CC only.
+    fn may_pair_fine(&self, device: &str, ch: u8, cc: u8) -> bool {
+        !self.rule_modes.contains_key(&(ch, cc)) && self.may_pair(device, ch, cc)
+    }
+
+    /// One CC value on its own: read the way the rules file says from the first message (a relative value of no
+    /// ticks sends nothing), otherwise by the automatic reading.
+    fn unpaired_cc(&mut self, device: &str, ch: u8, cc: u8, val: u8) -> Option<SurfaceEvent> {
         let key = (ch, cc);
+        if let Some(mode) = self.rule_modes.get(&key).copied() {
+            let control = format!("midi.{device}.ch{ch}.cc{cc}");
+            return match mode {
+                CcMode::Button => Some(SurfaceEvent::Button { control, pressed: val > 0 }),
+                CcMode::Absolute => Some(SurfaceEvent::Fader { control, value: f64::from(val) / 127.0 }),
+                relative => (relative.ticks(val) != 0).then(|| SurfaceEvent::Encoder { control, delta: relative.ticks(val) }),
+            };
+        }
         let mode = self.cc_mode(device, ch, cc).unwrap_or_else(|| {
             let history = self.cc_history.entry(key).or_default();
             history.push(val);
@@ -87,40 +120,63 @@ impl MidiParserState {
             let mode = if history.contains(&63) && history.contains(&65)
                 && history.iter().all(|&v| (60..=68).contains(&v) && v != 64)
             {
-                CcMode::Centered
+                AutoMode::Centered
             } else if history.contains(&1) && history.contains(&127)
                 && history.iter().all(|&v| v <= 5 || v >= 123)
             {
-                CcMode::Signed
+                AutoMode::Signed
             } else {
-                return CcMode::Absolute;
+                return AutoMode::Absolute;
             };
-            self.cc_modes.insert(key, mode);
+            self.auto_modes.insert(key, mode);
             mode
         });
 
         let control = format!("midi.{device}.ch{ch}.cc{cc}");
         let delta = match mode {
-            CcMode::Absolute => {
-                return SurfaceEvent::Fader { control, value: f64::from(val) / 127.0 };
+            AutoMode::Absolute => {
+                return Some(SurfaceEvent::Fader { control, value: f64::from(val) / 127.0 });
             }
-            CcMode::Centered => i64::from(val) - 64,
-            CcMode::Relative if (58..=70).contains(&val) => {
-                self.cc_modes.insert(key, CcMode::Centered);
+            AutoMode::Centered => i64::from(val) - 64,
+            AutoMode::Relative if (58..=70).contains(&val) => {
+                self.auto_modes.insert(key, AutoMode::Centered);
                 i64::from(val) - 64
             }
-            CcMode::Relative => {
-                self.cc_modes.insert(key, CcMode::Signed);
+            AutoMode::Relative => {
+                self.auto_modes.insert(key, AutoMode::Signed);
                 i64::from(val) - if val < 64 { 0 } else { 128 }
             }
-            CcMode::Signed => i64::from(val) - if val < 64 { 0 } else { 128 },
+            AutoMode::Signed => i64::from(val) - if val < 64 { 0 } else { 128 },
         };
-        SurfaceEvent::Encoder { control, delta }
+        Some(SurfaceEvent::Encoder { control, delta })
     }
 
-    fn flush_msb(&mut self, device: &str) -> Option<SurfaceEvent> {
+    /// The held coarse CC on its own, as the reader sends it when the port goes idle without its fine half.
+    pub(crate) fn flush_msb(&mut self, device: &str) -> Option<SurfaceEvent> {
         let (ch, cc, val) = self.pending_msb.take()?;
-        Some(self.unpaired_cc(device, ch, cc, val))
+        self.unpaired_cc(device, ch, cc, val)
+    }
+
+    /// Sets how the rules file reads this port's CCs, from its `(control ID, mode)` list. IDs on `port` or on
+    /// its raw-node alias count; the rest are another device's. A coarse CC held for its fine half under a reading
+    /// that changes is dropped, so a fader value read before a Reload never becomes a press or a tick after it; one
+    /// whose reading stays the same is kept and still pairs.
+    pub fn set_cc_modes(&mut self, port: &str, alias: Option<&str>, modes: &[(String, CcMode)]) {
+        let rule_modes: HashMap<(u8, u8), CcMode> = modes
+            .iter()
+            .filter_map(|(id, mode)| {
+                let mut parts = id.strip_prefix("midi.")?.split('.');
+                let (p, ch, cc) = (parts.next()?, parts.next()?, parts.next()?);
+                let ours = p == port || Some(p) == alias;
+                ours.then(|| Some(((ch.strip_prefix("ch")?.parse().ok()?, cc.strip_prefix("cc")?.parse().ok()?), *mode)))?
+            })
+            .collect();
+        if let Some((ch, cc, _)) = self.pending_msb {
+            if rule_modes.get(&(ch, cc)) != self.rule_modes.get(&(ch, cc)) {
+                self.pending_msb = None;
+            }
+        }
+        self.rule_modes = rule_modes;
     }
 }
 
@@ -212,7 +268,7 @@ pub fn parse_midi_bytes(
                 if msg_type == 0xB0
                     && ch == msb_ch
                     && cc == msb_cc + 32
-                    && matches!(state.cc_mode(device, ch, cc), None | Some(CcMode::Absolute))
+                    && state.may_pair_fine(device, ch, cc)
                 {
                     state.pending_msb = None;
                     let value = (u16::from(msb) << 7) | u16::from(val);
@@ -245,12 +301,10 @@ pub fn parse_midi_bytes(
                     });
                 }
                 0xB0 => {
-                    if cc < 32
-                        && matches!(state.cc_mode(device, ch, cc), None | Some(CcMode::Absolute))
-                    {
+                    if cc < 32 && state.may_pair(device, ch, cc) {
                         state.pending_msb = Some((ch, cc, val));
                     } else {
-                        events.push(state.unpaired_cc(device, ch, cc, val));
+                        events.extend(state.unpaired_cc(device, ch, cc, val));
                     }
                 }
                 0xE0 => {
@@ -609,11 +663,17 @@ pub enum DeviceProtocol {
 #[derive(Debug, Clone)]
 pub struct DiscoveredDevice {
     pub name: String,
+    /// Names the device's simple-mapping file (`controllers/<slug>.txt`).
     pub slug: String,
+    /// Device part of its control IDs and rules: `midi.<port>` or `hid.<pid>`.
+    pub rule_device: String,
+    /// Raw-node MIDI ID from before stable port names (`midi.midic1d0`), still accepted while this node is the device.
+    pub legacy_device: Option<String>,
     pub dev_node: String,
     pub protocol: DeviceProtocol,
     pub connected: bool,
-    pid: u16,
+    /// USB product ID of a generic NI HID device (its `hid.<pid>` control IDs); 0 for MIDI.
+    pub(crate) pid: u16,
 }
 
 /// Discovers connected ALSA raw MIDI devices (`/dev/snd/midiC*D*`).
@@ -623,6 +683,7 @@ pub fn scan_linux_alsa_midi_devices() -> Vec<DiscoveredDevice> {
         return found;
     };
 
+    let mut card_ids = Vec::new();
     for entry in entries.flatten() {
         let fname = entry.file_name().to_string_lossy().to_string();
         if !fname.starts_with("midiC") {
@@ -645,18 +706,50 @@ pub fn scan_linux_alsa_midi_devices() -> Vec<DiscoveredDevice> {
         }
 
         let slug = midi_device_slug(&card_name);
+        card_ids.push((fname.clone(), (card_name != fname).then(|| card_name.clone())));
         found.push(DiscoveredDevice {
             name: card_name,
             slug,
+            rule_device: String::new(),
+            legacy_device: None,
             dev_node,
             protocol: DeviceProtocol::Midi,
             connected: true,
             pid: 0,
         });
     }
+    for (device, (rule_device, legacy_device)) in found.iter_mut().zip(midi_port_ids(&card_ids)) {
+        device.rule_device = rule_device;
+        device.legacy_device = legacy_device;
+    }
 
     found.sort_by(|a, b| a.dev_node.cmp(&b.dev_node));
     found
+}
+
+/// Rule device IDs for raw MIDI nodes, given `(node file name, ALSA card id)`: `midi.<card id>`, with `_d<N>` for a
+/// card's second and later ports, so they survive card renumbering; the raw-node ID (`midi.midic1d0`) is the legacy
+/// alias. A node without a usable card id, or whose id would collide with another node's, keeps the raw-node ID.
+fn midi_port_ids(nodes: &[(String, Option<String>)]) -> Vec<(String, Option<String>)> {
+    let raw: Vec<String> = nodes.iter().map(|(file, _)| file.to_lowercase()).collect();
+    let stable: Vec<Option<String>> = nodes
+        .iter()
+        .map(|(file, card)| {
+            let port = file.strip_prefix("midiC")?.split_once('D')?.1;
+            let base = midi_device_slug(card.as_deref()?);
+            let usable = !base.is_empty() && base.is_ascii();
+            usable.then(|| if port == "0" { base } else { format!("{base}_d{port}") })
+        })
+        .collect();
+    raw.iter()
+        .zip(&stable)
+        .map(|(raw_id, id)| match id {
+            Some(id) if stable.iter().filter(|other| other.as_ref() == Some(id)).count() == 1 && !raw.contains(id) => {
+                (format!("midi.{id}"), Some(format!("midi.{raw_id}")))
+            }
+            _ => (format!("midi.{raw_id}"), None),
+        })
+        .collect()
 }
 
 fn midi_device_slug(name: &str) -> String {
@@ -667,7 +760,8 @@ fn midi_device_slug(name: &str) -> String {
     slug
 }
 
-/// Discovers connected Native Instruments HID devices outside the MX2/MX4 driver.
+/// Discovers connected Native Instruments HID devices outside the MX2 driver, the MX4 included: the MX2 driver
+/// opens only an MX2, so each device has one reader.
 pub fn scan_linux_generic_ni_hid_devices() -> Vec<DiscoveredDevice> {
     let mut found = Vec::new();
     let Ok(entries) = std::fs::read_dir("/sys/class/hidraw") else {
@@ -697,12 +791,14 @@ pub fn scan_linux_generic_ni_hid_devices() -> Vec<DiscoveredDevice> {
             }
         }
 
-        if dev_vid == NI_USB_VID && !matches!(dev_pid, TRAKTOR_MX2_PID | TRAKTOR_MX4_PID) {
+        if dev_vid == NI_USB_VID && dev_pid != TRAKTOR_MX2_PID {
             let model = lookup_ni_device(dev_vid, dev_pid)
                 .map(|d| d.model.to_string())
                 .unwrap_or_else(|| if !hid_name.is_empty() { hid_name } else { format!("NI Device {dev_pid:04x}") });
             let slug = slugify(&model);
             found.push(DiscoveredDevice {
+                rule_device: format!("hid.{dev_pid:04x}"),
+                legacy_device: None,
                 name: model,
                 slug,
                 dev_node: format!("/dev/{name}"),
@@ -731,10 +827,18 @@ fn slugify(s: &str) -> String {
 
 /// Hot-plug background manager that polls ALSA raw MIDI and generic NI HID devices.
 pub struct GenericControllerManager {
-    event_rx: Receiver<SurfaceEvent>,
+    /// Events tagged with the CC-reading generation the reader decoded them under.
+    event_rx: Receiver<(u64, SurfaceEvent)>,
     stop_signal: Arc<AtomicBool>,
     _worker_thread: Option<JoinHandle<()>>,
     pub discovered: Arc<Mutex<Vec<DiscoveredDevice>>>,
+    /// Last discovery list read on the GUI thread; kept when the lock is busy so that never looks like an unplug.
+    pub(crate) devices: Vec<DiscoveredDevice>,
+    /// The rules file's MIDI CC readings for the reader thread, with a change counter.
+    cc_modes: Arc<Mutex<(u64, Vec<(String, CcMode)>)>>,
+    /// The GUI's copy of the current readings and generation, and the readings before the last change.
+    modes_now: (u64, Vec<(String, CcMode)>),
+    modes_before: Vec<(String, CcMode)>,
     pub active_mapping: GenericControllerMapping,
     pub active_device_slug: Option<String>,
     pub learn_mode: bool,
@@ -749,15 +853,23 @@ impl Default for GenericControllerManager {
 
 impl GenericControllerManager {
     pub fn new() -> Self {
+        Self::with_cc_modes(Vec::new())
+    }
+
+    /// Starts the reader thread already knowing the rules file's MIDI CC readings, so an encoder that is
+    /// connected at startup has its first tick decoded the authored way.
+    pub fn with_cc_modes(modes: Vec<(String, CcMode)>) -> Self {
         let (tx, rx) = channel();
         let stop_signal = Arc::new(AtomicBool::new(false));
         let discovered = Arc::new(Mutex::new(Vec::new()));
 
+        let cc_modes = Arc::new(Mutex::new((0, modes.clone())));
         let stop_clone = Arc::clone(&stop_signal);
         let disc_clone = Arc::clone(&discovered);
+        let modes_clone = Arc::clone(&cc_modes);
 
         let worker = spawn(move || {
-            run_hardware_worker(tx, stop_clone, disc_clone);
+            run_hardware_worker(tx, stop_clone, disc_clone, modes_clone);
         });
 
         Self {
@@ -765,6 +877,10 @@ impl GenericControllerManager {
             stop_signal,
             _worker_thread: Some(worker),
             discovered,
+            devices: Vec::new(),
+            cc_modes,
+            modes_now: (0, modes),
+            modes_before: Vec::new(),
             active_mapping: GenericControllerMapping::default(),
             active_device_slug: None,
             learn_mode: false,
@@ -785,10 +901,57 @@ impl GenericControllerManager {
         }
     }
 
+    /// Connected generic devices as controller-rule devices (`midi.<port>`, `hid.<pid>`, and raw-node aliases).
+    pub fn connected_device_keys(&self) -> Vec<String> {
+        self.devices.iter().flat_map(|d| std::iter::once(d.rule_device.clone()).chain(d.legacy_device.clone())).collect()
+    }
+
+    /// The raw-node form of a stable MIDI control ID (`midi.xonek2.ch1.note3` is `midi.midic1d0.ch1.note3` while
+    /// the K2 is card 1), for mappings learned or written before stable port names.
+    pub fn legacy_alias(&self, control: &str) -> Option<String> {
+        let (port, tail) = control.strip_prefix("midi.")?.split_once('.')?;
+        let device = self.devices.iter().find(|d| d.rule_device.strip_prefix("midi.") == Some(port))?;
+        Some(format!("{}.{tail}", device.legacy_device.as_ref()?))
+    }
+
+    /// Hands the rules file's MIDI CC readings to the reader thread when they change.
+    pub fn set_cc_modes(&mut self, modes: &[(String, CcMode)]) {
+        if self.modes_now.1 == modes {
+            return;
+        }
+        let generation = self.modes_now.0 + 1;
+        self.modes_before = std::mem::replace(&mut self.modes_now, (generation, modes.to_vec())).1;
+        if let Ok(mut shared) = self.cc_modes.lock() {
+            *shared = self.modes_now.clone();
+        }
+    }
+
+    /// Whether a queued event was decoded the way the rules read it now. After a Reload, a MIDI CC already queued
+    /// under a reading that changed (say offset_64 to twos_complement) is dropped so it can't drive the new rules
+    /// with a stale value; buttons and CCs whose reading didn't change pass.
+    fn decoded_currently(&self, generation: u64, ev: &SurfaceEvent) -> bool {
+        let control = match ev {
+            SurfaceEvent::Button { .. } => return true,
+            SurfaceEvent::Fader { control, .. } | SurfaceEvent::Encoder { control, .. } => control,
+        };
+        if generation == self.modes_now.0 || !retraktor_hid::controller_rules::is_midi_cc(control) {
+            return true;
+        }
+        let alias = self.legacy_alias(control);
+        let mode = |modes: &[(String, CcMode)]| modes.iter().find(|(id, _)| id == control || Some(id) == alias.as_ref()).map(|(_, m)| *m);
+        generation + 1 == self.modes_now.0 && mode(&self.modes_before) == mode(&self.modes_now.1)
+    }
+
     /// Drains queued surface events from the background thread.
     pub fn poll_events(&mut self) -> Vec<SurfaceEvent> {
+        if let Ok(devices) = self.discovered.try_lock() {
+            self.devices.clone_from(&devices);
+        }
         let mut events = Vec::new();
-        while let Ok(ev) = self.event_rx.try_recv() {
+        while let Ok((generation, ev)) = self.event_rx.try_recv() {
+            if !self.decoded_currently(generation, &ev) {
+                continue;
+            }
             // If in learn mode, catch the touched control and select/add it
             if self.learn_mode {
                 let touched_id = match &ev {
@@ -798,8 +961,10 @@ impl GenericControllerManager {
                     _ => None,
                 };
                 if let Some(cid) = touched_id {
-                    self.selected_control_id = Some(cid.clone());
-                    if !self.active_mapping.entries.iter().any(|e| e.control_id == cid) {
+                    // A control learned before stable MIDI port names is found under its raw-node ID.
+                    let learned = self.legacy_alias(&cid).filter(|alias| self.active_mapping.entries.iter().any(|e| &e.control_id == alias));
+                    self.selected_control_id = Some(learned.clone().unwrap_or_else(|| cid.clone()));
+                    if learned.is_none() && !self.active_mapping.entries.iter().any(|e| e.control_id == cid) {
                         self.active_mapping.entries.push(MappingEntry {
                             control_id: cid.clone(),
                             friendly_name: format_friendly_control_id(&cid),
@@ -823,43 +988,33 @@ impl Drop for GenericControllerManager {
 
 /// Worker loop running on a dedicated thread, rescanning every 2 seconds and reading non-blocking.
 fn run_hardware_worker(
-    tx: Sender<SurfaceEvent>,
+    tx: Sender<(u64, SurfaceEvent)>,
     stop: Arc<AtomicBool>,
     discovered_out: Arc<Mutex<Vec<DiscoveredDevice>>>,
+    cc_modes: Arc<Mutex<(u64, Vec<(String, CcMode)>)>>,
 ) {
-    let mut midi_parsers: HashMap<String, (String, MidiParserState, std::fs::File)> = HashMap::new();
+    let mut midi_parsers: MidiReaders = HashMap::new();
+    let mut applied_modes: Option<u64> = None;
     let mut hid_decoders: HashMap<String, (u16, Vec<u8>, HidAnalogTracker, std::fs::File)> = HashMap::new();
-    let mut last_scan = std::time::Instant::now();
+    let mut last_scan: Option<std::time::Instant> = None;
 
     while !stop.load(Ordering::Relaxed) {
-        // 1. Rescan device nodes every 2 seconds
-        if last_scan.elapsed() >= Duration::from_secs(2) || (midi_parsers.is_empty() && hid_decoders.is_empty()) {
-            last_scan = std::time::Instant::now();
+        // 1. Scan at once, then every 2 seconds, even with nothing open, so a busy node isn't reopened every 5 ms.
+        if last_scan.map_or(true, |at| at.elapsed() >= Duration::from_secs(2)) {
+            last_scan = Some(std::time::Instant::now());
 
-            let midi_devs = scan_linux_alsa_midi_devices();
+            let mut midi_devs = scan_linux_alsa_midi_devices();
             let hid_devs = scan_linux_generic_ni_hid_devices();
 
-            let mut all_devs = midi_devs.clone();
+            if reconcile_midi_readers(&mut midi_parsers, &mut midi_devs) {
+                applied_modes = None;
+            }
+
+            let mut all_devs = midi_devs;
             all_devs.extend(hid_devs.clone());
 
             if let Ok(mut lock) = discovered_out.lock() {
                 *lock = all_devs;
-            }
-
-            // Open new MIDI devices non-blocking
-            for dev in midi_devs {
-                if !midi_parsers.contains_key(&dev.dev_node) {
-                    let mut opts = OpenOptions::new();
-                    opts.read(true);
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::OpenOptionsExt;
-                        opts.custom_flags(0x0800); // O_NONBLOCK
-                    }
-                    if let Ok(file) = opts.open(&dev.dev_node) {
-                        midi_parsers.insert(dev.dev_node, (dev.slug, MidiParserState::new(), file));
-                    }
-                }
             }
 
             // Open new Generic NI HID devices read-only non-blocking
@@ -882,9 +1037,19 @@ fn run_hardware_worker(
             }
         }
 
+        // CC readings from the rules file, before any read, so a CC is read the authored way from its first message.
+        if let Ok(shared) = cc_modes.lock() {
+            if applied_modes != Some(shared.0) {
+                for (state, _, port, alias) in midi_parsers.values_mut() {
+                    state.set_cc_modes(port, alias.as_deref(), &shared.1);
+                }
+                applied_modes = Some(shared.0);
+            }
+        }
+
         // 2. Poll open MIDI devices
         let mut midi_dead = Vec::new();
-        for (node, (slug, state, file)) in midi_parsers.iter_mut() {
+        for (node, (state, file, port, _)) in midi_parsers.iter_mut() {
             let mut buf = [0u8; 256];
             match file.read(&mut buf) {
                 Ok(0) => {
@@ -892,21 +1057,21 @@ fn run_hardware_worker(
                     midi_dead.push(node.clone());
                 }
                 Ok(n) => {
-                    let evs = parse_midi_bytes(state, slug, &buf[..n]);
+                    let evs = parse_midi_bytes(state, port, &buf[..n]);
                     for ev in evs {
-                        let _ = tx.send(ev);
+                        let _ = tx.send((applied_modes.unwrap_or(0), ev));
                     }
                 }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(ref e) if is_idle_read(e) => {
                     // shortcut: pairs must arrive within one poll interval or use a device-specific layout.
-                    if let Some(ev) = state.flush_msb(slug) {
-                        let _ = tx.send(ev);
+                    if e.kind() == std::io::ErrorKind::WouldBlock {
+                        if let Some(ev) = state.flush_msb(port) {
+                            let _ = tx.send((applied_modes.unwrap_or(0), ev));
+                        }
                     }
                 }
-                Err(ref e) if e.kind() == std::io::ErrorKind::BrokenPipe || e.kind() == std::io::ErrorKind::NotConnected => {
-                    midi_dead.push(node.clone());
-                }
-                Err(_) => {}
+                // ENODEV/EIO after an unplug never clear; the next scan reopens the node with a fresh parser.
+                Err(_) => midi_dead.push(node.clone()),
             }
         }
         for node in midi_dead {
@@ -926,16 +1091,13 @@ fn run_hardware_worker(
                     if !prev.is_empty() {
                         let evs = diff_hid_reports(*pid, prev, report, tracker);
                         for ev in evs {
-                            let _ = tx.send(ev);
+                            let _ = tx.send((applied_modes.unwrap_or(0), ev));
                         }
                     }
                     *prev = report.to_vec();
                 }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(ref e) if e.kind() == std::io::ErrorKind::BrokenPipe || e.kind() == std::io::ErrorKind::NotConnected => {
-                    hid_dead.push(node.clone());
-                }
-                Err(_) => {}
+                Err(ref e) if is_idle_read(e) => {}
+                Err(_) => hid_dead.push(node.clone()),
             }
         }
         for node in hid_dead {
@@ -945,6 +1107,68 @@ fn run_hardware_worker(
         // Sleep 5ms to avoid spinning
         std::thread::sleep(Duration::from_millis(5));
     }
+}
+
+/// Per open MIDI node path: parser, file, port (`xonek2`) and raw-node alias port (`midic1d0`).
+type MidiReaders = HashMap<String, (MidiParserState, std::fs::File, String, Option<String>)>;
+
+/// A non-blocking read that found nothing yet (an idle controller) or was interrupted; any other error is final.
+fn is_idle_read(e: &std::io::Error) -> bool {
+    matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted)
+}
+
+/// Brings the open MIDI readers in line with a scan: closes each reader whose path no longer names the node it
+/// opened (removed, or replaced at the same path by a replug while the old fd still just reads WouldBlock), opens
+/// the found nodes without a reader with a fresh parser, and marks each found node `connected` only if it has one.
+/// An open reader whose port ID or alias the scan worked out differently (another device with the same card ID came
+/// or went) takes the new names, as the device list and the rules do; only a coarse CC it held under the old name is
+/// dropped, while a half-read message and learned encoder readings carry on.
+/// Returns whether it opened or renamed any, so the rules' CC readings are applied to those parsers.
+fn reconcile_midi_readers(readers: &mut MidiReaders, found: &mut [DiscoveredDevice]) -> bool {
+    readers.retain(|node, (_, file, _, _)| still_names_open_node(node, file));
+    let mut changed = false;
+    let port_of = |id: &str| id.strip_prefix("midi.").unwrap_or(id).to_string();
+    for dev in found.iter_mut() {
+        let (port, alias) = (port_of(&dev.rule_device), dev.legacy_device.as_deref().map(port_of));
+        let flx4 = dev.slug == "ddj_flx4";
+        if let Some((state, _, open_port, open_alias)) = readers.get_mut(&dev.dev_node) {
+            if *open_port != port || *open_alias != alias {
+                (*open_port, *open_alias) = (port, alias);
+                (state.pending_msb, state.flx4) = (None, flx4);
+                changed = true;
+            }
+        } else {
+            let mut opts = OpenOptions::new();
+            opts.read(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.custom_flags(0x0800); // O_NONBLOCK
+            }
+            if let Ok(file) = opts.open(&dev.dev_node) {
+                let state = MidiParserState { flx4, ..MidiParserState::new() };
+                readers.insert(dev.dev_node.clone(), (state, file, port, alias));
+                changed = true;
+            }
+        }
+        dev.connected = readers.contains_key(&dev.dev_node);
+    }
+    changed
+}
+
+/// Whether `path` is still the node `file` was opened from: same filesystem device and inode.
+#[cfg(unix)]
+fn still_names_open_node(path: &str, file: &std::fs::File) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (file.metadata(), std::fs::metadata(path)) {
+        (Ok(open), Ok(live)) => (open.dev(), open.ino()) == (live.dev(), live.ino()),
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn still_names_open_node(path: &str, _file: &std::fs::File) -> bool {
+    std::path::Path::new(path).exists()
 }
 
 // ============================================================================
@@ -1346,6 +1570,257 @@ pub fn show_other_controllers_page(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CCs named by the rules file are read exactly from their first message: an absolute ramp through both ends
+    /// and the centre stays absolute, a relative encoder gives ticks at once, and a 14-bit pair still combines.
+    /// Other CCs, and other ports' declarations, keep the old automatic guess.
+    #[test]
+    fn rule_declared_cc_modes_replace_the_guess_from_the_first_message() {
+        let fader = |v: f64| SurfaceEvent::Fader { control: "midi.xonek2.ch1.cc70".into(), value: v };
+        let mut st = MidiParserState::new();
+        st.set_cc_modes(
+            "xonek2",
+            Some("midic1d0"),
+            &[
+                ("midi.xonek2.ch1.cc70".into(), CcMode::Absolute),
+                ("midi.midic1d0.ch1.cc1".into(), CcMode::Absolute),
+                ("midi.xonek2.ch2.cc16".into(), CcMode::SignBit),
+                ("midi.other.ch1.cc80".into(), CcMode::Offset64),
+            ],
+        );
+        let ramp = [0u8, 1, 2, 3, 62, 63, 64, 65, 66, 125, 126, 127, 0];
+        let mut bytes = vec![0xB0];
+        for v in ramp {
+            bytes.extend([70, v]);
+        }
+        let evs = parse_midi_bytes(&mut st, "xonek2", &bytes);
+        assert_eq!(evs, ramp.iter().map(|&v| fader(v as f64 / 127.0)).collect::<Vec<_>>());
+
+        let evs = parse_midi_bytes(&mut st, "xonek2", &[0xB1, 16, 1, 16, 65, 16, 67]);
+        let ticks: Vec<i64> = evs.iter().map(|e| match e {
+            SurfaceEvent::Encoder { delta, .. } => *delta,
+            other => panic!("expected an encoder tick, got {other:?}"),
+        }).collect();
+        assert_eq!(ticks, vec![1, -1, -3]);
+
+        // CC 1 is declared through the raw-node alias; its adjacent 14-bit fine half (CC 33) combines into one event.
+        let evs = parse_midi_bytes(&mut st, "xonek2", &[0xB0, 1, 64, 33, 0]);
+        assert_eq!(evs.len(), 1, "{evs:?}");
+        assert!(matches!(&evs[0], SurfaceEvent::Fader { control, value } if control == "midi.xonek2.ch1.cc1" && (*value - 8192.0 / 16383.0).abs() < 1e-9));
+
+        // Undeclared here (CC 80 belongs to another port): the guess still reads a 65/63 encoder for the simple mappings.
+        let evs = parse_midi_bytes(&mut st, "xonek2", &[0xB0, 80, 65, 80, 63]);
+        assert!(matches!(evs[1], SurfaceEvent::Encoder { delta: -1, .. }), "{evs:?}");
+
+        // Two knobs 32 CCs apart, both named: CC 48 is a control of its own, never CC 16's fine half.
+        st.set_cc_modes("xonek2", None, &[("midi.xonek2.ch1.cc16".into(), CcMode::Absolute), ("midi.xonek2.ch1.cc48".into(), CcMode::Absolute)]);
+        let knob = |cc: u8, v: u8| SurfaceEvent::Fader { control: format!("midi.xonek2.ch1.cc{cc}"), value: f64::from(v) / 127.0 };
+        assert_eq!(parse_midi_bytes(&mut st, "xonek2", &[0xB0, 16, 64, 48, 32]), vec![knob(16, 64), knob(48, 32)]);
+
+        // A CC button: 127 presses, a repeat stays pressed, 0 releases.
+        st.set_cc_modes("xonek2", None, &[("midi.xonek2.ch1.cc8".into(), CcMode::Button)]);
+        let press = |pressed| SurfaceEvent::Button { control: "midi.xonek2.ch1.cc8".into(), pressed };
+        assert_eq!(parse_midi_bytes(&mut st, "xonek2", &[0xB0, 8, 127, 8, 127, 8, 0]), vec![press(true), press(true), press(false)]);
+    }
+
+    /// A coarse CC held for its fine half when the rules are reloaded: if the reload changes how that CC is read (a
+    /// fader becomes a button), the held fader value is dropped, so neither the next fine byte nor the idle flush
+    /// turns it into a press; a held coarse CC whose reading didn't change still pairs, and still flushes alone.
+    #[test]
+    fn a_reload_drops_a_held_coarse_cc_only_when_its_reading_changes() {
+        let abs = |cc: u8| (format!("midi.k2.ch1.cc{cc}"), CcMode::Absolute);
+        let mut st = MidiParserState::new();
+        st.set_cc_modes("k2", None, &[abs(4), abs(1)]);
+        assert!(parse_midi_bytes(&mut st, "k2", &[0xB0, 4, 100]).is_empty(), "CC 4 waits for its fine half");
+        st.set_cc_modes("k2", None, &[("midi.k2.ch1.cc4".into(), CcMode::Button), abs(1)]);
+        assert_eq!(st.flush_msb("k2"), None, "a pre-reload fader value became an event under the new reading");
+        let after = parse_midi_bytes(&mut st, "k2", &[36, 5]);
+        assert_eq!(after, vec![SurfaceEvent::Fader { control: "midi.k2.ch1.cc36".into(), value: 5.0 / 127.0 }]);
+
+        // Unchanged CC 1 across a reload that changes only CC 4: the pair still combines into one event.
+        assert!(parse_midi_bytes(&mut st, "k2", &[1, 64]).is_empty());
+        st.set_cc_modes("k2", None, &[("midi.k2.ch1.cc4".into(), CcMode::Offset64), abs(1)]);
+        assert_eq!(parse_midi_bytes(&mut st, "k2", &[33, 0]), vec![SurfaceEvent::Fader { control: "midi.k2.ch1.cc1".into(), value: 8192.0 / 16383.0 }]);
+        // And alone on the idle that follows an unrelated reload.
+        assert!(parse_midi_bytes(&mut st, "k2", &[1, 10]).is_empty());
+        st.set_cc_modes("k2", None, &[("midi.k2.ch1.cc4".into(), CcMode::SignBit), abs(1)]);
+        assert_eq!(st.flush_msb("k2"), Some(SurfaceEvent::Fader { control: "midi.k2.ch1.cc1".into(), value: 10.0 / 127.0 }));
+    }
+
+    /// An open FLX4 reader through a second FLX4 arriving and leaving: while both cards normalize to `ddj_flx4` each
+    /// reader takes its raw-node ID, as the device list does, and back to `ddj_flx4` once alone. The rename drops a
+    /// coarse CC held under the old name but keeps a half-read message; the FLX4 table still reads its first jog
+    /// tick under the raw ID, and an unrelated device's raw ID doesn't get it. A rescan with no change touches nothing.
+    #[cfg(unix)]
+    #[test]
+    fn open_readers_follow_port_renames_and_keep_the_flx4_table() {
+        let dir = std::env::temp_dir().join(format!("retraktor-midi-rename-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let node = |n: &str| {
+            let path = dir.join(n);
+            std::fs::write(&path, b"").unwrap();
+            path.to_str().unwrap().to_string()
+        };
+        let (a, b, k) = (node("midiC1D0"), node("midiC2D0"), node("midiC3D0"));
+        // As the scan builds the list: card names to slugs, then the port IDs worked out over the whole set.
+        let scan = |cards: &[(&str, &str, &str)]| -> Vec<DiscoveredDevice> {
+            let ids = midi_port_ids(&cards.iter().map(|(file, card, _)| (file.to_string(), Some(card.to_string()))).collect::<Vec<_>>());
+            cards
+                .iter()
+                .zip(ids)
+                .map(|((_, card, path), (rule_device, legacy_device))| DiscoveredDevice {
+                    name: card.to_string(),
+                    slug: midi_device_slug(card),
+                    rule_device,
+                    legacy_device,
+                    dev_node: path.to_string(),
+                    protocol: DeviceProtocol::Midi,
+                    connected: false,
+                    pid: 0,
+                })
+                .collect()
+        };
+        let one = [("midiC1D0", "DDJFLX4", a.as_str()), ("midiC3D0", "XONEK2", k.as_str())];
+        let two = [("midiC1D0", "DDJFLX4", a.as_str()), ("midiC2D0", "DDJ-FLX4", b.as_str()), ("midiC3D0", "XONEK2", k.as_str())];
+        let names = |readers: &MidiReaders, path: &str| (readers[path].2.clone(), readers[path].3.clone());
+        let mut readers = MidiReaders::new();
+
+        let mut found = scan(&one);
+        assert!(reconcile_midi_readers(&mut readers, &mut found));
+        assert_eq!(names(&readers, &a), ("ddj_flx4".into(), Some("midic1d0".into())));
+        assert!(!reconcile_midi_readers(&mut readers, &mut scan(&one)), "an unchanged rescan renamed or reopened a reader");
+
+        // A coarse CC held and half of the next message read when the second FLX4 arrives.
+        let st = &mut readers.get_mut(&a).unwrap().0;
+        assert!(parse_midi_bytes(st, "ddj_flx4", &[0xB0, 3, 90, 0xB1]).is_empty());
+        let mut found = scan(&two);
+        assert!(reconcile_midi_readers(&mut readers, &mut found), "the rename wasn't reported, so the rules' readings wouldn't be applied again");
+        assert_eq!(names(&readers, &a), ("midic1d0".into(), None));
+        assert_eq!(found[0].rule_device, "midi.midic1d0", "the device list and the reader disagree");
+        assert_eq!(names(&readers, &b), ("midic2d0".into(), None));
+        let st = &mut readers.get_mut(&a).unwrap().0;
+        assert_eq!(st.flush_msb("midic1d0"), None, "a coarse CC held under ddj_flx4 came out under the raw ID");
+        // The rest of the half-read message (channel 2 jog, offset binary +1) arrives: read by the FLX4 table at once.
+        assert_eq!(parse_midi_bytes(st, "midic1d0", &[33, 65]), vec![SurfaceEvent::Encoder { control: "midi.midic1d0.ch2.cc33".into(), delta: 1 }]);
+        // The K2 on its raw-like ID is no FLX4: the same bytes are a fader there.
+        let k2 = &mut readers.get_mut(&k).unwrap().0;
+        assert!(matches!(&parse_midi_bytes(k2, "xonek2", &[0xB1, 33, 65])[..], [SurfaceEvent::Fader { .. }]));
+
+        // The second FLX4 leaves: the first takes ddj_flx4 and its alias back.
+        std::fs::remove_file(&b).unwrap();
+        let mut found = scan(&one);
+        assert!(reconcile_midi_readers(&mut readers, &mut found));
+        assert_eq!(names(&readers, &a), ("ddj_flx4".into(), Some("midic1d0".into())));
+        assert!(!readers.contains_key(&b));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The reader starts with the rules' CC readings, and after a Reload changes an encoder's encoding, a tick
+    /// queued under the old one is dropped while buttons, unchanged CCs and new ticks pass.
+    #[test]
+    fn startup_cc_readings_reach_the_reader_and_stale_reload_ticks_are_dropped() {
+        let (cc0, cc4) = ("midi.xonek2.ch15.cc0", "midi.xonek2.ch15.cc4");
+        let first = vec![(cc0.to_string(), CcMode::Offset64), (cc4.to_string(), CcMode::Absolute)];
+        let mut mgr = GenericControllerManager::with_cc_modes(first.clone());
+        assert_eq!(mgr.cc_modes.lock().unwrap().1, first, "the reader thread must start with the rules' CC readings");
+        let tick = SurfaceEvent::Encoder { control: cc0.into(), delta: 1 };
+        let fader = SurfaceEvent::Fader { control: cc4.into(), value: 0.5 };
+        let press = SurfaceEvent::Button { control: "midi.xonek2.ch15.note36".into(), pressed: false };
+        assert!(mgr.decoded_currently(0, &tick));
+
+        mgr.set_cc_modes(&[(cc0.to_string(), CcMode::TwosComplement), (cc4.to_string(), CcMode::Absolute)]);
+        assert_eq!(mgr.cc_modes.lock().unwrap().0, 1);
+        assert!(!mgr.decoded_currently(0, &tick), "a tick decoded as offset_64 drove the twos_complement rules");
+        assert!(mgr.decoded_currently(0, &fader), "an unchanged CC was dropped");
+        assert!(mgr.decoded_currently(0, &press), "a button release was dropped");
+        assert!(mgr.decoded_currently(1, &tick), "a tick decoded the new way was dropped");
+        mgr.set_cc_modes(&[(cc0.to_string(), CcMode::TwosComplement), (cc4.to_string(), CcMode::Absolute)]);
+        assert_eq!(mgr.cc_modes.lock().unwrap().0, 1, "unchanged readings must not start a new generation");
+    }
+
+    #[test]
+    fn midi_port_ids_follow_the_card_id_and_port_with_raw_node_aliases() {
+        let card = |node: &str, id: Option<&str>| (node.to_string(), id.map(str::to_string));
+        let ids = midi_port_ids(&[
+            card("midiC1D0", Some("XONEK2")),
+            card("midiC1D1", Some("XONEK2")),
+            card("midiC3D0", None),
+            card("midiC4D0", Some("Twin")),
+            card("midiC5D0", Some("TWIN")),
+        ]);
+        let pair = |id: &str, alias: Option<&str>| (id.to_string(), alias.map(str::to_string));
+        assert_eq!(ids[0], pair("midi.xonek2", Some("midi.midic1d0")));
+        assert_eq!(ids[1], pair("midi.xonek2_d1", Some("midi.midic1d1")), "a second port on the same card is told apart");
+        assert_eq!(ids[2], pair("midi.midic3d0", None), "no card id: raw-node ID");
+        assert_eq!(ids[3], pair("midi.midic4d0", None), "colliding card ids fall back to raw-node IDs");
+        assert_eq!(ids[4], pair("midi.midic5d0", None));
+        assert_eq!(midi_port_ids(&[card("midiC2D0", Some("XONEK2"))])[0], pair("midi.xonek2", Some("midi.midic2d0")), "renumbered card, same ID");
+    }
+
+    /// A K2 replug can recreate `/dev/snd/midiC1D0` at the same path while the old fd only reads WouldBlock, so
+    /// the scan compares inodes: a replaced node is reopened with a fresh parser, a removed one is closed and shown
+    /// disconnected but stays listed, and an unchanged node keeps its reader. Plain files stand in for the nodes.
+    #[cfg(unix)]
+    #[test]
+    fn scan_reopens_a_midi_node_replaced_at_the_same_path_and_drops_a_removed_one() {
+        let dir = std::env::temp_dir().join(format!("retraktor-midi-reconnect-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("midiC1D0");
+        let node = path.to_str().unwrap().to_string();
+        std::fs::write(&path, b"").unwrap();
+        let mut found = vec![DiscoveredDevice {
+            name: "XONEK2".into(),
+            slug: "xonek2".into(),
+            rule_device: "midi.xonek2".into(),
+            legacy_device: Some("midi.midic1d0".into()),
+            dev_node: node.clone(),
+            protocol: DeviceProtocol::Midi,
+            connected: false,
+            pid: 0,
+        }];
+        let mut readers = MidiReaders::new();
+
+        assert!(reconcile_midi_readers(&mut readers, &mut found), "a found node is opened");
+        assert!(found[0].connected);
+        assert_eq!((readers[&node].2.as_str(), readers[&node].3.as_deref()), ("xonek2", Some("midic1d0")));
+        // Half a CC message is pending when the next scan runs.
+        let _ = parse_midi_bytes(&mut readers.get_mut(&node).unwrap().0, "xonek2", &[0xB0]);
+
+        assert!(!reconcile_midi_readers(&mut readers, &mut found), "an unchanged node must keep its reader");
+        assert_eq!(readers[&node].0.running_status, Some(0xB0), "an unchanged node's parser was reset");
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"").unwrap();
+        assert!(reconcile_midi_readers(&mut readers, &mut found), "a node replaced at the same path must be reopened");
+        assert!(found[0].connected);
+        assert_eq!(readers[&node].0.running_status, None, "the reopened node kept the old parser");
+
+        // Removed after the directory listing: the stale reader closes and the still-listed port reads disconnected.
+        std::fs::remove_file(&path).unwrap();
+        assert!(!reconcile_midi_readers(&mut readers, &mut found));
+        assert!(readers.is_empty(), "a removed node kept its reader");
+        assert!(!found[0].connected, "a node that can't be opened must not show connected");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An idle controller's non-blocking read (EAGAIN) or an interrupted one keeps the reader; the ENODEV or EIO a
+    /// read gets after an unplug closes it, so the next scan can reopen the node.
+    #[test]
+    fn idle_reads_keep_the_reader_and_unplug_errors_close_it() {
+        use std::io::{Error, ErrorKind};
+        assert!(is_idle_read(&Error::from(ErrorKind::WouldBlock)));
+        assert!(is_idle_read(&Error::from(ErrorKind::Interrupted)));
+        #[cfg(target_os = "linux")]
+        {
+            assert!(is_idle_read(&Error::from_raw_os_error(11)), "EAGAIN");
+            assert!(!is_idle_read(&Error::from_raw_os_error(19)), "ENODEV");
+            assert!(!is_idle_read(&Error::from_raw_os_error(5)), "EIO");
+        }
+        assert!(!is_idle_read(&Error::from(ErrorKind::BrokenPipe)));
+    }
 
     #[test]
     fn test_midi_parser_running_status() {
