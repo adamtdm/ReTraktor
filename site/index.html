@@ -1,0 +1,569 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ReTraktor — Native Linux DJ Workstation in Safe Rust</title>
+  <meta name="description" content="ReTraktor pairs clean-room Traktor architecture (PipeWire/ALSA, NHL2 USB HID, .nml/.tsi, 4-stem mixing) with a companion dot-matrix workstation in 100% safe Rust.">
+  <link rel="icon" type="image/svg+xml" href="assets/retraktor.svg">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Archivo:wght@600;700;800&family=Golos+Text:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="site-nav">
+    <div class="wrap nav-inner">
+      <a class="brand" href="#top">
+        <img class="brand-mark" src="assets/retraktor.svg" alt="" width="28" height="28">
+        <span>ReTraktor</span>
+        <span class="brand-ver">v0.2.0</span>
+      </a>
+      <nav aria-label="Primary">
+        <ul class="nav-links">
+          <li><a href="#workstation">Workstation</a></li>
+          <li><a href="#layouts">Layouts</a></li>
+          <li><a href="#stems-dsp">Stems &amp; DSP</a></li>
+          <li><a href="#hardware">Hardware</a></li>
+          <li><a href="#library">Library &amp; AI</a></li>
+          <li><a href="#install">Install</a></li>
+        </ul>
+      </nav>
+      <div class="nav-actions">
+        <a class="btn btn-sm" href="https://github.com/adamtdm/ReTraktor" target="_blank" rel="noopener noreferrer">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true"><path d="M9 19c-4.3 1.4-4.3-2.5-6-3m12 5v-3.5c0-1 .1-1.4-.5-2 2.8-.3 5.5-1.4 5.5-6a4.6 4.6 0 0 0-1.3-3.2 4.2 4.2 0 0 0-.1-3.2s-1.1-.3-3.5 1.3a12.3 12.3 0 0 0-6.2 0C6.5 2.8 5.4 3.1 5.4 3.1a4.2 4.2 0 0 0-.1 3.2A4.6 4.6 0 0 0 4 9.5c0 4.6 2.7 5.7 5.5 6-.6.6-.6 1.2-.5 2V21"/></svg>
+          GitHub
+        </a>
+        <a class="btn btn-primary btn-sm" href="retraktor_latest_amd64.deb" download>
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true"><path d="M12 3v12m0 0l-4-4m4 4l4-4M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>
+          Download .deb
+        </a>
+      </div>
+    </div>
+  </header>
+
+  <main id="top">
+    <section class="hero" id="workstation">
+      <div class="wrap hero-grid">
+        <div class="hero-copy">
+          <h1>Native Linux DJ workstation. Built for the booth.</h1>
+          <p class="hero-lead">
+            A clean-room Traktor architecture written in 100% safe Rust. Direct PipeWire and ALSA audio, plug-and-play Native Instruments USB HID hardware, 4-stem mixing, and five companion layouts without Wine or subscriptions.
+          </p>
+
+          <div class="hero-cta-row">
+            <a class="btn btn-primary" href="retraktor_latest_amd64.deb" download>
+              <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true"><path d="M12 3v12m0 0l-4-4m4 4l4-4M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>
+              Download .deb (x86_64 · 8.5 MB)
+            </a>
+            <a class="btn" href="https://github.com/adamtdm/ReTraktor" target="_blank" rel="noopener noreferrer">
+              <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true"><path d="M9 19c-4.3 1.4-4.3-2.5-6-3m12 5v-3.5c0-1 .1-1.4-.5-2 2.8-.3 5.5-1.4 5.5-6a4.6 4.6 0 0 0-1.3-3.2 4.2 4.2 0 0 0-.1-3.2s-1.1-.3-3.5 1.3a12.3 12.3 0 0 0-6.2 0C6.5 2.8 5.4 3.1 5.4 3.1a4.2 4.2 0 0 0-.1 3.2A4.6 4.6 0 0 0 4 9.5c0 4.6 2.7 5.7 5.5 6-.6.6-.6 1.2-.5 2V21"/></svg>
+              github.com/adamtdm/ReTraktor
+            </a>
+          </div>
+
+          <div class="install-box">
+            <div class="install-box-head">
+              <span>Quick Linux Install (Ubuntu / Pop!_OS / Debian / Mint)</span>
+              <span>MIT / Apache-2.0</span>
+            </div>
+            <div class="cmd-row">
+              <code><span class="cmd-prefix">$</span>curl -fsSL https://retraktordj.vercel.app/install.sh | bash</code>
+              <button class="btn btn-sm" type="button" data-copy="curl -fsSL https://retraktordj.vercel.app/install.sh | bash">Copy</button>
+            </div>
+            <div class="cmd-row">
+              <code><span class="cmd-prefix">$</span>git clone https://github.com/adamtdm/ReTraktor.git &amp;&amp; cd ReTraktor &amp;&amp; ./install.sh</code>
+              <button class="btn btn-sm" type="button" data-copy="git clone https://github.com/adamtdm/ReTraktor.git && cd ReTraktor && ./install.sh">Copy</button>
+            </div>
+          </div>
+
+          <div class="spec-line">
+            <span><i class="led led-a" aria-hidden="true"></i> PipeWire 0.3.53+ / rtkit / ALSA</span>
+            <span><i class="led" aria-hidden="true"></i> 11 NI HID Models + MIDI Learn</span>
+            <span><i class="led led-b" aria-hidden="true"></i> ~103x real-time 4-deck DSP</span>
+          </div>
+        </div>
+
+        <div class="screen-bay" aria-label="Interactive ReTraktor screenshot viewer">
+          <div class="bay-bar">
+            <div class="bay-tabs" role="tablist" aria-label="Application screens">
+              <button class="bay-tab" role="tab" aria-selected="true" data-shot="mix">F1 Mix</button>
+              <button class="bay-tab" role="tab" aria-selected="false" data-shot="stems">Stems</button>
+              <button class="bay-tab" role="tab" aria-selected="false" data-shot="fourdeck">F2 4-Deck</button>
+              <button class="bay-tab" role="tab" aria-selected="false" data-shot="browser">F3 Browser</button>
+              <button class="bay-tab" role="tab" aria-selected="false" data-shot="timeline">F4 Timeline</button>
+              <button class="bay-tab" role="tab" aria-selected="false" data-shot="set">F5 Set</button>
+              <button class="bay-tab" role="tab" aria-selected="false" data-shot="mx2">MX2 Map</button>
+              <button class="bay-tab" role="tab" aria-selected="false" data-shot="next">Pattern &amp; Next</button>
+              <button class="bay-tab" role="tab" aria-selected="false" data-shot="themes">Themes</button>
+            </div>
+            <button class="btn btn-sm" type="button" id="bay-expand">Inspect 1440x900</button>
+          </div>
+          <div class="bay-frame">
+            <img id="bay-img" src="shots/mix.webp" width="1440" height="900" alt="ReTraktor Mix workspace showing stacked Deck A and Deck B waveforms, dot-matrix center mixer, Beat Jump, hotcue pads, and collection browser">
+          </div>
+          <div class="bay-caption">
+            <div>
+              <strong id="bay-key">F1 · MIX</strong>
+              <span id="bay-desc">Stacked Deck A &amp; B waveforms, symmetric dot-matrix EQ/stem mixer, Beat Jump (4–32 beats), 8 hotcue pads, and live collection browser.</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <div class="dot-rule" aria-hidden="true"></div>
+
+    <section class="section" id="layouts">
+      <div class="wrap">
+        <div class="section-head">
+          <h2>Five workspaces built around hardware hands</h2>
+          <p>The hardware handles the tactile performance. The companion screen focuses on beat phase, dot-matrix meters, transition curves, and harmonic digging—readable at arm's length with full keyboard navigation.</p>
+        </div>
+
+        <div class="layouts-shell">
+          <div class="layout-list" role="list">
+            <button class="layout-item" type="button" aria-current="true" data-layout="mix">
+              <span class="layout-key">F1</span>
+              <div>
+                <h3>Mix</h3>
+                <p>Stacked Deck A &amp; B parallel waveforms, per-deck FX strips, dot-matrix 2-channel mixer, crossfader ribbon, Beat Jump (4–32 beats), and compact library below.</p>
+              </div>
+            </button>
+            <button class="layout-item" type="button" aria-current="false" data-layout="fourdeck">
+              <span class="layout-key">F2</span>
+              <div>
+                <h3>4-Deck (A / B / C / D)</h3>
+                <p>All four independent decks simultaneously with a 4-channel dot-matrix mixer, per-channel fader brackets, headphone CUE switches, and deck-level stem toggles.</p>
+              </div>
+            </button>
+            <button class="layout-item" type="button" aria-current="false" data-layout="browser">
+              <span class="layout-key">F3</span>
+              <div>
+                <h3>Browser &amp; Headphone Preview</h3>
+                <p>Mini deck strips above a virtualized 20,000+ track table. Click any row waveform to audition on headphones alone without touching the main mix or recording.</p>
+              </div>
+            </button>
+            <button class="layout-item" type="button" aria-current="false" data-layout="timeline">
+              <span class="layout-key">F4</span>
+              <div>
+                <h3>Timeline Transition Studio</h3>
+                <p>DJ.Studio-style 8, 16, or 32-bar overlap editor with one-click Smooth Crossfade, Instant Bass-Swap, and Vocal Stem Bridge curves plus live Sync + Play Both auditioning.</p>
+              </div>
+            </button>
+            <button class="layout-item" type="button" aria-current="false" data-layout="set">
+              <span class="layout-key">F5</span>
+              <div>
+                <h3>Set Builder (Build → Perform → Record)</h3>
+                <p>Sequence sets against a dot-matrix energy, BPM, and Open Key arc with key-clash warnings, greedy flow reordering, Next Up deck loading (Shift+N), and timestamped WAV + .cue capture.</p>
+              </div>
+            </button>
+          </div>
+
+          <div class="layout-stage">
+            <img id="layout-img" src="shots/mix.webp" width="1440" height="900" alt="Active ReTraktor layout capture">
+            <div class="layout-stage-meta">
+              <div>
+                <h3 id="layout-title">F1 — Mix Workspace</h3>
+                <p id="layout-meta">Shows Deck A &amp; B bar numbers, 4-beat sweep bar counter, phase alignment meter, hotcue banks, and instant collection loading.</p>
+              </div>
+              <button class="btn btn-sm" type="button" id="layout-zoom">Full View</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="stems-dsp">
+      <div class="wrap">
+        <div class="section-head">
+          <h2>4-Stem isolation, Neural Mix™ EQ swap, and lock-free DSP</h2>
+          <p>Every loaded track splits into Drums, Bass, Other, and Vocals with zero latency through Linkwitz-Riley crossovers, or loads bleed-free Meta Demucs FLAC caches automatically. Try the live signal behavior below.</p>
+        </div>
+
+        <div class="lab-shell" aria-label="Interactive Stems and Neural Mix simulator">
+          <div class="lab-toolbar">
+            <div class="segmented" role="group" aria-label="EQ Mode">
+              <button type="button" id="mode-classic" aria-pressed="true">EQ: CLASSIC</button>
+              <button type="button" id="mode-neural" aria-pressed="false">EQ: STEMS (NEURAL)</button>
+            </div>
+
+            <div class="lab-select-group">
+              <label for="eq-model-select">EQ Curve
+                <select id="eq-model-select">
+                  <option value="Classic 24dB/oct">Classic (24 dB/oct Isolator)</option>
+                  <option value="Nuo 3-Band (+10 dB)">Nuo 3-Band (+10 dB)</option>
+                  <option value="Xone:92 4-Band (+6 dB)">Xone:92 4-Band (+6 dB)</option>
+                  <option value="Classic 3-Band">Classic 3-Band</option>
+                </select>
+              </label>
+
+              <label for="mixer-fx-select">Channel Mixer FX
+                <select id="mixer-fx-select">
+                  <option value="Filter">01 · Filter</option>
+                  <option value="Reverb">02 · Reverb</option>
+                  <option value="Dual Delay">03 · Dual Delay</option>
+                  <option value="Noise Sweep">04 · Noise Sweep</option>
+                  <option value="Time Gater">05 · Time Gater</option>
+                  <option value="Flanger">06 · Flanger</option>
+                  <option value="Barber Pole Phaser">07 · Barber Pole Phaser</option>
+                  <option value="Dotted Eighth Delay">08 · Dotted Eighth Delay</option>
+                  <option value="Bit Crush">09 · Bit Crush</option>
+                </select>
+              </label>
+            </div>
+          </div>
+
+          <div class="mixer-console">
+            <div class="deck-strip deck-strip-a">
+              <div class="deck-head">
+                <span class="deck-badge deck-badge-a">DECK A · LIVE SPLIT</span>
+                <span class="mono" style="font-size:12px;color:var(--text-secondary)">124.00 BPM · 8m</span>
+              </div>
+              <div class="stem-buttons" id="stems-a">
+                <button class="stem-btn" type="button" data-deck="a" data-stem="0" aria-pressed="true">DRUMS</button>
+                <button class="stem-btn" type="button" data-deck="a" data-stem="1" aria-pressed="true">BASS</button>
+                <button class="stem-btn" type="button" data-deck="a" data-stem="2" aria-pressed="true">OTHER</button>
+                <button class="stem-btn" type="button" data-deck="a" data-stem="3" aria-pressed="true">VOCALS</button>
+              </div>
+              <div class="iso-row">
+                <button class="iso-btn" type="button" data-iso="a:acapella" aria-pressed="false">ACAPELLA</button>
+                <button class="iso-btn" type="button" data-iso="a:inst" aria-pressed="false">INST</button>
+                <button class="iso-btn" type="button" data-iso="a:reset" aria-pressed="false">ALL ON</button>
+              </div>
+            </div>
+
+            <div class="dot-matrix-mixer">
+              <div class="matrix-labels">
+                <span id="matrix-mode-label">CLASSIC 3-BAND</span>
+                <span id="matrix-fx-label">FX: Filter</span>
+              </div>
+              <div class="matrix-grid" id="matrix-grid" aria-live="polite">
+                <!-- Populated by app.js -->
+              </div>
+              <div class="xfade-wrap">
+                <label class="mono" for="xfade-slider" style="font-size:11px;color:var(--text-muted);display:flex;justify-content:space-between;">
+                  <span>A</span><span>CROSSFADER (5% CUT-IN DEADZONE)</span><span>B</span>
+                </label>
+                <input id="xfade-slider" type="range" min="0" max="100" value="50">
+              </div>
+              <div class="lab-readout" id="lab-readout">A 100% · B 100% · Classic Isolator</div>
+            </div>
+
+            <div class="deck-strip deck-strip-b">
+              <div class="deck-head">
+                <span class="deck-badge deck-badge-b">DECK B · HTDEMUCS</span>
+                <span class="mono" style="font-size:12px;color:var(--text-secondary)">125.00 BPM · 9m</span>
+              </div>
+              <div class="stem-buttons" id="stems-b">
+                <button class="stem-btn" type="button" data-deck="b" data-stem="0" aria-pressed="true">DRUMS</button>
+                <button class="stem-btn" type="button" data-deck="b" data-stem="1" aria-pressed="true">BASS</button>
+                <button class="stem-btn" type="button" data-deck="b" data-stem="2" aria-pressed="true">OTHER</button>
+                <button class="stem-btn" type="button" data-deck="b" data-stem="3" aria-pressed="true">VOCALS</button>
+              </div>
+              <div class="iso-row">
+                <button class="iso-btn" type="button" data-iso="b:acapella" aria-pressed="false">ACAPELLA</button>
+                <button class="iso-btn" type="button" data-iso="b:inst" aria-pressed="false">INST</button>
+                <button class="iso-btn" type="button" data-iso="b:reset" aria-pressed="false">ALL ON</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="two-col">
+          <div class="spec-block">
+            <h3>Hybrid Stems, FX Rack &amp; Loudness</h3>
+            <p>Instant zero-latency frequency splitting keeps every deck ready immediately, while background Meta Demucs caching upgrades tracks to bleed-free 4-stem FLACs.</p>
+            <ul class="spec-list">
+              <li><strong>Instant DSP + Cached Demucs:</strong> Real-time Linkwitz-Riley 4-band split on every file; 1-click isolated <code>htdemucs</code> install (<code>nice -n 10</code> background worker) caches <code>drums</code>, <code>bass</code>, <code>other</code>, and <code>vocals</code> FLACs.</li>
+              <li><strong>Per-Stem FX &amp; Quick Isolators:</strong> Route Deck FX selectively per stem, hit <code>ACAPELLA</code> or <code>INST</code> in one click, or flip hardware EQ knobs into Neural Mix™ mode.</li>
+              <li><strong>40+ Deck FX &amp; Ozone Maximizer:</strong> Two-slot assignable FX unit (<em>Ziqualizer</em>, <em>Beatmasher 2</em>, <em>Gater</em>, <em>Formant Filter</em>, <em>Delay T3</em>, <em>Reverb T3</em>) plus master limiter (<code>BOOST</code> / <code>LIMIT</code>).</li>
+              <li><strong>WSOLA Key Lock &amp; EBU R128 Auto-Gain:</strong> Independent pitch lock across full tracks and stems, with automatic loudness matching on load.</li>
+            </ul>
+          </div>
+
+          <div class="spec-block">
+            <h3>Turntable Physics &amp; PipeWire Engine</h3>
+            <p>Designed around real-time thread safety on Linux without PulseAudio latency penalties or floating-point zipper noise.</p>
+            <ul class="spec-list">
+              <li><strong>Alpha-Beta Scratch Tracking:</strong> Proven tracking filter (α = 0.125, β = 0.0039) at true 33⅓ RPM (1.8 s per 1024 ticks) eliminates packet jitter and drift.</li>
+              <li><strong>4-Point Hermite Cubic &amp; Cartridge Model:</strong> Anti-aliased interpolation during backspins and scratches, with V ∝ v velocity attenuation so halted platters stay silent.</li>
+              <li><strong>Direct PipeWire &amp; rtkit Scheduling:</strong> Opens PipeWire 0.3.53+ directly with RealtimeKit priority and falls back cleanly to ALSA when no PipeWire server runs.</li>
+              <li><strong>Per-Card Output Routing:</strong> Assign separate adjacent stereo pairs for Main (1–2) and Headphones (3–4), or use Split Mono cue; hot-rescan supported.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="hardware">
+      <div class="wrap">
+        <div class="section-head">
+          <h2>Plug-and-play NI USB HID &amp; MIDI Learn</h2>
+          <p>Direct Linux <code>hidraw</code> and ALSA raw MIDI engine with rootless <code>udev</code> rules—including Traktor MX2 RGB LED control, S4 MK3 Haptic Drive™ platters, Kontrol RGB565 screens, and a Pioneer DDJ-FLX4 preset.</p>
+        </div>
+
+        <div class="hardware-grid">
+          <figure class="mapper-figure">
+            <img src="shots/mx2-mapper.webp" width="1440" height="900" alt="ReTraktor Preferences interactive 2D Traktor MX2 controller diagram showing clickable buttons, knobs, pads, and jogwheels">
+            <figcaption>
+              <strong>Interactive 2D MX2 Surface Remapper:</strong> Click any of the 83 buttons, 6 encoders, 26 12-bit pots/faders, or 1024-tick capacitive jogs (or touch the physical hardware control) to assign actions, tune scratch sensitivity (0.2×–3.0×), and set 8 hardware RGB LED colors plus 12 bottom-shell ambient modes.
+            </figcaption>
+          </figure>
+
+          <div>
+            <div class="hw-controls" role="group" aria-label="Filter supported hardware">
+              <button class="bay-tab" type="button" data-hw-filter="all" aria-selected="true">All Hardware (12)</button>
+              <button class="bay-tab" type="button" data-hw-filter="screen" aria-selected="false">Color Screens</button>
+              <button class="bay-tab" type="button" data-hw-filter="haptic" aria-selected="false">Motorized / Haptic</button>
+              <button class="bay-tab" type="button" data-hw-filter="midi" aria-selected="false">MIDI / Learn</button>
+            </div>
+
+            <div class="hw-table-wrap">
+              <table class="hw-table">
+                <thead>
+                  <tr>
+                    <th>Controller</th>
+                    <th>USB VID:PID</th>
+                    <th>Protocol &amp; Features</th>
+                  </tr>
+                </thead>
+                <tbody id="hw-tbody">
+                  <tr data-tags="hid">
+                    <td><strong>Traktor MX2</strong></td>
+                    <td class="mono">17CC:2420</td>
+                    <td><span class="tag tag-signal">First-Class</span> 83 btns, 105 top LEDs, 12 bottom RGBs, 24-bit/96kHz 4-out/2-in</td>
+                  </tr>
+                  <tr data-tags="hid">
+                    <td><strong>Traktor MX4</strong></td>
+                    <td class="mono">17CC:2430</td>
+                    <td>NHL2 HID driver + CSI layout</td>
+                  </tr>
+                  <tr data-tags="hid screen haptic">
+                    <td><strong>Traktor Kontrol S4 MK3</strong></td>
+                    <td class="mono">17CC:1720</td>
+                    <td><span class="tag">Haptic Drive™</span> Dual motorized platters (0x30/0x31) + 320×240 RGB565 screens</td>
+                  </tr>
+                  <tr data-tags="hid">
+                    <td><strong>Traktor Kontrol S3</strong></td>
+                    <td class="mono">17CC:1900</td>
+                    <td>4-deck NHL2 HID surface + mixer LEDs</td>
+                  </tr>
+                  <tr data-tags="hid">
+                    <td><strong>Traktor Kontrol S2 MK3</strong></td>
+                    <td class="mono">17CC:1730</td>
+                    <td>2-deck NHL2 HID surface + jogwheels</td>
+                  </tr>
+                  <tr data-tags="hid screen">
+                    <td><strong>Traktor Kontrol S8</strong></td>
+                    <td class="mono">17CC:1370</td>
+                    <td>480×272 RGB565 bulk screens + stem faders</td>
+                  </tr>
+                  <tr data-tags="hid screen">
+                    <td><strong>Traktor Kontrol S5</strong></td>
+                    <td class="mono">17CC:1420</td>
+                    <td>480×272 RGB565 screens + touch strips</td>
+                  </tr>
+                  <tr data-tags="hid screen">
+                    <td><strong>Traktor Kontrol D2</strong></td>
+                    <td class="mono">17CC:1400</td>
+                    <td>Modular deck + 480×272 RGB565 waveform display</td>
+                  </tr>
+                  <tr data-tags="hid">
+                    <td><strong>Traktor Kontrol X1 MK3</strong></td>
+                    <td class="mono">17CC:2200</td>
+                    <td>HID + generic report-diff learn mode</td>
+                  </tr>
+                  <tr data-tags="hid">
+                    <td><strong>Traktor Kontrol Z1 MK2</strong></td>
+                    <td class="mono">17CC:2400</td>
+                    <td>Mixer HID + generic report-diff learn mode</td>
+                  </tr>
+                  <tr data-tags="hid">
+                    <td><strong>Traktor Kontrol F1</strong></td>
+                    <td class="mono">17CC:1120</td>
+                    <td>4×4 RGB pad matrix + stem/remix control</td>
+                  </tr>
+                  <tr data-tags="midi">
+                    <td><strong>Pioneer DDJ-FLX4 &amp; Class-Compliant MIDI</strong></td>
+                    <td class="mono">ALSA MIDI</td>
+                    <td><span class="tag">Preset + Learn</span> 14-bit CC, relative encoders, custom <code>.txt</code> &amp; <code>.tsi</code> routing</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="library">
+      <div class="wrap">
+        <div class="section-head">
+          <h2>Collection migration, harmonic AI, themes, and recording</h2>
+          <p>Bring your Traktor <code>collection.nml</code> and playlists intact without modifying existing files, export straight to rekordbox XML, or build harmonic sets with your own AI API key.</p>
+        </div>
+
+        <div class="two-col">
+          <div class="spec-block">
+            <h3>Library, Format Interop &amp; Recording</h3>
+            <ul class="spec-list">
+              <li><strong>Native Multi-Format Decoder:</strong> Pure-Rust <code>symphonia</code> playback for <code>.mp3</code>, <code>.flac</code>, <code>.wav</code>, <code>.ogg</code>, <code>.m4a</code>, <code>.aac</code>, and <code>.aiff</code> with ID3/Vorbis/MP4/AIFF tag editing.</li>
+              <li><strong>Background Track Analyzer:</strong> Detects BPM, beatgrid, Open Key, 1–10 energy level, musical phrases, and up to 8 auto cue points at phrase boundaries.</li>
+              <li><strong>Traktor &amp; rekordbox Interop:</strong> Import <code>collection.nml</code> (v19/v20) with cues/loops/beatgrids/playlists, relocate moved files automatically, parse <code>.tsi</code> (DIOM TLV), export <code>ReTraktor-rekordbox.xml</code> or <code>.m3u8</code>, and import CSV/text tracklists with a missing-tracks shopping list.</li>
+              <li><strong>Master Mix Recorder (● REC):</strong> Streams post-maximizer 16-bit stereo WAV + <code>.cue</code> + tracklist to <code>~/Music/ReTraktor</code> (auto-upgrades to RF64 past 4 GiB).</li>
+            </ul>
+          </div>
+
+          <div class="spec-block">
+            <h3>Suggestions, BYOK AI &amp; Visual Customization</h3>
+            <ul class="spec-list">
+              <li><strong>Harmonic Suggestions &amp; Next Up:</strong> Instant collection ranking against Deck A using Open Key wheel compatibility and half/double-time aware BPM scoring.</li>
+              <li><strong>Bring-Your-Own-Key AI Assistant:</strong> Generate sets from plain prompts (<em>“45 minutes of warm-up house, 118–124 BPM”</em>) using <strong>Gemini</strong>, <strong>OpenAI</strong>, <strong>Anthropic</strong>, or local <strong>Ollama</strong>. Sends metadata only—never audio—with keys stored <code>chmod 600</code>.</li>
+              <li><strong>Pattern Player:</strong> Built-in 16-step drum sequencer (Kick, Clap, Hat, Perc) synced to master clock with <code>4X4</code> and <code>ROLL</code> modes.</li>
+              <li><strong>Three Themes &amp; Four Waveforms:</strong> Switch between <em>Night</em>, <em>Field</em> (light), and <em>Charcoal</em>; choose <em>Classic</em>, <em>Dots</em>, <em>Bars</em>, or <em>Line</em> waveforms and <em>Traktor</em>, <em>Native</em>, or <em>rekordbox</em> track overviews.</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="shots-trio">
+          <figure class="shot-figure">
+            <img src="shots/suggestions.webp" width="1440" height="900" alt="ReTraktor Browser Suggestions view showing harmonic and tempo match percentages against Deck A">
+            <figcaption>
+              <strong>Harmonic Suggestions</strong>
+              Ranks every track in your collection by Open Key wheel distance and BPM fit against Deck A.
+            </figcaption>
+          </figure>
+          <figure class="shot-figure">
+            <img src="shots/next-up.webp" width="1440" height="900" alt="ReTraktor Pattern Player step sequencer and Suggest Next Track picker modal">
+            <figcaption>
+              <strong>Pattern Sequencer &amp; Next-Up Picker</strong>
+              16-step beat-synced percussion sequencer plus keyboard-driven Next Track loader.
+            </figcaption>
+          </figure>
+          <figure class="shot-figure">
+            <img src="shots/themes.webp" width="1440" height="900" alt="ReTraktor Preferences Look tab showing Night, Field, and Charcoal themes, overview styles, and waveform styles">
+            <figcaption>
+              <strong>Themes, Overviews &amp; Waveforms</strong>
+              Night, Field, and Charcoal color palettes with Traktor, Native, or rekordbox strip shapes.
+            </figcaption>
+          </figure>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="cli">
+      <div class="wrap">
+        <div class="section-head">
+          <h2>CLI diagnostics &amp; 8-crate Rust architecture</h2>
+          <p>Every subsystem lives in an isolated Rust crate and exposes headless inspection, batch track analysis, hardware verification, and terminal playback via <code>retraktor-cli</code>.</p>
+        </div>
+
+        <div class="cli-panel">
+          <div class="cli-tabs" role="tablist" aria-label="CLI commands">
+            <button class="bay-tab" role="tab" aria-selected="true" data-cli="doctor">retraktor doctor</button>
+            <button class="bay-tab" role="tab" aria-selected="false" data-cli="analyze">analyze</button>
+            <button class="bay-tab" role="tab" aria-selected="false" data-cli="nml">inspect-nml</button>
+            <button class="bay-tab" role="tab" aria-selected="false" data-cli="rb">export-rekordbox</button>
+            <button class="bay-tab" role="tab" aria-selected="false" data-cli="sim">simulate-mix / tui</button>
+          </div>
+          <div class="cli-body">
+            <pre class="cli-pre" id="cli-output">$ retraktor doctor
+[audio]   PipeWire 0.3.53+ detected · RealtimeKit (rtkit) active
+[groups]  user belongs to: audio, plugdev
+[udev]    /etc/udev/rules.d/99-retraktor-ni.rules installed (VID 0x17CC)
+[hidraw]  Traktor MX2 (17CC:2420) accessible (read/write)
+[firmware] NHL2 HID mode ready (Left SHIFT + Right SHIFT toggles MIDI)</pre>
+            <div>
+              <h3 style="margin:0 0 8px;font-family:var(--font-display);font-size:17px;" id="cli-title">System &amp; Hardware Self-Test</h3>
+              <p style="margin:0 0 14px;color:var(--text-secondary);font-size:14px;" id="cli-desc">
+                Verifies PipeWire/ALSA audio subsystems, <code>audio</code> and <code>plugdev</code> group memberships, rootless <code>udev</code> device permissions, and connected controller state.
+              </p>
+              <button class="btn btn-sm" type="button" id="cli-copy" data-copy="retraktor doctor">Copy Command</button>
+            </div>
+          </div>
+        </div>
+
+        <table class="crate-table">
+          <thead>
+            <tr>
+              <th>Workspace Crate</th>
+              <th>Responsibility</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td class="mono">retraktor-core</td><td>Reactive <code>app.traktor.*</code> PropertyBus, QML Defines 1.0 enums, and CSI 1.0 engine</td></tr>
+            <tr><td class="mono">retraktor-dsp</td><td>24 dB/oct EQ models, 9 Mixer FX, 4-band stem summer, WSOLA key lock, Ozone Maximizer</td></tr>
+            <tr><td class="mono">retraktor-audio</td><td>Lock-free 4-deck engine, Alpha-Beta scratch tracking, Hermite interpolation, PipeWire / ALSA routing</td></tr>
+            <tr><td class="mono">retraktor-hid</td><td>NHL2 USB HID driver (11 NI devices), S4 MK3 Haptic FFB, RGB565 screens, MX2 LEDs, udev rules</td></tr>
+            <tr><td class="mono">retraktor-formats</td><td>Traktor <code>collection.nml</code> (v19/v20), <code>.tsi</code> (DIOM TLV), Stripes/Transients, <code>.stem.m4a</code>, rekordbox XML</td></tr>
+            <tr><td class="mono">retraktor-library</td><td>Open Key harmonic wheel, BPM/beatgrid/phrase/cue analyzer, smartlists, and deck loader</td></tr>
+            <tr><td class="mono">retraktor-cli</td><td>Diagnostic <code>doctor</code>, NML/TSI/CSI inspectors, batch analyzer, terminal TUI, 4-deck simulator</td></tr>
+            <tr><td class="mono">retraktor-gui</td><td>Native <code>egui</code> desktop workstation, 5 layouts, dot-matrix mixer, Set builder, BYOK AI, MX2 mapper</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="section" id="install">
+      <div class="wrap">
+        <div class="section-head">
+          <h2>Install on Linux</h2>
+          <p>Install the signed x86_64 <code>.deb</code> package directly on Ubuntu, Pop!_OS, Debian, or Linux Mint, or compile from source on Fedora, Arch, and any Linux distribution.</p>
+        </div>
+
+        <div class="install-grid">
+          <div class="install-card">
+            <h3>Debian / Ubuntu / Pop!_OS / Mint (.deb)</h3>
+            <p>Includes <code>retraktor-gui</code>, <code>retraktor-cli</code>, rootless <code>udev</code> rules (VID <code>0x17CC</code>), real-time limits, desktop icon, and <code>.nml</code> file association.</p>
+            <div class="hero-cta-row" style="margin-bottom:14px;">
+              <a class="btn btn-primary" href="retraktor_latest_amd64.deb" download>Download retraktor_latest_amd64.deb</a>
+            </div>
+            <div class="code-block">
+              <pre>curl -fsSL https://retraktordj.vercel.app/install.sh | bash</pre>
+            </div>
+            <button class="btn btn-sm" type="button" data-copy="curl -fsSL https://retraktordj.vercel.app/install.sh | bash">Copy one-line installer</button>
+          </div>
+
+          <div class="install-card">
+            <h3>Build From Source (Any Distro + Optional Demucs)</h3>
+            <p>Requires Rust 1.75+, PipeWire/SPA headers, <code>libhidapi</code>, <code>libusb</code>, <code>libasound2</code>, and <code>libclang</code>. Pass <code>--with-demucs</code> for offline neural stem separation.</p>
+            <div class="code-block">
+              <pre>git clone https://github.com/adamtdm/ReTraktor.git
+cd ReTraktor
+./install.sh --with-demucs</pre>
+            </div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;">
+              <button class="btn btn-sm" type="button" data-copy="git clone https://github.com/adamtdm/ReTraktor.git && cd ReTraktor && ./install.sh --with-demucs">Copy source install</button>
+              <a class="btn btn-sm" href="https://github.com/adamtdm/ReTraktor#option-2-manual-installation-from-source-any-linux-distribution" target="_blank" rel="noopener noreferrer">Fedora &amp; Arch dependencies</a>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="wrap footer-inner">
+      <div>
+        <strong>ReTraktor</strong> · Clean-room Linux DJ workstation · Dual-licensed MIT / Apache-2.0
+      </div>
+      <div class="footer-links">
+        <a href="https://github.com/adamtdm/ReTraktor" target="_blank" rel="noopener noreferrer">GitHub Repository</a>
+        <a href="retraktor_latest_amd64.deb" download>retraktor_latest_amd64.deb</a>
+        <a href="install.sh">install.sh</a>
+      </div>
+    </div>
+  </footer>
+
+  <dialog class="shot-modal" id="shot-modal" aria-label="Full resolution screenshot viewer">
+    <div class="modal-bar">
+      <span id="modal-title">ReTraktor 1440×900</span>
+      <button class="btn btn-sm" type="button" id="modal-close">Close (Esc)</button>
+    </div>
+    <img class="modal-img" id="modal-img" src="shots/mix.webp" width="1440" height="900" alt="">
+  </dialog>
+
+  <script src="app.js"></script>
+</body>
+</html>

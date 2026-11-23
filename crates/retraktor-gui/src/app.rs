@@ -2130,11 +2130,7 @@ impl ReTraktorApp {
             if let Some(act) = self.custom_mappings.get(control) {
                 match act.as_str() {
                     "browse" => {
-                        if delta > 0 {
-                            self.library.select_next_track();
-                        } else if delta < 0 {
-                            self.library.select_prev_track();
-                        }
+                        self.browse_turn(delta as i32);
                         return;
                     }
                     "jog:1" | "jog:2" => {
@@ -2182,7 +2178,9 @@ impl ReTraktorApp {
             return;
         }
 
+        // Stem mode on the EQ knobs needs Demucs stems; a deck without them keeps its EQ.
         let neural_eq = self.preferences.neural_mix_eq_mode;
+        let stems = [self.has_stems(0), self.has_stems(1)];
         match ev {
             SurfaceEvent::Fader { control, value } => {
                 let v = value as f32;
@@ -2193,21 +2191,21 @@ impl ReTraktorApp {
                     "surface.mixer.channels.1.gain" => self.channel_gain[0] = v,
                     "surface.mixer.channels.2.gain" => self.channel_gain[1] = v,
                     "surface.mixer.channels.1.eq.high" => {
-                        if neural_eq {
+                        if neural_eq && stems[0] {
                             self.deck_stem_volumes[0][3] = v; // Vocals
                         } else {
                             self.channel_eq_hi[0] = v;
                         }
                     }
                     "surface.mixer.channels.1.eq.mid" => {
-                        if neural_eq {
+                        if neural_eq && stems[0] {
                             self.deck_stem_volumes[0][2] = v; // Instruments
                         } else {
                             self.channel_eq_mid[0] = v;
                         }
                     }
                     "surface.mixer.channels.1.eq.low" => {
-                        if neural_eq {
+                        if neural_eq && stems[0] {
                             self.deck_stem_volumes[0][0] = v; // Drums
                             self.deck_stem_volumes[0][1] = v; // Bass
                         } else {
@@ -2215,21 +2213,21 @@ impl ReTraktorApp {
                         }
                     }
                     "surface.mixer.channels.2.eq.high" => {
-                        if neural_eq {
+                        if neural_eq && stems[1] {
                             self.deck_stem_volumes[1][3] = v; // Vocals
                         } else {
                             self.channel_eq_hi[1] = v;
                         }
                     }
                     "surface.mixer.channels.2.eq.mid" => {
-                        if neural_eq {
+                        if neural_eq && stems[1] {
                             self.deck_stem_volumes[1][2] = v; // Instruments
                         } else {
                             self.channel_eq_mid[1] = v;
                         }
                     }
                     "surface.mixer.channels.2.eq.low" => {
-                        if neural_eq {
+                        if neural_eq && stems[1] {
                             self.deck_stem_volumes[1][0] = v; // Drums
                             self.deck_stem_volumes[1][1] = v; // Bass
                         } else {
@@ -2443,14 +2441,24 @@ impl ReTraktorApp {
                                 self.next_track_selected = self.next_track_selected.saturating_sub(1);
                             }
                         }
-                    } else if delta > 0 {
-                        self.library.select_next_track();
-                    } else if delta < 0 {
-                        self.library.select_prev_track();
+                    } else {
+                        self.browse_turn(delta as i32);
                     }
                 }
                 _ => {}
             },
+        }
+    }
+
+    /// A browse encoder turned: the next or previous track, or with SHIFT (either deck's) the next or previous
+    /// sidebar entry, so playlists change from the deck as in Traktor.
+    fn browse_turn(&mut self, delta: i32) {
+        if self.deck_shift_held.iter().any(|&h| h) {
+            self.library.select_nav_offset(delta.signum());
+        } else if delta > 0 {
+            self.library.select_next_track();
+        } else if delta < 0 {
+            self.library.select_prev_track();
         }
     }
 
@@ -3755,7 +3763,7 @@ impl ReTraktorApp {
 
         let cues = self.deck_hotcue_slots(d);
         let loop_len = self.deck_loop_size_beats[d] as f64 * (60.0 / deck.bpm.max(30.0));
-        let wave_resp = if self.deck_stem_view[d] {
+        let wave_resp = if self.stem_view_on(d) {
             scrolling_stem_waveforms(
                 ui,
                 deck.elapsed_sec,
@@ -3967,6 +3975,20 @@ impl ReTraktorApp {
 
     /// STEMS view toggle, plus the one-click isolators while the view is on.
     fn stem_buttons(&mut self, ui: &mut Ui, d: usize) {
+        // Stems are Demucs separations only: without them the button makes them, here on the deck.
+        if !self.has_stems(d) {
+            let progress = self.library.stem_job_progress.filter(|(id, _)| self.deck_track_ids[d] == Some(*id));
+            let label = progress.map_or("CREATE STEMS".to_string(), |(_, p)| format!("STEMS {:.0}%", p * 100.0));
+            let shift = if d == 1 { "Shift+" } else { "" };
+            if pill(ui, &label, progress.is_some(), TraktorTheme::ACCENT(), 0.0)
+                .on_hover_text(format!("Separate this track into drums, bass, other and vocals with Demucs ({shift}G). Runs in the background at low priority; saved for next time."))
+                .clicked()
+                && progress.is_none()
+            {
+                self.request_deck_stems(d + 1);
+            }
+            return;
+        }
         let view_on = self.deck_stem_view[d];
         if pill(ui, "STEMS", view_on, TraktorTheme::ROW_SELECTED(), 0.0)
             .on_hover_text("Stem mode: four lanes (drums, bass, other, vocals) on the deck, and the mixer's EQ becomes four stem controls")
@@ -3977,15 +3999,6 @@ impl ReTraktorApp {
         if !view_on {
             return;
         }
-        // Say which separation is playing: clean Demucs stems, or the instant frequency split.
-        let saved = self.audio.shared.lock().is_ok_and(|st| st.loaded_tracks[d].as_ref().is_some_and(|t| t.stems_ready));
-        let (src, src_tip) = if saved {
-            ("SAVED STEMS", "Stems separated by Demucs and saved with the track; quality depends on the track")
-        } else {
-            ("LIVE SPLIT · BANDS", "Instant frequency split: ACAPELLA and VOCALS keep the vocal frequencies, not an isolated voice, so expect bleed. Use CREATE STEMS under TOOLS for separated stems")
-        };
-        ui.label(RichText::new(src).font(egui::FontId::proportional(10.5)).color(if saved { TraktorTheme::PLAY_ACTIVE() } else { TraktorTheme::METER_YELLOW() }))
-            .on_hover_text(src_tip);
         for (label, mutes, tip) in [
             ("ACAPELLA", [true, true, true, false], "Vocals only: mute drums, bass and other"),
             ("INST", [false, false, false, true], "Instrumental: mute the vocals"),
@@ -3995,6 +4008,16 @@ impl ReTraktorApp {
                 self.deck_stem_muted[d] = if active { [false; 4] } else { mutes };
             }
         }
+    }
+
+    /// Whether deck `d` plays Demucs stems.
+    fn has_stems(&self, d: usize) -> bool {
+        self.audio.shared.lock().is_ok_and(|st| st.loaded_tracks[d].as_ref().is_some_and(|t| t.stems_ready))
+    }
+
+    /// The stem lanes and mutes show only for a deck that has stems to show.
+    fn stem_view_on(&self, d: usize) -> bool {
+        self.deck_stem_view[d] && self.has_stems(d)
     }
 
     /// An unloaded deck says how to load it, and shows nothing else.
@@ -4141,7 +4164,7 @@ impl ReTraktorApp {
             let cues = self.deck_hotcue_slots(d);
             let loop_len_sec = self.deck_loop_size_beats[d] as f64 * (60.0 / bpm.max(30.0));
             if include_scrolling_waveform && waveform_height > 10.0 {
-                let wave_resp = if self.deck_stem_view[d] {
+                let wave_resp = if self.stem_view_on(d) {
                     scrolling_stem_waveforms(
                         ui,
                         deck.elapsed_sec,
@@ -4181,7 +4204,7 @@ impl ReTraktorApp {
             }
 
             // 5. Stem mutes, while the stems view is on.
-            if self.deck_stem_view[d] {
+            if self.stem_view_on(d) {
                 ui.horizontal(|ui| {
                     let gap = ui.spacing().item_spacing.x;
                     let w = (ui.available_width() - 10.0 * gap) / 4.0;
@@ -4326,19 +4349,6 @@ impl ReTraktorApp {
             // Wraps rather than widening a narrow deck past the window edge.
             ui.horizontal_wrapped(|ui| {
                 let shift = if d == 1 { "Shift+" } else { "" };
-                let progress = self.library.stem_job_progress.filter(|(id, _)| self.deck_track_ids[d] == Some(*id));
-                let label = match progress {
-                    Some((_, p)) => format!("STEMS {:.0}%", p * 100.0),
-                    None => "CREATE STEMS".to_string(),
-                };
-                if pill(ui, &label, progress.is_some(), TraktorTheme::ACCENT(), 0.0)
-                    .on_hover_text(format!("Separate this track into drums, bass, other and vocals with Demucs ({shift}G). Takes a few minutes; saved for next time."))
-                    .clicked()
-                    && progress.is_none()
-                {
-                    self.request_deck_stems(deck_idx);
-                }
-                ui.separator();
                 ui.label(caps("GRID"));
                 for (label, step, tip) in [("◀", -0.005, "Move the beatgrid 5 ms earlier"), ("▶", 0.005, "Move the beatgrid 5 ms later")] {
                     if pill(ui, label, false, Color32::TRANSPARENT, HIT).on_hover_text(tip).clicked() {

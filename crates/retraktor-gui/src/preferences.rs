@@ -1589,7 +1589,7 @@ impl PreferencesDialog {
         Self::list_row(
             ui,
             "Audio engine",
-            "32-bit float audio with live frequency splitting and optional Demucs stems.",
+            "32-bit float audio, with Demucs stems for tracks you prepare.",
             |ui| {
                 ui.label(RichText::new("Rust · 32-bit float").monospace());
             },

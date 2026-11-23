@@ -6,7 +6,7 @@
 //! Provides:
 //! - Non-blocking background virtual environment installer (`~/.local/share/retraktor/venv`).
 //! - Automatic detection of system or local Demucs binaries.
-//! - Background separation queue running with low process priority (`nice -n 10`)
+//! - Background separation queue at idle CPU priority (`chrt --idle`, else `nice -n 19`) on all cores but two
 //!   to guarantee 100% audio engine reliability and avoid audio dropouts.
 //! - Caching of true isolated 4-stem FLAC streams (`drums`, `bass`, `other`, `vocals`).
 
@@ -464,14 +464,13 @@ impl DemucsManager {
         thread::spawn(move || {
             let _ = fs::create_dir_all(&cache_root);
 
-            // Execute Demucs with `nice -n 10` so audio playback is NEVER starved of CPU
+            // Lowest priority and limited threads (see `demucs_nice_command`): slower stems, steady playback.
             let mut cmd = demucs_nice_command(&demucs_bin);
             cmd.args([
                 "-n",
                 "htdemucs",
-                // 2 jobs: ~20% faster on a 4-thread laptop (103 s -> 83 s per 30 s of audio); 4 needs more RAM for little gain.
                 "-j",
-                "2",
+                "1",
                 "--flac",
                 "-o",
             ]);
@@ -539,11 +538,19 @@ fn is_executable(path: &Path) -> bool {
     path.metadata().is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
+/// Demucs kept out of playback's way: Linux's idle scheduler (`chrt --idle 0`, CPU time nothing else wants), or
+/// `nice -n 19` without chrt; and PyTorch on all cores but two. Run flat out it took every core and the decks
+/// crackled while stems were made.
 fn demucs_nice_command(binary: &Path) -> Command {
-    let mut cmd = Command::new("nice");
-    cmd.args(["-n", "10"]).arg(binary);
+    let idle = ["/usr/bin/chrt", "/bin/chrt"].iter().any(|p| Path::new(p).exists());
+    let mut cmd = if idle { Command::new("chrt") } else { Command::new("nice") };
+    cmd.args(if idle { ["--idle", "0"] } else { ["-n", "19"] }).arg(binary);
     if binary.file_name().is_some_and(|name| name == "python3") {
         cmd.args(["-m", "demucs"]);
+    }
+    let threads = thread::available_parallelism().map_or(1, |n| n.get().saturating_sub(2).max(1)).to_string();
+    for var in ["OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"] {
+        cmd.env(var, &threads);
     }
     cmd
 }
@@ -573,7 +580,11 @@ mod tests {
         let binary = Path::new("/home/DJ's \"mix\" $(name)/venv/bin/python3");
         let cmd = demucs_nice_command(binary);
         let args: Vec<_> = cmd.get_args().collect();
-        assert_eq!(args, ["-n", "10", binary.to_str().unwrap(), "-m", "demucs"]);
+        assert_eq!(args[2..], [binary.as_os_str(), "-m".as_ref(), "demucs".as_ref()]);
+        assert!(args[..2] == ["--idle", "0"] || args[..2] == ["-n", "19"], "{args:?}");
+        let threads = cmd.get_envs().find(|(k, _)| *k == "OMP_NUM_THREADS").and_then(|(_, v)| v).unwrap();
+        let cores = thread::available_parallelism().map_or(1, |n| n.get());
+        assert_eq!(threads.to_str().unwrap().parse::<usize>().unwrap(), cores.saturating_sub(2).max(1));
     }
 
     #[test]

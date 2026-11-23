@@ -47,7 +47,7 @@ pub struct LoadedTrackAudio {
     /// cache keeps it (this load's or a browser row's, whichever was kept first), as its browser row draws it.
     pub overview: crate::overview::Overview,
     pub stems_ready: bool,
-    /// True isolated AI stems (from Demucs or synthesis). If Some, played with zero bleed.
+    /// Demucs stems. If Some, the deck plays their mix (with the stem volumes and mutes) instead of the track.
     pub pcm_drums: Option<Arc<Vec<f32>>>,
     pub pcm_bass: Option<Arc<Vec<f32>>>,
     pub pcm_other: Option<Arc<Vec<f32>>>,
@@ -217,8 +217,11 @@ impl LoadedTrackAudio {
         fallback_key: &str,
         autogain: bool,
     ) -> Result<Self, String> {
-        type CacheEntry = (crate::overview::FileIdentity, f32);
-        static AUTOGAIN_CACHE: LazyLock<Mutex<HashMap<PathBuf, CacheEntry>>> = LazyLock::new(Mutex::default);
+        // Measured once per file, ever: the true-peak meter is half of a load's time, so it is kept on disk too.
+        static AUTOGAIN_CACHE: LazyLock<Mutex<HashMap<PathBuf, AutogainEntry>>> = LazyLock::new(|| {
+            let text = autogain_file().and_then(|f| std::fs::read_to_string(f).ok()).unwrap_or_default();
+            Mutex::new(text.lines().filter_map(parse_autogain_line).collect())
+        });
 
         let cache_key = if autogain { path.canonicalize().ok().zip(file_identity(path)) } else { None };
         let mut file = AudioFile::open(path)?;
@@ -234,11 +237,17 @@ impl LoadedTrackAudio {
             if autogain { cached_gain } else { Some(1.0) },
         );
         if let Some((key, identity)) = cache_key.filter(|(_, identity)| cached_gain.is_none() && file_identity(path) == Some(*identity)) {
+            let line = autogain_line(&key, identity, loaded.auto_gain);
             let mut cache = AUTOGAIN_CACHE.lock().unwrap_or_else(PoisonError::into_inner);
-            if cache.len() >= 2048 {
-                cache.clear();
-            }
             cache.insert(key, (identity, loaded.auto_gain));
+            // shortcut: the file only grows (a re-measured file adds a line; the last one wins on reading), prune it if it ever gets large.
+            if let Some(file) = autogain_file() {
+                use std::io::Write;
+                let _ = file.parent().map(std::fs::create_dir_all);
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(file) {
+                    let _ = f.write_all(line.as_bytes());
+                }
+            }
         }
         loaded.title = tag_title.unwrap_or(loaded.title);
         loaded.artist = tag_artist.unwrap_or(loaded.artist);
@@ -894,12 +903,6 @@ pub struct AudioSharedState {
     pub stem_volumes: [[f32; 4]; 4],
     pub stem_muted: [[bool; 4]; 4],
     pub stem_fx_send: [[bool; 4]; 4],
-    stem_lp_l: [f32; 4],
-    stem_lp_r: [f32; 4],
-    stem_mp_l: [f32; 4],
-    stem_mp_r: [f32; 4],
-    stem_fast_env: [f32; 4],
-    stem_slow_env: [f32; 4],
 
     // 16-Step Pattern Player (Drum Machine) State
     pub pattern_enabled: bool,
@@ -1022,12 +1025,6 @@ impl Default for AudioSharedState {
             stem_volumes: [[1.0; 4]; 4],
             stem_muted: [[false; 4]; 4],
             stem_fx_send: [[false; 4]; 4],
-            stem_lp_l: [0.0; 4],
-            stem_lp_r: [0.0; 4],
-            stem_mp_l: [0.0; 4],
-            stem_mp_r: [0.0; 4],
-            stem_fast_env: [0.0; 4],
-            stem_slow_env: [0.0; 4],
             pattern_enabled: false,
             pattern_steps: default_steps,
             pattern_volume: 0.75,
@@ -1894,6 +1891,31 @@ pub struct PreviewPcm {
 }
 
 /// A file's modified time and byte size, to tell when it has been replaced.
+type AutogainEntry = (crate::overview::FileIdentity, f32);
+
+/// `~/.cache/retraktor/autogain.tsv`; none in tests, which never touch the user's files.
+fn autogain_file() -> Option<PathBuf> {
+    if cfg!(test) {
+        return None;
+    }
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache/retraktor/autogain.tsv"))
+}
+
+/// `gain, modified (ns since 1970), length, path`, tab-separated: the path last, as it may hold tabs.
+fn autogain_line(path: &Path, (modified, len): crate::overview::FileIdentity, gain: f32) -> String {
+    let ns = modified.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    format!("{gain}\t{ns}\t{len}\t{}\n", path.display())
+}
+
+fn parse_autogain_line(line: &str) -> Option<(PathBuf, AutogainEntry)> {
+    let mut parts = line.splitn(4, '\t');
+    let gain: f32 = parts.next()?.parse().ok().filter(|g: &f32| g.is_finite() && *g > 0.0)?;
+    let ns: u64 = parts.next()?.parse().ok()?;
+    let len: u64 = parts.next()?.parse().ok()?;
+    let modified = std::time::UNIX_EPOCH + std::time::Duration::from_nanos(ns);
+    Some((PathBuf::from(parts.next()?), ((modified, len), gain)))
+}
+
 pub(crate) fn file_identity(path: &Path) -> Option<(std::time::SystemTime, u64)> {
     let meta = std::fs::metadata(path).ok()?;
     Some((meta.modified().ok()?, meta.len()))
@@ -2654,7 +2676,7 @@ impl Renderer {
                         s_r *= phono_gain;
                     }
 
-                    // Check for true isolated AI stems (Demucs or pre-synthesized)
+                    // Demucs stems, when the track has them
                     if let (Some(dp), Some(bp), Some(op), Some(vp)) = (
                         &track.pcm_drums,
                         &track.pcm_bass,
@@ -2713,43 +2735,8 @@ impl Renderer {
                             d_r * g_drums + b_r * g_bass + o_r * g_inst + v_r * g_voc,
                         )
                     } else {
-                        // Real-Time 4-Stem Frequency Decomposition Fallback ([Drums, Bass, Instruments, Vocals])
-                        state.stem_lp_l[d] += 0.035 * (raw_l - state.stem_lp_l[d]);
-                        state.stem_lp_r[d] += 0.035 * (raw_r - state.stem_lp_r[d]);
-                        state.stem_mp_l[d] += 0.22 * (raw_l - state.stem_mp_l[d]);
-                        state.stem_mp_r[d] += 0.22 * (raw_r - state.stem_mp_r[d]);
-
-                        let bass_l = state.stem_lp_l[d];
-                        let bass_r = state.stem_lp_r[d];
-                        let mid_band_l = state.stem_mp_l[d] - bass_l;
-                        let mid_band_r = state.stem_mp_r[d] - bass_r;
-                        let high_band_l = raw_l - state.stem_mp_l[d];
-                        let high_band_r = raw_r - state.stem_mp_r[d];
-
-                        // Center vocal extraction from mid-band + transient percussion separation
-                        let mid_center = (mid_band_l + mid_band_r) * 0.5;
-                        let mid_side = (mid_band_l - mid_band_r) * 0.5;
-                        let abs_in = ((raw_l + raw_r) * 0.5).abs();
-                        state.stem_fast_env[d] = if abs_in > state.stem_fast_env[d] {
-                            state.stem_fast_env[d] + 0.35 * (abs_in - state.stem_fast_env[d])
-                        } else {
-                            state.stem_fast_env[d] * 0.992
-                        };
-                        state.stem_slow_env[d] += 0.008 * (abs_in - state.stem_slow_env[d]);
-                        let transient_gate =
-                            ((state.stem_fast_env[d] - state.stem_slow_env[d]).max(0.0) * 3.5).min(1.0);
-
-                        let drums_l = high_band_l * 0.65 + mid_band_l * transient_gate * 0.45;
-                        let drums_r = high_band_r * 0.65 + mid_band_r * transient_gate * 0.45;
-                        let vocal_l = mid_center * (1.0 - transient_gate * 0.45);
-                        let vocal_r = mid_center * (1.0 - transient_gate * 0.45);
-                        let inst_l = mid_side + high_band_l * 0.35;
-                        let inst_r = -mid_side + high_band_r * 0.35;
-
-                        (
-                            drums_l * g_drums + bass_l * g_bass + inst_l * g_inst + vocal_l * g_voc,
-                            drums_r * g_drums + bass_r * g_bass + inst_r * g_inst + vocal_r * g_voc,
-                        )
+                        // No Demucs stems: the track as it is. (A frequency "split" here coloured every track.)
+                        (raw_l, raw_r)
                     };
 
                     let (stem_l, stem_r) = state.jump_ease[d].next((stem_l, stem_r), sr, keylock_on);
@@ -3513,6 +3500,27 @@ mod tests {
         let mut out = vec![0.0f32; 256];
         r.render(&mut out, 2, 48_000, |x| x);
         out
+    }
+
+    /// Without Demucs stems a deck plays the track itself: stem mutes don't touch it, and nothing colours it
+    /// (the old live frequency "split" added a gated side signal to every track).
+    #[test]
+    fn a_deck_without_stems_plays_the_track_untouched() {
+        let plain = render_peaks(|_| {}, 2);
+        let muted = render_peaks(|st| st.stem_muted[0] = [true; 4], 2);
+        assert!(plain[0] > 0.1);
+        assert_eq!(plain, muted, "stem mutes changed a deck that has no stems");
+    }
+
+    /// A saved auto gain reads back as the same file version and gain; a changed file no longer matches it.
+    #[test]
+    fn autogain_cache_lines_round_trip() {
+        let modified = std::time::UNIX_EPOCH + std::time::Duration::from_nanos(1_763_900_000_123_456_789);
+        let path = Path::new("/music/DJ's\tmix/track 01.mp3");
+        let line = autogain_line(path, (modified, 14_402_917), 2.7001007);
+        let (back, ((m, len), gain)) = parse_autogain_line(line.trim_end_matches('\n')).unwrap();
+        assert_eq!((back.as_path(), m, len, gain), (path, modified, 14_402_917, 2.7001007));
+        assert!(parse_autogain_line("NaN\t1\t2\t/x").is_none() && parse_autogain_line("garbage").is_none());
     }
 
     /// Decks A and B both at 120 BPM with grids at 0 s; B follows A, `behind` beats behind it.

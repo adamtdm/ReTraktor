@@ -1958,6 +1958,24 @@ impl LibraryManager {
         self.scroll_to_selected = true;
     }
 
+    /// Moves the sidebar selection `step` entries down (up when negative), in the order the sidebar draws them,
+    /// stopping at either end: SHIFT + a browse encoder, as in Traktor, so playlists change from the deck.
+    pub fn select_nav_offset(&mut self, step: i32) {
+        let mut order = vec![NavItem::Collection];
+        if self.missing_count() > 0 {
+            order.push(NavItem::Missing);
+        }
+        order.extend([NavItem::Suggestions, NavItem::Stems, NavItem::History, NavItem::Explorer]);
+        order.extend((0..self.libraries.len()).map(NavItem::Library));
+        order.extend((0..self.playlists.len()).map(NavItem::Playlist));
+        let at = order.iter().position(|n| *n == self.selected_nav).unwrap_or(0) as i32;
+        let next = order[(at + step).clamp(0, order.len() as i32 - 1) as usize];
+        if next != self.selected_nav {
+            self.selected_nav = next;
+            self.selection.clear();
+        }
+    }
+
     pub fn select_next_track(&mut self) {
         self.select_offset(1);
     }
@@ -3568,6 +3586,20 @@ mod tests {
         wait_for_library(&mut reopened);
         assert_eq!(reopened.tracks.len(), 1, "only the re-added track, merged once");
         assert!(!fs::read_to_string(reopened.removed_file()).unwrap().contains("Deep Low"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn browse_encoder_with_shift_steps_through_the_sidebar() {
+        let (mut lib, dir) = temp_lib("nav-step");
+        lib.playlists.push(UserPlaylist { name: "Warmup".into(), track_ids: Vec::new(), missing: Vec::new() });
+        lib.playlists.push(UserPlaylist { name: "Peak".into(), track_ids: Vec::new(), missing: Vec::new() });
+        lib.select_nav_offset(-1);
+        assert_eq!(lib.selected_nav, NavItem::Collection, "stops at the top");
+        lib.select_nav_offset(5);
+        assert_eq!(lib.selected_nav, NavItem::Playlist(0), "Collection, Suggestions, Stems, History, Files, then playlists");
+        lib.select_nav_offset(9);
+        assert_eq!(lib.selected_nav, NavItem::Playlist(1), "stops at the last playlist");
         let _ = fs::remove_dir_all(dir);
     }
 

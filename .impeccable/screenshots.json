@@ -1,0 +1,18 @@
+{
+  "provenance": "Real ReTraktor desktop app screenshots captured headlessly via scripts/screenshot.sh (xvfb-run, 1440x900) at commit ca05deb with synthetic multi-band test FLAC tracks in /tmp/retraktor-shot-home/Music and converted to lossless WebP via ffmpeg.",
+  "commit": "ca05deb",
+  "viewport": "1440x900",
+  "format": "lossless WebP",
+  "files": {
+    "site/shots/mix.webp": "shots2/02-Mix.png (step: Mix)",
+    "site/shots/stems.webp": "shots2/03-stemsA.png (step: stemsA)",
+    "site/shots/fourdeck.webp": "shots2/06-FourDeck.png (step: FourDeck)",
+    "site/shots/browser.webp": "shots2/07-Browser.png (step: Browser)",
+    "site/shots/suggestions.webp": "shots2/08-nav-Suggestions.png (step: nav:Suggestions)",
+    "site/shots/timeline.webp": "shots2/09-Timeline.png (step: Timeline)",
+    "site/shots/set.webp": "shots/10-Set.png (step: Set)",
+    "site/shots/mx2-mapper.webp": "shots/11-prefs-Controllers.png (step: prefs:Controllers)",
+    "site/shots/themes.webp": "shots2/13-prefs-Look.png (step: prefs:Look)",
+    "site/shots/next-up.webp": "shots2/17-next.png (step: next)"
+  }
+}
