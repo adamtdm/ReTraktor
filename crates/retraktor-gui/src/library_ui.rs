@@ -224,6 +224,15 @@ impl UiTrackEntry {
         self.stems_ready |= tags.stems_ready;
     }
 
+    fn adopt_serato_cues(&mut self, cues: Vec<NmlCue>) {
+        if self.cues.is_empty() {
+            if let Some(bpm) = cues.iter().find_map(|cue| cue.grid_bpm) {
+                self.bpm = bpm;
+            }
+            self.cues = cues;
+        }
+    }
+
     fn search_blob(&self) -> String {
         format!(
             "{} {} {} {} {} {} {} {} {:.0}",
@@ -246,8 +255,14 @@ pub fn is_audio_file(path: &Path) -> bool {
 
 /// Reads a file's tags and audio properties. Missing tags stay empty — never invented.
 pub fn read_track_file(path: &Path) -> UiTrackEntry {
+    let (mut track, cues) = read_track_tags(path);
+    track.adopt_serato_cues(cues);
+    track
+}
+
+fn read_track_tags(path: &Path) -> (UiTrackEntry, Vec<NmlCue>) {
     use lofty::file::{AudioFile, TaggedFileExt};
-    use lofty::tag::{Accessor, ItemKey};
+    use lofty::tag::{Accessor, ItemKey, TagType};
 
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").trim();
     let (artist, title) = match stem.split_once(" - ") {
@@ -262,14 +277,14 @@ pub fn read_track_file(path: &Path) -> UiTrackEntry {
         stems_ready: DemucsManager::get_cached_stem_dir(path).is_some(),
         ..Default::default()
     };
-    let Ok(tagged) = lofty::read_from_path(path) else {
-        return t;
+    let Ok(mut tagged) = lofty::read_from_path(path) else {
+        return (t, Vec::new());
     };
     let props = tagged.properties();
     t.duration_sec = props.duration().as_secs_f64();
     t.bitrate_kbps = props.audio_bitrate().or(props.overall_bitrate()).unwrap_or(0);
     let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) else {
-        return t;
+        return (t, Vec::new());
     };
     let set = |dst: &mut String, v: Option<std::borrow::Cow<str>>| {
         if let Some(v) = v.map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) {
@@ -297,7 +312,10 @@ pub fn read_track_file(path: &Path) -> UiTrackEntry {
         .and_then(KeyWheel::to_open_key)
         .unwrap_or("")
         .to_string();
-    t
+    let tags = [TagType::Id3v2, TagType::VorbisComments, TagType::Mp4Ilst]
+        .into_iter()
+        .filter_map(|kind| tagged.remove(kind));
+    (t, retraktor_formats::serato::read_cues(tags))
 }
 
 /// Writes the editable fields back into the audio file's own tags.
@@ -430,7 +448,10 @@ pub fn stereo_to_mono(pcm: &[f32]) -> Vec<f32> {
 /// Reads tags for `items` and sends them in batches.
 fn read_tags_into(tx: &Sender<Msg>, items: &[(usize, PathBuf)]) {
     for (n, chunk) in items.chunks(100).enumerate() {
-        let batch = chunk.iter().map(|(id, p)| (*id, read_track_file(p))).collect();
+        let batch = chunk.iter().map(|(id, p)| {
+            let (tags, cues) = read_track_tags(p);
+            (*id, tags, cues)
+        }).collect();
         let _ = tx.send(Msg::Tags(batch));
         let _ = tx.send(Msg::Status(format!("Reading tags: {} of {}…", n * 100 + chunk.len(), items.len())));
     }
@@ -631,7 +652,7 @@ pub enum Msg {
     Scanned(Vec<UiTrackEntry>),
     Checked(Vec<(usize, bool, bool)>),
     Relocated(Vec<(usize, PathBuf)>),
-    Tags(Vec<(usize, UiTrackEntry)>),
+    Tags(Vec<(usize, UiTrackEntry, Vec<NmlCue>)>),
     /// (track id, analysis, overwrite existing values)
     Analyzed(usize, TrackAnalysis, bool),
     Saved(Result<usize, String>),
@@ -1809,8 +1830,9 @@ impl LibraryManager {
                     self.touch();
                 }
                 Msg::Tags(batch) => {
-                    for (id, tags) in batch {
-                        if let Some(t) = self.track_mut(id) {
+                    for (id, tags, cues) in batch {
+                        if let Some(t) = self.track_mut(id).filter(|t| t.file_path == tags.file_path) {
+                            t.adopt_serato_cues(cues);
                             t.fill_empty_from(tags);
                         }
                     }
@@ -3923,6 +3945,51 @@ mod tests {
         let mut t = UiTrackEntry { title: "Kept".into(), bpm: 128.0, ..Default::default() };
         t.fill_empty_from(UiTrackEntry { title: "Other".into(), genre: "Garage".into(), bpm: 64.0, musical_key: "8m".into(), ..Default::default() });
         assert_eq!((t.title.as_str(), t.genre.as_str(), t.bpm, t.musical_key.as_str()), ("Kept", "Garage", 128.0, "8m"));
+    }
+
+    #[test]
+    fn serato_tags_fill_only_tracks_without_cues() {
+        use lofty::config::WriteOptions;
+        use lofty::id3::v2::{BinaryFrame, Frame, FrameId, Id3v2Tag};
+        use lofty::tag::TagExt;
+        use retraktor_core::CueType;
+
+        let (mut lib, dir) = temp_lib("serato");
+        let path = dir.join("Tagged.mp3");
+        let mut id3 = Id3v2Tag::new();
+        id3.insert(Frame::Binary(BinaryFrame::new(
+            FrameId::Valid("GEOB".into()),
+            b"\0application/octet-stream\0\0Serato BeatGrid\0\x01\x00\x00\x00\x00\x01\x3e\x80\x00\x00\x42\xf0\x00\x00\x37".to_vec(),
+        )));
+        let mut file = Vec::new();
+        id3.dump_to(&mut file, WriteOptions::default()).unwrap();
+        // Two MPEG-1 Layer III frames, 128 kbps at 44.1 kHz.
+        let mut frame = [0; 417];
+        frame[..4].copy_from_slice(&[0xff, 0xfb, 0x90, 0x64]);
+        file.extend_from_slice(&frame);
+        file.extend_from_slice(&frame);
+        fs::write(&path, &file).unwrap();
+
+        let id = lib.add_file(&path);
+        let added = lib.track(id).unwrap();
+        assert_eq!(added.bpm, 120.0);
+        assert_eq!(added.cues.len(), 1);
+        assert_eq!((added.cues[0].cue_type, added.cues[0].start_ms), (CueType::Grid, 250.0));
+
+        let existing = NmlCue {
+            name: "Existing".into(), displ_order: 0, cue_type: CueType::Cue,
+            start_ms: 2000.0, len_ms: 0.0, repeats: -1, hotcue: 0, grid_bpm: None,
+        };
+        let track = lib.track_mut(id).unwrap();
+        track.cues = vec![existing.clone()];
+        track.bpm = 0.0;
+        read_tags_into(&lib.tx, &[(id, path.clone())]);
+        lib.poll();
+        let track = lib.track(id).unwrap();
+        assert_eq!(track.cues, [existing]);
+        assert_eq!(track.bpm, 0.0);
+        assert_eq!(fs::read(&path).unwrap(), file);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
