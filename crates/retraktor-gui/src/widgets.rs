@@ -1753,6 +1753,7 @@ pub fn render_shortcuts_hud(ctx: &egui::Context, is_open: &mut bool) {
                     key_row(ui, "Shift+N", "Load Next Up to Deck", c);
                     key_row(ui, "O / Ctrl+Z", "Order Flow / Undo", c);
                     key_row(ui, "Alt+↑ / ↓", "Reorder Track in Set", c);
+                    key_row(ui, "Delete", "Remove Track from Set", c);
                     ui.add_space(6.0);
                     ui.label(RichText::new("TIMELINE STUDIO").color(TraktorTheme::DECK_A()).strong());
                     ui.add_space(4.0);

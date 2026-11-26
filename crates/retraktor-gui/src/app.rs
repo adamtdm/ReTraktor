@@ -2831,7 +2831,8 @@ impl ReTraktorApp {
                         _ => 8,
                     };
                 }
-                if i.key_pressed(Key::A) {
+                // Shift+A is the library's Add to Set.
+                if !shift && i.key_pressed(Key::A) {
                     self.sync_deck(2);
                     if let Ok(mut state) = self.audio.shared.lock() {
                         state.start_playing(0);
@@ -5874,6 +5875,27 @@ mod sync_audio {
                 Some((n.name()?.to_string(), n.role(), r, n.is_disabled()))
             })
             .collect()
+    }
+
+    /// Shift+A adds the selection to the set (in the library); only a plain A syncs and plays both decks.
+    #[test]
+    fn shift_a_leaves_the_decks_alone() {
+        let ctx = egui::Context::default();
+        let mut app = ReTraktorApp::default();
+        {
+            let mut s = app.audio.shared.lock().unwrap();
+            for d in 0..2 {
+                s.loaded_tracks[d] = Some(LoadedTrackAudio::from_pcm(vec![0.0; 44_100 * 2], 44_100, "T", "A", 124.0, "8m"));
+            }
+        }
+        let press = |app: &mut ReTraktorApp, modifiers| {
+            let raw = egui::RawInput { modifiers, events: vec![egui::Event::Key { key: Key::A, physical_key: None, pressed: true, repeat: false, modifiers }], ..Default::default() };
+            let _ = ctx.run(raw, |ctx| app.handle_keyboard_shortcuts(ctx));
+        };
+        press(&mut app, egui::Modifiers::SHIFT);
+        assert_eq!(app.audio.shared.lock().unwrap().is_playing[..2], [false, false], "Shift+A played the decks");
+        press(&mut app, egui::Modifiers::NONE);
+        assert_eq!(app.audio.shared.lock().unwrap().is_playing[..2], [true, true]);
     }
 
     fn key(key: Key, shift: bool) -> egui::Event {

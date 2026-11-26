@@ -108,6 +108,10 @@ impl SetList {
 
     /// Saves the set list to disk, creating parent directories if needed.
     pub fn save(&self) -> std::io::Result<()> {
+        // Tests never write the real set file.
+        if cfg!(test) {
+            return Ok(());
+        }
         let path = default_set_path();
         self.save_to_path(&path)
     }
@@ -561,6 +565,44 @@ impl SetUiState {
         }
     }
 
+    /// The set's tracks the library has, each with its position in `track_ids` (which keeps ones it doesn't have yet).
+    fn rows(&self, library: &LibraryManager) -> Vec<(usize, UiTrackEntry)> {
+        self.set_list.track_ids.iter().enumerate().filter_map(|(i, &id)| Some((i, library.track(id)?.clone()))).collect()
+    }
+
+    /// Moves the track at `from` so it lands before what is now at `before` (`len` for the end); selection follows it.
+    pub fn move_track(&mut self, from: usize, before: usize) {
+        let ids = &mut self.set_list.track_ids;
+        if from >= ids.len() || before > ids.len() {
+            return;
+        }
+        let to = if before > from { before - 1 } else { before };
+        let id = ids.remove(from);
+        ids.insert(to, id);
+        self.selected_index = Some(to);
+        self.undo_order = None;
+        let _ = self.set_list.save();
+    }
+
+    pub fn remove_at(&mut self, at: usize) {
+        if at >= self.set_list.track_ids.len() {
+            return;
+        }
+        self.set_list.track_ids.remove(at);
+        let len = self.set_list.track_ids.len();
+        self.selected_index = self.selected_index.filter(|_| len > 0).map(|s| if s > at { s - 1 } else { s.min(len - 1) });
+        self.undo_order = None;
+        let _ = self.set_list.save();
+    }
+
+    /// Adds a playlist's tracks; an empty set takes the playlist's name, so Save writes back to it.
+    pub fn add_playlist(&mut self, name: &str, ids: &[usize]) {
+        if self.set_list.track_ids.is_empty() {
+            self.set_list.name = name.to_string();
+        }
+        self.add_tracks(ids);
+    }
+
     /// Adds track IDs to the set list.
     pub fn add_tracks(&mut self, ids: &[usize]) {
         for &id in ids {
@@ -609,13 +651,7 @@ impl SetUiState {
             } else if !alt && down {
                 self.selected_index = Some((idx + 1).min(len - 1));
             } else if del {
-                self.set_list.track_ids.remove(idx);
-                self.selected_index = if self.set_list.track_ids.is_empty() {
-                    None
-                } else {
-                    Some(idx.min(self.set_list.track_ids.len() - 1))
-                };
-                let _ = self.set_list.save();
+                self.remove_at(idx);
             } else if enter {
                 if let Some(&id) = self.set_list.track_ids.get(idx) {
                     load_action = Some((idle_deck, id));
@@ -724,9 +760,13 @@ impl SetUiState {
         let avail_h = ui.available_height().max(240.0);
         let top_h = (avail_h * 0.48).clamp(180.0, 260.0);
 
-        let resolved = self.resolved_tracks(library);
+        let rows = self.rows(library);
+        let resolved: Vec<UiTrackEntry> = rows.iter().map(|(_, t)| t.clone()).collect();
         let warnings = flow_warnings(&resolved);
         let total_sec = total_duration(&resolved);
+        // The selection is a place in `track_ids`; the arc and the join read are by row.
+        let sel_row = rows.iter().position(|(at, _)| Some(*at) == self.selected_index);
+        let mut edit: Option<(usize, Option<usize>)> = None; // (at, Some(before) moves it, None removes it)
 
         panel(TraktorTheme::BG_PANEL()).show(ui, |ui| {
             ui.set_height(top_h);
@@ -760,7 +800,7 @@ impl SetUiState {
                                     self.confirm_clear = false;
                                 }
                                 if ui.add(egui::Button::new(RichText::new(format!("Clear {n} tracks")).color(TraktorTheme::METER_RED()).size(11.0)).min_size(Vec2::new(0.0, HIT))).clicked() {
-                                    self.set_list.track_ids.clear();
+                                    self.set_list = SetList::default();
                                     self.selected_index = None;
                                     self.confirm_clear = false;
                                     let _ = self.set_list.save();
@@ -773,6 +813,32 @@ impl SetUiState {
                             {
                                 self.confirm_clear = true;
                             }
+
+                            let save_tip = if library.playlists.iter().any(|p| p.name == self.set_list.name) {
+                                format!("Replace playlist '{}' with this set, in this order", self.set_list.name)
+                            } else {
+                                format!("Save this set as a new playlist '{}'", self.set_list.name)
+                            };
+                            if n > 0 && ui.add(egui::Button::new(RichText::new("Save to playlist").color(TraktorTheme::TEXT_PRIMARY()).size(11.0)).fill(TraktorTheme::CONTROL()).min_size(Vec2::new(0.0, HIT))).on_hover_text(save_tip).clicked() {
+                                library.save_playlist(&self.set_list.name, &self.set_list.track_ids);
+                            }
+                            ui.menu_button(RichText::new("Add playlist ▾").size(11.0), |ui| {
+                                if library.playlists.is_empty() {
+                                    ui.label(RichText::new("No playlists yet").color(TraktorTheme::TEXT_MUTED()));
+                                }
+                                let mut picked = None;
+                                egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                                    for p in &library.playlists {
+                                        if ui.button(format!("{} ({})", p.name, p.track_ids.len())).clicked() {
+                                            picked = Some((p.name.clone(), p.track_ids.clone()));
+                                        }
+                                    }
+                                });
+                                if let Some((name, ids)) = picked {
+                                    self.add_playlist(&name, &ids);
+                                    ui.close_menu();
+                                }
+                            }).response.on_hover_text("Add a playlist's tracks to the set. An empty set takes its name, so Save writes back to it.");
 
                             let order_label = if self.undo_order.is_some() { "Undo Order (O)" } else { "Order Flow (O)" };
                             if ui.add(
@@ -817,7 +883,7 @@ impl SetUiState {
                                             .font(theme::dot_font(12.0)),
                                     );
                                     ui.label(
-                                        RichText::new("Select tracks in the library below and press Shift+A or right-click to add")
+                                        RichText::new("Add a playlist above, or select tracks in the library below and press Shift+A or right-click to add")
                                             .color(TraktorTheme::TEXT_SECONDARY())
                                             .font(egui::FontId::proportional(11.0)),
                                     );
@@ -825,8 +891,9 @@ impl SetUiState {
                                 return;
                             }
 
-                            for (i, track) in resolved.iter().enumerate() {
-                                let is_sel = self.selected_index == Some(i);
+                            for (i, (at, track)) in rows.iter().enumerate() {
+                                let at = *at;
+                                let is_sel = self.selected_index == Some(at);
                                 let is_played = self.played_track_ids.contains(&track.id);
 
                                 let row_bg = if is_sel {
@@ -837,7 +904,7 @@ impl SetUiState {
                                     Color32::TRANSPARENT
                                 };
 
-                                let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 22.0), Sense::click());
+                                let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 22.0), Sense::click_and_drag());
                                 if ui.is_rect_visible(rect) {
                                     let painter = ui.painter();
                                     if row_bg != Color32::TRANSPARENT {
@@ -875,22 +942,53 @@ impl SetUiState {
                                     let energy_str = if track.energy > 0 { format!("E{}", track.energy) } else { "-".into() };
                                     painter.text(Pos2::new(artist_rect.right() + 84.0, y), Align2::LEFT_CENTER, &energy_str, FontId::monospace(10.0), TraktorTheme::ACCENT());
 
+                                    // The right 26 px hold the × remove button.
                                     let dur_str = format_duration(track.duration_sec);
-                                    painter.text(Pos2::new(rect.right() - 8.0, y), Align2::RIGHT_CENTER, &dur_str, FontId::monospace(10.0), TraktorTheme::TEXT_SECONDARY());
+                                    painter.text(Pos2::new(rect.right() - 30.0, y), Align2::RIGHT_CENTER, &dur_str, FontId::monospace(10.0), TraktorTheme::TEXT_SECONDARY());
 
                                     // The join into the next track, named in words: hover gives the detail.
                                     let row_warnings: Vec<_> = warnings.iter().filter(|(idx, _)| *idx == i).map(|(_, w)| w.short()).collect();
                                     if !row_warnings.is_empty() {
-                                        painter.text(Pos2::new(rect.right() - 52.0, y), Align2::RIGHT_CENTER, format!("⚠ {}", row_warnings.join(" ")), egui::FontId::proportional(10.5), TraktorTheme::METER_YELLOW());
+                                        painter.text(Pos2::new(rect.right() - 74.0, y), Align2::RIGHT_CENTER, format!("⚠ {}", row_warnings.join(" ")), egui::FontId::proportional(10.5), TraktorTheme::METER_YELLOW());
                                     }
                                 }
 
                                 if resp.clicked() {
-                                    self.selected_index = Some(i);
+                                    self.selected_index = Some(at);
                                 }
                                 if resp.double_clicked() {
                                     library.load_to_deck(idle_deck, track.id, locks);
                                 }
+                                let remove = egui::Rect::from_min_max(Pos2::new(rect.right() - 24.0, rect.top() + 1.0), Pos2::new(rect.right() - 2.0, rect.bottom() - 1.0));
+                                if ui.put(remove, egui::Button::new(RichText::new("×").size(13.0).color(TraktorTheme::TEXT_SECONDARY())).frame(false)).on_hover_text("Remove from the set (Delete)").clicked() {
+                                    edit = Some((at, None));
+                                }
+                                // Drag a row onto another to move it there: above or below that row's middle.
+                                resp.dnd_set_drag_payload(SetRow(at));
+                                let before = |p: Pos2| if p.y < rect.center().y { at } else { at + 1 };
+                                if resp.dnd_hover_payload::<SetRow>().is_some() {
+                                    if let Some(p) = ui.ctx().pointer_hover_pos() {
+                                        let line_y = if before(p) == at { rect.top() } else { rect.bottom() };
+                                        ui.painter().hline(rect.x_range(), line_y, Stroke::new(2.0, TraktorTheme::ACCENT()));
+                                    }
+                                }
+                                if let (Some(from), Some(p)) = (resp.dnd_release_payload::<SetRow>(), ui.ctx().pointer_interact_pos()) {
+                                    edit = Some((from.0, Some(before(p))));
+                                }
+                                let last = self.set_list.track_ids.len();
+                                resp.context_menu(|ui| {
+                                    for (label, to) in [("Move to top", Some(0)), ("Move up (Alt+↑)", at.checked_sub(1)), ("Move down (Alt+↓)", (at + 1 < last).then_some(at + 2)), ("Move to bottom", Some(last))] {
+                                        if ui.add_enabled(to.is_some_and(|t| t != at && t != at + 1), egui::Button::new(label)).clicked() {
+                                            edit = Some((at, to));
+                                            ui.close_menu();
+                                        }
+                                    }
+                                    ui.separator();
+                                    if ui.button("Remove from set (Delete)").clicked() {
+                                        edit = Some((at, None));
+                                        ui.close_menu();
+                                    }
+                                });
 
                                 // Warning tooltip
                                 let row_warnings: Vec<_> = warnings.iter().filter(|(idx, _)| *idx == i).map(|(_, w)| *w).collect();
@@ -922,12 +1020,12 @@ impl SetUiState {
                         .collect();
 
                     let arc_h = top_h - 66.0;
-                    let (_, clicked) = dot::set_arc_display(ui, &arc_tracks, self.selected_index, Vec2::new(arc_w - 8.0, arc_h));
+                    let (_, clicked) = dot::set_arc_display(ui, &arc_tracks, sel_row, Vec2::new(arc_w - 8.0, arc_h));
                     if let Some(c) = clicked {
-                        self.selected_index = Some(c);
+                        self.selected_index = rows.get(c).map(|(at, _)| *at);
                     }
                     // Name the highlighted column, so the plot reads without the list.
-                    if let Some(t) = self.selected_index.and_then(|i| resolved.get(i).map(|t| (i, t))) {
+                    if let Some(t) = sel_row.and_then(|i| resolved.get(i).map(|t| (i, t))) {
                         ui.add(
                             egui::Label::new(
                                 RichText::new(format!(
@@ -979,7 +1077,7 @@ impl SetUiState {
                         }
                     });
                     // The selected track's join into the next one, spelled out.
-                    if let Some(i) = self.selected_index.filter(|&i| i + 1 < resolved.len()) {
+                    if let Some(i) = sel_row.filter(|&i| i + 1 < resolved.len()) {
                         let here: Vec<_> = warnings.iter().filter(|(idx, _)| *idx == i).map(|(_, w)| w.label()).collect();
                         if !here.is_empty() {
                             let (a, b) = (&resolved[i], &resolved[i + 1]);
@@ -996,8 +1094,16 @@ impl SetUiState {
                 });
             });
         });
+        match edit {
+            Some((at, Some(before))) => self.move_track(at, before),
+            Some((at, None)) => self.remove_at(at),
+            None => {}
+        }
     }
 }
+
+/// A set row being dragged, by its place in the set.
+struct SetRow(usize);
 
 #[cfg(test)]
 mod tests {
@@ -1014,6 +1120,46 @@ mod tests {
             duration_sec,
             ..Default::default()
         }
+    }
+
+    /// Drag, the row menu and Delete: moves land where dropped, removals keep the selection on its track,
+    /// a playlist names an empty set, and Save writes the set's order back to that playlist.
+    #[test]
+    fn set_rows_move_remove_and_save_back_to_their_playlist() {
+        let mut lib = LibraryManager::new(std::env::temp_dir().join(format!("retraktor-set-{}/c.nml", std::process::id())));
+        for id in 1..=4 {
+            lib.tracks.push(make_test_track(id, 124.0, "8m", 5, 300.0));
+        }
+        lib.rebuild_index();
+        lib.playlists.push(crate::library_ui::UserPlaylist { name: "Friday".into(), track_ids: vec![1, 2, 3, 4], missing: Vec::new() });
+        let mut s = SetUiState { set_list: SetList::default(), ..Default::default() };
+
+        s.add_playlist("Friday", &[1, 2, 3, 4]);
+        assert_eq!((s.set_list.name.as_str(), &s.set_list.track_ids[..]), ("Friday", &[1, 2, 3, 4][..]));
+        s.add_playlist("Other", &[4, 2]);
+        assert_eq!(s.set_list.name, "Friday", "a set with tracks keeps its name");
+
+        s.move_track(0, 3); // dropped above the 4th row
+        assert_eq!((s.set_list.track_ids.clone(), s.selected_index), (vec![2, 3, 1, 4], Some(2)));
+        s.move_track(3, 0);
+        assert_eq!((s.set_list.track_ids.clone(), s.selected_index), (vec![4, 2, 3, 1], Some(0)));
+        s.move_track(1, 4); // to the bottom
+        assert_eq!(s.set_list.track_ids, vec![4, 3, 1, 2]);
+        s.move_track(0, 9);
+        assert_eq!(s.set_list.track_ids, vec![4, 3, 1, 2], "an out-of-range drop changes nothing");
+
+        s.selected_index = Some(2);
+        s.remove_at(0);
+        assert_eq!((s.set_list.track_ids.clone(), s.selected_index), (vec![3, 1, 2], Some(1)), "the selection stays on its track");
+        s.remove_at(2);
+        assert_eq!((s.set_list.track_ids.clone(), s.selected_index), (vec![3, 1], Some(1)));
+
+        lib.save_playlist(&s.set_list.name, &s.set_list.track_ids);
+        assert_eq!(lib.playlists[0].track_ids, vec![3, 1]);
+        lib.undo();
+        assert_eq!(lib.playlists[0].track_ids, vec![1, 2, 3, 4], "Ctrl+Z restores the playlist");
+        lib.save_playlist("New set", &[2]);
+        assert_eq!(lib.playlists.last().map(|p| (p.name.as_str(), p.track_ids.clone())), Some(("New set", vec![2])));
     }
 
     #[test]

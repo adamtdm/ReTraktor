@@ -2354,6 +2354,17 @@ impl LibraryManager {
         self.add_to_playlist(&[id], Some(idx));
     }
 
+    /// The Set view's Save: playlist `name` (made if missing) becomes `ids`, in that order. Ctrl+Z undoes it.
+    pub fn save_playlist(&mut self, name: &str, ids: &[usize]) {
+        self.remember_for_undo(format!("saved the set to '{name}'"));
+        match self.playlists.iter_mut().find(|p| p.name == name) {
+            Some(p) => p.track_ids = ids.to_vec(),
+            None => self.playlists.push(UserPlaylist { name: name.to_string(), track_ids: ids.to_vec(), missing: Vec::new() }),
+        }
+        self.status_message = format!("Saved {} to playlist '{name}' · Ctrl+Z in the library undoes it", plural(ids.len()));
+        self.touch();
+    }
+
     fn preparation_index(&mut self) -> usize {
         self.playlists.iter().position(|p| p.name == "Preparation").unwrap_or_else(|| {
             self.playlists.push(UserPlaylist { name: "Preparation".to_string(), track_ids: Vec::new(), missing: Vec::new() });
