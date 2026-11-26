@@ -702,6 +702,17 @@ pub fn build_rerank_prompt(live_ref: &TrackBrief, candidates: &[TrackBrief], flo
     out
 }
 
+/// The Set view's bridge: the rerank prompt, told which track the pick must lead into.
+pub fn build_bridge_prompt(from: &TrackBrief, to: &TrackBrief, candidates: &[TrackBrief]) -> String {
+    build_rerank_prompt(from, candidates, EnergyFlow::Hold).replace(
+        "\nTop candidates for the next track:\n",
+        &format!(
+            "It must then lead smoothly into:\n\"{}\" by \"{}\" | BPM: {:.1} | Key: {} | Energy: {} | Genre: {}\n\nTop candidates for the bridge track:\n",
+            to.title, to.artist, to.bpm, to.key, to.energy, to.genre
+        ),
+    )
+}
+
 /// Parses the AI re-ranking reply into an ordered list of `(id, reason)`.
 pub fn parse_rerank_reply(reply: &str, valid_candidates: &[TrackBrief]) -> Vec<(usize, String)> {
     let valid_ids: HashSet<usize> = valid_candidates.iter().map(|t| t.id).collect();
@@ -1000,6 +1011,13 @@ mod tests {
 
         // Reason string includes genre
         assert!(explain_candidate(&candidate_calmer, &live).contains("Deep House"));
+    }
+
+    #[test]
+    fn bridge_prompt_names_the_track_to_lead_into() {
+        let t = |id, title: &str| TrackBrief { id, title: title.into(), artist: "A".into(), bpm: 126.0, key: "9A".into(), genre: String::new(), energy: 5, duration_sec: 300.0 };
+        let p = build_bridge_prompt(&t(1, "From"), &t(2, "Into"), &[t(3, "Cand")]);
+        assert!(p.contains("lead smoothly into:\n\"Into\"") && p.contains("bridge track:\nID: 3"), "{p}");
     }
 
     #[test]

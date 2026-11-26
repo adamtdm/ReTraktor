@@ -304,6 +304,25 @@ pub fn order_for_flow(tracks: &[UiTrackEntry]) -> Vec<usize> {
 }
 
 /// Total playback duration in seconds for a list of tracks.
+/// Library tracks that mix out of `a` and into `b`, best first, with why they fit; never one already in the set.
+pub fn bridge_candidates(tracks: &[UiTrackEntry], a: &UiTrackEntry, b: &UiTrackEntry, set: &[usize]) -> Vec<(usize, String)> {
+    let mut scored: Vec<(f32, &UiTrackEntry)> = tracks
+        .iter()
+        .map(|t| (crate::ai::score_next_candidate(t, a, set, crate::ai::EnergyFlow::Hold, false) * crate::library_ui::match_score(b, t), t))
+        .filter(|(s, _)| *s > 0.0)
+        .collect();
+    scored.sort_by(|x, y| y.0.total_cmp(&x.0));
+    scored.into_iter().take(30).map(|(_, t)| (t.id, crate::ai::explain_candidate(t, a))).collect()
+}
+
+/// The AI's order with every set track kept: any it left out stay at the end in their old order.
+pub fn merge_order(ids: &[usize], ai: &[usize]) -> Vec<usize> {
+    let mut rest = ids.to_vec();
+    let mut out: Vec<usize> = ai.iter().filter_map(|id| rest.iter().position(|x| x == id).map(|p| rest.remove(p))).collect();
+    out.extend(rest);
+    out
+}
+
 pub fn total_duration(tracks: &[UiTrackEntry]) -> f64 {
     tracks.iter().map(|t| t.duration_sec).sum()
 }
@@ -450,12 +469,31 @@ pub struct SetUiState {
     deck_logged: [bool; 4],
     /// Clear asks once before it empties the set.
     confirm_clear: bool,
+    /// Tracks offered between two set tracks; shown in place of the arc.
+    bridge: Option<Bridge>,
+    ai_order: Option<crate::ai::AiPlaylistRunner>,
+    /// The set shape typed for AI Order, e.g. "warm up, peak at 60%, cool down".
+    ai_shape: String,
+    ai_note: Option<String>,
+}
+
+struct Bridge {
+    /// Set positions (in `track_ids`) of the tracks either side; a pick goes in before `to`.
+    from: usize,
+    to: usize,
+    picks: Vec<(usize, String)>,
+    ai: Option<crate::ai::AiRerankRunner>,
+    note: Option<String>,
 }
 
 impl Default for SetUiState {
     fn default() -> Self {
         Self {
             confirm_clear: false,
+            bridge: None,
+            ai_order: None,
+            ai_shape: String::new(),
+            ai_note: None,
             set_list: SetList::load(),
             selected_index: None,
             undo_order: None,
@@ -581,6 +619,7 @@ impl SetUiState {
         ids.insert(to, id);
         self.selected_index = Some(to);
         self.undo_order = None;
+        self.bridge = None;
         let _ = self.set_list.save();
     }
 
@@ -589,10 +628,19 @@ impl SetUiState {
             return;
         }
         self.set_list.track_ids.remove(at);
+        self.bridge = None;
         let len = self.set_list.track_ids.len();
         self.selected_index = self.selected_index.filter(|_| len > 0).map(|s| if s > at { s - 1 } else { s.min(len - 1) });
         self.undo_order = None;
         let _ = self.set_list.save();
+    }
+
+    /// Offers library tracks to go between the set tracks at `from` and `to`.
+    fn open_bridge(&mut self, library: &LibraryManager, from: usize, to: usize) {
+        let ids = &self.set_list.track_ids;
+        let (Some(a), Some(b)) = (library.track(ids[from]), library.track(ids[to])) else { return };
+        let picks = bridge_candidates(&library.tracks, a, b, ids);
+        self.bridge = Some(Bridge { from, to, picks, ai: None, note: None });
     }
 
     /// Adds a playlist's tracks; an empty set takes the playlist's name, so Save writes back to it.
@@ -767,6 +815,10 @@ impl SetUiState {
         // The selection is a place in `track_ids`; the arc and the join read are by row.
         let sel_row = rows.iter().position(|(at, _)| Some(*at) == self.selected_index);
         let mut edit: Option<(usize, Option<usize>)> = None; // (at, Some(before) moves it, None removes it)
+        let mut bridge_req: Option<(usize, usize)> = None;
+        let mut insert: Option<(usize, usize)> = None; // (before, track id)
+        let mut close_bridge = false;
+        self.poll_ai();
 
         panel(TraktorTheme::BG_PANEL()).show(ui, |ui| {
             ui.set_height(top_h);
@@ -802,6 +854,7 @@ impl SetUiState {
                                 if ui.add(egui::Button::new(RichText::new(format!("Clear {n} tracks")).color(TraktorTheme::METER_RED()).size(11.0)).min_size(Vec2::new(0.0, HIT))).clicked() {
                                     self.set_list = SetList::default();
                                     self.selected_index = None;
+                                    self.bridge = None;
                                     self.confirm_clear = false;
                                     let _ = self.set_list.save();
                                 }
@@ -853,6 +906,8 @@ impl SetUiState {
                             .on_hover_text("Greedy reorder keeping first track, minimising key/tempo/energy clash (O)")
                             .clicked()
                             {
+                                self.bridge = None;
+                                self.ai_note = None;
                                 if let Some(prev) = self.undo_order.take() {
                                     self.set_list.track_ids = prev;
                                     let _ = self.set_list.save();
@@ -862,6 +917,25 @@ impl SetUiState {
                                     let _ = self.set_list.save();
                                 }
                             }
+                            let ai_label = if self.ai_order.is_some() { "AI Order…" } else { "AI Order ▾" };
+                            ui.menu_button(RichText::new(ai_label).color(TraktorTheme::ACCENT()).size(11.0), |ui| {
+                                ui.label("The shape of the set:");
+                                ui.add(egui::TextEdit::singleline(&mut self.ai_shape).hint_text("warm up, peak at 60%, cool down").desired_width(260.0));
+                                if ui.add_enabled(resolved.len() > 1 && self.ai_order.is_none(), egui::Button::new("Order with AI")).clicked() {
+                                    let settings = crate::ai::AiSettings::load();
+                                    if settings.is_configured() {
+                                        let briefs: Vec<_> = resolved.iter().map(crate::ai::TrackBrief::from_ui).collect();
+                                        let shape = if self.ai_shape.trim().is_empty() { "a smooth journey that builds to a peak" } else { self.ai_shape.trim() };
+                                        let request = format!("Order ALL of these tracks as one DJ set, using every track exactly once. Shape of the set: {shape}");
+                                        let prompt = crate::ai::build_playlist_prompt(&request, &briefs, briefs.len());
+                                        self.ai_order = Some(crate::ai::AiPlaylistRunner::start(settings, prompt, briefs.iter().map(|b| b.id).collect()));
+                                        self.ai_note = Some("Asking your AI model to order the set…".into());
+                                    } else {
+                                        self.ai_note = Some(NO_AI_KEY.into());
+                                    }
+                                    ui.close_menu();
+                                }
+                            }).response.on_hover_text("Your AI model orders the set to a shape you describe. Undo Order puts it back.");
                         });
                     });
 
@@ -969,7 +1043,7 @@ impl SetUiState {
                                 if resp.dnd_hover_payload::<SetRow>().is_some() {
                                     if let Some(p) = ui.ctx().pointer_hover_pos() {
                                         let line_y = if before(p) == at { rect.top() } else { rect.bottom() };
-                                        ui.painter().hline(rect.x_range(), line_y, Stroke::new(2.0, TraktorTheme::ACCENT()));
+                                        ui.painter().hline(rect.x_range(), line_y, Stroke::new(2.0_f32, TraktorTheme::ACCENT()));
                                     }
                                 }
                                 if let (Some(from), Some(p)) = (resp.dnd_release_payload::<SetRow>(), ui.ctx().pointer_interact_pos()) {
@@ -984,6 +1058,12 @@ impl SetUiState {
                                         }
                                     }
                                     ui.separator();
+                                    if let Some(&(next, _)) = rows.get(i + 1) {
+                                        if ui.button("Find a bridge into the next track").clicked() {
+                                            bridge_req = Some((at, next));
+                                            ui.close_menu();
+                                        }
+                                    }
                                     if ui.button("Remove from set (Delete)").clicked() {
                                         edit = Some((at, None));
                                         ui.close_menu();
@@ -1009,6 +1089,44 @@ impl SetUiState {
                 // --- Right Column: Dot-Matrix Arc Display & Running Time ---
                 ui.allocate_ui_with_layout(Vec2::new(arc_w, top_h), Layout::top_down(Align::Min), |ui| {
                     ui.set_width(arc_w);
+
+                    if let Some(b) = &mut self.bridge {
+                        let num = |at: usize| rows.iter().position(|r| r.0 == at).map_or(0, |i| i + 1);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(format!("BRIDGE {:02} → {:02}", num(b.from), num(b.to))).color(TraktorTheme::TEXT_MUTED()).font(egui::FontId::monospace(10.5)).strong());
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui.button("Close").clicked() {
+                                    close_bridge = true;
+                                }
+                                if b.ai.is_some() {
+                                    ui.spinner();
+                                } else if !b.picks.is_empty() && ui.button("Ask AI").on_hover_text("Your AI model re-ranks these, with a reason for each").clicked() {
+                                    let settings = crate::ai::AiSettings::load();
+                                    let ids = &self.set_list.track_ids;
+                                    if !settings.is_configured() {
+                                        b.note = Some(NO_AI_KEY.into());
+                                    } else if let (Some(x), Some(z)) = (library.track(ids[b.from]), library.track(ids[b.to])) {
+                                        let cands: Vec<_> = b.picks.iter().filter_map(|(id, _)| library.track(*id)).map(crate::ai::TrackBrief::from_ui).collect();
+                                        let prompt = crate::ai::build_bridge_prompt(&crate::ai::TrackBrief::from_ui(x), &crate::ai::TrackBrief::from_ui(z), &cands);
+                                        b.ai = Some(crate::ai::AiRerankRunner::start(settings, prompt, cands));
+                                        b.note = Some("Asking your AI model…".into());
+                                    }
+                                }
+                            });
+                        });
+                        let note = b.note.as_deref().unwrap_or(if b.picks.is_empty() { "Nothing in the library mixes out of one and into the other" } else { "Click one to put it in between" });
+                        ui.label(RichText::new(note).color(TraktorTheme::TEXT_SECONDARY()).font(egui::FontId::proportional(11.0)));
+                        egui::ScrollArea::vertical().id_salt("set_bridge_picks").max_height(top_h - 56.0).show(ui, |ui| {
+                            for (id, why) in &b.picks {
+                                let Some(t) = library.track(*id) else { continue };
+                                let text = RichText::new(format!("+ {} – {}  ·  {why}", t.artist, t.title)).color(TraktorTheme::TEXT_PRIMARY()).size(11.0);
+                                if ui.add(egui::Label::new(text).truncate().sense(Sense::click())).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                    insert = Some((b.to, *id));
+                                }
+                            }
+                        });
+                        return;
+                    }
 
                     let arc_tracks: Vec<SetArcTrack> = resolved
                         .iter()
@@ -1089,7 +1207,13 @@ impl SetUiState {
                                 .color(TraktorTheme::METER_YELLOW())
                                 .font(egui::FontId::proportional(11.0)),
                             );
+                            if ui.button("Find bridge").on_hover_text("Library tracks that would go between these two").clicked() {
+                                bridge_req = Some((rows[i].0, rows[i + 1].0));
+                            }
                         }
+                    }
+                    if let Some(n) = &self.ai_note {
+                        ui.label(RichText::new(n).color(TraktorTheme::TEXT_SECONDARY()).font(egui::FontId::proportional(11.0)));
                     }
                 });
             });
@@ -1099,8 +1223,61 @@ impl SetUiState {
             Some((at, None)) => self.remove_at(at),
             None => {}
         }
+        if close_bridge {
+            self.bridge = None;
+        }
+        if let Some((before, id)) = insert {
+            self.insert_at(before, id);
+        }
+        if let Some((from, to)) = bridge_req {
+            self.open_bridge(library, from, to);
+        }
+        if self.ai_order.is_some() || self.bridge.as_ref().is_some_and(|b| b.ai.is_some()) {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+        }
+    }
+
+    /// Puts track `id` in the set before position `before`, and selects it.
+    fn insert_at(&mut self, before: usize, id: usize) {
+        self.set_list.track_ids.insert(before.min(self.set_list.track_ids.len()), id);
+        self.selected_index = Some(before);
+        self.undo_order = None;
+        self.bridge = None;
+        let _ = self.set_list.save();
+    }
+
+    /// Takes in AI answers that have arrived: the set's new order, or a bridge's ranking.
+    fn poll_ai(&mut self) {
+        if let Some(res) = self.ai_order.as_ref().and_then(|r| r.poll()) {
+            self.ai_order = None;
+            match res {
+                Ok(ai) => {
+                    self.undo_order = Some(self.set_list.track_ids.clone());
+                    self.set_list.track_ids = merge_order(&self.set_list.track_ids, &ai);
+                    self.bridge = None;
+                    self.ai_note = Some("AI ordered the set · Undo Order puts it back".into());
+                    let _ = self.set_list.save();
+                }
+                Err(e) => self.ai_note = Some(format!("AI Order failed: {e}")),
+            }
+        }
+        if let Some(b) = &mut self.bridge {
+            if let Some(res) = b.ai.as_ref().and_then(|r| r.poll()) {
+                b.ai = None;
+                b.note = Some(match res {
+                    Ok(picks) if !picks.is_empty() => {
+                        b.picks = picks;
+                        "Ranked by your AI model · click one to put it in between".into()
+                    }
+                    Ok(_) => "The AI model gave no picks; this is the offline ranking".into(),
+                    Err(e) => format!("AI failed: {e}"),
+                });
+            }
+        }
     }
 }
+
+const NO_AI_KEY: &str = "Add your AI key in Preferences > Stems & AI first";
 
 /// A set row being dragged, by its place in the set.
 struct SetRow(usize);
@@ -1120,6 +1297,20 @@ mod tests {
             duration_sec,
             ..Default::default()
         }
+    }
+
+    /// A bridge mixes out of one track and into the next, never repeats a set track, and AI Order keeps every track.
+    #[test]
+    fn bridges_fit_both_sides_and_ai_order_keeps_every_track() {
+        let playable = |id, bpm, key: &str, energy| UiTrackEntry { file_path: Some(format!("/m/{id}.mp3").into()), ..make_test_track(id, bpm, key, energy, 300.0) };
+        let (a, b) = (playable(1, 124.0, "8A", 5), playable(2, 128.0, "10A", 6));
+        let lib = vec![a.clone(), b.clone(), playable(3, 126.0, "9A", 5), playable(4, 126.0, "3B", 5), playable(5, 126.0, "9A", 5)];
+        let picks: Vec<usize> = bridge_candidates(&lib, &a, &b, &[1, 2, 5]).into_iter().map(|(id, _)| id).collect();
+        assert_eq!(picks.first(), Some(&3), "9A at 126 sits between 8A/124 and 10A/128: {picks:?}");
+        assert!(!picks.contains(&5) && !picks.contains(&1), "set tracks are never offered: {picks:?}");
+
+        assert_eq!(merge_order(&[1, 2, 3, 4], &[3, 1, 9]), vec![3, 1, 2, 4], "unknown ids dropped, skipped ones kept at the end");
+        assert_eq!(merge_order(&[7, 7, 8], &[8, 7, 7, 7]), vec![8, 7, 7]);
     }
 
     /// Drag, the row menu and Delete: moves land where dropped, removals keep the selection on its track,
