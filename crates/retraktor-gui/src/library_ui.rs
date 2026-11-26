@@ -1174,7 +1174,8 @@ impl LibraryManager {
     /// Whether a linked library's entry is a track the user removed (also when the library knows it by another folder).
     fn was_removed(&self, p: &Path) -> bool {
         self.removed.contains(p)
-            || !p.is_file() && p.file_name().is_some_and(|n| self.removed_names.contains(&n.to_string_lossy().to_ascii_lowercase()))
+            // Name first: the file check is a network round trip per track on a NAS, and this runs for every linked track on the UI thread.
+            || p.file_name().is_some_and(|n| self.removed_names.contains(&n.to_string_lossy().to_ascii_lowercase())) && !p.is_file()
     }
 
     fn save_libraries(&mut self) {
@@ -1554,7 +1555,7 @@ impl LibraryManager {
             if library.is_some() && self.was_removed(&p) {
                 continue;
             }
-            let moved = || if p.is_file() { None } else { file_key(&p).and_then(|k| by_name.get(&k)).filter(|v| v.len() == 1).map(|v| v[0]) };
+            let moved = || file_key(&p).and_then(|k| by_name.get(&k)).filter(|v| v.len() == 1 && !p.is_file()).map(|v| v[0]);
             // A track read before the volume was known sits at its saved path: move it onto the volume.
             let at_saved = || (p != saved).then(|| by_path.get(&saved).copied()).flatten();
             let id = match by_path.get(&p).copied().or_else(|| library.and_then(|_| at_saved().or_else(moved))) {
