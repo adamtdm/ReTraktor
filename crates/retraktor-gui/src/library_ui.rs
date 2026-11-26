@@ -319,10 +319,34 @@ fn read_track_tags(path: &Path) -> (UiTrackEntry, Vec<NmlCue>) {
 }
 
 /// Writes the editable fields back into the audio file's own tags.
-fn write_track_tags(t: &UiTrackEntry) -> Result<(), String> {
+/// Writes `fields` of `t` into its file's tags; a field left empty removes its tag. Only these fields are
+/// touched, so tags ReTraktor never read survive. Fields with no tag here (year, track no., rating, energy) are skipped.
+fn write_track_tags(t: &UiTrackEntry, fields: &[SortColumn]) -> Result<(), String> {
     use lofty::config::WriteOptions;
     use lofty::file::TaggedFileExt;
-    use lofty::tag::{Accessor, ItemKey, Tag, TagExt};
+    use lofty::tag::{ItemKey, Tag, TagExt};
+
+    let tags: Vec<(ItemKey, String)> = fields
+        .iter()
+        .filter_map(|&c| {
+            let key = match c {
+                SortColumn::Title => ItemKey::TrackTitle,
+                SortColumn::Artist => ItemKey::TrackArtist,
+                SortColumn::Album => ItemKey::AlbumTitle,
+                SortColumn::Genre => ItemKey::Genre,
+                SortColumn::Comment => ItemKey::Comment,
+                SortColumn::Remixer => ItemKey::Remixer,
+                SortColumn::Label => ItemKey::Label,
+                SortColumn::Key => ItemKey::InitialKey,
+                SortColumn::Bpm => ItemKey::Bpm,
+                _ => return None,
+            };
+            Some((key, field_text(t, c)))
+        })
+        .collect();
+    if tags.is_empty() {
+        return Ok(());
+    }
 
     let path = t.file_path.as_ref().ok_or("track has no file")?;
     let mut tagged = lofty::read_from_path(path).map_err(|e| e.to_string())?;
@@ -331,17 +355,7 @@ fn write_track_tags(t: &UiTrackEntry) -> Result<(), String> {
         tagged.insert_tag(Tag::new(tag_type));
     }
     let tag = tagged.primary_tag_mut().ok_or("cannot create tag")?;
-    tag.set_title(t.title.clone());
-    tag.set_artist(t.artist.clone());
-    tag.set_album(t.album.clone());
-    tag.set_genre(t.genre.clone());
-    tag.set_comment(t.comment.clone());
-    for (key, val) in [
-        (ItemKey::Remixer, t.remixer.clone()),
-        (ItemKey::Label, t.label.clone()),
-        (ItemKey::InitialKey, t.musical_key.clone()),
-        (ItemKey::Bpm, if t.bpm > 0.0 { format!("{:.2}", t.bpm) } else { String::new() }),
-    ] {
+    for (key, val) in tags {
         if val.is_empty() {
             tag.remove_key(&key);
         } else {
@@ -439,6 +453,126 @@ fn column_menu(ui: &mut Ui, c: &mut LibraryColumnsConfig) {
 
 fn plural(n: usize) -> String {
     if n == 1 { "1 track".to_string() } else { format!("{n} tracks") }
+}
+
+/// The fields a DJ can type into, in the editor's order. Alt+click edits these in the table too.
+const EDITABLE: [SortColumn; 13] = [
+    SortColumn::Title,
+    SortColumn::Artist,
+    SortColumn::Album,
+    SortColumn::Genre,
+    SortColumn::Remixer,
+    SortColumn::Label,
+    SortColumn::Year,
+    SortColumn::TrackNum,
+    SortColumn::Key,
+    SortColumn::Bpm,
+    SortColumn::Rating,
+    SortColumn::Energy,
+    SortColumn::Comment,
+];
+
+/// A track's field as the text a DJ edits; empty for an unset number.
+fn field_text(t: &UiTrackEntry, c: SortColumn) -> String {
+    let n = |v: u32| if v > 0 { v.to_string() } else { String::new() };
+    match c {
+        SortColumn::Title => t.title.clone(),
+        SortColumn::Artist => t.artist.clone(),
+        SortColumn::Album => t.album.clone(),
+        SortColumn::Genre => t.genre.clone(),
+        SortColumn::Remixer => t.remixer.clone(),
+        SortColumn::Label => t.label.clone(),
+        SortColumn::Year => t.year.clone(),
+        SortColumn::Comment => t.comment.clone(),
+        SortColumn::Key => t.musical_key.clone(),
+        SortColumn::Bpm if t.bpm > 0.0 => format!("{:.2}", t.bpm),
+        SortColumn::TrackNum => n(t.track_number),
+        SortColumn::Rating => n(t.rating.into()),
+        SortColumn::Energy => n(t.energy.into()),
+        _ => String::new(),
+    }
+}
+
+/// Sets a field from typed text, checking it first; the error says what to type instead.
+fn set_field(t: &mut UiTrackEntry, c: SortColumn, text: &str) -> Result<(), String> {
+    let v = text.trim();
+    let num = |max: f64, what: &str| -> Result<f64, String> {
+        if v.is_empty() {
+            return Ok(0.0);
+        }
+        v.parse::<f64>().ok().filter(|n| (0.0..=max).contains(n)).ok_or_else(|| format!("{what} must be a number from 0 to {max}, not '{v}'"))
+    };
+    match c {
+        SortColumn::Title => t.title = v.into(),
+        SortColumn::Artist => t.artist = v.into(),
+        SortColumn::Album => t.album = v.into(),
+        SortColumn::Genre => t.genre = v.into(),
+        SortColumn::Remixer => t.remixer = v.into(),
+        SortColumn::Label => t.label = v.into(),
+        SortColumn::Year => t.year = v.into(),
+        SortColumn::Comment => t.comment = v.into(),
+        SortColumn::Key if v.is_empty() => t.musical_key.clear(),
+        SortColumn::Key => {
+            let k = KeyWheel::normalize(v).and_then(KeyWheel::to_open_key).ok_or_else(|| format!("'{v}' isn't a key: use e.g. 8m, 8A or Am"))?;
+            t.musical_key = k.to_string();
+        }
+        SortColumn::Bpm => t.bpm = num(250.0, "BPM")?,
+        SortColumn::TrackNum => t.track_number = num(9999.0, "Track number")?.round() as u32,
+        SortColumn::Rating => t.rating = num(5.0, "Rating")?.round() as u8,
+        SortColumn::Energy => t.energy = num(10.0, "Energy")?.round() as u8,
+        _ => return Err(format!("{} can't be edited", c.header())),
+    }
+    Ok(())
+}
+
+fn field_name(c: SortColumn) -> &'static str {
+    match c {
+        SortColumn::TrackNum => "Track no.",
+        _ => c.header(),
+    }
+}
+
+/// The track editor, for one track or many. Each field keeps the tracks' shared value (`None` where they
+/// differ) and what's typed now; only the fields that change are written, to every track.
+struct Editor {
+    ids: Vec<usize>,
+    fields: Vec<(SortColumn, Option<String>, String)>,
+    /// ×½ / ×2 pressed while BPMs differ: each track's own BPM is scaled.
+    bpm_scale: f64,
+    error: Option<String>,
+}
+
+impl Editor {
+    fn new(tracks: &[&UiTrackEntry]) -> Self {
+        let fields = EDITABLE
+            .iter()
+            .map(|&c| {
+                let first = field_text(tracks[0], c);
+                let shared = tracks.iter().all(|t| field_text(t, c) == first).then_some(first);
+                (c, shared.clone(), shared.unwrap_or_default())
+            })
+            .collect();
+        Self { ids: tracks.iter().map(|t| t.id).collect(), fields, bpm_scale: 1.0, error: None }
+    }
+
+    /// Changed from the shared value, or typed into where the tracks differ.
+    fn is_changed(was: &Option<String>, now: &str) -> bool {
+        was.as_ref().map_or(!now.trim().is_empty(), |w| w.trim() != now.trim())
+    }
+
+    /// The fields to write.
+    fn changes(&self) -> Vec<(SortColumn, String)> {
+        self.fields.iter().filter(|(_, was, now)| Self::is_changed(was, now)).map(|(c, _, now)| (*c, now.clone())).collect()
+    }
+
+    /// The fields a save writes, BPM included when only scaled.
+    fn changed_fields(&self) -> Vec<SortColumn> {
+        let mut cols: Vec<SortColumn> = self.changes().into_iter().map(|(c, _)| c).collect();
+        if self.bpm_scale != 1.0 && !cols.contains(&SortColumn::Bpm) {
+            cols.push(SortColumn::Bpm);
+        }
+        cols
+    }
 }
 
 pub fn stereo_to_mono(pcm: &[f32]) -> Vec<f32> {
@@ -778,7 +912,7 @@ enum Action {
     LoadAuto(usize),
     AddToPlaylist(Vec<usize>, Option<usize>),
     RemoveFromPlaylist(Vec<usize>),
-    Edit(usize),
+    Edit(Vec<usize>),
     FillTags(Vec<usize>),
     Analyze(Vec<usize>),
     Stems(usize),
@@ -854,7 +988,9 @@ pub struct LibraryManager {
     undo: Option<(String, Vec<UiTrackEntry>, Vec<UserPlaylist>)>,
 
     renaming: Option<(usize, String)>,
-    editing: Option<UiTrackEntry>,
+    editing: Option<Editor>,
+    /// The table cell being typed into (Alt+click): track, field, text, and whether it opened this frame.
+    cell_edit: Option<(usize, SortColumn, String, bool)>,
     /// Traktor collections found on this computer; `None` while still searching.
     detected: Option<Vec<PathBuf>>,
     picked: Vec<(Pick, PathBuf)>,
@@ -949,6 +1085,7 @@ impl LibraryManager {
             undo: None,
             renaming: None,
             editing: None,
+            cell_edit: None,
             detected: None,
             picked: Vec::new(),
             typed_path: None,
@@ -2066,6 +2203,70 @@ impl LibraryManager {
         }
     }
 
+    /// Dev screenshot step: the editor open on the first six tracks in view.
+    pub fn shot_bulk_edit(&mut self) {
+        let ids: Vec<usize> = self.view.iter().take(6).map(|&i| self.tracks[i].id).collect();
+        self.selection = ids.iter().copied().collect();
+        self.open_editor(&ids);
+        if let Some(f) = self.editing.as_mut().and_then(|ed| ed.fields.iter_mut().find(|f| f.0 == SortColumn::Genre)) {
+            f.2 = "UK Garage".into();
+        }
+    }
+
+    /// Dev screenshot step: the second track's Genre cell open for typing.
+    pub fn shot_cell_edit(&mut self) {
+        if let Some(t) = self.view.get(1).map(|&i| &self.tracks[i]) {
+            self.selection = BTreeSet::from([t.id]);
+            self.cell_edit = Some((t.id, SortColumn::Genre, field_text(t, SortColumn::Genre), true));
+        }
+    }
+
+    /// Opens the editor on these tracks (one, or many at once).
+    fn open_editor(&mut self, ids: &[usize]) {
+        let tracks: Vec<&UiTrackEntry> = ids.iter().filter_map(|&id| self.track(id)).collect();
+        let editor = (!tracks.is_empty()).then(|| Editor::new(&tracks));
+        if editor.is_some() {
+            self.cell_edit = None;
+            self.editing = editor;
+        }
+    }
+
+    /// Writes `changes` to every track in `ids`, and scales each one's BPM by `bpm_scale` unless BPM is among
+    /// them, as one undoable edit. Every value is checked first, so a bad one changes nothing.
+    fn edit_tracks(&mut self, ids: &[usize], changes: &[(SortColumn, String)], bpm_scale: f64) -> Result<(), String> {
+        let mut probe = UiTrackEntry::default();
+        for (c, v) in changes {
+            set_field(&mut probe, *c, v)?;
+        }
+        let scale = bpm_scale != 1.0 && !changes.iter().any(|(c, _)| *c == SortColumn::Bpm);
+        if changes.is_empty() && !scale {
+            return Ok(());
+        }
+        if scale {
+            let over: Vec<&str> = ids.iter().filter_map(|&id| self.track(id)).filter(|t| t.bpm * bpm_scale > 250.0).map(|t| t.title.as_str()).collect();
+            if let Some(first) = over.first() {
+                return Err(format!("That would put {} over 250 BPM, e.g. '{first}'. Nothing was changed.", plural(over.len())));
+            }
+        }
+        let what = match (changes, ids) {
+            ([(c, _)], [id]) => format!("edited {} of '{}'", field_name(*c), self.track(*id).map_or(String::new(), |t| t.title.clone())),
+            _ => format!("edited {}", plural(ids.len())),
+        };
+        self.remember_for_undo(what);
+        for &id in ids {
+            if let Some(t) = self.track_mut(id) {
+                for (c, v) in changes {
+                    let _ = set_field(t, *c, v);
+                }
+                if scale {
+                    t.bpm *= bpm_scale;
+                }
+            }
+        }
+        self.touch();
+        Ok(())
+    }
+
     fn remember_for_undo(&mut self, what: String) {
         self.undo = Some((what, self.tracks.clone(), self.playlists.clone()));
     }
@@ -2198,7 +2399,7 @@ impl LibraryManager {
                     }
                 }
             }
-            Action::Edit(id) => self.editing = self.track(id).cloned(),
+            Action::Edit(ids) => self.open_editor(&ids),
             Action::FillTags(ids) => self.start_tag_fill(&ids),
             Action::Analyze(ids) => self.start_analysis(ids, true),
             Action::Stems(id) => {
@@ -2856,8 +3057,8 @@ impl LibraryManager {
                         self.status_message = format!("Added {} to set list", plural(n));
                         ui.close_menu();
                     }
-                    if n == 1 && ui.button("Edit track info…").clicked() {
-                        self.editing = self.track(ids[0]).cloned();
+                    if ui.button(if n == 1 { "Edit track info…".to_string() } else { format!("Edit {n} tracks…") }).clicked() {
+                        self.open_editor(&ids);
                         ui.close_menu();
                     }
                 })
@@ -3109,6 +3310,10 @@ impl LibraryManager {
         if keys && ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Z)) {
             self.undo();
         }
+        if keys && ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::I)) {
+            let ids = self.selected_ids();
+            self.open_editor(&ids);
+        }
         if keys {
             let (down, up, enter, shift, del, all, add_set) = ui.input(|i| {
                 (
@@ -3163,6 +3368,11 @@ impl LibraryManager {
         }
         let (sort_col, sort_asc) = (self.sort_col, self.sort_asc);
         let (mut visible, mut preview_click, mut refused_click) = (Vec::new(), None, None);
+        // The cell being typed into; how its editing ended (save?, Tab step); an Alt+click that starts one.
+        let mut cell_edit = self.cell_edit.take();
+        let mut cell_done: Option<(bool, i32)> = None;
+        let mut cell_start: Option<(usize, SortColumn)> = None;
+        let mut cell_drawn = false;
         table
             .header(22.0, |mut header| {
                 for &c in &cols {
@@ -3195,8 +3405,26 @@ impl LibraryManager {
                     row.set_selected(selected);
                     let (mut wave, mut problem) = (None, None);
                     let mut filter_cells: Vec<(egui::Response, QuickFilterAction)> = Vec::new();
+                    let mut cells: Vec<(SortColumn, egui::Rect)> = Vec::new();
                     for &c in &cols {
                         row.col(|ui| {
+                            cells.push((c, ui.max_rect()));
+                            if let Some((_, _, text, fresh)) = cell_edit.as_mut().filter(|e| e.0 == t.id && e.1 == c) {
+                                cell_drawn = true;
+                                let r = ui.add(egui::TextEdit::singleline(text).id(egui::Id::new(("cell_edit", t.id, c))).font(egui::FontId::proportional(12.0)).margin(egui::vec2(3.0, 1.0)).desired_width(f32::INFINITY));
+                                if std::mem::take(fresh) {
+                                    // Opens with the text selected, so typing replaces it.
+                                    let mut st = egui::text_edit::TextEditState::load(ui.ctx(), r.id).unwrap_or_default();
+                                    st.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(text.chars().count()))));
+                                    st.store(ui.ctx(), r.id);
+                                    r.request_focus();
+                                } else if r.lost_focus() {
+                                    // Enter or a click elsewhere saves, Esc cancels, Tab / Shift+Tab save and move along the row.
+                                    let (esc, tab, shift) = ui.input(|i| (i.key_pressed(egui::Key::Escape), i.key_pressed(egui::Key::Tab), i.modifiers.shift));
+                                    cell_done = Some((!esc, if !tab { 0 } else if shift { -1 } else { 1 }));
+                                }
+                                return;
+                            }
                             if c == SortColumn::Preview {
                                 let (response, why) = self.row_waveform(ui, t);
                                 (wave, problem) = (Some(response), why);
@@ -3228,6 +3456,19 @@ impl LibraryManager {
                     // The waveform takes its own clicks, above the row: they select, and a plain one previews from
                     // there, but never reach the row's double-click load. Drags pass through to the row.
                     let row_resp = row.response();
+                    // Alt+click edits the cell under the pointer in place (Shift filters, Ctrl selects).
+                    let alt = ui_modifiers(&row_resp).alt;
+                    if alt && (row_resp.clicked() || filter_cells.iter().any(|(cr, _)| cr.clicked())) {
+                        let pos = row_resp.ctx.input(|i| i.pointer.interact_pos());
+                        if let Some(&(c, _)) = pos.and_then(|p| cells.iter().find(|(_, r)| r.contains(p))) {
+                            if EDITABLE.contains(&c) {
+                                cell_start = Some((t.id, c));
+                                if !selected {
+                                    actions.push(Action::Select(t.id, egui::Modifiers::NONE));
+                                }
+                            }
+                        }
+                    }
                     let mut resp = row_resp.clone();
                     let wave_clicked = wave.as_ref().filter(|w| w.clicked());
                     let mut filter_clicked = false;
@@ -3248,7 +3489,7 @@ impl LibraryManager {
                         }
                         resp = resp.union(cr);
                     }
-                    if !filter_clicked {
+                    if !filter_clicked && !alt {
                         if let Some(mods) = cell_plain_click {
                             actions.push(Action::Select(t.id, mods));
                         } else if row_resp.clicked() || wave_clicked.is_some() {
@@ -3263,7 +3504,9 @@ impl LibraryManager {
                             (None, None) => {}
                         }
                     }
-                    if cell_double_click {
+                    if alt {
+                        // A quick second Alt+click is still editing, not a load.
+                    } else if cell_double_click {
                         actions.push(Action::LoadAuto(t.id));
                     } else if row_resp.double_clicked() {
                         // Shift sends it to deck B; plain double-click takes the first free deck.
@@ -3316,8 +3559,9 @@ impl LibraryManager {
                             ui.close_menu();
                         }
                         ui.separator();
-                        if ui.button("Edit track info…").clicked() {
-                            actions.push(Action::Edit(t.id));
+                        let edit = if ids.len() == 1 { "Edit track info…".to_string() } else { format!("Edit {} tracks…", ids.len()) };
+                        if ui.button(edit).on_hover_text("Ctrl+I · or Alt+click a cell to edit it in place").clicked() {
+                            actions.push(Action::Edit(ids.clone()));
                             ui.close_menu();
                         }
                         if ui.button("Analyze BPM, key, energy").on_hover_text("Replaces existing BPM/key/energy values").clicked() {
@@ -3347,6 +3591,29 @@ impl LibraryManager {
                 });
             });
         self.visible_rows = visible;
+        // A cell scrolled or filtered out of view while typing saves, as clicking away does.
+        if cell_done.is_none() && !cell_drawn && cell_edit.as_ref().is_some_and(|e| !e.3) {
+            cell_done = Some((true, 0));
+        }
+        if let Some(((save, step), (id, col, text, _))) = cell_done.and_then(|d| Some((d, cell_edit.take()?))) {
+            let unchanged = self.track(id).is_some_and(|t| field_text(t, col).trim() == text.trim());
+            match if save && !unchanged { self.edit_tracks(&[id], &[(col, text.clone())], 1.0) } else { Ok(()) } {
+                Err(e) => {
+                    self.status_message = e;
+                    cell_edit = Some((id, col, text, true));
+                }
+                Ok(()) if step != 0 => {
+                    let editable: Vec<SortColumn> = cols.iter().copied().filter(|c| EDITABLE.contains(c)).collect();
+                    let next = editable.iter().position(|&c| c == col).and_then(|i| editable.get(i.checked_add_signed(step as isize)?));
+                    cell_start = cell_start.or(next.map(|&c| (id, c)));
+                }
+                Ok(()) => {}
+            }
+        }
+        if let Some((id, c)) = cell_start {
+            cell_edit = self.track(id).map(|t| (id, c, field_text(t, c), true));
+        }
+        self.cell_edit = cell_edit;
         if preview_click.is_some() {
             self.overview_clicked = preview_click;
         }
@@ -3365,81 +3632,109 @@ impl LibraryManager {
     }
 
     fn show_editor(&mut self, ctx: &egui::Context) {
-        let Some(draft) = &mut self.editing else { return };
-        let mut open = true;
-        let mut result: Option<bool> = None; // Some(write_tags)
-        egui::Window::new("Track info").collapsible(false).resizable(false).open(&mut open).show(ctx, |ui| {
+        let Some(mut ed) = self.editing.take() else { return };
+        let n = ed.ids.len();
+        let path = if n == 1 { self.track(ed.ids[0]).and_then(|t| t.file_path.clone()) } else { None };
+        let single_bpm = if n == 1 { self.track(ed.ids[0]).map(|t| t.bpm) } else { None };
+        let (mut open, mut save, mut write, mut cancel) = (true, false, false, false);
+        let title = if n == 1 { "Track info".to_string() } else { format!("Edit {n} tracks") };
+        egui::Window::new(title).id(egui::Id::new("track_editor")).pivot(egui::Align2::CENTER_CENTER).default_pos(ctx.screen_rect().center()).collapsible(false).resizable(false).open(&mut open).show(ctx, |ui| {
+            if n > 1 {
+                ui.label(RichText::new("What you change here is written to every selected track. Fields marked Mixed differ between them and stay as they are unless you type in them.").size(11.5).color(TraktorTheme::TEXT_SECONDARY()));
+                ui.add_space(6.0);
+            }
             egui::Grid::new("track_editor").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
-                for (label, field) in [
-                    ("Title", &mut draft.title),
-                    ("Artist", &mut draft.artist),
-                    ("Album", &mut draft.album),
-                    ("Genre", &mut draft.genre),
-                    ("Remixer", &mut draft.remixer),
-                    ("Label", &mut draft.label),
-                    ("Year", &mut draft.year),
-                    ("Key", &mut draft.musical_key),
-                    ("Comment", &mut draft.comment),
-                ] {
-                    ui.label(label);
-                    ui.add(egui::TextEdit::singleline(field).desired_width(320.0));
+                for (c, was, now) in &mut ed.fields {
+                    let changed = Editor::is_changed(was, now) || (*c == SortColumn::Bpm && ed.bpm_scale != 1.0);
+                    let name = RichText::new(field_name(*c)).color(if changed { TraktorTheme::ACCENT() } else { TraktorTheme::TEXT_SECONDARY() });
+                    ui.label(if changed { name.strong() } else { name }).on_hover_text(if changed { "Changed: written on save" } else { "" });
+                    ui.horizontal(|ui| {
+                        let hint = match (*c, was.is_some()) {
+                            (_, false) => "Mixed",
+                            (SortColumn::Key, _) => "e.g. 8m, 8A or Am",
+                            (SortColumn::Rating, _) => "0–5 stars",
+                            (SortColumn::Energy, _) => "1–10",
+                            _ => "",
+                        };
+                        // Italic and muted, so a hint never reads as a value the tracks have.
+                        let hint = RichText::new(hint).italics().color(TraktorTheme::TEXT_SECONDARY());
+                        let r = ui.add(egui::TextEdit::singleline(now).hint_text(hint).desired_width(if *c == SortColumn::Bpm { 180.0 } else { 320.0 }));
+                        save |= r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        if *c == SortColumn::Bpm {
+                            for (label, f, tip) in [("×½", 0.5, "Halve (fix double-time detection)"), ("×2", 2.0, "Double (fix half-time detection)")] {
+                                if ui.small_button(label).on_hover_text(tip).clicked() {
+                                    // Scale the exact stored BPM, not the 2-decimal text, unless a new value was typed.
+                                    match now.trim().parse::<f64>() {
+                                        Ok(bpm) if Editor::is_changed(was, now) => *now = format!("{:.2}", bpm * f),
+                                        _ => ed.bpm_scale *= f,
+                                    }
+                                }
+                            }
+                            if ed.bpm_scale != 1.0 && !Editor::is_changed(was, now) {
+                                let x = if ed.bpm_scale > 1.0 { format!("×{}", ed.bpm_scale) } else { format!("×1/{}", 1.0 / ed.bpm_scale) };
+                                let shown = match single_bpm {
+                                    Some(b) if b > 0.0 => format!("→ {:.2}", b * ed.bpm_scale),
+                                    _ => format!("each track {x}"),
+                                };
+                                ui.label(RichText::new(shown).size(11.5).color(TraktorTheme::ACCENT()));
+                            }
+                        }
+                    });
                     ui.end_row();
                 }
-                ui.label("BPM");
-                ui.horizontal(|ui| {
-                    ui.add(egui::DragValue::new(&mut draft.bpm).range(0.0..=250.0).speed(0.05).fixed_decimals(2));
-                    if ui.small_button("×½").on_hover_text("Halve (fix double-time detection)").clicked() {
-                        draft.bpm /= 2.0;
-                    }
-                    if ui.small_button("×2").on_hover_text("Double (fix half-time detection)").clicked() {
-                        draft.bpm *= 2.0;
-                    }
-                });
-                ui.end_row();
-                ui.label("Rating");
-                ui.add(egui::Slider::new(&mut draft.rating, 0..=5));
-                ui.end_row();
-                ui.label("Energy");
-                ui.add(egui::Slider::new(&mut draft.energy, 0..=10));
-                ui.end_row();
             });
-            if let Some(p) = &draft.file_path {
+            if let Some(p) = &path {
                 ui.label(RichText::new(p.display().to_string()).size(10.5).color(TraktorTheme::TEXT_MUTED()));
             }
+            if let Some(e) = &ed.error {
+                ui.label(RichText::new(e).size(11.5).color(TraktorTheme::METER_RED()));
+            }
+            ui.add_space(4.0);
+            let any = n == 1 || !ed.changes().is_empty() || ed.bpm_scale != 1.0;
             ui.horizontal(|ui| {
-                if ui.button("Save").clicked() {
-                    result = Some(false);
+                let label = if n == 1 { "Save".to_string() } else { format!("Apply to {n} tracks") };
+                save |= ui.add_enabled(any, egui::Button::new(label)).on_disabled_hover_text("Change a field first").clicked();
+                let tags = if n == 1 { "Save and write tags to file" } else { "Apply and write tags to files" };
+                if ui.add_enabled(any, egui::Button::new(tags)).on_hover_text("Also updates the tags inside the audio files").on_disabled_hover_text("Change a field first").clicked() {
+                    (save, write) = (true, true);
                 }
-                if ui.button("Save and write tags to file").on_hover_text("Also updates the tags inside the audio file").clicked() {
-                    result = Some(true);
-                }
+                cancel = ui.button("Cancel").clicked();
             });
         });
-        if let Some(write) = result {
-            let mut t = self.editing.take().unwrap();
-            if !t.musical_key.is_empty() {
-                match KeyWheel::normalize(&t.musical_key).and_then(KeyWheel::to_open_key) {
-                    Some(k) => t.musical_key = k.to_string(),
-                    None => {
-                        self.status_message = format!("Unrecognised key '{}' — use e.g. 8m, 8A or Am", t.musical_key);
-                        self.editing = Some(t);
-                        return;
+        if cancel || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            open = false;
+        }
+        if save && open {
+            let changes = ed.changes();
+            match self.edit_tracks(&ed.ids, &changes, ed.bpm_scale) {
+                Ok(()) => {
+                    let mut fields = ed.changed_fields();
+                    let names: Vec<&str> = fields.iter().map(|&c| field_name(c)).collect();
+                    if !names.is_empty() {
+                        self.status_message = format!("Changed {} on {} · Ctrl+Z undoes it", names.join(", "), plural(n));
                     }
+                    if write {
+                        // Nothing changed on one track: write what it has, never blanks over the file's own tags.
+                        if fields.is_empty() {
+                            let t = self.track(ed.ids[0]);
+                            fields = EDITABLE.iter().copied().filter(|&c| t.is_some_and(|t| !field_text(t, c).is_empty())).collect();
+                        }
+                        let copies: Vec<UiTrackEntry> = ed.ids.iter().filter_map(|&id| self.track(id).cloned()).collect();
+                        self.spawn_job(move |_| {
+                            let failed: Vec<String> = copies.iter().filter_map(|t| write_track_tags(t, &fields).err().map(|e| format!("{}: {e}", t.title))).collect();
+                            match failed.first() {
+                                None => format!("Wrote tags to {}", plural(copies.len())),
+                                Some(first) => format!("Could not write tags to {} of {} ({first})", failed.len(), copies.len()),
+                            }
+                        });
+                    }
+                    return;
                 }
+                Err(e) => ed.error = Some(e),
             }
-            if write {
-                let copy = t.clone();
-                self.spawn_job(move |_| match write_track_tags(&copy) {
-                    Ok(()) => format!("Wrote tags to {}", copy.title),
-                    Err(e) => format!("Could not write tags: {e}"),
-                });
-            }
-            if let Some(slot) = self.track_mut(t.id) {
-                *slot = t;
-            }
-            self.touch();
-        } else if !open {
-            self.editing = None;
+        }
+        if open {
+            self.editing = Some(ed);
         }
     }
 
@@ -3699,6 +3994,144 @@ mod tests {
         assert_eq!(lib.tracks[0].file_path.as_deref(), Some(song.as_path()));
         let set = lib.playlists.iter().find(|p| p.name.ends_with("/ Set")).expect("library playlist");
         assert_eq!(set.track_ids, vec![old], "playlists still find the track by its saved key");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn typed_fields_are_checked_and_normalised() {
+        let mut t = UiTrackEntry::default();
+        set_field(&mut t, SortColumn::Key, "Am").unwrap();
+        assert_eq!(t.musical_key, "1m", "keys are stored as Open Key");
+        assert!(set_field(&mut t, SortColumn::Key, "H#").is_err());
+        assert_eq!(t.musical_key, "1m", "a bad key leaves the old one");
+        set_field(&mut t, SortColumn::Bpm, " 126.5 ").unwrap();
+        assert_eq!(t.bpm, 126.5);
+        assert!(set_field(&mut t, SortColumn::Bpm, "fast").is_err() && set_field(&mut t, SortColumn::Rating, "6").is_err());
+        set_field(&mut t, SortColumn::Rating, "").unwrap();
+        assert_eq!(t.rating, 0, "empty clears a number");
+        assert!(set_field(&mut t, SortColumn::Duration, "3:00").is_err(), "only editable fields");
+        assert_eq!(field_text(&t, SortColumn::Bpm), "126.50");
+    }
+
+    #[test]
+    fn bulk_edit_writes_only_changed_fields_to_every_track_and_undoes() {
+        let (mut lib, dir) = temp_lib("bulk-edit");
+        let ids: Vec<usize> = [("A", 120.0, "House"), ("B", 87.0, "House"), ("C", 0.0, "House")]
+            .iter()
+            .map(|&(artist, bpm, genre)| lib.push_track(UiTrackEntry { title: format!("T{artist}"), artist: artist.into(), bpm, genre: genre.into(), ..Default::default() }))
+            .collect();
+        let tracks: Vec<&UiTrackEntry> = ids.iter().filter_map(|&id| lib.track(id)).collect();
+        let mut ed = Editor::new(&tracks);
+        let field = |ed: &Editor, c: SortColumn| ed.fields.iter().find(|f| f.0 == c).cloned().unwrap();
+        assert_eq!(field(&ed, SortColumn::Genre).1.as_deref(), Some("House"), "a shared value shows");
+        assert_eq!(field(&ed, SortColumn::Artist).1, None, "differing values are mixed");
+        assert!(ed.changes().is_empty(), "opening changes nothing");
+        for f in &mut ed.fields {
+            match f.0 {
+                SortColumn::Genre => f.2 = "UK Garage".into(),
+                SortColumn::Label => f.2 = " ".into(),
+                _ => {}
+            }
+        }
+        ed.bpm_scale = 2.0;
+        assert_eq!(ed.changes(), vec![(SortColumn::Genre, "UK Garage".to_string())], "blank mixed or untouched fields aren't written");
+        lib.edit_tracks(&ed.ids, &ed.changes(), ed.bpm_scale).unwrap();
+        let after: Vec<(String, String, f64)> = ids.iter().map(|&id| lib.track(id).map(|t| (t.artist.clone(), t.genre.clone(), t.bpm)).unwrap()).collect();
+        assert_eq!(after, vec![("A".into(), "UK Garage".into(), 240.0), ("B".into(), "UK Garage".into(), 174.0), ("C".into(), "UK Garage".into(), 0.0)]);
+
+        assert!(lib.edit_tracks(&ids, &[(SortColumn::Genre, "Techno".into()), (SortColumn::Key, "nope".into())], 1.0).is_err());
+        let over = lib.edit_tracks(&ids, &[], 2.0).unwrap_err();
+        assert!(over.contains("over 250") && over.contains("TA"), "{over}");
+        assert_eq!(lib.track(ids[0]).unwrap().bpm, 240.0, "a scale past 250 BPM changes no track");
+        assert!(ids.iter().all(|&id| lib.track(id).unwrap().genre == "UK Garage"), "one bad value changes nothing");
+
+        lib.undo();
+        assert!(ids.iter().all(|&id| lib.track(id).unwrap().genre == "House"), "Ctrl+Z puts every track back");
+        assert_eq!(lib.track(ids[0]).unwrap().bpm, 120.0);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cell_editor_saves_on_tab_and_moves_along_cancels_on_esc_and_keeps_bad_values_open() {
+        use egui::{Event, Key, Modifiers};
+        let (mut lib, dir) = temp_lib("cell-edit");
+        let id = lib.push_track(track("Old title", &dir.join("a.flac")));
+        let ctx = egui::Context::default();
+        let mut cols = crate::preferences::LibraryColumnsConfig::default();
+        let mut frame = |lib: &mut LibraryManager, events: Vec<Event>| {
+            let _ = ctx.run(egui::RawInput { events, ..Default::default() }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    lib.ensure_view();
+                    lib.show_table(ui, &mut cols, [false; 4], 2, false);
+                });
+            });
+        };
+        let key = |key, modifiers| vec![Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }, Event::Key { key, physical_key: None, pressed: false, repeat: false, modifiers }];
+        let open = |lib: &mut LibraryManager, c: SortColumn| lib.cell_edit = Some((id, c, field_text(lib.track(id).unwrap(), c), true));
+
+        // Typing replaces the selected text; Tab saves and opens the next field along the row.
+        open(&mut lib, SortColumn::Title);
+        frame(&mut lib, vec![]);
+        frame(&mut lib, vec![Event::Text("New title".into())]);
+        frame(&mut lib, key(Key::Tab, Modifiers::NONE));
+        frame(&mut lib, vec![]);
+        assert_eq!(lib.track(id).unwrap().title, "New title");
+        assert_eq!(lib.cell_edit.as_ref().map(|e| e.1), Some(SortColumn::Artist), "Tab moves to the next field");
+
+        // Esc leaves the value as it was.
+        frame(&mut lib, vec![Event::Text("Someone else".into())]);
+        frame(&mut lib, key(Key::Escape, Modifiers::NONE));
+        frame(&mut lib, vec![]);
+        assert_eq!(lib.track(id).unwrap().artist, "Artist");
+        assert!(lib.cell_edit.is_none());
+
+        // A value that isn't allowed stays open with the reason, and changes nothing.
+        open(&mut lib, SortColumn::Bpm);
+        frame(&mut lib, vec![]);
+        frame(&mut lib, vec![Event::Text("fast".into())]);
+        frame(&mut lib, key(Key::Enter, Modifiers::NONE));
+        frame(&mut lib, vec![]);
+        assert_eq!(lib.track(id).unwrap().bpm, 128.0);
+        assert_eq!(lib.cell_edit.as_ref().map(|e| e.1), Some(SortColumn::Bpm));
+        assert!(lib.status_message.contains("BPM"), "{}", lib.status_message);
+
+        // Filtered out of view while typing: saved, as clicking away does.
+        frame(&mut lib, vec![Event::Text("124".into())]);
+        lib.search_query = "nothing matches this".into();
+        frame(&mut lib, vec![]);
+        assert_eq!(lib.track(id).unwrap().bpm, 124.0);
+        assert!(lib.cell_edit.is_none());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn writing_tags_touches_only_the_fields_asked_for() {
+        use lofty::file::TaggedFileExt;
+        use lofty::tag::Accessor;
+        let (_, dir) = temp_lib("tag-write");
+        // A tiny valid WAV: 44-byte header, 4 silent 16-bit mono frames.
+        let p = dir.join("t.wav");
+        let mut wav = b"RIFF".to_vec();
+        wav.extend(44u32.to_le_bytes());
+        wav.extend(b"WAVEfmt ");
+        wav.extend(16u32.to_le_bytes());
+        wav.extend([1, 0, 1, 0]);
+        wav.extend(44100u32.to_le_bytes());
+        wav.extend(88200u32.to_le_bytes());
+        wav.extend([2, 0, 16, 0]);
+        wav.extend(b"data");
+        wav.extend(8u32.to_le_bytes());
+        wav.extend([0u8; 8]);
+        fs::write(&p, wav).unwrap();
+        let mut t = UiTrackEntry { artist: "Kept Artist".into(), genre: "House".into(), file_path: Some(p.clone()), ..Default::default() };
+        write_track_tags(&t, &[SortColumn::Artist, SortColumn::Genre]).unwrap();
+        // ReTraktor doesn't know the artist; a genre-only write must leave the file's artist alone.
+        (t.artist, t.genre) = (String::new(), "Garage".into());
+        write_track_tags(&t, &[SortColumn::Genre]).unwrap();
+        let tagged = lofty::read_from_path(&p).unwrap();
+        let tag = tagged.primary_tag().unwrap();
+        assert_eq!(tag.artist().as_deref(), Some("Kept Artist"));
+        assert_eq!(tag.genre().as_deref(), Some("Garage"));
         let _ = fs::remove_dir_all(dir);
     }
 

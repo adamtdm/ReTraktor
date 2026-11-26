@@ -921,6 +921,8 @@ impl ReTraktorApp {
             "expandA" => self.deck_expanded[0] = true,
             "expandAll" => self.deck_expanded = [true; 4],
             "pick" => self.library.selected_track_id = self.library.tracks.first().map(|t| t.id),
+            "bulk" if first => self.library.shot_bulk_edit(),
+            "cell" if first => self.library.shot_cell_edit(),
             "master" => self.tempo_master_deck = Some(0),
             "setpick" => self.set_state.selected_index = Some(1),
             s if s.starts_with("lib:") => {

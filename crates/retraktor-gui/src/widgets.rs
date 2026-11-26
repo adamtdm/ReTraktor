@@ -1742,6 +1742,11 @@ pub fn render_shortcuts_hud(ctx: &egui::Context, is_open: &mut bool) {
                     key_row(ui, "F4", "Timeline Studio", c);
                     key_row(ui, "F5", "Set Workflow (Build)", c);
                     ui.add_space(6.0);
+                    ui.label(RichText::new("LIBRARY").color(TraktorTheme::DECK_A()).strong());
+                    ui.add_space(4.0);
+                    key_row(ui, "Alt+click", "Edit a Cell in Place", c);
+                    key_row(ui, "Ctrl+I", "Edit Selected Tracks", c);
+                    ui.add_space(6.0);
                     ui.label(RichText::new("SET & PERFORM").color(TraktorTheme::DECK_B()).strong());
                     ui.add_space(4.0);
                     key_row(ui, "Shift+A", "Add Selected to Set", c);
