@@ -562,6 +562,26 @@ impl LibKind {
     }
 }
 
+/// Traktor saves paths from the root of the volume they're on (a share is `/Volumes/Music` on a Mac), so on
+/// another machine they don't exist. The volume is then the nearest folder above the .nml (usually the one
+/// holding its `Traktor` folder) under which most of a sample of the missing paths do exist.
+fn volume_root(col: &NmlCollection, nml: &Path) -> Option<PathBuf> {
+    let missing: Vec<PathBuf> = col.entries.iter().map(|e| PathBuf::from(e.location.to_posix_path())).filter(|p| !p.exists()).collect();
+    let sample: Vec<&PathBuf> = missing.iter().step_by((missing.len() / 20).max(1)).take(20).collect();
+    if sample.is_empty() {
+        return None;
+    }
+    nml.parent()?
+        .ancestors()
+        .filter(|a| a.parent().is_some())
+        .find(|a| sample.iter().filter(|p| on_volume(a, p).exists()).count() * 2 > sample.len())
+        .map(Path::to_path_buf)
+}
+
+fn on_volume(root: &Path, saved: &Path) -> PathBuf {
+    root.join(saved.strip_prefix("/").unwrap_or(saved))
+}
+
 pub struct LinkedLibrary {
     pub kind: LibKind,
     pub path: PathBuf,
@@ -656,7 +676,7 @@ pub enum Msg {
     /// (track id, analysis, overwrite existing values)
     Analyzed(usize, TrackAnalysis, bool),
     Saved(Result<usize, String>),
-    LibraryRead(PathBuf, Result<NmlCollection, String>),
+    LibraryRead(PathBuf, Result<(NmlCollection, Option<PathBuf>), String>),
     Done(String),
 }
 
@@ -1057,7 +1077,10 @@ impl LibraryManager {
         lib.note = "Reading…".into();
         let (kind, path) = (lib.kind, lib.path.clone());
         self.spawn_job(move |tx| {
-            let read = fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|t| kind.parse(&t));
+            let read = fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|t| kind.parse(&t)).map(|col| {
+                let root = volume_root(&col, &path);
+                (col, root)
+            });
             let _ = tx.send(Msg::LibraryRead(path, read));
             String::new()
         });
@@ -1357,7 +1380,7 @@ impl LibraryManager {
     pub fn import_nml_file(&mut self, path: &Path) -> Result<usize, String> {
         let content = fs::read_to_string(path).map_err(|e| e.to_string())?;
         let col = NmlCollection::parse_xml(&content)?;
-        let (added, _) = self.merge_collection(&col, None);
+        let (added, _) = self.merge_collection(&col, None, None);
         self.status_message = format!("Imported {added} new tracks and {} playlists from {}", self.playlists.len(), path.display());
         Ok(col.entries.len())
     }
@@ -1365,7 +1388,8 @@ impl LibraryManager {
     /// Merges tracks and playlists into the collection; returns (new tracks, ids of every merged track).
     /// With `library`, its playlists live in a "<library> / …" folder that mirrors the source,
     /// files from another computer match yours by file name, and your tracks only gain what they lack.
-    fn merge_collection(&mut self, col: &NmlCollection, library: Option<&str>) -> (usize, Vec<usize>) {
+    /// With `root`, saved paths that don't exist here are read under it (see [`volume_root`]).
+    fn merge_collection(&mut self, col: &NmlCollection, library: Option<&str>, root: Option<&Path>) -> (usize, Vec<usize>) {
         let mut by_path: HashMap<PathBuf, usize> = self
             .tracks
             .iter()
@@ -1384,14 +1408,24 @@ impl LibraryManager {
         let mut ids = Vec::with_capacity(col.entries.len());
         let mut added = 0;
         for e in &col.entries {
-            let t = UiTrackEntry::from_nml(e);
+            let mut t = UiTrackEntry::from_nml(e);
+            let saved = t.file_path.clone().unwrap_or_default();
+            if let Some(r) = root.filter(|_| !saved.exists()) {
+                t.file_path = Some(on_volume(r, &saved));
+            }
             let p = t.file_path.clone().unwrap_or_default();
             if library.is_some() && self.was_removed(&p) {
                 continue;
             }
             let moved = || if p.is_file() { None } else { file_key(&p).and_then(|k| by_name.get(&k)).filter(|v| v.len() == 1).map(|v| v[0]) };
-            let id = match by_path.get(&p).copied().or_else(|| library.and_then(|_| moved())) {
+            // A track read before the volume was known sits at its saved path: move it onto the volume.
+            let at_saved = || (p != saved).then(|| by_path.get(&saved).copied()).flatten();
+            let id = match by_path.get(&p).copied().or_else(|| library.and_then(|_| at_saved().or_else(moved))) {
                 Some(id) => {
+                    if let Some(mine) = self.track_mut(id).filter(|m| p != saved && m.file_path.as_deref() == Some(saved.as_path())) {
+                        mine.file_path = Some(p.clone());
+                        by_path.insert(p.clone(), id);
+                    }
                     if library.is_some() {
                         if let Some(mine) = self.track_mut(id) {
                             mine.adopt_from(t);
@@ -1853,8 +1887,8 @@ impl LibraryManager {
                     let Some(i) = self.libraries.iter().position(|l| l.path == path) else { continue };
                     let name = self.library_name(i);
                     match read {
-                        Ok(col) => {
-                            let (added, ids) = self.merge_collection(&col, Some(&name));
+                        Ok((col, root)) => {
+                            let (added, ids) = self.merge_collection(&col, Some(&name), root.as_deref());
                             let prefix = format!("{name} / ");
                             let lists = self.playlists.iter().filter(|p| p.name.starts_with(&prefix)).count();
                             let lib = &mut self.libraries[i];
@@ -3639,6 +3673,32 @@ mod tests {
         wait_for_library(&mut reopened);
         assert_eq!(reopened.tracks.len(), 1, "only the re-added track, merged once");
         assert!(!fs::read_to_string(reopened.removed_file()).unwrap().contains("Deep Low"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn linked_traktor_paths_are_found_on_the_volume_holding_the_nml() {
+        let (mut lib, dir) = temp_lib("volume-root");
+        // The share mounted on this laptop; the Mac saved its paths from the volume root ("/Volumes/Music").
+        let volume = dir.join("smb-share:server=nas,share=music/Music");
+        let song = volume.join("Audio Tracks/Hip Hop/song.flac");
+        fs::create_dir_all(song.parent().unwrap()).unwrap();
+        fs::write(&song, b"x").unwrap();
+        fs::create_dir_all(volume.join("Traktor")).unwrap();
+        let nml = volume.join("Traktor/MEEKMAC.nml");
+        fs::write(&nml, r#"<?xml version="1.0" encoding="UTF-8" standalone="no" ?><NML VERSION="20"><COLLECTION ENTRIES="1">
+<ENTRY TITLE="Song" ARTIST="A"><LOCATION DIR="/:Audio Tracks/:Hip Hop/:" FILE="song.flac" VOLUME="Music" VOLUMEID="Music"/></ENTRY>
+</COLLECTION><PLAYLISTS><NODE TYPE="FOLDER" NAME="$ROOT"><SUBNODES COUNT="1"><NODE TYPE="PLAYLIST" NAME="Set"><PLAYLIST ENTRIES="1" TYPE="LIST">
+<ENTRY><PRIMARYKEY TYPE="TRACK" KEY="Music/:Audio Tracks/:Hip Hop/:song.flac"/></ENTRY></PLAYLIST></NODE></SUBNODES></NODE></PLAYLISTS></NML>"#).unwrap();
+        // Read once before this fix: the track sits at the bare saved path and must move, not duplicate.
+        let old = lib.push_track(track("Song", Path::new("/Audio Tracks/Hip Hop/song.flac")));
+        lib.link_library(LibKind::Traktor, nml.clone());
+        wait_for_library(&mut lib);
+        assert_eq!(lib.tracks.len(), 1, "{:?}", lib.tracks.iter().map(|t| &t.file_path).collect::<Vec<_>>());
+        assert_eq!(lib.tracks[0].id, old);
+        assert_eq!(lib.tracks[0].file_path.as_deref(), Some(song.as_path()));
+        let set = lib.playlists.iter().find(|p| p.name.ends_with("/ Set")).expect("library playlist");
+        assert_eq!(set.track_ids, vec![old], "playlists still find the track by its saved key");
         let _ = fs::remove_dir_all(dir);
     }
 
