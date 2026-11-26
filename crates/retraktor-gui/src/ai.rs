@@ -4,7 +4,7 @@
 //! and re-ranking using the user's own API key (Gemini, OpenAI, Anthropic, or OpenAI-compatible).
 //! Only metadata (title, artist, BPM, key, genre, energy, duration) is sent — never file paths or audio.
 
-use crate::library_ui::{match_score, UiTrackEntry};
+use crate::library_ui::{genre_score, match_score, UiTrackEntry};
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::PathBuf;
@@ -493,40 +493,125 @@ pub fn prefilter_tracks(tracks: &[UiTrackEntry], request: &str, limit: usize) ->
 // Suggest Next Track: Pure scoring and explanations
 // ---------------------------------------------------------------------------
 
+/// Energy / pace direction filter for Next Track suggestions.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EnergyFlow {
+    Slow,
+    #[default]
+    Hold,
+    Raise,
+}
+
+fn effective_bpm_delta(cand_bpm: f64, ref_bpm: f64) -> Option<f64> {
+    if cand_bpm <= 0.0 || ref_bpm <= 0.0 {
+        return None;
+    }
+    let mut cand = cand_bpm;
+    if cand < ref_bpm * 0.75 {
+        cand *= 2.0;
+    } else if cand > ref_bpm * 1.5 {
+        cand /= 2.0;
+    }
+    Some(cand - ref_bpm)
+}
+
 /// Pure scoring function for next-track recommendations.
-/// Takes compatibility from `match_score`, rules out played tracks from `history`,
-/// and favors similar or slightly higher energy.
-pub fn score_next_candidate(candidate: &UiTrackEntry, live_ref: &UiTrackEntry, history: &[usize]) -> f32 {
+/// Takes compatibility from `match_score` (key, BPM, energy, genre), rules out played tracks
+/// from `history`, and applies the optional `flow` (Slow / Hold / Raise) and `same_genre` filters.
+pub fn score_next_candidate(
+    candidate: &UiTrackEntry,
+    live_ref: &UiTrackEntry,
+    history: &[usize],
+    flow: EnergyFlow,
+    same_genre: bool,
+) -> f32 {
     if candidate.missing || candidate.file_path.is_none() {
         return 0.0;
     }
     if candidate.id == live_ref.id || history.contains(&candidate.id) {
         return 0.0;
     }
+    if same_genre && !live_ref.genre.trim().is_empty() {
+        if !genre_score(&live_ref.genre, &candidate.genre).is_some_and(|g| g >= 0.5) {
+            return 0.0;
+        }
+    }
     let base = match_score(live_ref, candidate);
     if base <= 0.0 {
         return 0.0;
     }
 
-    // Energy progression: similar (0) or slightly higher (+1) is ideal for maintaining or building energy.
-    let energy_mult = if live_ref.energy > 0 && candidate.energy > 0 {
-        let diff = candidate.energy as i32 - live_ref.energy as i32;
-        match diff {
-            1 => 1.25,  // slightly higher: building energy
-            0 => 1.15,  // same energy: seamless hold
-            2 => 1.05,  // 2 steps higher: punchy transition
-            -1 => 0.90, // slight drop: acceptable breather
-            _ if diff < -1 => 0.70, // big energy loss
-            _ => 0.85,  // very large jump (+3 or more)
+    let bpm_delta = effective_bpm_delta(candidate.bpm, live_ref.bpm);
+    let has_energy = live_ref.energy > 0 && candidate.energy > 0;
+    let diff = candidate.energy as i32 - live_ref.energy as i32;
+
+    let energy_mult = match flow {
+        EnergyFlow::Hold => {
+            if has_energy {
+                match diff {
+                    1 => 1.25,  // slightly higher: building energy
+                    0 => 1.15,  // same energy: seamless hold
+                    2 => 1.05,  // 2 steps higher: punchy transition
+                    -1 => 0.90, // slight drop: acceptable breather
+                    _ if diff < -1 => 0.70, // big energy loss
+                    _ => 0.85,  // very large jump (+3 or more)
+                }
+            } else {
+                1.0
+            }
         }
-    } else {
-        1.0
+        EnergyFlow::Raise => {
+            if has_energy {
+                if diff > 0 {
+                    match diff {
+                        1 => 1.30,
+                        2 => 1.35,
+                        _ => 1.15,
+                    }
+                } else if diff == 0 && bpm_delta.is_some_and(|d| d > 0.5) {
+                    1.00
+                } else {
+                    return 0.0;
+                }
+            } else if bpm_delta.is_some_and(|d| d > 0.2) {
+                1.10
+            } else {
+                return 0.0;
+            }
+        }
+        EnergyFlow::Slow => {
+            if has_energy {
+                if diff < 0 {
+                    match diff {
+                        -1 => 1.30,
+                        -2 => 1.35,
+                        _ => 1.15,
+                    }
+                } else if diff == 0 && bpm_delta.is_some_and(|d| d < -0.5) {
+                    1.00
+                } else {
+                    return 0.0;
+                }
+            } else if bpm_delta.is_some_and(|d| d < -0.2) {
+                1.10
+            } else {
+                return 0.0;
+            }
+        }
     };
 
-    base * energy_mult
+    let tempo_nudge = match (flow, bpm_delta) {
+        (EnergyFlow::Raise, Some(d)) if d > 0.2 => 1.05,
+        (EnergyFlow::Raise, Some(d)) if d < -0.2 => 0.95,
+        (EnergyFlow::Slow, Some(d)) if d < -0.2 => 1.05,
+        (EnergyFlow::Slow, Some(d)) if d > 0.2 => 0.95,
+        _ => 1.0,
+    };
+
+    base * energy_mult * tempo_nudge
 }
 
-/// Generates a concise one-line reason (key match, tempo delta, energy) for a candidate.
+/// Generates a concise one-line reason (key match, tempo delta, energy, genre) for a candidate.
 pub fn explain_candidate(candidate: &UiTrackEntry, live_ref: &UiTrackEntry) -> String {
     let mut parts = Vec::new();
 
@@ -574,6 +659,12 @@ pub fn explain_candidate(candidate: &UiTrackEntry, live_ref: &UiTrackEntry) -> S
         }
     }
 
+    // Genre
+    let g = candidate.genre.trim();
+    if !g.is_empty() {
+        parts.push(g.to_string());
+    }
+
     if parts.is_empty() {
         "Match candidate".to_string()
     } else {
@@ -582,14 +673,19 @@ pub fn explain_candidate(candidate: &UiTrackEntry, live_ref: &UiTrackEntry) -> S
 }
 
 /// Formats the prompt sent to the model for AI next-track re-ranking.
-pub fn build_rerank_prompt(live_ref: &TrackBrief, candidates: &[TrackBrief]) -> String {
+pub fn build_rerank_prompt(live_ref: &TrackBrief, candidates: &[TrackBrief], flow: EnergyFlow) -> String {
     let mut out = format!(
         "You are an expert DJ assisting live in the mix.\n\
          Currently playing track:\n\
-         \"{}\" by \"{}\" | BPM: {:.1} | Key: {} | Energy: {}\n\n\
-         Top candidates for the next track:\n",
-        live_ref.title, live_ref.artist, live_ref.bpm, live_ref.key, live_ref.energy
+         \"{}\" by \"{}\" | BPM: {:.1} | Key: {} | Energy: {} | Genre: {}\n",
+        live_ref.title, live_ref.artist, live_ref.bpm, live_ref.key, live_ref.energy, live_ref.genre
     );
+    match flow {
+        EnergyFlow::Raise => out.push_str("DJ goal: raise the energy and pick up the pace.\n"),
+        EnergyFlow::Slow => out.push_str("DJ goal: lower the energy and slow the pace down.\n"),
+        EnergyFlow::Hold => {}
+    }
+    out.push_str("\nTop candidates for the next track:\n");
     for t in candidates {
         out.push_str(&format!(
             "ID: {} | \"{}\" by \"{}\" | BPM: {:.1} | Key: {} | Energy: {} | Genre: {}\n",
@@ -861,15 +957,49 @@ mod tests {
         };
 
         let history = vec![1];
-        let score_boost = score_next_candidate(&candidate_perfect, &live, &history);
-        let score_same = score_next_candidate(&candidate_same_e, &live, &history);
+        let score_boost = score_next_candidate(&candidate_perfect, &live, &history, EnergyFlow::Hold, false);
+        let score_same = score_next_candidate(&candidate_same_e, &live, &history, EnergyFlow::Hold, false);
 
         assert!(score_boost > 0.0);
         assert!(score_boost > score_same);
 
         // Played in history must receive 0.0
         let history_with_2 = vec![1, 2];
-        assert_eq!(score_next_candidate(&candidate_perfect, &live, &history_with_2), 0.0);
+        assert_eq!(score_next_candidate(&candidate_perfect, &live, &history_with_2, EnergyFlow::Hold, false), 0.0);
+
+        // EnergyFlow::Raise keeps higher energy and excludes lower/same-bpm-same-energy
+        let candidate_calmer = UiTrackEntry {
+            id: 4,
+            bpm: 122.0,
+            musical_key: "8m".to_string(),
+            energy: 3,
+            genre: "Deep House".to_string(),
+            file_path: Some(PathBuf::from("/music/d.mp3")),
+            ..Default::default()
+        };
+        assert!(score_next_candidate(&candidate_perfect, &live, &history, EnergyFlow::Raise, false) > 0.0);
+        assert_eq!(score_next_candidate(&candidate_same_e, &live, &history, EnergyFlow::Raise, false), 0.0);
+        assert_eq!(score_next_candidate(&candidate_calmer, &live, &history, EnergyFlow::Raise, false), 0.0);
+
+        // EnergyFlow::Slow keeps lower energy and excludes higher
+        assert!(score_next_candidate(&candidate_calmer, &live, &history, EnergyFlow::Slow, false) > 0.0);
+        assert_eq!(score_next_candidate(&candidate_perfect, &live, &history, EnergyFlow::Slow, false), 0.0);
+
+        // Unanalyzed energy falls back to BPM direction for Raise / Slow
+        let live_no_e = UiTrackEntry { energy: 0, genre: "House".into(), ..live.clone() };
+        let faster = UiTrackEntry { id: 5, bpm: 127.0, musical_key: "8m".into(), energy: 0, genre: "Tech House".into(), file_path: Some(PathBuf::from("/music/e.mp3")), ..Default::default() };
+        let slower = UiTrackEntry { id: 6, bpm: 121.0, musical_key: "8m".into(), energy: 0, genre: "Techno".into(), file_path: Some(PathBuf::from("/music/f.mp3")), ..Default::default() };
+        assert!(score_next_candidate(&faster, &live_no_e, &[], EnergyFlow::Raise, false) > 0.0);
+        assert_eq!(score_next_candidate(&slower, &live_no_e, &[], EnergyFlow::Raise, false), 0.0);
+        assert!(score_next_candidate(&slower, &live_no_e, &[], EnergyFlow::Slow, false) > 0.0);
+        assert_eq!(score_next_candidate(&faster, &live_no_e, &[], EnergyFlow::Slow, false), 0.0);
+
+        // Same-genre filter keeps genre family ("House" <-> "Tech House") and excludes "Techno"
+        assert!(score_next_candidate(&faster, &live_no_e, &[], EnergyFlow::Hold, true) > 0.0);
+        assert_eq!(score_next_candidate(&slower, &live_no_e, &[], EnergyFlow::Hold, true), 0.0);
+
+        // Reason string includes genre
+        assert!(explain_candidate(&candidate_calmer, &live).contains("Deep House"));
     }
 
     #[test]

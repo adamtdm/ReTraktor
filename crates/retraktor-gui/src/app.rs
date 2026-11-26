@@ -122,6 +122,8 @@ pub struct ReTraktorApp {
     pub next_track_target_deck: usize,
     /// The highlighted pick: arrows move it, Enter loads it.
     pub next_track_selected: usize,
+    pub next_track_energy: crate::ai::EnergyFlow,
+    pub next_track_same_genre: bool,
     /// Digit keys handled by the Next Track picker stay suppressed for hotcues until released.
     picker_swallowed_digits: [bool; 5],
     /// Read when the picker opens, not every frame.
@@ -303,6 +305,8 @@ impl Default for ReTraktorApp {
             next_track_picks: Vec::new(),
             next_track_target_deck: 2,
             next_track_selected: 0,
+            next_track_energy: crate::ai::EnergyFlow::Hold,
+            next_track_same_genre: false,
             picker_swallowed_digits: [false; 5],
             cached_ai_settings: crate::ai::AiSettings::load(),
             ai_rerank_runner: None,
@@ -4574,6 +4578,13 @@ impl ReTraktorApp {
         }
     }
 
+    fn next_track_live_ref(&self, live_d: usize) -> Option<crate::library_ui::UiTrackEntry> {
+        self.deck_track_ids[live_d]
+            .and_then(|id| self.library.track(id).cloned())
+            .or_else(|| self.library.history.last().and_then(|&id| self.library.track(id).cloned()))
+            .or_else(|| self.library.tracks.iter().find(|t| !t.missing && t.file_path.is_some()).cloned())
+    }
+
     fn compute_next_track_picks(&mut self) {
         let (live_d, idle_d) = {
             let (play_a, play_b) = if let Ok(state) = self.audio.shared.lock() {
@@ -4595,17 +4606,14 @@ impl ReTraktorApp {
         self.next_track_selected = 0;
         self.cached_ai_settings = crate::ai::AiSettings::load();
 
-        let live_ref_opt = self.deck_track_ids[live_d]
-            .and_then(|id| self.library.track(id).cloned())
-            .or_else(|| self.library.history.last().and_then(|&id| self.library.track(id).cloned()))
-            .or_else(|| self.library.tracks.iter().find(|t| !t.missing && t.file_path.is_some()).cloned());
-
-        if let Some(live_ref) = live_ref_opt {
+        let flow = self.next_track_energy;
+        let same_genre = self.next_track_same_genre;
+        if let Some(live_ref) = self.next_track_live_ref(live_d) {
             let mut scored: Vec<(usize, f32, String)> = self.library.tracks
                 .iter()
                 .filter(|t| !t.missing && t.file_path.is_some())
                 .filter_map(|t| {
-                    let s = crate::ai::score_next_candidate(t, &live_ref, &self.library.history);
+                    let s = crate::ai::score_next_candidate(t, &live_ref, &self.library.history, flow, same_genre);
                     if s > 0.0 {
                         let reason = crate::ai::explain_candidate(t, &live_ref);
                         Some((t.id, s, reason))
@@ -4615,7 +4623,7 @@ impl ReTraktorApp {
                 })
                 .collect();
             scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            if scored.is_empty() {
+            if scored.is_empty() && flow == crate::ai::EnergyFlow::Hold && !same_genre {
                 scored = self.library.tracks
                     .iter()
                     .filter(|t| !t.missing && t.file_path.is_some() && t.id != live_ref.id)
@@ -4624,6 +4632,8 @@ impl ReTraktorApp {
                     .collect();
             }
             self.next_track_picks = scored.into_iter().take(5).collect();
+        } else {
+            self.next_track_picks.clear();
         }
     }
 
@@ -4657,8 +4667,12 @@ impl ReTraktorApp {
 
         let deck_letter = if self.next_track_target_deck == 1 { "A" } else { "B" };
         let deck_accent = if self.next_track_target_deck == 1 { TraktorTheme::DECK_A() } else { TraktorTheme::DECK_B() };
+        let live_d = if self.next_track_target_deck == 1 { 1 } else { 0 };
+        let live_ref = self.next_track_live_ref(live_d);
+        let live_genre = live_ref.as_ref().map(|t| t.genre.trim().to_string()).unwrap_or_default();
 
         let mut load_pick = None;
+        let mut recompute = false;
 
         egui::Window::new("Suggest next track")
             .open(&mut self.show_next_track_panel)
@@ -4702,25 +4716,80 @@ impl ReTraktorApp {
                             .min_size(Vec2::new(76.0, 22.0));
 
                             if ui.add_enabled(!is_busy, ai_btn).on_hover_text("Re-rank candidates using your configured AI model").clicked() {
-                                let (live_d, _) = if self.next_track_target_deck == 1 { (1, 0) } else { (0, 1) };
-                                let live_ref_opt = self.deck_track_ids[live_d]
-                                    .and_then(|id| self.library.track(id).cloned())
-                                    .or_else(|| self.library.history.last().and_then(|&id| self.library.track(id).cloned()))
-                                    .or_else(|| self.library.tracks.first().cloned());
-                                if let Some(live_ref) = live_ref_opt {
-                                    let candidates: Vec<crate::ai::TrackBrief> = self.library.tracks
+                                if let Some(ref live_ref) = live_ref {
+                                    let flow = self.next_track_energy;
+                                    let same_genre = self.next_track_same_genre;
+                                    let mut scored: Vec<(f32, &crate::library_ui::UiTrackEntry)> = self.library.tracks
                                         .iter()
-                                        .filter(|t| !t.missing && t.file_path.is_some() && t.id != live_ref.id)
-                                        .take(30)
-                                        .map(crate::ai::TrackBrief::from_ui)
+                                        .filter_map(|t| {
+                                            let s = crate::ai::score_next_candidate(t, live_ref, &self.library.history, flow, same_genre);
+                                            (s > 0.0).then_some((s, t))
+                                        })
                                         .collect();
-                                    let live_brief = crate::ai::TrackBrief::from_ui(&live_ref);
-                                    let prompt = crate::ai::build_rerank_prompt(&live_brief, &candidates);
-                                    self.ai_rerank_status = Some("Asking AI model to evaluate flow…".to_string());
-                                    self.ai_rerank_runner = Some(crate::ai::AiRerankRunner::start(self.cached_ai_settings.clone(), prompt, candidates));
+                                    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                                    let candidates: Vec<crate::ai::TrackBrief> = if !scored.is_empty() {
+                                        scored.into_iter().take(30).map(|(_, t)| crate::ai::TrackBrief::from_ui(t)).collect()
+                                    } else if flow == crate::ai::EnergyFlow::Hold && !same_genre {
+                                        self.library.tracks
+                                            .iter()
+                                            .filter(|t| !t.missing && t.file_path.is_some() && t.id != live_ref.id)
+                                            .take(30)
+                                            .map(crate::ai::TrackBrief::from_ui)
+                                            .collect()
+                                    } else {
+                                        Vec::new()
+                                    };
+                                    if !candidates.is_empty() {
+                                        let live_brief = crate::ai::TrackBrief::from_ui(live_ref);
+                                        let prompt = crate::ai::build_rerank_prompt(&live_brief, &candidates, flow);
+                                        self.ai_rerank_status = Some("Asking AI model to evaluate flow…".to_string());
+                                        self.ai_rerank_runner = Some(crate::ai::AiRerankRunner::start(self.cached_ai_settings.clone(), prompt, candidates));
+                                    }
                                 }
                             }
                         }
+                    });
+                });
+
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("ENERGY")
+                            .color(TraktorTheme::TEXT_SECONDARY())
+                            .font(egui::FontId::monospace(10.5)),
+                    );
+                    for (flow, label, tip) in [
+                        (crate::ai::EnergyFlow::Slow, "SLOW ↓", "Lower energy / slower pace"),
+                        (crate::ai::EnergyFlow::Hold, "HOLD", "Balanced energy progression"),
+                        (crate::ai::EnergyFlow::Raise, "RAISE ↑", "Higher energy / faster pace"),
+                    ] {
+                        let active = self.next_track_energy == flow;
+                        if pill(ui, label, active, TraktorTheme::ACCENT(), 52.0)
+                            .on_hover_text(tip)
+                            .clicked()
+                            && !active
+                        {
+                            self.next_track_energy = flow;
+                            recompute = true;
+                        }
+                    }
+
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let has_genre = !live_genre.is_empty();
+                        let tip = if has_genre {
+                            format!("Only show tracks matching {live_genre}")
+                        } else {
+                            "Live track has no genre tag".to_string()
+                        };
+                        ui.add_enabled_ui(has_genre, |ui| {
+                            if pill(ui, "SAME GENRE", self.next_track_same_genre && has_genre, TraktorTheme::ROW_SELECTED(), 0.0)
+                                .on_hover_text(tip)
+                                .clicked()
+                            {
+                                self.next_track_same_genre = !self.next_track_same_genre;
+                                recompute = true;
+                            }
+                        });
                     });
                 });
 
@@ -4734,7 +4803,12 @@ impl ReTraktorApp {
                 }
 
                 if self.next_track_picks.is_empty() {
-                    ui.label(RichText::new("No recommendations available. Load a track onto the live deck first.").color(TraktorTheme::TEXT_MUTED()));
+                    let msg = if self.next_track_energy != crate::ai::EnergyFlow::Hold || self.next_track_same_genre {
+                        "No tracks match this filter — try Hold or turn off Same genre."
+                    } else {
+                        "No recommendations available. Load a track onto the live deck first."
+                    };
+                    ui.label(RichText::new(msg).color(TraktorTheme::TEXT_MUTED()));
                 } else {
                     for (rank, &(id, _score, ref reason)) in self.next_track_picks.iter().enumerate() {
                         if let Some(track) = self.library.track(id).cloned() {
@@ -4762,9 +4836,10 @@ impl ReTraktorApp {
                             );
 
                             // Title & Artist
+                            let clip = egui::Rect::from_min_max(rect.min, egui::Pos2::new(rect.right() - 96.0, rect.bottom()));
                             let text_pos = rect.min + Vec2::new(42.0, 4.0);
                             // Clipped so a long title cannot run under the BPM and key on the right.
-                            ui.painter().with_clip_rect(egui::Rect::from_min_max(rect.min, egui::Pos2::new(rect.right() - 96.0, rect.bottom()))).text(
+                            ui.painter().with_clip_rect(clip).text(
                                 text_pos,
                                 egui::Align2::LEFT_TOP,
                                 format!("{} – {}", track.title, track.artist),
@@ -4774,7 +4849,7 @@ impl ReTraktorApp {
 
                             // Reason line
                             let reason_pos = rect.min + Vec2::new(42.0, 19.0);
-                            ui.painter().text(
+                            ui.painter().with_clip_rect(clip).text(
                                 reason_pos,
                                 egui::Align2::LEFT_TOP,
                                 reason,
@@ -4830,6 +4905,11 @@ impl ReTraktorApp {
                 });
             });
 
+        if recompute {
+            self.ai_rerank_runner = None;
+            self.ai_rerank_status = None;
+            self.compute_next_track_picks();
+        }
         if let Some(pick) = load_pick {
             self.load_next_pick(pick);
         }
@@ -6115,6 +6195,46 @@ mod sync_audio {
         assert!(!app.show_next_track_panel && app.load_generation[1] == 2);
         assert_eq!(app.library.status_message, "Loading 'Track 3' on deck B");
         assert!(!app.deck_loading[0], "a picker digit reached deck A's hotcues");
+    }
+
+    #[test]
+    fn next_track_picks_respect_energy_and_genre_filters() {
+        let mut app = ReTraktorApp::default();
+        let file = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let mk = |id: usize, title: &str, bpm: f64, energy: u8, genre: &str| crate::library_ui::UiTrackEntry {
+            id,
+            title: title.into(),
+            bpm,
+            musical_key: "8m".into(),
+            energy,
+            genre: genre.into(),
+            file_path: Some(file.clone()),
+            ..Default::default()
+        };
+        app.library.tracks = vec![
+            mk(1, "Live", 124.0, 5, "Deep House"),
+            mk(2, "LiftHouse", 125.0, 7, "Tech House"),
+            mk(3, "LiftTechno", 125.0, 7, "Techno"),
+            mk(4, "SlowHouse", 122.0, 3, "House"),
+        ];
+        app.library.rebuild_index();
+        app.deck_track_ids[0] = Some(1);
+
+        app.next_track_energy = crate::ai::EnergyFlow::Raise;
+        app.next_track_same_genre = false;
+        app.compute_next_track_picks();
+        let ids: Vec<usize> = app.next_track_picks.iter().map(|p| p.0).collect();
+        assert_eq!(ids, vec![2, 3]);
+
+        app.next_track_same_genre = true;
+        app.compute_next_track_picks();
+        let ids: Vec<usize> = app.next_track_picks.iter().map(|p| p.0).collect();
+        assert_eq!(ids, vec![2]);
+
+        app.next_track_energy = crate::ai::EnergyFlow::Slow;
+        app.compute_next_track_picks();
+        let ids: Vec<usize> = app.next_track_picks.iter().map(|p| p.0).collect();
+        assert_eq!(ids, vec![4]);
     }
 
     /// Hide-missing: Preferences and the library toolbar each win when they change.

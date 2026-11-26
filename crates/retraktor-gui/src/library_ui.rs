@@ -620,7 +620,27 @@ fn write_atomic(path: &Path, contents: &str) -> Result<(), String> {
     fs::rename(&tmp, path).map_err(|e| e.to_string())
 }
 
-/// Harmonic + tempo (+ energy when known) compatibility of `t` with `r`, `0.0..=1.0`.
+/// Genre similarity in `0.0..=1.0`, or `None` when either track has no genre tag.
+pub fn genre_score(a: &str, b: &str) -> Option<f32> {
+    let (a, b) = (a.trim(), b.trim());
+    if a.is_empty() || b.is_empty() {
+        return None;
+    }
+    if a.eq_ignore_ascii_case(b) {
+        return Some(1.0);
+    }
+    let (al, bl) = (a.to_ascii_lowercase(), b.to_ascii_lowercase());
+    if al.contains(&bl) || bl.contains(&al) {
+        return Some(0.7);
+    }
+    // Same root genre word (e.g. "Deep House" vs "Tech House", but not "Deep House" vs "Deep Techno").
+    fn root(s: &str) -> Option<&str> {
+        s.split(|c: char| !c.is_alphanumeric()).filter(|w| w.len() >= 3).last()
+    }
+    Some(if root(&al).is_some() && root(&al) == root(&bl) { 0.5 } else { 0.0 })
+}
+
+/// Harmonic + tempo (+ energy, genre when known) compatibility of `t` with `r`, `0.0..=1.0`.
 pub fn match_score(r: &UiTrackEntry, t: &UiTrackEntry) -> f32 {
     let (ref_key, ref_bpm) = (r.musical_key.as_str(), r.bpm);
     let key_s = match (KeyWheel::parse_open_key(ref_key), KeyWheel::parse_open_key(&t.musical_key)) {
@@ -641,11 +661,14 @@ pub fn match_score(r: &UiTrackEntry, t: &UiTrackEntry) -> f32 {
     } else {
         0.0
     };
-    if r.energy > 0 && t.energy > 0 {
-        let energy_s = (1.0 - (t.energy as f32 - r.energy as f32).abs() / 4.0).max(0.0);
-        0.5 * key_s + 0.4 * bpm_s + 0.1 * energy_s
-    } else {
-        0.55 * key_s + 0.45 * bpm_s
+    let energy_s = (r.energy > 0 && t.energy > 0)
+        .then(|| (1.0 - (t.energy as f32 - r.energy as f32).abs() / 4.0).max(0.0));
+    let genre_s = genre_score(&r.genre, &t.genre);
+    match (energy_s, genre_s) {
+        (Some(e), Some(g)) => 0.45 * key_s + 0.35 * bpm_s + 0.10 * e + 0.10 * g,
+        (Some(e), None) => 0.50 * key_s + 0.40 * bpm_s + 0.10 * e,
+        (None, Some(g)) => 0.50 * key_s + 0.40 * bpm_s + 0.10 * g,
+        (None, None) => 0.55 * key_s + 0.45 * bpm_s,
     }
 }
 
@@ -4506,8 +4529,19 @@ mod tests {
         assert_eq!(match_score(&r, &far), 0.0);
         let r_e = UiTrackEntry { energy: 5, ..r.clone() };
         let calm = UiTrackEntry { energy: 1, ..t.clone() };
-        let close = UiTrackEntry { energy: 6, ..t };
+        let close = UiTrackEntry { energy: 6, ..t.clone() };
         assert!(match_score(&r_e, &close) > match_score(&r_e, &calm));
+
+        assert_eq!(genre_score("Deep House", "deep house"), Some(1.0));
+        assert_eq!(genre_score("House", "Deep House"), Some(0.7));
+        assert_eq!(genre_score("Deep House", "Tech House"), Some(0.5));
+        assert_eq!(genre_score("Deep House", "Deep Techno"), Some(0.0));
+        assert_eq!(genre_score("", "House"), None);
+
+        let r_g = UiTrackEntry { genre: "Deep House".into(), ..r };
+        let same_g = UiTrackEntry { genre: "Tech House".into(), ..t.clone() };
+        let diff_g = UiTrackEntry { genre: "Techno".into(), ..t };
+        assert!(match_score(&r_g, &same_g) > match_score(&r_g, &diff_g));
     }
 
     #[test]
