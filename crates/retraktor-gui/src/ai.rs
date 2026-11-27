@@ -752,14 +752,6 @@ pub fn parse_rerank_reply(reply: &str, valid_candidates: &[TrackBrief]) -> Vec<(
 // Background Job State Holders
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum JobStatus<T> {
-    Idle,
-    Loading(String),
-    Success(T),
-    Error(String),
-}
-
 /// Async runner for AI test requests in Preferences.
 pub struct AiTestRunner {
     rx: Receiver<Result<String, String>>,

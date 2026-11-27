@@ -117,10 +117,7 @@ impl SetList {
     }
 
     pub fn save_to_path(&self, path: &Path) -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(path, self.to_text())
+        crate::library_ui::write_atomic(path, &self.to_text())
     }
 }
 

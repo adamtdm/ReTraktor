@@ -477,12 +477,6 @@ pub fn waveform_style() -> WaveformStyle {
     store().read().map(|s| s.waveform_style).unwrap_or_default()
 }
 
-pub fn set_waveform_style(style: WaveformStyle) {
-    if let Ok(mut st) = store().write() {
-        st.waveform_style = style;
-    }
-}
-
 /// Selected track overview look (Preferences > Look).
 pub fn overview_look() -> OverviewLook {
     store().read().map(|s| s.overview_look).unwrap_or(OverviewLook::Native)
@@ -517,15 +511,6 @@ pub fn fade(ctx: &egui::Context, id: impl std::hash::Hash, on: bool) -> f32 {
     }
     let t = ctx.animate_bool_with_time(egui::Id::new(("fade", id)), on, 0.16);
     1.0 - (1.0 - t).powi(3)
-}
-
-/// 0..=1 pulse that peaks on each beat and decays; steady 1.0 when animations are off.
-pub fn beat_pulse(position_sec: f64, bpm: f64) -> f32 {
-    if !animations() || bpm <= 0.0 {
-        return 1.0;
-    }
-    let phase = (position_sec.max(0.0) * bpm / 60.0).fract() as f32;
-    0.25 + 0.75 * (1.0 - phase).powi(3)
 }
 
 fn theme_path() -> std::path::PathBuf {

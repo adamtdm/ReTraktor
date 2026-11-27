@@ -5148,8 +5148,6 @@ impl DeckView {
 const DECK_LETTERS: [&str; 4] = ["A", "B", "C", "D"];
 /// Smallest side of anything clickable.
 const HIT: f32 = 24.0;
-/// Three 24 px crossfader-side buttons and their two 2 px gaps.
-const XFADER_ASSIGN_W: f32 = 3.0 * HIT + 2.0 * 2.0;
 const KNOB_TIP: &str = "Drag up or down; double-click to reset.";
 const XFADER_TIP: &str = "Crossfader. Drag to blend A and B; double-click to centre";
 

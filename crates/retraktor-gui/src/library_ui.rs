@@ -611,13 +611,19 @@ fn walk_audio(root: &Path, f: &mut impl FnMut(PathBuf)) {
     }
 }
 
-fn write_atomic(path: &Path, contents: &str) -> Result<(), String> {
+/// Writes through a temp file and a rename, so a crash or a full disk never leaves a half-written file.
+/// Each call gets its own temp name: two saves of one file at once (autosave and close) can't mix their bytes.
+pub(crate) fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("nml.tmp");
-    fs::write(&tmp, contents).map_err(|e| e.to_string())?;
-    fs::rename(&tmp, path).map_err(|e| e.to_string())
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".tmp{}-{}", std::process::id(), SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+    let tmp = PathBuf::from(tmp);
+    fs::write(&tmp, contents).and_then(|_| fs::rename(&tmp, path)).inspect_err(|_| {
+        let _ = fs::remove_file(&tmp);
+    })
 }
 
 /// Genre similarity in `0.0..=1.0`, or `None` when either track has no genre tag.
@@ -1446,6 +1452,7 @@ impl LibraryManager {
 
     pub(crate) fn rebuild_index(&mut self) {
         self.id_index = self.tracks.iter().enumerate().map(|(i, t)| (t.id, i)).collect();
+        self.next_track_id = self.tracks.iter().map(|t| t.id + 1).fold(self.next_track_id, usize::max);
     }
 
     pub fn track(&self, id: usize) -> Option<&UiTrackEntry> {
@@ -1457,8 +1464,12 @@ impl LibraryManager {
     }
 
     fn next_id(&mut self) -> usize {
-        // Entries pushed with their own ids (demo, tests) raise the mark too.
-        let id = self.tracks.iter().map(|t| t.id + 1).fold(self.next_track_id, usize::max);
+        // Entries pushed with their own ids (demo, tests) skip the index; rebuilding it raises the mark past them.
+        // Only a stale index pays for that scan: one per added track made linking a big collection quadratic.
+        if self.id_index.len() != self.tracks.len() {
+            self.rebuild_index();
+        }
+        let id = self.next_track_id;
         self.next_track_id = id + 1;
         id
     }
@@ -1512,7 +1523,7 @@ impl LibraryManager {
     /// Saves the collection and playlists as Traktor `.nml` v20 (atomic write).
     pub fn save_collection_nml(&mut self, path: &Path) -> Result<usize, String> {
         let col = self.snapshot();
-        write_atomic(path, &col.to_xml())?;
+        write_atomic(path, &col.to_xml()).map_err(|e| e.to_string())?;
         if path == self.collection_path {
             self.dirty_since = None;
         }
@@ -1553,7 +1564,7 @@ impl LibraryManager {
         let tx = self.tx.clone();
         thread::spawn(move || {
             let n = col.entries.len();
-            let _ = tx.send(Msg::Saved(write_atomic(&path, &col.to_xml()).map(|_| n)));
+            let _ = tx.send(Msg::Saved(write_atomic(&path, &col.to_xml()).map(|_| n).map_err(|e| e.to_string())));
         });
     }
 
@@ -1804,17 +1815,13 @@ impl LibraryManager {
     }
 
     fn save_missing_sidecar(&self) {
-        let path = Self::missing_sidecar_path();
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
         let mut out = String::new();
         for pl in &self.playlists {
             for m in &pl.missing {
                 out.push_str(&format!("{}\t{}\t{}\n", pl.name, m.artist, m.title));
             }
         }
-        let _ = fs::write(path, out);
+        let _ = write_atomic(&Self::missing_sidecar_path(), &out);
     }
 
     fn load_missing_sidecar(&mut self) {
@@ -3944,6 +3951,21 @@ pub fn deck_drop_target(ui: &Ui, rect: egui::Rect) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_atomic_writes_never_mix_and_leave_no_temp_files() {
+        let dir = std::env::temp_dir().join(format!("rt-atomic-{}", std::process::id()));
+        let path = dir.join("collection.nml");
+        let (a, b) = ("a".repeat(1 << 20), "b".repeat(1 << 20));
+        std::thread::scope(|s| {
+            s.spawn(|| write_atomic(&path, &a).unwrap());
+            s.spawn(|| write_atomic(&path, &b).unwrap());
+        });
+        let got = fs::read_to_string(&path).unwrap();
+        assert!(got == a || got == b, "a save mixed two writers' bytes");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1, "a temp file was left behind");
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     fn wait_for_library(lib: &mut LibraryManager) {
         for _ in 0..500 {

@@ -438,11 +438,7 @@ impl GenericControllerMapping {
 
     /// Saves the mapping to disk.
     pub fn save(&self, device_slug: &str) -> std::io::Result<()> {
-        let path = Self::file_path(device_slug);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(path, self.to_text())
+        crate::library_ui::write_atomic(&Self::file_path(device_slug), &self.to_text())
     }
 
     /// Loads the mapping from disk if present.
@@ -829,12 +825,12 @@ fn run_hardware_worker(
 ) {
     let mut midi_parsers: HashMap<String, (String, MidiParserState, std::fs::File)> = HashMap::new();
     let mut hid_decoders: HashMap<String, (u16, Vec<u8>, HidAnalogTracker, std::fs::File)> = HashMap::new();
-    let mut last_scan = std::time::Instant::now();
+    let mut last_scan: Option<std::time::Instant> = None;
 
     while !stop.load(Ordering::Relaxed) {
-        // 1. Rescan device nodes every 2 seconds
-        if last_scan.elapsed() >= Duration::from_secs(2) || (midi_parsers.is_empty() && hid_decoders.is_empty()) {
-            last_scan = std::time::Instant::now();
+        // 1. Rescan device nodes every 2 seconds (with nothing connected too: not on every 5 ms pass).
+        if last_scan.is_none_or(|t| t.elapsed() >= Duration::from_secs(2)) {
+            last_scan = Some(std::time::Instant::now());
 
             let midi_devs = scan_linux_alsa_midi_devices();
             let hid_devs = scan_linux_generic_ni_hid_devices();

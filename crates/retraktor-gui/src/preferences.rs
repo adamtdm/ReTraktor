@@ -286,12 +286,9 @@ impl PreferencesDialog {
 
     /// Saves user preferences to disk.
     pub fn save(&self) {
-        let path = Self::config_path();
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+        if let Err(e) = crate::library_ui::write_atomic(&Self::config_path(), &self.to_json_str()) {
+            eprintln!("retraktor: could not save preferences: {e}");
         }
-        let json = self.to_json_str();
-        let _ = std::fs::write(&path, json);
     }
 
     pub fn to_json_str(&self) -> String {

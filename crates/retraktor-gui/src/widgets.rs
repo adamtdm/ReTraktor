@@ -4,19 +4,6 @@ use retraktor_formats::StripeColumn;
 use eframe::egui::{self, Color32, Pos2, Rect, Response, RichText, Sense, Stroke, Ui, Vec2};
 use std::f32::consts::PI;
 
-/// Custom Rotary Knob Widget (270° sweep, center detent, dB/percentage labels, mouse drag)
-pub fn rotary_knob(
-    ui: &mut Ui,
-    value: &mut f32,
-    min: f32,
-    max: f32,
-    default: f32,
-    label: &str,
-    accent: Color32,
-) -> Response {
-    rotary_knob_sized(ui, value, min, max, default, label, accent, 36.0)
-}
-
 /// Compact Rotary Knob Widget with authentic Traktor Pro 4 matte dark grey styling
 pub fn rotary_knob_sized(
     ui: &mut Ui,
@@ -112,88 +99,6 @@ pub fn rotary_knob_sized(
     response
 }
 
-/// Custom Vertical Volume Fader Widget with smooth track, matte cap, and tick markers
-pub fn vertical_fader(
-    ui: &mut Ui,
-    value: &mut f32,
-    min: f32,
-    max: f32,
-    _accent: Color32,
-    height: f32,
-) -> Response {
-    let size = Vec2::new(24.0, height);
-    let (rect, mut response) = ui.allocate_exact_size(size, Sense::click_and_drag());
-
-    if response.dragged() {
-        let delta = -response.drag_delta().y / (rect.height() - 16.0).max(20.0) * (max - min);
-        *value = (*value + delta).clamp(min, max);
-        response.mark_changed();
-    }
-
-    if response.double_clicked() {
-        *value = 0.85;
-        response.mark_changed();
-    }
-
-    if ui.is_rect_visible(rect) {
-        let painter = ui.painter();
-        let track_x = rect.center().x;
-        let track_top = rect.top() + 6.0;
-        let track_bot = rect.bottom() - 6.0;
-        let track_h = (track_bot - track_top).max(10.0);
-
-        // dB Tick marks on left and right (like Traktor Pro 4 pitch/volume faders)
-        for i in 0..=10 {
-            let norm = i as f32 / 10.0;
-            let y = track_bot - norm * track_h;
-            let tick_w = if i == 5 || i == 0 || i == 10 {
-                6.5
-            } else {
-                4.0
-            };
-            painter.line_segment(
-                [Pos2::new(track_x - tick_w - 2.0, y), Pos2::new(track_x - 2.5, y)],
-                Stroke::new(0.8_f32, TraktorTheme::BORDER_ACCENT()),
-            );
-            painter.line_segment(
-                [Pos2::new(track_x + 2.5, y), Pos2::new(track_x + tick_w + 2.0, y)],
-                Stroke::new(0.8_f32, TraktorTheme::BORDER_ACCENT()),
-            );
-        }
-
-        // Fader rail / slot
-        let slot_rect = Rect::from_min_max(
-            Pos2::new(track_x - 1.5, track_top),
-            Pos2::new(track_x + 1.5, track_bot),
-        );
-        painter.rect_filled(slot_rect, 0.5, TraktorTheme::BG_INPUT());
-
-        let norm_val = (*value - min) / (max - min).max(1e-5);
-        let cap_y = track_bot - norm_val * track_h;
-
-        // Traktor-style flat matte fader cap with crisp light grey center line
-        let cap_w = 18.0;
-        let cap_h = 9.0;
-        let cap_rect = Rect::from_center_size(Pos2::new(track_x, cap_y), Vec2::new(cap_w, cap_h));
-
-        painter.rect_filled(cap_rect, 1.5, TraktorTheme::CONTROL_HOVER());
-        painter.rect_stroke(
-            cap_rect,
-            1.5,
-            Stroke::new(0.8_f32, TraktorTheme::BORDER_COLOR()),
-        );
-        painter.line_segment(
-            [
-                Pos2::new(cap_rect.left() + 2.0, cap_y),
-                Pos2::new(cap_rect.right() - 2.0, cap_y),
-            ],
-            Stroke::new(1.5_f32, TraktorTheme::TEXT_PRIMARY()),
-        );
-    }
-
-    response
-}
-
 /// Custom Horizontal Crossfader Widget
 pub fn crossfader(ui: &mut Ui, value: &mut f32, width: f32) -> Response {
     let size = Vec2::new(width, 20.0);
@@ -253,47 +158,6 @@ pub fn crossfader(ui: &mut Ui, value: &mut f32, width: f32) -> Response {
     }
 
     response
-}
-
-/// Stereo Segmented LED VU Meter Tower Widget (Toned-down Traktor Pro 4 style)
-pub fn vu_meter(ui: &mut Ui, level_l: f32, level_r: f32, height: f32) {
-    let width = 10.0;
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
-
-    if !ui.is_rect_visible(rect) {
-        return;
-    }
-
-    let painter = ui.painter();
-    painter.rect_filled(rect, 1.0, TraktorTheme::METER_BG());
-
-    let segments = 16;
-    let seg_w = (width - 3.0) / 2.0;
-    let seg_h = ((height - 4.0) / segments as f32 - 1.0).max(1.2);
-
-    let draw_channel = |ch_x: f32, level: f32| {
-        let lit_count = ((level.clamp(0.0, 1.0) * segments as f32).round() as usize).min(segments);
-        for seg_idx in 0..segments {
-            let y = rect.bottom() - 2.0 - (seg_idx as f32 + 1.0) * (seg_h + 1.0);
-            let seg_rect = Rect::from_min_size(Pos2::new(ch_x, y), Vec2::new(seg_w, seg_h));
-
-            let color = if seg_idx < lit_count {
-                if seg_idx >= segments - 2 {
-                    TraktorTheme::METER_RED()
-                } else if seg_idx >= segments - 4 {
-                    TraktorTheme::METER_YELLOW()
-                } else {
-                    TraktorTheme::METER_GREEN()
-                }
-            } else {
-                TraktorTheme::METER_GREEN().gamma_multiply(0.15)
-            };
-            painter.rect_filled(seg_rect, 0.0, color);
-        }
-    };
-
-    draw_channel(rect.left() + 1.0, level_l);
-    draw_channel(rect.left() + 1.0 + seg_w + 1.0, level_r);
 }
 
 /// Maps 3-band `[low, mid, high]` amplitudes into the waveform colours `bands` ([`crate::theme::waveform_bands`]):
@@ -1359,54 +1223,6 @@ pub fn stripe_overview(
         painter.line_segment(
             [Pos2::new(scrub_x, rect.top()), Pos2::new(scrub_x, rect.bottom())],
             Stroke::new(1.5_f32, TraktorTheme::WAVEFORM_PLAYHEAD()),
-        );
-    }
-
-    response
-}
-
-/// Hotcue Pad Widget (`1`..`8`) — Understated matte grey Traktor Pro 4 hotcue bar
-pub fn cue_pad(ui: &mut Ui, index: usize, has_cue: bool, active: bool, width: f32) -> Response {
-    let size = Vec2::new(width, 18.0);
-    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
-
-    if ui.is_rect_visible(rect) {
-        let painter = ui.painter();
-        let bg = if active {
-            TraktorTheme::DECK_A()
-        } else if has_cue {
-            TraktorTheme::CONTROL_HOVER()
-        } else {
-            TraktorTheme::HOTCUE_EMPTY()
-        };
-
-        painter.rect_filled(rect, 1.0, bg);
-        painter.rect_stroke(rect, 1.0, Stroke::new(0.8_f32, TraktorTheme::BORDER_COLOR()));
-
-        // Subtle bottom accent bar when a cue/state is stored
-        if has_cue {
-            let cue_col = TraktorTheme::hotcue_color(index);
-            let bar_rect = Rect::from_min_max(
-                Pos2::new(rect.left() + 1.0, rect.bottom() - 2.5),
-                Pos2::new(rect.right() - 1.0, rect.bottom() - 0.5),
-            );
-            painter.rect_filled(bar_rect, 0.5, cue_col);
-        }
-
-        let text_color = if active {
-            TraktorTheme::BG_INPUT()
-        } else if has_cue {
-            TraktorTheme::TEXT_PRIMARY()
-        } else {
-            TraktorTheme::TEXT_MUTED()
-        };
-
-        painter.text(
-            Pos2::new(rect.left() + 5.0, rect.center().y - 0.5),
-            egui::Align2::LEFT_CENTER,
-            index.to_string(),
-            egui::FontId::proportional(9.5),
-            text_color,
         );
     }
 

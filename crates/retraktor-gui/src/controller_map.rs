@@ -408,11 +408,7 @@ impl Mapping {
     }
 
     pub fn save(&self) -> std::io::Result<()> {
-        let path = Self::path();
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        std::fs::write(path, self.to_text())
+        crate::library_ui::write_atomic(&Self::path(), &self.to_text())
     }
 }
 
