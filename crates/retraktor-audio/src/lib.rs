@@ -133,7 +133,7 @@ impl Default for FourDeckAudioEngine {
                 filter: BipolarFilter::default(),
             }),
             crossfader: 0.5,
-            crossfader_curve: 0.5,
+            crossfader_curve: 0.0,
             master_volume: 0.8,
             maximizer: OzoneMaximizerDsp::default(),
             last_master_peak: (0.0, 0.0),
@@ -160,23 +160,32 @@ impl FourDeckAudioEngine {
         }
     }
 
-    /// Computes Crossfader Left/Right gains for `crossfader` in `0.0..=1.0` and `crossfader_curve`
-    /// (`< 0.55` Smooth, `0.55..0.9` Steep, `>= 0.9` Scratch cut). Every curve is a flat-top DJ blend:
-    /// both sides sit at unity from their own end through the center and fade only across the far half,
-    /// with a 5% end-stop cut deadzone so hardware potentiometers silence the opposite deck completely.
+    /// Crossfader Left/Right gains for `crossfader` in `0.0..=1.0` and `crossfader_curve` from `0.0` (smooth)
+    /// to `1.0` (sharp cut), as Traktor's curve slider. Measured on Traktor 4.5.1: each side is at unity from its
+    /// own end through the centre and fades as sin² over the last stretch of travel, 0.47 wide on the smooth end
+    /// narrowing to a cut on the sharp end. No deadzone, as Traktor: the MX2 reader clamps its fader's end stops.
     pub fn crossfader_gains(&self) -> (f32, f32) {
-        const DEADZONE: f32 = 0.05;
-        let raw = if self.crossfader.is_finite() { self.crossfader.clamp(0.0, 1.0) } else { 0.5 };
-        let x = ((raw - DEADZONE) / (1.0 - 2.0 * DEADZONE)).clamp(0.0, 1.0);
-        let curve = if self.crossfader_curve.is_finite() { self.crossfader_curve } else { 0.5 };
-        if curve >= 0.9 {
-            // Scratch: cut in over the first/last 5% past the end-stop deadzone.
-            return (((1.0 - x) * 20.0).clamp(0.0, 1.0), (x * 20.0).clamp(0.0, 1.0));
+        let x = if self.crossfader.is_finite() { self.crossfader.clamp(0.0, 1.0) } else { 0.5 };
+        let curve = if self.crossfader_curve.is_finite() { self.crossfader_curve.clamp(0.0, 1.0) } else { 0.0 };
+        let width = (0.47 - 0.46 * curve).max(0.005);
+        let fade = |from_end: f32| (std::f32::consts::FRAC_PI_2 * (from_end / width).min(1.0)).sin().powi(2);
+        (fade(1.0 - x), fade(x))
+    }
+
+    /// A channel fader's gain at `position` `0.0..=1.0`, Traktor's taper as measured on 4.5.1 (-10 dB halfway).
+    pub fn fader_gain(position: f32) -> f32 {
+        const DB: [f32; 21] = [
+            -90.0, -37.69, -29.62, -25.39, -22.17, -19.15, -16.98, -15.08, -13.11, -11.6, -10.0, -8.75, -7.58, -6.31, -5.3,
+            -4.34, -3.29, -2.44, -1.63, -0.73, 0.0,
+        ];
+        if !(position > 0.0) {
+            return 0.0;
         }
-        // Smooth fades gently from zero across the far half; Steep holds longer and drops near the end.
-        let shape = if curve < 0.55 { 1.25 } else { 0.45 };
-        let fade = |t: f32| t.clamp(0.0, 1.0).powf(shape);
-        (fade((1.0 - x) * 2.0), fade(x * 2.0))
+        let at = position.min(1.0) * 20.0;
+        let i = (at as usize).min(19);
+        // Below the first step the level falls to silence in amplitude, not in dB, so 0 is truly off.
+        let db = DB[i] + (DB[i + 1] - DB[i]) * (at - i as f32);
+        if i == 0 { (at * 10f32.powf(DB[1] / 20.0)).min(1.0) } else { 10f32.powf(db / 20.0) }
     }
 
     /// Synchronizes deck/mixer state from [`PropertyBus`] into the audio engine and writes
@@ -300,7 +309,7 @@ impl FourDeckAudioEngine {
                 1.0
             };
 
-            let post_gain = strip.volume * xf_scalar;
+            let post_gain = Self::fader_gain(strip.volume) * xf_scalar;
             post_fader[i] = (pre_l * post_gain, pre_r * post_gain);
             master_l += post_fader[i].0;
             master_r += post_fader[i].1;
@@ -348,46 +357,30 @@ mod tests {
         assert!(meter > 0.1);
     }
 
+    /// Points measured on Traktor 4.5.1's crossfader and channel fader, in dB; ours stays within 1.5 dB of each (the sin² fit is furthest off deep in the fade).
     #[test]
-    fn crossfader_curves_are_flat_top_with_distinct_shapes() {
-        let gains = |pos: f32, curve: f32| {
+    fn crossfader_and_fader_follow_traktor() {
+        let right_db = |pos: f32, curve: f32| {
             let mut e = FourDeckAudioEngine::default();
-            e.crossfader = pos;
-            e.crossfader_curve = curve;
-            e.crossfader_gains()
+            (e.crossfader, e.crossfader_curve) = (pos, curve);
+            20.0 * e.crossfader_gains().1.max(1e-9).log10()
         };
-        for curve in [0.5, 0.6, 0.95] {
-            for left_stop in [0.0, 0.03, 0.05] {
-                assert_eq!(gains(left_stop, curve), (1.0, 0.0), "curve {curve} left stop {left_stop}");
-            }
-            assert_eq!(gains(0.5, curve), (1.0, 1.0), "curve {curve} center");
-            for right_stop in [0.95, 0.97, 1.0] {
-                assert_eq!(gains(right_stop, curve), (0.0, 1.0), "curve {curve} right stop {right_stop}");
-            }
+        for (pos, curve, traktor) in [(0.05, 0.0, -32.51), (0.15, 0.0, -13.11), (0.3, 0.0, -3.24), (0.45, 0.0, -0.09), (0.1, 0.504, -8.16), (0.2, 0.504, -0.65), (0.025, 0.874, -9.59)] {
+            let ours = right_db(pos, curve);
+            assert!((ours - traktor).abs() < 1.5, "curve {curve} at {pos}: ours {ours:.2} dB, Traktor {traktor} dB");
         }
-        for curve in [0.5, 0.6] {
-            let (l, r) = gains(0.75, curve);
-            assert!(r == 1.0 && l < 1.0 && l > 0.0, "curve {curve} far-half fade: {l}");
+        for curve in [0.0, 0.5, 1.0] {
+            let mut e = FourDeckAudioEngine::default();
+            (e.crossfader, e.crossfader_curve) = (0.0, curve);
+            assert_eq!(e.crossfader_gains(), (1.0, 0.0), "an end silences the other deck");
+            e.crossfader = 0.5;
+            assert_eq!(e.crossfader_gains(), (1.0, 1.0), "both decks full at the centre");
         }
-        let (smooth, steep) = (gains(0.25, 0.5).1, gains(0.25, 0.6).1);
-        assert!(steep > smooth + 0.1, "Smooth {smooth} vs Steep {steep}");
-        assert_eq!(gains(0.25, 0.95).1, 1.0, "scratch is fully in past cut-in");
-        let scratch_ramp = gains(0.0725, 0.95).1;
-        assert!(scratch_ramp > 0.3 && scratch_ramp < 0.7, "scratch cut-in ramp: {scratch_ramp}");
-
-        // End-to-end mix check: opposite deck is strictly silent inside the end-stop deadzone.
-        for (xf, inputs, label) in [
-            (0.04, [(0.0, 0.0), (0.8, 0.8), (0.0, 0.0), (0.0, 0.0)], "Deck B bled through at left crossfader stop"),
-            (0.96, [(0.8, 0.8), (0.0, 0.0), (0.0, 0.0), (0.0, 0.0)], "Deck A bled through at right crossfader stop"),
-        ] {
-            let mut engine = FourDeckAudioEngine::default();
-            engine.strips[0].playing = true;
-            engine.strips[1].playing = true;
-            engine.crossfader = xf;
-            for _ in 0..32 {
-                let (ml, mr, _, _) = engine.process_frame(inputs);
-                assert_eq!((ml, mr), (0.0, 0.0), "{label}");
-            }
+        for (pos, traktor) in [(0.05, -37.69), (0.25, -19.15), (0.5, -10.0), (0.83, -2.95), (1.0, 0.0)] {
+            let ours = 20.0 * FourDeckAudioEngine::fader_gain(pos).log10();
+            assert!((ours - traktor).abs() < 0.4, "fader at {pos}: ours {ours:.2} dB, Traktor {traktor} dB");
         }
+        assert_eq!(FourDeckAudioEngine::fader_gain(0.0), 0.0);
+        assert!(FourDeckAudioEngine::fader_gain(0.02) < FourDeckAudioEngine::fader_gain(0.04));
     }
 }

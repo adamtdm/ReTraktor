@@ -49,6 +49,10 @@ impl MixerEqModel {
     /// into a linear amplitude scalar (`0.0` full kill in `ZIso3Band` / `P600_3Band` mode).
     pub fn knob_to_linear(&self, knob: f32) -> f32 {
         let clamped = knob.clamp(0.0, 1.0);
+        if self.flavor == MixerEqFlavor::ZIso3Band {
+            // Measured on Traktor 4.5.1: Z ISO's band gain is 2 × the knob, from kill through unity to +6 dB.
+            return 2.0 * clamped;
+        }
         if (clamped - 0.5).abs() < 1e-4 {
             return 1.0;
         }
@@ -161,7 +165,7 @@ impl Lr4Bands {
     }
 }
 
-/// DJ-style 3-band isolator: low below 300 Hz, high above 2.5 kHz, 24 dB/oct slopes.
+/// DJ-style 3-band isolator: low below 284 Hz, high above 4.65 kHz, 24 dB/oct slopes (Traktor's Z ISO, measured).
 /// At unity the bands sum to a flat (allpass) response.
 #[derive(Debug, Clone, Default)]
 pub struct ThreeBandIsolator {
@@ -174,8 +178,8 @@ pub struct ThreeBandIsolator {
 }
 
 impl ThreeBandIsolator {
-    pub const LOW_HZ: f32 = 300.0;
-    pub const HIGH_HZ: f32 = 2500.0;
+    pub const LOW_HZ: f32 = 284.0;
+    pub const HIGH_HZ: f32 = 4650.0;
     const GLIDE_SEC: f32 = 0.005;
 
     /// Applies linear band gains (`1.0` = unity, `0.0` = kill) to one stereo frame.
@@ -285,6 +289,8 @@ struct FxCore {
     comb_lp: [[f32; 4]; 2],
     allpass: [[DelayLine; 2]; 2],
     svf: [Svf; 2],
+    /// The Filter's second 12 dB/oct stage.
+    svf2: [Svf; 2],
     tone: [Svf; 2],
     beats: f64,
     gate: f32,
@@ -304,6 +310,7 @@ impl Default for FxCore {
             comb_lp: [[0.0; 4]; 2],
             allpass: std::array::from_fn(|_| std::array::from_fn(|_| DelayLine::new(1280))),
             svf: Default::default(),
+            svf2: Default::default(),
             tone: Default::default(),
             beats: 0.0,
             gate: 1.0,
@@ -342,6 +349,7 @@ impl FxCore {
                 }
             }
             self.svf = Default::default();
+            self.svf2 = Default::default();
             self.tone = Default::default();
             self.last_kind = kind;
             self.quiet = DELAY_FRAMES;
@@ -386,11 +394,18 @@ impl FxCore {
         let mut y = [0.0f32; 2];
         match kind {
             MixerFxKind::Filter => {
-                let t = tone.abs();
-                let fc = if tone < 0.0 { 20_000.0 * 0.001f32.powf(t) } else { 20.0 * 1000f32.powf(t) };
-                let (g, k) = (svf_g(fc, sr), SVF_K * (1.0 - 0.8 * feedback));
+                // Traktor's Z filter, fitted to measurements of Traktor 4.5.1: two damped 12 dB/oct stages (k = 1.8)
+                // whose cutoff moves log-linearly between these points at every 0.1 of the knob's travel from centre.
+                const LOW_PASS_HZ: [f32; 11] = [22_000.0, 12_800.0, 7_143.0, 3_988.0, 2_422.0, 1_471.0, 821.0, 499.0, 303.0, 169.0, 103.0];
+                const HIGH_PASS_HZ: [f32; 11] = [20.0, 55.0, 96.0, 166.0, 263.0, 421.0, 724.0, 1_150.0, 1_842.0, 3_185.0, 5_063.0];
+                let table = if tone < 0.0 { &LOW_PASS_HZ } else { &HIGH_PASS_HZ };
+                let at = tone.abs().min(1.0) * 10.0;
+                let i = (at as usize).min(9);
+                let fc = table[i] * (table[i + 1] / table[i]).powf(at - i as f32);
+                let (g, k) = (svf_g(fc, sr), 1.8 * (1.0 - 0.8 * feedback));
                 for c in 0..2 {
                     let (lp, _, hp) = self.svf[c].tick_k(x[c], g, k);
+                    let (lp, _, hp) = self.svf2[c].tick_k(if tone < 0.0 { lp } else { hp }, g, k);
                     y[c] = if tone < 0.0 { lp } else { hp };
                 }
             }
@@ -540,7 +555,7 @@ impl BipolarFilter {
         // Keep the active tap side while a send tail rings out back through center.
         let side = |below: f32, above: f32| if self.last_sign < 0.0 { below } else { above };
         let [amount, feedback] = match self.kind {
-            MixerFxKind::Filter => [0.5, 0.35],
+            MixerFxKind::Filter => [0.5, 0.0], // no resonance: Traktor's Z filter has none
             // Fixed room size avoids pitch-scrubbing comb delays as the knob returns to center.
             MixerFxKind::Reverb => [0.6, 0.25 + 0.7 * d],
             MixerFxKind::DualDelay => [0.5, 0.3 + 0.55 * d],
@@ -556,7 +571,8 @@ impl BipolarFilter {
         if FxCore::is_send(self.kind) {
             (in_l + wl, in_r + wr)
         } else {
-            let m = (4.0 * d).min(1.0);
+            // Traktor's filter still lets about a fifth of the dry signal through at 0.05 off centre.
+            let m = (if self.kind == MixerFxKind::Filter { 8.0 } else { 4.0 } * d).min(1.0);
             (in_l + (wl - in_l) * m, in_r + (wr - in_r) * m)
         }
     }
@@ -1041,12 +1057,31 @@ mod tests {
         }
     }
 
+    /// Points measured on Traktor 4.5.1's Z filter (knob, Hz, dB); ours stays within 1.5 dB.
+    #[test]
+    fn mixer_filter_follows_traktors_z_filter() {
+        for (knob, hz, traktor) in [(0.25, 1016.0, -4.5), (0.25, 2032.0, -17.44), (0.1, 254.0, -7.25), (0.75, 640.0, -3.97), (0.9, 2560.0, -4.96), (0.0, 50.0, -1.77)] {
+            let mut f = MixerFxProcessor::default();
+            (f.knob, f.enabled) = (knob, true);
+            let (mut inp, mut out) = (0.0f64, 0.0f64);
+            for n in 0..44_100 + 22_050 {
+                let x = 0.25 * (std::f32::consts::TAU * hz * n as f32 / 44_100.0).sin();
+                let (y, _) = f.process_at(x, x, 44_100.0, 120.0);
+                if n >= 44_100 {
+                    (inp, out) = (inp + (x * x) as f64, out + (y * y) as f64);
+                }
+            }
+            let ours = 10.0 * (out / inp).log10() as f32;
+            assert!((ours - traktor).abs() < 1.5, "knob {knob} at {hz} Hz: ours {ours:.2} dB, Traktor {traktor} dB");
+        }
+    }
+
     #[test]
     fn test_eq_flux_transport_and_ozone_maximizer() {
         let eq = MixerEqModel::default();
         assert_eq!(eq.knob_to_linear(0.0), 0.0); // Z-ISO full kill
         assert!((eq.knob_to_linear(0.5) - 1.0).abs() < 1e-5);
-        assert!(eq.knob_to_linear(1.0) > 2.5);
+        assert_eq!((eq.knob_to_linear(0.25), eq.knob_to_linear(1.0)), (0.5, 2.0), "Z ISO: 2 × knob, as Traktor 4.5.1 measures (-6 dB at a quarter, +6 dB full)");
 
         let meta = StemMetadata::default();
         let mut summer = StemSummer::from_metadata(&meta);

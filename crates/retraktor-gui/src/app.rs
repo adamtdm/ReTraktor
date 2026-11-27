@@ -1879,13 +1879,8 @@ impl ReTraktorApp {
         drop(self.audio.shared.lock().map(|mut s| s.take_retired()));
         if let Ok(mut state) = self.audio.shared.lock() {
             state.crossfader = self.crossfader_pos;
-            state.crossfader_curve = if self.preferences.xfader_curve_idx == 2 {
-                0.95
-            } else if self.preferences.xfader_curve_idx == 1 {
-                0.6
-            } else {
-                0.5
-            };
+            // Smooth, the middle and the sharp end of Traktor's curve slider.
+            state.crossfader_curve = self.preferences.xfader_curve_idx.min(2) as f32 / 2.0;
 
             state.stem_volumes = self.deck_stem_volumes;
             state.stem_muted = self.deck_stem_muted;

@@ -367,7 +367,7 @@ impl PropertyBus {
             }
         }
         bus.register("app.traktor.mixer.xfader.adjust", PropValue::Float(0.5), Some(0.0), Some(1.0), "Crossfader Position");
-        bus.register("app.traktor.mixer.xfader.curve", PropValue::Float(0.5), Some(0.0), Some(1.0), "Crossfader Curve");
+        bus.register("app.traktor.mixer.xfader.curve", PropValue::Float(0.0), Some(0.0), Some(1.0), "Crossfader Curve");
         bus.register("app.traktor.mixer.master.volume", PropValue::Float(0.8), Some(0.0), Some(1.0), "Master Volume");
         bus.register("app.traktor.mixer.master_volume", PropValue::Float(0.8), Some(0.0), Some(1.0), "Master Volume Alias");
         bus.register("app.traktor.mixer.mic_volume", PropValue::Float(0.0), Some(0.0), Some(1.0), "Microphone Volume");

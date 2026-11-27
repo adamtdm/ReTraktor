@@ -1000,7 +1000,7 @@ impl Default for AudioSharedState {
             play_requests: [0; 4],
             playhead_residual: [(0.0, 0.0); 4],
             crossfader: 0.5,
-            crossfader_curve: 0.5,
+            crossfader_curve: 0.0,
             scratch_active: [false; 4],
             scratch_rate: [0.0; 4],
             scratch_target_rate: [0.0; 4],
