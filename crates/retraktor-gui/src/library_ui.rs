@@ -1143,12 +1143,17 @@ impl LibraryManager {
         };
         let path = mgr.collection_path.clone();
         if path.is_file() {
-            match mgr.import_nml_file(&path) {
+            crate::diag::stage("startup: reading your collection .nml");
+            let t0 = std::time::Instant::now();
+            let read = mgr.import_nml_file(&path);
+            crate::diag::log(&format!("read your collection in {} ms: {} tracks", t0.elapsed().as_millis(), mgr.tracks.len()));
+            match read {
                 Ok(_) => mgr.status_message.clear(),
                 Err(e) => mgr.status_message = format!("Could not read {}: {e}", path.display()),
             }
             mgr.dirty_since = None;
         }
+        crate::diag::stage("startup: missing list, removed list");
         mgr.load_missing_sidecar();
         mgr.removed = fs::read_to_string(mgr.removed_file()).unwrap_or_default().lines().map(PathBuf::from).collect();
         mgr.rebuild_removed_names();
@@ -1320,7 +1325,9 @@ impl LibraryManager {
 
     /// Processes background results and chosen files; call every frame, even while preferences are open.
     pub fn apply_picks(&mut self, music_folders: &mut Vec<PathBuf>) {
+        crate::diag::stage("library: background results");
         self.poll();
+        crate::diag::stage("library: picked files");
         if std::mem::take(&mut self.relocate_linked) && !music_folders.is_empty() {
             self.relocate_after_check = Some(music_folders.clone());
         }
@@ -1996,6 +2003,7 @@ impl LibraryManager {
                 Msg::Detected(found) => self.detected = Some(found),
                 Msg::Status(s) => self.job_status = s,
                 Msg::Scanned(batch) => {
+                    crate::diag::stage("library: adding scanned tracks");
                     let known: HashSet<PathBuf> = self.tracks.iter().filter_map(|t| t.file_path.clone()).collect();
                     for t in batch {
                         if !t.file_path.as_ref().is_some_and(|p| known.contains(p)) {
@@ -2006,6 +2014,7 @@ impl LibraryManager {
                     self.touch();
                 }
                 Msg::Checked(res) => {
+                    crate::diag::stage("library: missing-file check results");
                     for (id, missing, stems) in res {
                         if let Some(t) = self.track_mut(id) {
                             t.missing = missing;
@@ -2015,6 +2024,7 @@ impl LibraryManager {
                     self.version += 1;
                 }
                 Msg::Relocated(fixed) => {
+                    crate::diag::stage("library: relinked tracks");
                     self.status_message = format!("Re-linked {} tracks; reading their tags…", fixed.len());
                     for (id, p) in fixed {
                         if let Some(t) = self.track_mut(id) {
@@ -2025,6 +2035,7 @@ impl LibraryManager {
                     self.touch();
                 }
                 Msg::Tags(batch) => {
+                    crate::diag::stage("library: tag batch");
                     for (id, tags, cues) in batch {
                         if let Some(t) = self.track_mut(id).filter(|t| t.file_path == tags.file_path) {
                             t.adopt_serato_cues(cues);
@@ -2034,6 +2045,7 @@ impl LibraryManager {
                     self.touch();
                 }
                 Msg::Analyzed(id, a, overwrite) => {
+                    crate::diag::stage("library: analysis result");
                     if let Some(t) = self.track_mut(id) {
                         t.apply_analysis(&a, overwrite, true);
                     }
@@ -2045,6 +2057,8 @@ impl LibraryManager {
                 }
                 Msg::Saved(Ok(_)) => self.saving = false,
                 Msg::LibraryRead(path, read) => {
+                    crate::diag::stage("library: merging a linked collection");
+                    let t0 = std::time::Instant::now();
                     let Some(i) = self.libraries.iter().position(|l| l.path == path) else { continue };
                     let name = self.library_name(i);
                     match read {
@@ -2057,6 +2071,7 @@ impl LibraryManager {
                             lib.track_ids = ids;
                             self.status_message = format!("{name}: {}", lib.note);
                             self.relocate_linked |= added > 0;
+                            crate::diag::log(&format!("merged linked library {name}: {} tracks, {added} new, in {} ms", self.libraries[i].track_ids.len(), t0.elapsed().as_millis()));
                         }
                         Err(e) => {
                             self.libraries[i].note = format!("Couldn't read it: {e}");
@@ -2065,6 +2080,7 @@ impl LibraryManager {
                     }
                 }
                 Msg::Done(s) => {
+                    crate::diag::stage("library: job done");
                     self.jobs = self.jobs.saturating_sub(1);
                     if !s.is_empty() {
                         self.status_message = s;
@@ -2084,6 +2100,7 @@ impl LibraryManager {
                 }
             }
         }
+        crate::diag::stage("library: autosave snapshot");
         self.autosave();
     }
 

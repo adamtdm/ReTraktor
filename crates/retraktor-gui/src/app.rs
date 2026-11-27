@@ -294,10 +294,10 @@ impl Default for ReTraktorApp {
         default_steps[3][15] = true;
 
         Self {
-            audio: AudioSystem::new(),
-            library: LibraryManager::default(),
-            preferences: PreferencesDialog::load(),
-            demucs: crate::demucs::DemucsManager::new(),
+            audio: { crate::diag::stage("startup: audio"); AudioSystem::new() },
+            library: { crate::diag::stage("startup: library"); LibraryManager::default() },
+            preferences: { crate::diag::stage("startup: preferences"); PreferencesDialog::load() },
+            demucs: { crate::diag::stage("startup: demucs"); crate::demucs::DemucsManager::new() },
             bus,
             layout: TraktorLayout::Browser, // Library first; switches to Mix on the first load
             show_shortcuts_hud: false,
@@ -381,7 +381,7 @@ impl Default for ReTraktorApp {
             deck_load_failed: [None; 4],
             load_channel: mpsc::channel(),
             preview: None,
-            preview_loader: crate::audio::PreviewLoader::new(crate::overview::StripeCache::user()),
+            preview_loader: { crate::diag::stage("startup: preview loader"); crate::audio::PreviewLoader::new(crate::overview::StripeCache::user()) },
             stripes: crate::overview::StripeCache::user(),
             prepared: Vec::new(),
             browse_seen: (None, std::time::Instant::now()),
@@ -400,7 +400,7 @@ impl Default for ReTraktorApp {
             pattern_decay: 0.5,
             timeline_transition_bars: 16,
             timeline_preset_idx: 1,
-            mx2_driver: Mx2HidDriver::new(),
+            mx2_driver: { crate::diag::stage("startup: MX2 driver"); Mx2HidDriver::new() },
             mx2_hidraw_file: None,
             mx2_rx: None,
             mx2_dev_node: None,
@@ -428,7 +428,7 @@ impl Default for ReTraktorApp {
                 let steps = std::env::var("SHOT_STEPS").unwrap_or_else(|_| "Mix,FourDeck,Browser,prefs".into());
                 (d, steps.split(',').map(str::to_string).collect())
             }),
-            set_state: crate::setlist::SetUiState::default(),
+            set_state: { crate::diag::stage("startup: set list"); crate::setlist::SetUiState::default() },
         }
     }
 }
@@ -475,6 +475,7 @@ fn spawn_hid_reader(dev_node: &str) -> Option<std::sync::mpsc::Receiver<Option<V
 
 impl eframe::App for ReTraktorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        crate::diag::frame_start();
         // Capped frame rate only while something moves; otherwise a slow tick. Controller threads wake it on input.
         crate::preferences::LOW_POWER.store(self.preferences.low_power, std::sync::atomic::Ordering::Relaxed);
         if self.needs_continuous_repaint() {
@@ -488,7 +489,9 @@ impl eframe::App for ReTraktorApp {
             self.screenshot_step(ctx);
         }
 
+        crate::diag::stage("audio output");
         self.apply_audio_output();
+        crate::diag::stage("recording & close");
 
         // Flush the autosaved collection and preferences on close.
         if self.poll_recording() && self.close_after_recording {
@@ -532,8 +535,11 @@ impl eframe::App for ReTraktorApp {
             }
         }
 
+        crate::diag::stage("deck loads finishing");
         self.finish_loads();
+        crate::diag::stage("preview player");
         self.poll_preview();
+        crate::diag::stage("keys");
         if self.deck_loading.iter().any(|&l| l) {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
@@ -543,6 +549,7 @@ impl eframe::App for ReTraktorApp {
             self.set_state.add_tracks(&ids);
         }
 
+        crate::diag::stage("audio state lock (set playback)");
         let dt = ctx.input(|i| i.stable_dt);
         let (is_rec, rec_offset) = match &self.recording {
             Some(rec) if rec.is_active() => (true, rec.seconds()),
@@ -562,8 +569,11 @@ impl eframe::App for ReTraktorApp {
             }
         }
 
+        crate::diag::stage("MX2 hardware");
         self.poll_mx2_hardware();
+        crate::diag::stage("audio state sync");
         self.sync_audio_state();
+        crate::diag::stage("theme");
 
         crate::theme::apply_visuals(ctx);
         crate::theme::set_waveform_colours(self.preferences.waveform_color_mode);
@@ -584,6 +594,7 @@ impl eframe::App for ReTraktorApp {
                 }
                 ui.set_opacity(work_t);
 
+                crate::diag::stage("top bar");
                 // 1. Top FX Rack, Master Clock, Layout Switcher, Pattern Toggle & Mix Recorder
                 self.show_top_bar(ui);
 
@@ -607,6 +618,7 @@ impl eframe::App for ReTraktorApp {
                     }
                 }
                 ui.set_opacity(work_t * layout_t);
+                crate::diag::stage("deck layout");
                 match self.layout {
                     TraktorLayout::Parallel => {
                         self.show_parallel_layout(ui);
@@ -630,12 +642,14 @@ impl eframe::App for ReTraktorApp {
                         let idle = self.idle_deck();
                         let locks = self.locked_decks();
                         self.show_mini_decks_bar(ui);
+                        crate::diag::stage("set view");
                         self.set_state.show_set_view(ui, &mut self.library, idle, locks);
                         self.show_browser_panel(ui);
                     }
                 }
             });
 
+        crate::diag::stage("controllers & preferences sync");
         // Synchronize live hardware state with Preferences Controller Dialog
         self.preferences.mx2_connected_node = self.mx2_dev_node.clone();
         self.preferences.mx2_access_status = self.mx2_access_status.clone();
@@ -675,6 +689,7 @@ impl eframe::App for ReTraktorApp {
             }
         }
         self.library.apply_picks(&mut self.preferences.music_folders);
+        crate::diag::stage("settings sync");
         if self.preferences.trigger_music_rescan {
             self.preferences.trigger_music_rescan = false;
             self.library.start_scan(self.preferences.music_folders.clone());
@@ -699,6 +714,7 @@ impl eframe::App for ReTraktorApp {
             self.custom_mappings.insert(entry.control_id.clone(), entry.action.clone());
         }
 
+        crate::diag::stage("demucs");
         // Demucs background installer & separation worker synchronization
         self.preferences.demucs_install_state = self.demucs.get_install_state();
         if self.preferences.trigger_demucs_install {
@@ -775,6 +791,7 @@ impl eframe::App for ReTraktorApp {
             }
         }
 
+        crate::diag::stage("audio status");
         // Preferences Dialog
         self.preferences.audio_output = self.audio.status_line();
         self.audio.log_stream_trouble();
@@ -794,8 +811,10 @@ impl eframe::App for ReTraktorApp {
 
         // Suggest Next Track Window
         if self.show_next_track_panel {
+            crate::diag::stage("next track window");
             self.render_next_track_window(ctx);
         }
+        crate::diag::frame_end();
     }
 }
 
@@ -4526,6 +4545,7 @@ impl ReTraktorApp {
                 // Left Navigation Tree
                 ui.allocate_ui_with_layout(Vec2::new(178.0, avail_h - 16.0), Layout::top_down(Align::Min), |ui| {
                     ui.set_width(178.0);
+                    crate::diag::stage("browser: nav tree");
                     self.library.show_nav_tree(ui);
                 });
 
@@ -4533,7 +4553,9 @@ impl ReTraktorApp {
 
                 let four_deck_mode = self.layout == TraktorLayout::FourDeck || self.preferences.four_deck_mode;
                 let locked_decks = self.locked_decks();
+                crate::diag::stage("browser: preview");
                 self.browser_preview_view();
+                crate::diag::stage("browser: track list");
                 self.library.show_browser_content(
                     ui,
                     four_deck_mode,
@@ -4541,7 +4563,9 @@ impl ReTraktorApp {
                     &mut self.preferences.library_columns,
                     &mut self.preferences.music_folders,
                 );
+                crate::diag::stage("deck loads starting");
                 self.drain_pending_loads();
+                crate::diag::stage("browser: after list");
                 if let Some(selected) = self.library.preview_requested.take() {
                     self.press_preview(selected);
                 }

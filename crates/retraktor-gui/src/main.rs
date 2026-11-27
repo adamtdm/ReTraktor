@@ -16,6 +16,7 @@ mod app;
 mod audio;
 mod controller_map;
 mod demucs;
+mod diag;
 mod dot;
 mod keylock;
 mod library_ui;
@@ -102,6 +103,7 @@ fn percent_decode_path(s: &str) -> String {
 }
 
 fn main() -> eframe::Result<()> {
+    diag::start();
     // Before any thread starts: PipeWire must play our channels as sent (main on 1–2, headphones on 3–4). Left to
     // remix, it folds the cue pair into the speakers on a stereo device and copies the main mix into the headphones
     // on a 4-out one, so both decks are heard whatever the crossfader says. A user's own PIPEWIRE_PROPS wins.
@@ -124,6 +126,7 @@ fn main() -> eframe::Result<()> {
         "ReTraktor",
         native_options,
         Box::new(move |cc| {
+            diag::stage("startup: fonts");
             let _ = UI_CTX.set(cc.egui_ctx.clone());
             theme::install_fonts(&cc.egui_ctx);
             if let Err(e) = theme::remember_first_overview_look() {
@@ -131,8 +134,11 @@ fn main() -> eframe::Result<()> {
             }
             // egui moves 40 pt per wheel notch (under 2 library rows); desktop apps move about 3 lines.
             cc.egui_ctx.options_mut(|o| o.line_scroll_speed = 3.0 * 22.0);
+            diag::stage("startup: building the app (library, audio, controllers)");
             let mut app = ReTraktorApp::default();
+            diag::stage("startup: opening .nml files");
             app.open_nml_files(nml_files);
+            diag::log("startup done; first frame next");
             Ok(Box::new(app))
         }),
     )
